@@ -1,0 +1,243 @@
+//! Bitmap physical frame allocator.
+//!
+//! One bit per 4 KiB frame over the whole usable physical range; a set bit
+//! means the frame is in use. The bitmap itself lives in the first usable
+//! hole large enough to hold it, past everything the boot loader placed.
+
+use super::{page_align_up, phys_to_virt, HHDM_LIMIT, KERNEL_PHYS_START, PAGE_SIZE_U64};
+use crate::multiboot::BootInfo;
+use crate::sync::Spinlock;
+
+pub struct BitmapAllocator {
+    bitmap: *mut u64,
+    words: usize,
+    total_frames: usize,
+    used_frames: usize,
+    /// Where the next linear search starts, to avoid rescanning from zero.
+    hint: usize,
+    bitmap_phys: u64,
+    bitmap_bytes: usize,
+}
+
+unsafe impl Send for BitmapAllocator {}
+
+impl BitmapAllocator {
+    #[inline]
+    fn test(&self, frame: usize) -> bool {
+        unsafe { (*self.bitmap.add(frame / 64) >> (frame % 64)) & 1 != 0 }
+    }
+
+    #[inline]
+    fn set(&mut self, frame: usize) {
+        unsafe {
+            let word = self.bitmap.add(frame / 64);
+            *word |= 1u64 << (frame % 64);
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self, frame: usize) {
+        unsafe {
+            let word = self.bitmap.add(frame / 64);
+            *word &= !(1u64 << (frame % 64));
+        }
+    }
+
+    fn mark_range_used(&mut self, start: u64, end: u64) {
+        let first = (start / PAGE_SIZE_U64) as usize;
+        let last = (page_align_up(end) / PAGE_SIZE_U64) as usize;
+        for f in first..last.min(self.total_frames) {
+            if !self.test(f) {
+                self.used_frames += 1;
+            }
+            self.set(f);
+        }
+    }
+
+    fn mark_range_free(&mut self, start: u64, end: u64) {
+        let first = (page_align_up(start) / PAGE_SIZE_U64) as usize;
+        let last = (end / PAGE_SIZE_U64) as usize;
+        for f in first..last.min(self.total_frames) {
+            if self.test(f) {
+                self.used_frames -= 1;
+            }
+            self.clear(f);
+        }
+    }
+
+    /// Allocate one 4 KiB frame, returning its physical address.
+    pub fn alloc(&mut self) -> Option<u64> {
+        if self.used_frames >= self.total_frames {
+            return None;
+        }
+        for pass in 0..2 {
+            let start = if pass == 0 { self.hint } else { 0 };
+            let end = if pass == 0 { self.total_frames } else { self.hint };
+            let mut w = start / 64;
+            let wend = (end + 63) / 64;
+            while w < wend {
+                let word = unsafe { *self.bitmap.add(w) };
+                if word != u64::MAX {
+                    let bit = (!word).trailing_zeros() as usize;
+                    let frame = w * 64 + bit;
+                    if frame < self.total_frames && !self.test(frame) {
+                        self.set(frame);
+                        self.used_frames += 1;
+                        self.hint = frame + 1;
+                        return Some(frame as u64 * PAGE_SIZE_U64);
+                    }
+                }
+                w += 1;
+            }
+        }
+        None
+    }
+
+    /// Allocate `count` physically contiguous frames.
+    pub fn alloc_contiguous(&mut self, count: usize) -> Option<u64> {
+        if count == 0 {
+            return None;
+        }
+        if count == 1 {
+            return self.alloc();
+        }
+        let mut run = 0usize;
+        for f in 0..self.total_frames {
+            if self.test(f) {
+                run = 0;
+                continue;
+            }
+            run += 1;
+            if run == count {
+                let first = f + 1 - count;
+                for x in first..=f {
+                    self.set(x);
+                }
+                self.used_frames += count;
+                return Some(first as u64 * PAGE_SIZE_U64);
+            }
+        }
+        None
+    }
+
+    pub fn free(&mut self, phys: u64) {
+        let frame = (phys / PAGE_SIZE_U64) as usize;
+        if frame >= self.total_frames {
+            return;
+        }
+        if self.test(frame) {
+            self.used_frames -= 1;
+            self.clear(frame);
+            if frame < self.hint {
+                self.hint = frame;
+            }
+        }
+    }
+
+    pub fn total_frames(&self) -> usize {
+        self.total_frames
+    }
+    pub fn used_frames(&self) -> usize {
+        self.used_frames
+    }
+    pub fn free_frames(&self) -> usize {
+        self.total_frames - self.used_frames
+    }
+    pub fn bitmap_region(&self) -> (u64, usize) {
+        (self.bitmap_phys, self.bitmap_bytes)
+    }
+}
+
+static ALLOCATOR: Spinlock<Option<BitmapAllocator>> = Spinlock::new(None);
+
+/// Build the frame allocator from the boot loader's memory map.
+pub fn init(boot: &BootInfo) {
+    // Highest usable physical address, clamped to what the boot trampoline
+    // direct-maps; frames above that are unreachable through the HHDM.
+    let mut max_addr = 0u64;
+    for r in &boot.regions[..boot.region_count] {
+        if r.is_usable() {
+            max_addr = max_addr.max(r.end());
+        }
+    }
+    if max_addr > HHDM_LIMIT {
+        max_addr = HHDM_LIMIT;
+    }
+
+    let total_frames = (max_addr / PAGE_SIZE_U64) as usize;
+    let bitmap_bytes = page_align_up(((total_frames + 7) / 8) as u64) as usize;
+
+    // The bitmap must not land on the kernel image, the modules, or the
+    // multiboot blob, so start looking past all of them.
+    let barrier = super::kernel_phys_end().max(boot.reserved_end).max(0x10_0000);
+    let mut bitmap_phys = 0u64;
+    for r in &boot.regions[..boot.region_count] {
+        if !r.is_usable() {
+            continue;
+        }
+        let start = page_align_up(r.addr.max(barrier));
+        if start + bitmap_bytes as u64 <= r.end() {
+            bitmap_phys = start;
+            break;
+        }
+    }
+    assert!(bitmap_phys != 0, "no room for the frame bitmap");
+
+    let bitmap = phys_to_virt(bitmap_phys) as *mut u64;
+    let words = bitmap_bytes / 8;
+    unsafe { core::ptr::write_bytes(bitmap, 0xFF, bitmap_bytes) };
+
+    let mut alloc = BitmapAllocator {
+        bitmap,
+        words,
+        total_frames,
+        used_frames: total_frames,
+        hint: 0,
+        bitmap_phys,
+        bitmap_bytes,
+    };
+
+    // Release usable RAM, then take back everything that is already spoken for.
+    for r in &boot.regions[..boot.region_count] {
+        if r.is_usable() {
+            alloc.mark_range_free(r.addr, r.end().min(max_addr));
+        }
+    }
+    alloc.mark_range_used(0, 0x10_0000);
+    alloc.mark_range_used(KERNEL_PHYS_START, super::kernel_phys_end());
+    alloc.mark_range_used(bitmap_phys, bitmap_phys + bitmap_bytes as u64);
+    alloc.mark_range_used(boot.info_phys, boot.reserved_end);
+    for m in &boot.modules[..boot.module_count] {
+        alloc.mark_range_used(m.start, m.end);
+    }
+
+    *ALLOCATOR.lock() = Some(alloc);
+}
+
+pub fn alloc_frame() -> Option<u64> {
+    ALLOCATOR.lock().as_mut().and_then(|a| a.alloc())
+}
+
+/// Allocate a frame and zero it through the direct map.
+pub fn alloc_zeroed_frame() -> Option<u64> {
+    let frame = alloc_frame()?;
+    unsafe { core::ptr::write_bytes(phys_to_virt(frame) as *mut u8, 0, 4096) };
+    Some(frame)
+}
+
+pub fn alloc_contiguous(count: usize) -> Option<u64> {
+    ALLOCATOR.lock().as_mut().and_then(|a| a.alloc_contiguous(count))
+}
+
+pub fn free_frame(phys: u64) {
+    if let Some(a) = ALLOCATOR.lock().as_mut() {
+        a.free(phys);
+    }
+}
+
+pub fn stats() -> (usize, usize) {
+    match ALLOCATOR.lock().as_ref() {
+        Some(a) => (a.used_frames(), a.total_frames()),
+        None => (0, 0),
+    }
+}

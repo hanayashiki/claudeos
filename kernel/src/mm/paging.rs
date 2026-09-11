@@ -1,0 +1,285 @@
+//! 4-level x86_64 page tables.
+//!
+//! Tables are always reached through the direct map, so no recursive mapping
+//! or temporary windows are needed.
+
+use super::frame;
+use super::{page_align_down, phys_to_virt, HHDM_BASE, PAGE_SIZE_U64};
+use core::arch::asm;
+
+pub const PRESENT: u64 = 1 << 0;
+pub const WRITABLE: u64 = 1 << 1;
+pub const USER: u64 = 1 << 2;
+pub const WRITE_THROUGH: u64 = 1 << 3;
+pub const NO_CACHE: u64 = 1 << 4;
+pub const ACCESSED: u64 = 1 << 5;
+pub const DIRTY: u64 = 1 << 6;
+pub const HUGE: u64 = 1 << 7;
+pub const GLOBAL: u64 = 1 << 8;
+pub const NO_EXECUTE: u64 = 1 << 63;
+
+/// Bits software may use freely in a non-present entry.
+pub const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+#[inline]
+pub fn read_cr3() -> u64 {
+    let value: u64;
+    unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    value & ADDR_MASK
+}
+
+#[inline]
+pub unsafe fn write_cr3(phys: u64) {
+    asm!("mov cr3, {}", in(reg) phys, options(nostack, preserves_flags));
+}
+
+#[inline]
+pub fn flush_tlb(virt: u64) {
+    unsafe { asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)) };
+}
+
+#[inline]
+pub fn flush_tlb_all() {
+    unsafe { write_cr3(read_cr3()) };
+}
+
+#[inline]
+fn index_of(virt: u64, level: u32) -> usize {
+    ((virt >> (12 + 9 * level)) & 0x1FF) as usize
+}
+
+#[inline]
+unsafe fn table_at(phys: u64) -> *mut u64 {
+    phys_to_virt(phys) as *mut u64
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapError {
+    OutOfMemory,
+    AlreadyMapped,
+}
+
+/// A page table hierarchy, identified by the physical address of its PML4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddressSpace {
+    pub pml4: u64,
+}
+
+impl AddressSpace {
+    pub fn current() -> AddressSpace {
+        AddressSpace { pml4: read_cr3() }
+    }
+
+    /// Create a fresh address space that shares the kernel half.
+    pub fn new_user() -> Option<AddressSpace> {
+        let pml4 = frame::alloc_zeroed_frame()?;
+        let kernel = Self::current();
+        unsafe {
+            let src = table_at(kernel.pml4);
+            let dst = table_at(pml4);
+            // Entries 256..512 cover the kernel: direct map, heap, image.
+            for i in 256..512 {
+                *dst.add(i) = *src.add(i);
+            }
+        }
+        Some(AddressSpace { pml4 })
+    }
+
+    pub unsafe fn switch_to(&self) {
+        write_cr3(self.pml4);
+    }
+
+    /// Walk to the page table entry for `virt`, allocating tables if asked.
+    unsafe fn entry_for(
+        &self,
+        virt: u64,
+        create: bool,
+        parent_flags: u64,
+    ) -> Result<*mut u64, MapError> {
+        let mut table = self.pml4;
+        for level in (1..4).rev() {
+            let idx = index_of(virt, level);
+            let entry_ptr = table_at(table).add(idx);
+            let entry = *entry_ptr;
+            if entry & PRESENT == 0 {
+                if !create {
+                    return Err(MapError::OutOfMemory);
+                }
+                let new = frame::alloc_zeroed_frame().ok_or(MapError::OutOfMemory)?;
+                *entry_ptr = new | PRESENT | WRITABLE | (parent_flags & USER);
+                table = new;
+            } else {
+                if entry & HUGE != 0 {
+                    // A large page already covers this address.
+                    return Err(MapError::AlreadyMapped);
+                }
+                // Widen permissions on the way down: a user leaf is
+                // unreachable if any parent lacks the user bit.
+                if parent_flags & USER != 0 && entry & USER == 0 {
+                    *entry_ptr = entry | USER;
+                }
+                table = entry & ADDR_MASK;
+            }
+        }
+        Ok(table_at(table).add(index_of(virt, 0)))
+    }
+
+    pub fn map(&self, virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
+        let virt = page_align_down(virt);
+        unsafe {
+            let entry = self.entry_for(virt, true, flags)?;
+            *entry = (phys & ADDR_MASK) | flags | PRESENT;
+        }
+        flush_tlb(virt);
+        Ok(())
+    }
+
+    /// Map without requiring the entry to be absent; replaces any existing one.
+    pub fn remap(&self, virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
+        self.map(virt, phys, flags)
+    }
+
+    /// Allocate a frame and map it at `virt`.
+    pub fn map_new(&self, virt: u64, flags: u64) -> Result<u64, MapError> {
+        let phys = frame::alloc_zeroed_frame().ok_or(MapError::OutOfMemory)?;
+        self.map(virt, phys, flags)?;
+        Ok(phys)
+    }
+
+    pub fn unmap(&self, virt: u64) -> Option<u64> {
+        let virt = page_align_down(virt);
+        unsafe {
+            let entry = self.entry_for(virt, false, 0).ok()?;
+            let value = *entry;
+            if value & PRESENT == 0 {
+                return None;
+            }
+            *entry = 0;
+            flush_tlb(virt);
+            Some(value & ADDR_MASK)
+        }
+    }
+
+    pub fn translate(&self, virt: u64) -> Option<u64> {
+        unsafe {
+            let mut table = self.pml4;
+            for level in (1..4).rev() {
+                let entry = *table_at(table).add(index_of(virt, level));
+                if entry & PRESENT == 0 {
+                    return None;
+                }
+                if entry & HUGE != 0 {
+                    let page_size = 1u64 << (12 + 9 * level);
+                    return Some((entry & ADDR_MASK & !(page_size - 1)) | (virt & (page_size - 1)));
+                }
+                table = entry & ADDR_MASK;
+            }
+            let entry = *table_at(table).add(index_of(virt, 0));
+            if entry & PRESENT == 0 {
+                return None;
+            }
+            Some((entry & ADDR_MASK) | (virt & 0xFFF))
+        }
+    }
+
+    pub fn flags_of(&self, virt: u64) -> Option<u64> {
+        unsafe {
+            let entry = self.entry_for(virt, false, 0).ok()?;
+            let value = *entry;
+            if value & PRESENT == 0 {
+                None
+            } else {
+                Some(value & !ADDR_MASK)
+            }
+        }
+    }
+
+    pub fn set_flags(&self, virt: u64, flags: u64) -> Option<()> {
+        unsafe {
+            let entry = self.entry_for(virt, false, flags).ok()?;
+            let value = *entry;
+            if value & PRESENT == 0 {
+                return None;
+            }
+            *entry = (value & ADDR_MASK) | flags | PRESENT;
+        }
+        flush_tlb(virt);
+        Some(())
+    }
+
+    pub fn map_range(
+        &self,
+        virt: u64,
+        phys: u64,
+        size: u64,
+        flags: u64,
+    ) -> Result<(), MapError> {
+        let pages = super::page_align_up(size) / PAGE_SIZE_U64;
+        for i in 0..pages {
+            self.map(virt + i * PAGE_SIZE_U64, phys + i * PAGE_SIZE_U64, flags)?;
+        }
+        Ok(())
+    }
+
+    /// Free every user frame and page table below the kernel half.
+    pub fn free_user_memory(&self) {
+        unsafe {
+            let pml4 = table_at(self.pml4);
+            for i in 0..256 {
+                let entry = *pml4.add(i);
+                if entry & PRESENT == 0 {
+                    continue;
+                }
+                self.free_table(entry & ADDR_MASK, 3);
+                *pml4.add(i) = 0;
+            }
+        }
+    }
+
+    unsafe fn free_table(&self, table_phys: u64, level: u32) {
+        if level > 1 {
+            let table = table_at(table_phys);
+            for i in 0..512 {
+                let entry = *table.add(i);
+                if entry & PRESENT == 0 || entry & HUGE != 0 {
+                    continue;
+                }
+                self.free_table(entry & ADDR_MASK, level - 1);
+            }
+        } else {
+            let table = table_at(table_phys);
+            for i in 0..512 {
+                let entry = *table.add(i);
+                if entry & PRESENT != 0 {
+                    frame::free_frame(entry & ADDR_MASK);
+                }
+            }
+        }
+        frame::free_frame(table_phys);
+    }
+
+    /// Release the PML4 itself. The kernel half is shared, so it is not freed.
+    pub fn destroy(self) {
+        self.free_user_memory();
+        frame::free_frame(self.pml4);
+    }
+}
+
+/// Drop the boot-time identity map of the low 4 GiB now that the kernel runs
+/// entirely out of the higher half. This frees PML4[0] for user programs.
+pub unsafe fn drop_identity_map() {
+    let pml4 = table_at(read_cr3());
+    *pml4.add(0) = 0;
+    flush_tlb_all();
+}
+
+/// True when `virt` is a canonical user-space address.
+#[inline]
+pub fn is_user_addr(virt: u64) -> bool {
+    virt < 0x0000_8000_0000_0000
+}
+
+#[inline]
+pub fn is_hhdm_addr(virt: u64) -> bool {
+    virt >= HHDM_BASE && virt < HHDM_BASE + super::HHDM_LIMIT
+}
