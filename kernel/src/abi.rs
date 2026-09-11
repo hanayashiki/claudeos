@@ -269,6 +269,7 @@ pub const CLONE_VM: u64 = 0x00000100;
 pub const CLONE_FS: u64 = 0x00000200;
 pub const CLONE_FILES: u64 = 0x00000400;
 pub const CLONE_SIGHAND: u64 = 0x00000800;
+pub const CLONE_VFORK: u64 = 0x00004000;
 pub const CLONE_PARENT: u64 = 0x00008000;
 pub const CLONE_THREAD: u64 = 0x00010000;
 pub const CLONE_SETTLS: u64 = 0x00080000;

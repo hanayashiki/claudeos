@@ -52,6 +52,7 @@ pub fn register(task: Box<Task>) -> u32 {
     let pid = task.pid;
     let ptr = Box::into_raw(task);
     TASKS.lock().push(TaskPtr(ptr));
+    crate::fs::procfs::add_process(pid);
     pid
 }
 
@@ -81,6 +82,15 @@ pub fn foreground() -> u32 {
 
 pub fn current_pgid() -> u32 {
     current().pgid
+}
+
+/// True when a task other than the current one is running on `pml4`.
+pub fn space_in_use(pml4: u64) -> bool {
+    let cur = unsafe { CURRENT };
+    let tasks = TASKS.lock();
+    tasks
+        .iter()
+        .any(|t| t.0 != cur && t.get().space.pml4 == pml4 && t.get().state != State::Zombie)
 }
 
 fn pick_next() -> Option<*mut Task> {
@@ -239,6 +249,15 @@ pub fn exit_current(status: i32) -> ! {
         let ppid = task.ppid;
         let pid = task.pid;
 
+        if let Some(parent_pid) = task.vfork_parent.take() {
+            if let Some(parent) = find(parent_pid) {
+                if parent.state == State::Sleeping {
+                    parent.state = State::Runnable;
+                    parent.wake_at = 0;
+                }
+            }
+        }
+
         if pid == 1 {
             crate::println!();
             crate::println!(
@@ -348,6 +367,7 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
         let mut tasks = TASKS.lock();
         tasks.retain(|t| t.0 != ptr);
     }
+    crate::fs::procfs::remove_process(pid);
     unsafe {
         let mut task = Box::from_raw(ptr);
         let pml4 = task.space.pml4;

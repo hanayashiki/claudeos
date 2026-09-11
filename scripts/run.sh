@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KERNEL="$ROOT/build/kernel.elf"
 TIMEOUT=20
 INITRD=""
+APPEND=""
 EXTRA=()
 
 while [ $# -gt 0 ]; do
@@ -12,6 +13,7 @@ while [ $# -gt 0 ]; do
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --initrd)  INITRD="$2";  shift 2 ;;
     --kernel)  KERNEL="$2";  shift 2 ;;
+    --append)  APPEND="$2";  shift 2 ;;
     *) EXTRA+=("$1"); shift ;;
   esac
 done
@@ -20,6 +22,7 @@ ARGS=(-kernel "$KERNEL" -serial stdio -display none -m 512M
       -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04
       -cpu qemu64,+pdpe1gb,+rdrand,+fsgsbase,+xsave)
 if [ -n "$INITRD" ]; then ARGS+=(-initrd "$INITRD"); fi
+if [ -n "$APPEND" ]; then ARGS+=(-append "$APPEND"); fi
 if [ ${#EXTRA[@]} -gt 0 ]; then ARGS+=("${EXTRA[@]}"); fi
 
 exec perl -e '

@@ -107,6 +107,8 @@ pub struct Task {
     pub started: bool,
     /// Program a freshly created task should exec before reaching user mode.
     pub pending_exec: Option<(String, Vec<String>, Vec<String>)>,
+    /// Parent blocked in vfork, to be woken when this task execs or exits.
+    pub vfork_parent: Option<u32>,
 }
 
 unsafe impl Send for Task {}
@@ -168,6 +170,7 @@ impl Task {
             umask: 0o022,
             started: false,
             pending_exec: None,
+            vfork_parent: None,
         }))
     }
 

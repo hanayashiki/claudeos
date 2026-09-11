@@ -105,8 +105,21 @@ pub fn fork(
         }
     }
 
+    let vfork = flags & CLONE_VFORK != 0;
+    if vfork {
+        child.vfork_parent = Some(parent.pid);
+    }
+
     parent.children.push(child_pid);
     sched::register(child);
+
+    if vfork {
+        // vfork's contract: the parent does not run again until the child has
+        // handed back its address space by exec'ing or exiting.
+        let parent = sched::current();
+        parent.state = State::Sleeping;
+        sched::schedule();
+    }
     Ok(child_pid as u64)
 }
 
@@ -169,9 +182,15 @@ pub fn exec_into_current(
         }
     };
 
-    // The old image is unreachable now.
-    if old_space.pml4 != new_space.pml4 {
+    // The old image is unreachable from this task. Under CLONE_VM another
+    // task is still running on it, so only the last user tears it down.
+    if old_space.pml4 != new_space.pml4 && !sched::space_in_use(old_space.pml4) {
         old_space.destroy();
+    }
+
+    // A vfork parent may resume as soon as the address space is handed back.
+    if let Some(parent_pid) = task.vfork_parent.take() {
+        sched::wake(parent_pid);
     }
 
     task.fds.close_on_exec();

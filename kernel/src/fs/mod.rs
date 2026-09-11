@@ -6,6 +6,7 @@
 pub mod cpio;
 pub mod dev;
 pub mod pipe;
+pub mod procfs;
 
 use crate::abi::*;
 use crate::sync::Spinlock;
@@ -23,6 +24,8 @@ pub enum NodeKind {
     Dir,
     Symlink,
     Device(dev::DeviceKind),
+    /// A file whose contents the kernel produces on each read.
+    Generated(procfs::Generated),
     Fifo,
 }
 
@@ -82,6 +85,7 @@ impl Node {
         match self.kind {
             NodeKind::Dir => 4096,
             NodeKind::Device(_) => 0,
+            NodeKind::Generated(kind) => procfs::size(kind),
             _ => self.inner.lock().data.len() as u64,
         }
     }
@@ -96,17 +100,16 @@ impl Node {
             NodeKind::File => DT_REG,
             NodeKind::Symlink => DT_LNK,
             NodeKind::Device(_) => DT_CHR,
+            NodeKind::Generated(_) => DT_REG,
             NodeKind::Fifo => DT_FIFO,
         }
     }
 
     pub fn stat(&self) -> Stat {
+        // Generated files report a length that has to be computed without the
+        // node lock held, so do it first.
+        let size = self.size() as i64;
         let inner = self.inner.lock();
-        let size = match self.kind {
-            NodeKind::Dir => 4096,
-            NodeKind::Device(_) => 0,
-            _ => inner.data.len() as i64,
-        };
         Stat {
             st_dev: 1,
             st_ino: self.ino,
@@ -132,6 +135,7 @@ impl Node {
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
         match self.kind {
             NodeKind::Device(kind) => dev::read(kind, buf),
+            NodeKind::Generated(kind) => procfs::read(kind, offset, buf),
             NodeKind::Dir => Err(Errno::EISDIR),
             _ => {
                 let inner = self.inner.lock();
@@ -149,6 +153,7 @@ impl Node {
     pub fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, Errno> {
         match self.kind {
             NodeKind::Device(kind) => dev::write(kind, buf),
+            NodeKind::Generated(_) => Err(Errno::EACCES),
             NodeKind::Dir => Err(Errno::EISDIR),
             _ => {
                 let mut inner = self.inner.lock();
@@ -192,6 +197,7 @@ pub fn init() {
         let _ = mkdir(&alloc::format!("/{}", dir), 0o755);
     }
     dev::populate();
+    procfs::populate();
 }
 
 /// Collapse `.`/`..` and make `path` absolute relative to `cwd`.

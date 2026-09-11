@@ -48,7 +48,8 @@ fn parse_cmdline(cmdline: Option<&str>) -> BootOptions {
     let mut options =
         BootOptions { init: "/bin/init".to_string(), trace: 0, args: Vec::new() };
     let Some(cmdline) = cmdline else { return options };
-    for word in cmdline.split_whitespace() {
+    // The boot loader puts the kernel's own path in the first word.
+    for word in cmdline.split_whitespace().skip(1) {
         if let Some(value) = word.strip_prefix("init=") {
             options.init = value.to_string();
         } else if let Some(value) = word.strip_prefix("trace=") {
@@ -57,8 +58,9 @@ fn parse_cmdline(cmdline: Option<&str>) -> BootOptions {
             } else {
                 value.parse().unwrap_or(0)
             };
-        } else if let Some(value) = word.strip_prefix("--") {
-            options.args.push(value.to_string());
+        } else {
+            // Anything else is handed to the init process as an argument.
+            options.args.push(word.to_string());
         }
     }
     options
