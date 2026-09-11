@@ -9,32 +9,70 @@ use core::panic::PanicInfo;
 
 #[macro_use]
 mod serial;
+mod abi;
 mod console;
 mod cpu;
+mod elf;
+mod fs;
 mod io;
 mod mm;
 mod multiboot;
 mod sched;
 mod sync;
+mod syscall;
+mod task;
+mod time;
 mod trap;
+mod uaccess;
+
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 global_asm!(include_str!("boot.s"), options(att_syntax));
 global_asm!(include_str!("cpu/interrupts.s"), options(att_syntax));
+global_asm!(include_str!("switch.s"), options(att_syntax));
+global_asm!(include_str!("syscall/entry.s"), options(att_syntax));
 
 extern "C" {
     static kernel_stack_top: u8;
+}
+
+/// Options parsed out of the boot loader command line.
+struct BootOptions {
+    init: String,
+    trace: u64,
+    args: Vec<String>,
+}
+
+fn parse_cmdline(cmdline: Option<&str>) -> BootOptions {
+    let mut options =
+        BootOptions { init: "/bin/init".to_string(), trace: 0, args: Vec::new() };
+    let Some(cmdline) = cmdline else { return options };
+    for word in cmdline.split_whitespace() {
+        if let Some(value) = word.strip_prefix("init=") {
+            options.init = value.to_string();
+        } else if let Some(value) = word.strip_prefix("trace=") {
+            options.trace = if value == "all" {
+                u64::MAX
+            } else {
+                value.parse().unwrap_or(0)
+            };
+        } else if let Some(value) = word.strip_prefix("--") {
+            options.args.push(value.to_string());
+        }
+    }
+    options
 }
 
 #[no_mangle]
 pub extern "C" fn kmain(mb_info_phys: u64, magic: u64) -> ! {
     serial::init();
     println!();
-    println!("=== claudeos ===");
+    println!("claudeos: booting");
 
     if magic as u32 != multiboot::MULTIBOOT_BOOTLOADER_MAGIC {
         panic!("bad multiboot magic {:#x}", magic);
     }
-
     let boot = unsafe { multiboot::parse(mb_info_phys) };
 
     cpu::gdt::init();
@@ -45,77 +83,100 @@ pub extern "C" fn kmain(mb_info_phys: u64, magic: u64) -> ! {
     cpu::init_sse();
 
     mm::frame::init(&boot);
+    mm::heap::init();
     let (used, total) = mm::frame::stats();
     println!(
-        "memory: {} MiB usable, {} MiB in use by the kernel image",
+        "memory: {} MiB total, {} MiB in use, {} MiB kernel heap",
         total * 4096 / (1024 * 1024),
-        used * 4096 / (1024 * 1024)
+        used * 4096 / (1024 * 1024),
+        mm::KERNEL_HEAP_SIZE / (1024 * 1024)
     );
 
-    mm::heap::init();
-    println!("heap: {} MiB at {:#x}", mm::KERNEL_HEAP_SIZE / (1024 * 1024), mm::KERNEL_HEAP_BASE);
+    // The command line lives in low memory and needs the heap to parse.
+    let cmdline = unsafe { multiboot::cstr_at(boot.cmdline_phys) };
+    let options = parse_cmdline(cmdline);
 
     cpu::pic::init();
     cpu::pit::init(cpu::pit::TICK_HZ);
+    time::init();
     console::init();
     cpu::pic::unmask(0);
 
-    // Everything the loader left in low memory has been consumed.
+    syscall::init();
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(syscall::TRACE), options.trace) };
+
+    fs::init();
+    mount_initramfs(&boot);
+
+    // Nothing reads low memory through the identity map from here on.
     unsafe { mm::paging::drop_identity_map() };
 
-    sync::enable_interrupts();
+    sched::init();
 
-    selftest(&boot);
+    let mut argv = alloc::vec![options.init.clone()];
+    argv.extend(options.args.iter().cloned());
+    let envp = alloc::vec![
+        "PATH=/bin:/usr/bin".to_string(),
+        "HOME=/root".to_string(),
+        "TERM=linux".to_string(),
+        "USER=root".to_string(),
+        "PWD=/".to_string(),
+    ];
 
-    println!("idle");
-    loop {
-        cpu::halt();
+    match task::spawn(&options.init, argv, envp, 0) {
+        Ok(pid) => {
+            sched::set_foreground(pid);
+            println!("claudeos: starting {} as pid {}", options.init, pid);
+        }
+        Err(err) => {
+            println!("claudeos: cannot start {}: {:?}", options.init, err);
+            println!("claudeos: filesystem contents:");
+            syscall::file::dump_tree("/", 1);
+        }
     }
+
+    sync::enable_interrupts();
+    sched::idle_loop();
 }
 
-fn selftest(boot: &multiboot::BootInfo) {
-    use alloc::string::String;
-    use alloc::vec::Vec;
-
-    let mut v: Vec<u64> = Vec::new();
-    for i in 0..1000 {
-        v.push(i * i);
+fn mount_initramfs(boot: &multiboot::BootInfo) {
+    if boot.module_count == 0 {
+        println!("claudeos: no initramfs module supplied");
+        return;
     }
-    let sum: u64 = v.iter().sum();
-    let mut s = String::new();
-    s.push_str("heap");
-    println!("selftest: {} vec sum={} len={}", s, sum, v.len());
-
-    let space = mm::paging::AddressSpace::current();
-    let probe = 0xFFFF_D000_0000_0000u64;
-    space
-        .map_new(probe, mm::paging::PRESENT | mm::paging::WRITABLE | mm::paging::NO_EXECUTE)
-        .expect("probe map");
-    unsafe {
-        core::ptr::write_volatile(probe as *mut u64, 0xDEAD_BEEF);
-        assert_eq!(core::ptr::read_volatile(probe as *const u64), 0xDEAD_BEEF);
-    }
-    space.unmap(probe);
-    println!("selftest: paging map/unmap ok");
-
-    let ticks_before = trap::ticks();
-    let mut spins = 0u64;
-    while trap::ticks() == ticks_before && spins < 500_000_000 {
-        spins += 1;
-        core::hint::spin_loop();
-    }
-    println!("selftest: timer ticking ({} ticks)", trap::ticks());
-
-    for m in &boot.modules[..boot.module_count] {
-        println!("module: {:#x}..{:#x} ({} bytes)", m.start, m.end, m.len());
+    let module = boot.modules[0];
+    let virt = mm::phys_to_virt(module.start);
+    let archive = unsafe { core::slice::from_raw_parts(virt as *const u8, module.len()) };
+    match fs::cpio::extract(archive) {
+        Ok(stats) => println!(
+            "initramfs: {} files, {} dirs, {} links, {} KiB",
+            stats.files,
+            stats.dirs,
+            stats.symlinks,
+            stats.bytes / 1024
+        ),
+        Err(err) => println!("initramfs: failed to unpack: {}", err),
     }
 }
 
 /// Ask QEMU's isa-debug-exit device to terminate with `code`.
 pub fn qemu_exit(code: u32) -> ! {
-    unsafe {
-        io::outl(0xf4, code);
+    unsafe { io::outl(0xf4, code) };
+    loop {
+        cpu::halt();
     }
+}
+
+/// Shut the machine down. Tries the ACPI sleep register QEMU exposes, then
+/// the debug-exit device, then simply stops.
+pub fn power_off() -> ! {
+    unsafe {
+        io::outw(0x604, 0x2000); // QEMU / modern ACPI
+        io::outw(0xB004, 0x2000); // older QEMU
+        io::outw(0x4004, 0x3400); // virt machines
+        io::outl(0xf4, 0);
+    }
+    sync::disable_interrupts();
     loop {
         cpu::halt();
     }
@@ -126,6 +187,10 @@ fn panic(info: &PanicInfo) -> ! {
     sync::disable_interrupts();
     println!();
     println!("KERNEL PANIC: {}", info);
+    if sched::has_current() {
+        let task = sched::current();
+        println!("  in pid {} ({})", task.pid, task.name);
+    }
     loop {
         cpu::halt();
     }

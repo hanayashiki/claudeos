@@ -2,7 +2,6 @@
 
 use crate::cpu::idt::{register, TrapFrame, EXCEPTION_NAMES};
 use crate::cpu::{pic, read_cr2};
-use crate::println;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub static TICKS: AtomicU64 = AtomicU64::new(0);

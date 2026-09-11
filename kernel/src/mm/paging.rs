@@ -258,6 +258,55 @@ impl AddressSpace {
         frame::free_frame(table_phys);
     }
 
+    /// Copy every user mapping from `src` into this address space, giving the
+    /// copy its own frames.
+    pub fn clone_user_from(&self, src: &AddressSpace) -> Result<(), MapError> {
+        unsafe {
+            let src_pml4 = table_at(src.pml4);
+            for i in 0..256usize {
+                let e4 = *src_pml4.add(i);
+                if e4 & PRESENT == 0 {
+                    continue;
+                }
+                let pdpt = table_at(e4 & ADDR_MASK);
+                for j in 0..512usize {
+                    let e3 = *pdpt.add(j);
+                    if e3 & PRESENT == 0 || e3 & HUGE != 0 {
+                        continue;
+                    }
+                    let pd = table_at(e3 & ADDR_MASK);
+                    for k in 0..512usize {
+                        let e2 = *pd.add(k);
+                        if e2 & PRESENT == 0 || e2 & HUGE != 0 {
+                            continue;
+                        }
+                        let pt = table_at(e2 & ADDR_MASK);
+                        for l in 0..512usize {
+                            let e1 = *pt.add(l);
+                            if e1 & PRESENT == 0 {
+                                continue;
+                            }
+                            let virt = ((i as u64) << 39)
+                                | ((j as u64) << 30)
+                                | ((k as u64) << 21)
+                                | ((l as u64) << 12);
+                            let virt = sign_extend(virt);
+                            let new_frame =
+                                frame::alloc_frame().ok_or(MapError::OutOfMemory)?;
+                            core::ptr::copy_nonoverlapping(
+                                phys_to_virt(e1 & ADDR_MASK) as *const u8,
+                                phys_to_virt(new_frame) as *mut u8,
+                                4096,
+                            );
+                            self.map(virt, new_frame, e1 & !ADDR_MASK)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Release the PML4 itself. The kernel half is shared, so it is not freed.
     pub fn destroy(self) {
         self.free_user_memory();
@@ -271,6 +320,12 @@ pub unsafe fn drop_identity_map() {
     let pml4 = table_at(read_cr3());
     *pml4.add(0) = 0;
     flush_tlb_all();
+}
+
+/// Sign-extend a 48-bit virtual address into canonical form.
+#[inline]
+pub fn sign_extend(virt: u64) -> u64 {
+    ((virt << 16) as i64 >> 16) as u64
 }
 
 /// True when `virt` is a canonical user-space address.
