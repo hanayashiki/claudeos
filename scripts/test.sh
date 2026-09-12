@@ -1,8 +1,19 @@
 #!/bin/bash
 # Boot the OS once per suite. Every suite must report zero failures.
+#
+# ARCH picks the machine, x86_64 unless told otherwise, and is passed on to
+# run.sh and to the interactive driver.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+ARCH="${ARCH:-x86_64}"
+export ARCH
+if [ "$ARCH" = aarch64 ]; then
+  IMAGE="$ROOT/build/initramfs-aarch64.cpio"
+else
+  IMAGE="$ROOT/build/initramfs.cpio"
+fi
 
 status=0
 
@@ -14,7 +25,7 @@ banner() {
 
 # Run a script or program inside the OS and require "N passed, 0 failed".
 run_suite() {
-  local name="$1" append="$2" timeout="$3" image="${4:-$ROOT/build/initramfs.cpio}"
+  local name="$1" append="$2" timeout="$3" image="${4:-$IMAGE}"
   banner "$name"
   local output
   output="$("$ROOT/scripts/run.sh" --timeout "$timeout" \
@@ -37,7 +48,7 @@ run_suite() {
 run_interactive() {
   banner "interactive session"
   local output
-  output="$(python3 "$ROOT/tools/drive.py" --timeout 60 -- \
+  output="$(python3 "$ROOT/tools/drive.py" --timeout 60 --initramfs "$IMAGE" -- \
       "wait:2.5" "echo live-input-works\n" "wait:0.6" \
       "echo abcXY" "wait:0.4" "\x7f\x7f" "wait:0.4" "Z\n" "wait:0.6" \
       "echo throwaway" "wait:0.4" "\x15" "wait:0.4" "echo line-kill-works\n" "wait:0.6" \
@@ -96,13 +107,22 @@ run_suite "network protocols" "net=test" 60
 # The socket system calls, through the standard library, over the loopback
 # address, so no card has to be there.
 run_suite "internet sockets" "init=/bin/inet" 120
-if [ -x "$ROOT/build/rootfs/bin/busybox" ]; then
+# The two suites below run software this project did not build. Both images
+# are fetched as x86-64 binaries, so on any other machine there is nothing to
+# run rather than something that fails.
+if [ "$ARCH" != x86_64 ]; then
+  echo ">> upstream busybox: skipped (the fetched image is x86-64 only)"
+  echo
+elif [ -x "$ROOT/build/rootfs/bin/busybox" ]; then
   run_suite "upstream busybox" "/root/busybox.sh" 300
 else
   echo ">> upstream busybox: skipped (run scripts/fetch-busybox.sh)"
   echo
 fi
-if [ -f "$ROOT/build/alpine.cpio" ]; then
+if [ "$ARCH" != x86_64 ]; then
+  echo ">> alpine linux userland: skipped (the fetched image is x86-64 only)"
+  echo
+elif [ -f "$ROOT/build/alpine.cpio" ]; then
   run_suite "alpine linux userland" "init=/bin/sh /root/alpine.sh" 300 \
       "$ROOT/build/alpine.cpio"
 else
