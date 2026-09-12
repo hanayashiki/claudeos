@@ -37,6 +37,8 @@ pub struct NodeInner {
     pub data: Vec<u8>,
     pub children: BTreeMap<String, NodeRef>,
     pub mtime: i64,
+    /// How many directory entries name this node.
+    pub nlink: u32,
 }
 
 pub struct Node {
@@ -85,6 +87,7 @@ impl Node {
                 data: Vec::new(),
                 children: BTreeMap::new(),
                 mtime: crate::time::unix_time(),
+                nlink: 1,
             }),
         })
     }
@@ -139,7 +142,7 @@ impl Node {
         Stat {
             st_dev: 1,
             st_ino: self.ino,
-            st_nlink: 1,
+            st_nlink: inner.nlink as u64,
             st_mode: inner.mode,
             st_uid: inner.uid,
             st_gid: inner.gid,
@@ -289,6 +292,7 @@ fn lookup_inner(path: &str, follow_final: bool, depth: usize) -> Result<NodeRef,
         if !node.is_dir() {
             return Err(Errno::ENOTDIR);
         }
+        procfs::refresh_dir(&node);
         let child = {
             let inner = node.inner.lock();
             inner.children.get(*name).cloned()
@@ -395,9 +399,32 @@ pub fn symlink(path: &str, target: &str) -> Result<(), Errno> {
     Ok(())
 }
 
+pub fn mkfifo(path: &str, mode: u32) -> Result<NodeRef, Errno> {
+    let (parent, name) = split_parent(path)?;
+    let mut inner = parent.inner.lock();
+    if inner.children.contains_key(&name) {
+        return Err(Errno::EEXIST);
+    }
+    let node = Node::new(NodeKind::Fifo, S_IFIFO | (mode & 0o7777));
+    inner.children.insert(name, node.clone());
+    Ok(node)
+}
+
 pub fn link_node(path: &str, node: NodeRef) -> Result<(), Errno> {
     let (parent, name) = split_parent(path)?;
     parent.inner.lock().children.insert(name, node);
+    Ok(())
+}
+
+/// A second directory entry for a file that already has one.
+pub fn hard_link(path: &str, node: NodeRef) -> Result<(), Errno> {
+    let (parent, name) = split_parent(path)?;
+    let mut inner = parent.inner.lock();
+    if inner.children.contains_key(&name) {
+        return Err(Errno::EEXIST);
+    }
+    node.inner.lock().nlink += 1;
+    inner.children.insert(name, node);
     Ok(())
 }
 
@@ -415,6 +442,11 @@ pub fn unlink(path: &str, want_dir: bool) -> Result<(), Errno> {
         return Err(Errno::ENOTEMPTY);
     }
     inner.children.remove(&name);
+    drop(inner);
+    {
+        let mut node_inner = node.inner.lock();
+        node_inner.nlink = node_inner.nlink.saturating_sub(1);
+    }
     Ok(())
 }
 
@@ -435,6 +467,7 @@ pub struct DirEntry {
 }
 
 pub fn readdir(node: &NodeRef) -> Vec<DirEntry> {
+    procfs::refresh_dir(node);
     let mut out = Vec::new();
     out.push(DirEntry { ino: node.ino, kind: DT_DIR, name: ".".to_string() });
     out.push(DirEntry { ino: node.ino, kind: DT_DIR, name: "..".to_string() });

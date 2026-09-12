@@ -89,13 +89,65 @@ impl Write for Serial {
 
 pub static SERIAL: Spinlock<Serial> = Spinlock::new(Serial::new(COM1));
 
+/// Everything the kernel has printed, which is what `dmesg` reads back.
+///
+/// The serial port is also the user's console, so only kernel messages go in
+/// here: this is fed from `_print`, not from the console write path. It is a
+/// fixed array because the first messages are written before there is a heap.
+pub const LOG_CAPACITY: usize = 16 * 1024;
+
+pub struct KernelLog {
+    data: [u8; LOG_CAPACITY],
+    len: usize,
+}
+
+impl KernelLog {
+    fn push(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if self.len == LOG_CAPACITY {
+                // Full: drop the oldest half rather than the newest message.
+                let keep = LOG_CAPACITY / 2;
+                self.data.copy_within(LOG_CAPACITY - keep.., 0);
+                self.len = keep;
+            }
+            self.data[self.len] = byte;
+            self.len += 1;
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
+pub static LOG: Spinlock<KernelLog> = Spinlock::new(KernelLog { data: [0; LOG_CAPACITY], len: 0 });
+
+/// Writes to the port and records what was written.
+struct Logged;
+
+impl Write for Logged {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        SERIAL.lock().write_str(s)?;
+        LOG.lock().push(s.as_bytes());
+        Ok(())
+    }
+}
+
 pub fn init() {
     SERIAL.lock().init();
 }
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    let _ = SERIAL.lock().write_fmt(args);
+    let _ = Logged.write_fmt(args);
 }
 
 #[macro_export]

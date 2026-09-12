@@ -196,6 +196,13 @@ pub fn openat(dirfd: i64, path_addr: u64, flags: u32, mode: u32) -> SysResult {
         node.truncate(0)?;
     }
 
+    if node.kind == fs::NodeKind::Fifo {
+        let file = fs::pipe::open_fifo(node.ino, flags, &path)?;
+        let cloexec = flags & O_CLOEXEC != 0;
+        let fd = sched::current().fds.alloc(file, cloexec)?;
+        return Ok(fd as u64);
+    }
+
     let file = OpenFile::from_node_at(node, flags, &path);
     let cloexec = flags & O_CLOEXEC != 0;
     let fd = sched::current().fds.alloc(file, cloexec)?;
@@ -397,6 +404,52 @@ pub fn symlinkat(target_addr: u64, dirfd: i64, path_addr: u64) -> SysResult {
     let path = resolve_at(dirfd, path_addr)?;
     fs::symlink(&path, &target)?;
     Ok(0)
+}
+
+/// A second name for an existing file. Nodes are reference counted and the
+/// directory entry is the reference, so this is the same node under two names.
+pub fn linkat(
+    old_dirfd: i64,
+    old_addr: u64,
+    new_dirfd: i64,
+    new_addr: u64,
+    flags: u32,
+) -> SysResult {
+    let old = resolve_at(old_dirfd, old_addr)?;
+    let new = resolve_at(new_dirfd, new_addr)?;
+    let node = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+        fs::lookup_nofollow(&old)?
+    } else {
+        fs::lookup(&old)?
+    };
+    if node.is_dir() {
+        return Err(Errno::EPERM);
+    }
+    if fs::lookup_nofollow(&new).is_ok() {
+        return Err(Errno::EEXIST);
+    }
+    fs::hard_link(&new, node)?;
+    Ok(0)
+}
+
+pub fn mknodat(dirfd: i64, path_addr: u64, mode: u32, _dev: u64) -> SysResult {
+    let path = resolve_at(dirfd, path_addr)?;
+    match mode & S_IFMT {
+        S_IFIFO => {
+            fs::mkfifo(&path, mode)?;
+            Ok(0)
+        }
+        0 | S_IFREG => {
+            if fs::lookup_nofollow(&path).is_ok() {
+                return Err(Errno::EEXIST);
+            }
+            fs::create(&path, mode)?;
+            Ok(0)
+        }
+        // Character and block devices are the kernel's to hand out, not a
+        // program's to invent.
+        _ => Err(Errno::EPERM),
+    }
 }
 
 pub fn readlinkat(dirfd: i64, path_addr: u64, out: u64, len: usize) -> SysResult {

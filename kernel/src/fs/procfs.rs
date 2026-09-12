@@ -39,6 +39,44 @@ pub fn populate() {
     }
 }
 
+/// The `/proc/<pid>/fd` directories, by inode. Their contents change every
+/// time a descriptor is opened or closed, so they are rebuilt when something
+/// looks inside rather than being kept up to date.
+static FD_DIRS: crate::sync::Spinlock<alloc::collections::BTreeMap<u64, u32>> =
+    crate::sync::Spinlock::new(alloc::collections::BTreeMap::new());
+
+/// Rebuild `node` if it is one of those directories. Called on the way into
+/// any directory, so the cheap case is a lookup that finds nothing.
+pub fn refresh_dir(node: &crate::fs::NodeRef) {
+    let pid = match FD_DIRS.lock().get(&node.ino) {
+        Some(pid) => *pid,
+        None => return,
+    };
+    let task = match crate::sched::find(pid) {
+        Some(task) => task,
+        None => return,
+    };
+    let mut children = alloc::collections::BTreeMap::new();
+    for (fd, entry) in task.fds.entries.iter().enumerate() {
+        let file = match entry {
+            Some(file) => file,
+            None => continue,
+        };
+        // A descriptor on a file is a symbolic link to it, which is what
+        // readlink reports and what following the link has to reach. A pipe
+        // has no name to point at, so the entry is a pipe of its own: stat
+        // sees the right type instead of a link to nothing.
+        let entry = match &file.backing {
+            crate::fs::FileBacking::Node(_) if !file.path.is_empty() => {
+                Node::new_symlink(&file.path)
+            }
+            _ => Node::new(NodeKind::Fifo, crate::abi::S_IFIFO | 0o600),
+        };
+        children.insert(format!("{}", fd), entry);
+    }
+    node.inner.lock().children = children;
+}
+
 /// Create /proc/<pid> for a new task.
 pub fn add_process(pid: u32) {
     let dir = format!("/proc/{}", pid);
@@ -55,6 +93,9 @@ pub fn add_process(pid: u32) {
         let node = Node::new(NodeKind::Generated(kind), S_IFREG | 0o444);
         let _ = link_node(&format!("{}/{}", dir, name), node);
     }
+    if let Ok(fd_dir) = mkdir_p(&format!("{}/fd", dir)) {
+        FD_DIRS.lock().insert(fd_dir.ino, pid);
+    }
 }
 
 pub fn remove_process(pid: u32) {
@@ -62,6 +103,11 @@ pub fn remove_process(pid: u32) {
     for name in ["stat", "status", "cmdline", "maps"] {
         let _ = unlink(&format!("{}/{}", dir, name), false);
     }
+    if let Ok(fd_dir) = crate::fs::lookup_nofollow(&format!("{}/fd", dir)) {
+        FD_DIRS.lock().remove(&fd_dir.ino);
+        fd_dir.inner.lock().children.clear();
+    }
+    let _ = unlink(&format!("{}/fd", dir), true);
     let _ = unlink(&dir, true);
 }
 

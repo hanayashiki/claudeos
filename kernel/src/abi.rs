@@ -121,6 +121,14 @@ pub mod nr {
     pub const RENAMEAT: u64 = 264;
     pub const LINKAT: u64 = 265;
     pub const SYMLINKAT: u64 = 266;
+    pub const MKNOD: u64 = 133;
+    pub const MKNODAT: u64 = 259;
+    pub const FLOCK: u64 = 73;
+    pub const GETPRIORITY: u64 = 140;
+    pub const SETPRIORITY: u64 = 141;
+    pub const IOPRIO_SET: u64 = 251;
+    pub const IOPRIO_GET: u64 = 252;
+    pub const SYSLOG: u64 = 103;
     pub const READLINKAT: u64 = 267;
     pub const FCHMODAT: u64 = 268;
     pub const FACCESSAT: u64 = 269;
@@ -248,6 +256,8 @@ pub const S_IFBLK: u32 = 0o060000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFCHR: u32 = 0o020000;
 pub const S_IFIFO: u32 = 0o010000;
+/// `linkat`: resolve the last component of the source if it is a symlink.
+pub const AT_SYMLINK_FOLLOW: u32 = 0x400;
 
 // getdents64 d_type values.
 pub const DT_UNKNOWN: u8 = 0;

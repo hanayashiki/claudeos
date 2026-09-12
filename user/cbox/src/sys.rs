@@ -37,6 +37,8 @@ pub const SYS_CHDIR: u64 = 80;
 pub const SYS_KILL: u64 = 62;
 pub const SYS_IOCTL: u64 = 16;
 pub const SYS_SYNC: u64 = 162;
+pub const SYS_MKNOD: u64 = 133;
+pub const SYS_SYSLOG: u64 = 103;
 
 #[inline(always)]
 unsafe fn syscall0(n: u64) -> i64 {
@@ -140,6 +142,16 @@ pub fn chdir(path: &str) -> i64 {
         Err(_) => return -22,
     };
     unsafe { syscall1(SYS_CHDIR, c.as_ptr() as u64) }
+}
+
+/// Create a node the open/create path cannot: a named pipe.
+pub fn mknod(path: &CString, mode: u32) -> i64 {
+    unsafe { syscall3(SYS_MKNOD, path.as_ptr() as u64, mode as u64, 0) }
+}
+
+/// Read back what the kernel has printed.
+pub fn klog(buf: &mut [u8]) -> i64 {
+    unsafe { syscall3(SYS_SYSLOG, 3, buf.as_mut_ptr() as u64, buf.len() as u64) }
 }
 
 pub fn sync() {

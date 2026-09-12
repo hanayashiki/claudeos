@@ -351,6 +351,79 @@ pub fn kill(pid: i64, signal: i32) -> SysResult {
     }
 }
 
+/// `which` is PRIO_PROCESS, PRIO_PGRP or PRIO_USER; only the first selects a
+/// single task, and `who` of 0 means the caller.
+fn priority_target(which: u64, who: u64) -> Option<&'static mut crate::task::Task> {
+    if which != 0 {
+        return None;
+    }
+    let pid = if who == 0 { sched::current().pid } else { who as u32 };
+    sched::find(pid)
+}
+
+pub fn setpriority(which: u64, who: u64, value: i64) -> SysResult {
+    let nice = value.clamp(-20, 19) as i32;
+    match priority_target(which, who) {
+        Some(task) => {
+            task.nice = nice;
+            Ok(0)
+        }
+        None if which <= 2 => Ok(0),
+        None => Err(Errno::EINVAL),
+    }
+}
+
+pub fn getpriority(which: u64, who: u64) -> SysResult {
+    // The raw call returns 20 - nice so the result is never negative.
+    match priority_target(which, who) {
+        Some(task) => Ok((20 - task.nice) as u64),
+        None if which <= 2 => Ok(20),
+        None => Err(Errno::EINVAL),
+    }
+}
+
+/// `klogctl`: hand back what the kernel has printed. Actions 2, 3 and 4 read
+/// it, 9 and 10 report its size, and 5 clears it.
+pub fn syslog(action: u64, buf: u64, len: i64) -> SysResult {
+    const READ: u64 = 2;
+    const READ_ALL: u64 = 3;
+    const READ_CLEAR: u64 = 4;
+    const CLEAR: u64 = 5;
+    const SIZE_UNREAD: u64 = 9;
+    const SIZE_BUFFER: u64 = 10;
+
+    match action {
+        READ | READ_ALL | READ_CLEAR => {
+            if len < 0 {
+                return Err(Errno::EINVAL);
+            }
+            // Copy it out from under the lock: writing to user memory can
+            // fault, and the fault handler prints.
+            let copy = {
+                let log = crate::serial::LOG.lock();
+                let bytes = log.bytes();
+                let n = bytes.len().min(len as usize);
+                // Keep the tail when the buffer cannot take all of it, which
+                // is the part a reader wants.
+                alloc::vec::Vec::from(&bytes[bytes.len() - n..])
+            };
+            let n = copy.len();
+            uaccess::write_bytes(buf, &copy)?;
+            if action == READ_CLEAR {
+                crate::serial::LOG.lock().clear();
+            }
+            Ok(n as u64)
+        }
+        CLEAR => {
+            crate::serial::LOG.lock().clear();
+            Ok(0)
+        }
+        SIZE_UNREAD => Ok(crate::serial::LOG.lock().len() as u64),
+        SIZE_BUFFER => Ok(crate::serial::LOG_CAPACITY as u64),
+        _ => Ok(0),
+    }
+}
+
 pub fn setpgid(pid: u32, pgid: u32) -> SysResult {
     let target = if pid == 0 { sched::current().pid } else { pid };
     let value = if pgid == 0 { target } else { pgid };

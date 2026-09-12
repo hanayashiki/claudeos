@@ -100,6 +100,20 @@ fn primary(terms: &[&str]) -> bool {
                     .unwrap_or(false),
                 "-s" => std::fs::metadata(value).map(|m| m.len() > 0).unwrap_or(false),
                 "-r" | "-w" => std::fs::metadata(value).is_ok(),
+                "-p" | "-c" | "-b" | "-S" => {
+                    use std::os::unix::fs::FileTypeExt;
+                    std::fs::metadata(value)
+                        .map(|m| {
+                            let kind = m.file_type();
+                            match terms[0] {
+                                "-p" => kind.is_fifo(),
+                                "-c" => kind.is_char_device(),
+                                "-b" => kind.is_block_device(),
+                                _ => kind.is_socket(),
+                            }
+                        })
+                        .unwrap_or(false)
+                }
                 "-x" => {
                     use std::os::unix::fs::MetadataExt;
                     std::fs::metadata(value).map(|m| m.mode() & 0o111 != 0).unwrap_or(false)

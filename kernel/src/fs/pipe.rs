@@ -117,6 +117,74 @@ impl Pipe {
     }
 }
 
+/// Every named pipe that has been opened, by inode number. A FIFO's two ends
+/// are separate `open` calls that have to meet at the same buffer, so the
+/// buffer belongs to the file rather than to the descriptor.
+static FIFOS: Spinlock<alloc::collections::BTreeMap<u64, Arc<Pipe>>> =
+    Spinlock::new(alloc::collections::BTreeMap::new());
+
+fn fifo_for(ino: u64) -> Arc<Pipe> {
+    let mut fifos = FIFOS.lock();
+    if let Some(pipe) = fifos.get(&ino) {
+        return pipe.clone();
+    }
+    let pipe = Pipe::new();
+    fifos.insert(ino, pipe.clone());
+    pipe
+}
+
+/// Open one end of a named pipe.
+///
+/// Opening for reading waits for a writer and opening for writing waits for a
+/// reader, which is what makes a FIFO a rendezvous. O_RDWR opens both ends at
+/// once and never waits.
+pub fn open_fifo(ino: u64, flags: u32, path: &str) -> Result<Arc<super::OpenFile>, Errno> {
+    use crate::abi::{O_ACCMODE, O_NONBLOCK, O_RDWR, O_WRONLY};
+    let pipe = fifo_for(ino);
+    let access = flags & O_ACCMODE;
+    let writing = access == O_WRONLY;
+    let both = access == O_RDWR;
+
+    if writing {
+        if flags & O_NONBLOCK != 0 && pipe.readers.load(Ordering::Acquire) == 0 {
+            return Err(Errno::ENXIO);
+        }
+        pipe.writers.fetch_add(1, Ordering::AcqRel);
+    } else {
+        pipe.readers.fetch_add(1, Ordering::AcqRel);
+        if both {
+            pipe.writers.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    // The end that just arrived may be the one the other side was waiting for.
+    pipe.not_empty.wake_all();
+    pipe.not_full.wake_all();
+
+    let file = Arc::new(super::OpenFile {
+        backing: super::FileBacking::Pipe(pipe.clone(), writing),
+        offset: Spinlock::new(0),
+        flags: Spinlock::new(flags),
+        path: alloc::string::String::from(path),
+    });
+
+    if !both && flags & O_NONBLOCK == 0 {
+        let want = if writing { &pipe.readers } else { &pipe.writers };
+        let queue = if writing { &pipe.not_full } else { &pipe.not_empty };
+        loop {
+            if want.load(Ordering::Acquire) > 0 {
+                break;
+            }
+            if crate::sched::has_pending_signal() {
+                return Err(Errno::EINTR);
+            }
+            queue.wait_until(|| {
+                want.load(Ordering::Acquire) > 0 || crate::sched::has_pending_signal()
+            });
+        }
+    }
+    Ok(file)
+}
+
 /// Create a connected pair of open files: (read end, write end).
 pub fn create_pair(flags: u32) -> (Arc<super::OpenFile>, Arc<super::OpenFile>) {
     use super::{FileBacking, OpenFile};

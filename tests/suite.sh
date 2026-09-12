@@ -174,6 +174,27 @@ check "head -c on a device" "8"          "$(head -c 8 /dev/zero | wc -c)"
 check "background reaped"  "0"           "$(sleep 1 & sleep 2; ps | grep -c ' Z ')"
 
 echo
+echo "-- links, named pipes and /proc/self/fd --"
+rm -rf /tmp/lk; mkdir -p /tmp/lk
+echo hi > /tmp/lk/a
+ln /tmp/lk/a /tmp/lk/b
+check "hard link reads"      "hi"       "$(cat /tmp/lk/b)"
+check "two names, one file"  "2"        "$(stat -c %h /tmp/lk/a)"
+echo changed > /tmp/lk/b
+check "writes are shared"    "changed"  "$(cat /tmp/lk/a)"
+check "same inode"           "0"        "$(test $(stat -c %i /tmp/lk/a) -eq $(stat -c %i /tmp/lk/b); echo $?)"
+rm /tmp/lk/b
+check "unlink drops a name"  "1"        "$(stat -c %h /tmp/lk/a)"
+check "the file is still there" "changed" "$(cat /tmp/lk/a)"
+mkfifo /tmp/lk/f
+check "mkfifo makes a fifo"  "0"        "$(test -p /tmp/lk/f; echo $?)"
+check "a fifo carries data"  "through"  "$(echo through > /tmp/lk/f & cat /tmp/lk/f)"
+check "descriptors are listed" "1"      "$(ls /proc/self/fd | grep -c '^0$')"
+check "a descriptor names its file" "/tmp/lk/a" "$(sh -c 'readlink /proc/self/fd/0' < /tmp/lk/a)"
+check "dmesg has the boot log" "1"      "$(dmesg | grep -c 'claudeos: booting')"
+rm -rf /tmp/lk
+
+echo
 echo "-- stopping and continuing --"
 sleep 30 &
 stopped=$!

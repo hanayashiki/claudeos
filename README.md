@@ -124,7 +124,16 @@ and `bg`, `kill %1` takes a job number, and `ps` shows a stopped task as `T`.
 passed as a multiboot module. Character devices (`/dev/null`, `/dev/zero`,
 `/dev/random`, `/dev/console`) and a generated `/proc` (`meminfo`, `uptime`,
 `cpuinfo`, `tasks`, and a directory per process) are mounted into the same
-tree. Pipes, symbolic links, and `getdents64` all work.
+tree. Pipes, symbolic links, and `getdents64` all work. A file can have more
+than one name: nodes are reference counted and a directory entry is the
+reference, so `link` is a second entry for the same node and `st_nlink` counts
+them. `mkfifo` makes a named pipe whose two ends meet at one buffer, with the
+open of each side waiting for the other. `/proc/<pid>/fd` is rebuilt whenever
+something looks inside it, so it lists the descriptors the process has open
+right now.
+
+**Kernel log.** Everything the kernel prints is also kept in a 16 KiB ring, and
+`syslog` hands it back, so `dmesg` shows the boot messages.
 
 **Console.** A 16550 UART and a PS/2 keyboard feed one input ring. A line
 discipline implements canonical mode with echo, backspace, `Ctrl-C`, `Ctrl-D`
@@ -157,17 +166,17 @@ Ctrl-A/E/B/F/K/U/W/L, a `history` builtin, and tab completion of command names
 from PATH and of file paths elsewhere. Cooked mode comes back before a command
 runs, so the job owns the terminal.
 
-The coreutils cover the common set: `ls cat cp mv rm mkdir rmdir touch ln chmod
-stat find du df echo wc head tail grep sort uniq cut tr tee seq rev printf expr
-test ps free uptime date env id uname hostname mount kill sleep clear hexdump
-basename dirname yes true false`.
+The coreutils cover the common set: `ls cat cp mv rm mkdir rmdir touch ln mkfifo
+chmod stat find du df echo wc head tail grep sort uniq cut tr tee seq rev
+printf expr test ps free uptime dmesg date env id uname hostname mount kill
+sleep clear hexdump basename dirname yes true false`.
 
 ## Tests
 
 `make test` boots the OS once per suite and requires each to report zero
 failures.
 
-- `tests/suite.sh` runs **176 checks** inside the OS, driving the shell through
+- `tests/suite.sh` runs **187 checks** inside the OS, driving the shell through
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
   subprocesses and `/proc`.
@@ -183,7 +192,7 @@ failures.
   host computes for the same input), `ps`, `df`, `xargs`, `timeout`, and
   busybox's own `ash` shell running loops, pipelines and arithmetic. Run
   `make busybox` first to fetch it; the suite is skipped when it is absent.
-- `tests/alpine.sh` runs **29 checks** inside an unmodified Alpine Linux root
+- `tests/alpine.sh` runs **34 checks** inside an unmodified Alpine Linux root
   filesystem, where every program is dynamically linked and loaded by Alpine's
   own musl loader: `awk`, `sed`, `tar` with gzip, `md5sum` and `sha256sum`
   against digests the host computes, `find`, `stat`, `ps`, and ash running

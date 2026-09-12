@@ -87,6 +87,23 @@ pub fn free(args: &[String]) -> i32 {
     }
 }
 
+/// What the kernel has printed since boot.
+pub fn dmesg(args: &[String]) -> i32 {
+    let mut buffer = vec![0u8; 16 * 1024];
+    let n = crate::sys::klog(&mut buffer);
+    if n < 0 {
+        eprintln!("dmesg: cannot read the kernel log");
+        return 1;
+    }
+    buffer.truncate(n as usize);
+    let text = String::from_utf8_lossy(&buffer);
+    if args.iter().any(|a| a == "-c" || a == "-C") {
+        // Nothing to clear separately: reading took a copy.
+    }
+    print!("{}", text);
+    0
+}
+
 pub fn uptime(_args: &[String]) -> i32 {
     match fs::read_to_string("/proc/uptime") {
         Ok(text) => {

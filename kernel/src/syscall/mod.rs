@@ -96,6 +96,15 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::UNLINKAT => file::unlinkat(args[0] as i64, args[1], args[2] as u32),
         nr::RENAME => file::rename(AT_FDCWD, args[0], AT_FDCWD, args[1]),
         nr::RENAMEAT => file::rename(args[0] as i64, args[1], args[2] as i64, args[3]),
+        nr::LINK => file::linkat(AT_FDCWD, args[0], AT_FDCWD, args[1], 0),
+        nr::LINKAT => {
+            file::linkat(args[0] as i64, args[1], args[2] as i64, args[3], args[4] as u32)
+        }
+        nr::MKNOD => file::mknodat(AT_FDCWD, args[0], args[1] as u32, args[2]),
+        nr::MKNODAT => file::mknodat(args[0] as i64, args[1], args[2] as u32, args[3]),
+        // One task at a time and no shared storage, so an advisory lock has
+        // nothing to arbitrate between; taking it always succeeds.
+        nr::FLOCK => Ok(0),
         nr::SYMLINK => file::symlinkat(args[0], AT_FDCWD, args[1]),
         nr::SYMLINKAT => file::symlinkat(args[0], args[1] as i64, args[2]),
         nr::READLINK => file::readlinkat(AT_FDCWD, args[0], args[1], args[2] as usize),
@@ -184,6 +193,12 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::TIMES => Ok(crate::trap::ticks()),
         nr::SCHED_GETAFFINITY => proc::sched_getaffinity(args[2], args[1] as usize),
         nr::SCHED_GETPARAM | nr::SCHED_GETSCHEDULER => Ok(0),
+        nr::SETPRIORITY => proc::setpriority(args[0], args[1], args[2] as i64),
+        nr::GETPRIORITY => proc::getpriority(args[0], args[1]),
+        // No I/O scheduler to ask, so the class is whatever was set.
+        nr::IOPRIO_SET => Ok(0),
+        nr::IOPRIO_GET => Ok(0),
+        nr::SYSLOG => proc::syslog(args[0], args[1], args[2] as i64),
         nr::SCHED_GET_PRIORITY_MAX => Ok(0),
         nr::SCHED_GET_PRIORITY_MIN => Ok(0),
 

@@ -607,18 +607,44 @@ pub fn ln(args: &[String]) -> i32 {
         eprintln!("usage: ln [-sf] target linkname");
         return 2;
     }
-    if !flags.contains('s') {
-        eprintln!("ln: only symbolic links are supported");
-        return 1;
-    }
     if flags.contains('f') {
         // -f replaces an existing link or file.
         let _ = fs::remove_file(&operands[1]);
     }
-    match std::os::unix::fs::symlink(&operands[0], &operands[1]) {
+    if flags.contains('s') {
+        return match std::os::unix::fs::symlink(&operands[0], &operands[1]) {
+            Ok(()) => 0,
+            Err(err) => fail("ln", &operands[1], err),
+        };
+    }
+    match fs::hard_link(&operands[0], &operands[1]) {
         Ok(()) => 0,
         Err(err) => fail("ln", &operands[1], err),
     }
+}
+
+/// A named pipe. Two processes open it by name and meet at the same buffer.
+pub fn mkfifo(args: &[String]) -> i32 {
+    let (_, operands) = split_flags(args);
+    if operands.is_empty() {
+        eprintln!("usage: mkfifo name...");
+        return 2;
+    }
+    let mut status = 0;
+    for path in &operands {
+        let name = match std::ffi::CString::new(path.as_str()) {
+            Ok(name) => name,
+            Err(_) => {
+                status = 1;
+                continue;
+            }
+        };
+        if crate::sys::mknod(&name, 0o010000 | 0o644) < 0 {
+            eprintln!("mkfifo: {}: cannot create", path);
+            status = 1;
+        }
+    }
+    status
 }
 
 pub fn readlink(args: &[String]) -> i32 {
@@ -645,13 +671,84 @@ pub fn readlink(args: &[String]) -> i32 {
     status
 }
 
+/// `stat -c`: one line per file, built from the format's `%` escapes.
+fn stat_format(format: &str, path: &str, metadata: &fs::Metadata) -> String {
+    let mut out = String::new();
+    let mut chars = format.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push_str(path),
+            Some('s') => out.push_str(&metadata.len().to_string()),
+            Some('h') => out.push_str(&metadata.nlink().to_string()),
+            Some('i') => out.push_str(&metadata.ino().to_string()),
+            Some('a') => out.push_str(&format!("{:o}", metadata.mode() & 0o7777)),
+            Some('f') => out.push_str(&format!("{:x}", metadata.mode())),
+            Some('u') => out.push_str(&metadata.uid().to_string()),
+            Some('g') => out.push_str(&metadata.gid().to_string()),
+            Some('U') => out.push_str("root"),
+            Some('G') => out.push_str("root"),
+            Some('F') => out.push_str(if metadata.is_dir() {
+                "directory"
+            } else if metadata.file_type().is_symlink() {
+                "symbolic link"
+            } else {
+                "regular file"
+            }),
+            Some('Y') => out.push_str(&metadata.mtime().to_string()),
+            Some('y') => out.push_str(&timestamp(metadata.mtime())),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
 pub fn stat(args: &[String]) -> i32 {
-    let (_, operands) = split_flags(args);
+    // -c takes the format as its own argument, so it cannot go through the
+    // usual flag splitting.
+    let mut format: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "-c" || argument == "--format" {
+            format = args.get(index + 1).cloned();
+            index += 2;
+            continue;
+        }
+        if let Some(text) = argument.strip_prefix("-c") {
+            if !text.is_empty() {
+                format = Some(text.to_string());
+                index += 1;
+                continue;
+            }
+        }
+        rest.push(argument.clone());
+        index += 1;
+    }
+    let (_, operands) = split_flags(&rest);
     if operands.is_empty() {
-        eprintln!("usage: stat file...");
+        eprintln!("usage: stat [-c format] file...");
         return 2;
     }
     let mut status = 0;
+    if let Some(format) = format {
+        for path in &operands {
+            match fs::symlink_metadata(path) {
+                Ok(metadata) => println!("{}", stat_format(&format, path, &metadata)),
+                Err(err) => status = fail("stat", path, err),
+            }
+        }
+        return status;
+    }
     for path in &operands {
         match fs::symlink_metadata(path) {
             Ok(metadata) => {

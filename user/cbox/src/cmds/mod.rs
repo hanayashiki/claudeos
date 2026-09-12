@@ -18,6 +18,7 @@ pub fn run(name: &str, args: &[String]) -> Option<i32> {
         "rmdir" => fileops::rmdir(args),
         "touch" => fileops::touch(args),
         "ln" => fileops::ln(args),
+        "mkfifo" => fileops::mkfifo(args),
         "stat" => fileops::stat(args),
         "find" => fileops::find(args),
         "du" => fileops::du(args),
@@ -43,6 +44,7 @@ pub fn run(name: &str, args: &[String]) -> Option<i32> {
         // system
         "uname" => sysinfo::uname(args),
         "ps" => sysinfo::ps(args),
+        "dmesg" => sysinfo::dmesg(args),
         "free" => sysinfo::free(args),
         "uptime" => sysinfo::uptime(args),
         "date" => sysinfo::date(args),

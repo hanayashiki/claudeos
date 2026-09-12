@@ -108,6 +108,9 @@ pub struct Task {
     pub robust_list: u64,
 
     pub pending_signals: u64,
+    /// The scheduling nice value. Round robin does not act on it, but a
+    /// program that sets it reads it back.
+    pub nice: i32,
     /// The signal that stopped this task, and whether the stop and the
     /// following continue have been reported to whoever is waiting.
     pub stop_signal: i32,
@@ -180,6 +183,7 @@ impl Task {
             set_child_tid: 0,
             robust_list: 0,
             pending_signals: 0,
+            nice: 0,
             stop_signal: 0,
             report_stop: false,
             report_continue: false,
