@@ -125,6 +125,14 @@ pub fn halt() {
     cpu::halt();
 }
 
+/// Make bytes the kernel has just written fetchable as instructions.
+///
+/// Nothing to do here: this processor keeps its instruction cache coherent
+/// with stores, so writing a page and then jumping into it works without
+/// being told. The call is in the interface because it is not free everywhere.
+#[inline]
+pub fn sync_instruction_cache(_start: u64, _len: usize) {}
+
 // ---------------------------------------------------------------------------
 // Interrupt enable state
 // ---------------------------------------------------------------------------

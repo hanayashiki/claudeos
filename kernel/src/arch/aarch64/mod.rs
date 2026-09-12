@@ -140,6 +140,43 @@ pub fn halt() {
     unsafe { asm!("wfi", options(nomem, nostack)) };
 }
 
+/// Make bytes the kernel has just written fetchable as instructions.
+///
+/// The two caches are not coherent with each other here. Bytes the kernel
+/// stores go into the data cache; the instruction side fetches past it, and
+/// may already hold whatever was at those addresses before. So the data cache
+/// has to be cleaned down to the level both sides share, and the instruction
+/// cache told to forget what it has, before anything jumps there.
+///
+/// Leaving this out fails in a way emulation never shows: a program executes
+/// whatever the instruction cache happened to be holding, which depends on
+/// what ran before it and on where the page boundaries fall.
+pub fn sync_instruction_cache(start: u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let ctr: u64;
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
+    // Both fields hold the log2 of the line length in words.
+    let data_line = 4u64 << ((ctr >> 16) & 0xF);
+    let instruction_line = 4u64 << (ctr & 0xF);
+    let end = start + len as u64;
+
+    let mut at = start & !(data_line - 1);
+    while at < end {
+        unsafe { asm!("dc cvau, {}", in(reg) at, options(nostack, preserves_flags)) };
+        at += data_line;
+    }
+    unsafe { asm!("dsb ish", options(nostack, preserves_flags)) };
+
+    let mut at = start & !(instruction_line - 1);
+    while at < end {
+        unsafe { asm!("ic ivau, {}", in(reg) at, options(nostack, preserves_flags)) };
+        at += instruction_line;
+    }
+    unsafe { asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
+}
+
 // ---------------------------------------------------------------------------
 // Interrupt enable state
 // ---------------------------------------------------------------------------
@@ -227,10 +264,34 @@ pub fn qemu_exit(_code: u32) -> ! {
     power_off()
 }
 
-/// Stop the machine. Nothing here can cut the power, so this masks everything
-/// and parks the core.
+/// The power management block, and the word that has to be in the top of every
+/// write to it for the write to count.
+const POWER_MANAGEMENT: u64 = PERIPHERAL_BASE + 0x10_0000;
+const PM_PASSWORD: u32 = 0x5A00_0000;
+/// Which partition to come back up in; zero is the ordinary one.
+const PM_RSTS: u64 = 0x20;
+/// The watchdog's countdown, in ticks of a 65 kHz clock.
+const PM_WDOG: u64 = 0x24;
+/// Reset control. Asking for a full reset here is how anything on this board
+/// restarts it; there is no way to cut the power from software.
+const PM_RSTC: u64 = 0x1C;
+const RSTC_FULL_RESET: u32 = 0x20;
+const RSTC_CONFIG_MASK: u32 = 0xFFFF_FFCF;
+const RSTS_PARTITION_MASK: u32 = 0xFFFF_FAAA;
+
+/// Stop the machine, by asking the watchdog to restart it and then not being
+/// there when it does. A board told not to reboot stops instead, which is what
+/// a finished test wants.
 pub fn power_off() -> ! {
     disable_interrupts();
+    unsafe {
+        let at = |offset: u64| crate::mm::phys_to_virt(POWER_MANAGEMENT + offset) as *mut u32;
+        let partition = core::ptr::read_volatile(at(PM_RSTS)) & RSTS_PARTITION_MASK;
+        core::ptr::write_volatile(at(PM_RSTS), PM_PASSWORD | partition);
+        core::ptr::write_volatile(at(PM_WDOG), PM_PASSWORD | 10);
+        let control = core::ptr::read_volatile(at(PM_RSTC)) & RSTC_CONFIG_MASK;
+        core::ptr::write_volatile(at(PM_RSTC), PM_PASSWORD | control | RSTC_FULL_RESET);
+    }
     loop {
         halt();
     }

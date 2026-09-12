@@ -394,6 +394,14 @@ impl Task {
                 crate::mm::PAGE_SIZE,
             );
         }
+        // A page the program may execute has just been written through a
+        // different address than the one it will be fetched from.
+        if flags & NO_EXECUTE == 0 {
+            crate::arch::sync_instruction_cache(
+                crate::mm::phys_to_virt(copy.addr()),
+                crate::mm::PAGE_SIZE,
+            );
+        }
         // Taking the old mapping away hands back the reference this table
         // held on the shared frame; the copy takes its place.
         let shared = self.space.unmap(page);
@@ -448,6 +456,11 @@ impl Task {
                         page as *mut u8,
                         available,
                     );
+                }
+                // A text page arrives this way, so these bytes may be the
+                // next thing the program executes.
+                if vma.page_flags() & NO_EXECUTE == 0 {
+                    crate::arch::sync_instruction_cache(page, available);
                 }
             }
         }
