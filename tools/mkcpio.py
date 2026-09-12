@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Build a cpio 'newc' archive from a directory tree.
 
+Each entry carries the time its file was last written. A board with no clock
+of its own takes the latest of those as the earliest it can possibly be, so an
+archive with no dates leaves such a machine believing it is 1970.
+
 Usage: mkcpio.py <source-dir> <output.cpio>
 """
 import os
@@ -21,9 +25,9 @@ def pad4(stream):
         stream.write(b"\0" * (4 - remainder))
 
 
-def write_entry(out, name, mode, data, ino, nlink=1):
+def write_entry(out, name, mode, data, ino, mtime=0, nlink=1):
     out.write(MAGIC)
-    for value in (ino, mode, 0, 0, nlink, 0, len(data), 0, 0, 0, 0, len(name) + 1, 0):
+    for value in (ino, mode, 0, 0, nlink, mtime, len(data), 0, 0, 0, 0, len(name) + 1, 0):
         out.write(field(value))
     out.write(name.encode() + b"\0")
     pad4(out)
@@ -48,23 +52,23 @@ def main():
             rel = os.path.relpath(full, source)
             info = os.lstat(full)
             if stat.S_ISDIR(info.st_mode):
-                entries.append((rel, stat.S_IFDIR | 0o755, b""))
+                entries.append((rel, stat.S_IFDIR | 0o755, b"", int(info.st_mtime)))
             elif stat.S_ISLNK(info.st_mode):
-                entries.append((rel, stat.S_IFLNK | 0o777, os.readlink(full).encode()))
+                entries.append((rel, stat.S_IFLNK | 0o777, os.readlink(full).encode(), int(info.st_mtime)))
             elif stat.S_ISREG(info.st_mode):
                 with open(full, "rb") as handle:
                     data = handle.read()
                 mode = stat.S_IFREG | (0o755 if info.st_mode & 0o111 else 0o644)
-                entries.append((rel, mode, data))
+                entries.append((rel, mode, data, int(info.st_mtime)))
 
     entries.sort(key=lambda e: e[0])
     with open(target, "wb") as out:
-        for rel, mode, data in entries:
-            write_entry(out, rel, mode, data, ino)
+        for rel, mode, data, mtime in entries:
+            write_entry(out, rel, mode, data, ino, mtime)
             ino += 1
         write_entry(out, TRAILER, 0, b"", 0)
 
-    total = sum(len(data) for _, _, data in entries)
+    total = sum(len(data) for _, _, data, _ in entries)
     print(f"{target}: {len(entries)} entries, {total} bytes of file data")
     return 0
 

@@ -65,6 +65,21 @@ pub fn init() {
         days * 86400 + now.hour * 3600 + now.minute * 60 + now.second;
 }
 
+/// Say that the machine cannot be earlier than `unix`, and move the clock
+/// forward if it currently believes otherwise.
+///
+/// A board with no battery-backed clock starts at the epoch, which makes every
+/// file it writes older than every file it was given. The dates on the initial
+/// ram disk are the only evidence of the real time that arrives with it, so
+/// they are used as a floor. This is a stand-in: it makes times within a boot
+/// monotonic and plausible, and it is not the same thing as knowing the date.
+pub fn set_floor(unix: i64) {
+    let mut boot = BOOT_UNIX_TIME.lock();
+    if *boot < unix {
+        *boot = unix;
+    }
+}
+
 /// Nanoseconds since boot.
 pub fn monotonic_ns() -> u64 {
     let per_second = CYCLES_PER_SECOND.load(Ordering::Acquire);
