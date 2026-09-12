@@ -101,7 +101,7 @@ fn event_and_poll(report: &mut Report) {
     report.check("epoll takes descriptors", ok, String::new());
 
     // Nothing has arrived on either, so a zero timeout reports nothing.
-    let mut events = [0u8; 24];
+    let mut events = [0u8; 2 * sys::EPOLL_EVENT_SIZE];
     let idle = sys::epoll_wait(epoll, &mut events, 0);
     report.check("epoll reports nothing yet", idle == 0, format!("{}", idle));
 
@@ -109,7 +109,8 @@ fn event_and_poll(report: &mut Report) {
     // because of the counter, not because time passed.
     sys::write(event, &1u64.to_le_bytes());
     let count = sys::epoll_wait(epoll, &mut events, -1);
-    let which = u64::from_le_bytes(events[4..12].try_into().unwrap_or([0; 8]));
+    let data = sys::EPOLL_EVENT_SIZE - 8;
+    let which = u64::from_le_bytes(events[data..data + 8].try_into().unwrap_or([0; 8]));
     report.check(
         "epoll wakes for the counter",
         count == 1 && which == 1,
