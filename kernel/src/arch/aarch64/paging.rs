@@ -12,7 +12,7 @@
 //! write. Reading them back therefore gives the same word that was asked for.
 
 use crate::mm::frame::{self, Frame};
-use crate::mm::{page_align_down, page_align_up, phys_to_virt, HHDM_BASE, PAGE_SIZE_U64};
+use crate::mm::{phys_to_virt, HHDM_BASE, PAGE_SIZE_U64};
 use core::arch::asm;
 
 /// The descriptor is valid. At the last level a page descriptor also needs
@@ -170,12 +170,12 @@ impl AddressSpace {
 
     /// Walk to the last-level descriptor for `virt`, allocating tables if
     /// asked.
-    unsafe fn entry_for(
-        &self,
-        virt: u64,
-        create: bool,
-        parent_flags: u64,
-    ) -> Result<*mut u64, MapError> {
+    ///
+    /// Nothing is said about permissions on the way down. A table descriptor
+    /// can forbid what the pages under it allow, and using that would mean
+    /// revisiting every ancestor whenever one page's permissions changed, so
+    /// the tables are left permissive and the last level decides.
+    unsafe fn entry_for(&self, virt: u64, create: bool) -> Result<*mut u64, MapError> {
         let mut table = self.root;
         for level in (1..4).rev() {
             let idx = index_of(virt, level);
@@ -193,16 +193,13 @@ impl AddressSpace {
             } else {
                 table = entry & ADDR_MASK;
             }
-            // A table descriptor can forbid what the pages under it allow, so
-            // it is left permissive and the last level decides.
-            let _ = parent_flags;
         }
         Ok(table_at(table).add(index_of(virt, 0)))
     }
 
     pub fn map(&self, virt: u64, frame: Frame, flags: u64) -> Result<(), MapError> {
         unsafe {
-            let entry = self.entry_for(virt, true, flags)?;
+            let entry = self.entry_for(virt, true)?;
             if *entry & PRESENT != 0 {
                 return Err(MapError::AlreadyMapped);
             }
@@ -216,7 +213,7 @@ impl AddressSpace {
     /// practice a device's registers.
     pub fn map_fixed(&self, virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
         unsafe {
-            let entry = self.entry_for(virt, true, flags)?;
+            let entry = self.entry_for(virt, true)?;
             if *entry & PRESENT != 0 {
                 return Err(MapError::AlreadyMapped);
             }
@@ -237,7 +234,7 @@ impl AddressSpace {
     /// Take the mapping away, handing back the reference it held.
     pub fn unmap(&self, virt: u64) -> Option<Frame> {
         let frame = unsafe {
-            let entry = self.entry_for(virt, false, 0).ok()?;
+            let entry = self.entry_for(virt, false).ok()?;
             if *entry & PRESENT == 0 {
                 return None;
             }
@@ -276,7 +273,7 @@ impl AddressSpace {
     /// The flags on the mapping of `virt`, as they were asked for.
     pub fn flags_of(&self, virt: u64) -> Option<u64> {
         unsafe {
-            let entry = self.entry_for(virt, false, 0).ok()?;
+            let entry = self.entry_for(virt, false).ok()?;
             if *entry & PRESENT == 0 {
                 return None;
             }
@@ -287,7 +284,7 @@ impl AddressSpace {
     /// Change the flags on an existing mapping, leaving the frame alone.
     pub fn set_flags(&self, virt: u64, flags: u64) -> Option<()> {
         unsafe {
-            let entry = self.entry_for(virt, false, 0).ok()?;
+            let entry = self.entry_for(virt, false).ok()?;
             if *entry & PRESENT == 0 {
                 return None;
             }
@@ -425,11 +422,4 @@ pub fn is_user_addr(virt: u64) -> bool {
 #[inline]
 pub fn is_hhdm_addr(virt: u64) -> bool {
     virt >= HHDM_BASE && virt < HHDM_BASE + crate::mm::HHDM_LIMIT
-}
-
-/// Keep the helpers the portable half does not call from being warned about;
-/// they are named here because this module is part of the contract.
-#[allow(dead_code)]
-fn _unused(virt: u64) -> u64 {
-    page_align_down(virt) + page_align_up(virt)
 }
