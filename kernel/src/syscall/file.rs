@@ -716,6 +716,23 @@ fn poll_state(file: &Arc<OpenFile>, events: i16) -> i16 {
     revents
 }
 
+/// `ppoll` says how long to wait with a `timespec` rather than a count of
+/// milliseconds, and a null pointer means no limit. It is the only form
+/// aarch64 has, so a program that calls `poll` reaches the kernel through
+/// this.
+pub fn ppoll(fds_addr: u64, count: usize, timeout_addr: u64) -> SysResult {
+    let timeout_ms = if timeout_addr == 0 {
+        -1
+    } else {
+        let spec: Timespec = uaccess::read_struct(timeout_addr)?;
+        if spec.tv_sec < 0 || spec.tv_nsec < 0 || spec.tv_nsec >= 1_000_000_000 {
+            return Err(Errno::EINVAL);
+        }
+        spec.tv_sec * 1_000 + spec.tv_nsec / 1_000_000
+    };
+    poll(fds_addr, count, timeout_ms)
+}
+
 pub fn poll(fds_addr: u64, count: usize, timeout_ms: i64) -> SysResult {
     if count > 1024 {
         return Err(Errno::EINVAL);

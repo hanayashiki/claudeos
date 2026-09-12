@@ -114,7 +114,8 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::PIPE2 => file::pipe2(args[0], args[1] as u32),
         nr::FCNTL => file::fcntl(args[0] as i32, args[1] as u32, args[2]),
         nr::IOCTL => file::ioctl(args[0] as i32, args[1], args[2]),
-        nr::POLL | nr::PPOLL => file::poll(args[0], args[1] as usize, args[2] as i64),
+        nr::POLL => file::poll(args[0], args[1] as usize, args[2] as i64),
+        nr::PPOLL => file::ppoll(args[0], args[1] as usize, args[2]),
         nr::SELECT => {
             file::select(args[0] as i32, args[1], args[2], args[3], args[4], 1_000)
         }
