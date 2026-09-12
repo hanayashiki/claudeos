@@ -1,8 +1,8 @@
 # claudeos
 
-An x86-64 operating system kernel written from scratch in Rust that implements
-enough of the Linux system call interface to run unmodified static Linux
-binaries.
+An operating system kernel written from scratch in Rust that implements enough
+of the Linux system call interface to run unmodified static Linux binaries. It
+runs on x86-64 and on aarch64, where the machine it targets is a Raspberry Pi 4.
 
 It boots an unmodified Alpine Linux root filesystem. It also runs a stock
 `rustc --target x86_64-unknown-linux-musl` executable, a C program linked
@@ -58,6 +58,94 @@ After `make alpine`, boot into Alpine itself:
 ```
 
 `make run` gives a shell on the serial console. `exit` powers the machine off.
+
+### The other machine
+
+The kernel also builds for aarch64 and boots on a Raspberry Pi 4, emulated or
+real. `ARCH` picks which one; everything defaults to x86-64.
+
+```sh
+rustup target add aarch64-unknown-none-softfloat aarch64-unknown-linux-musl
+
+ARCH=aarch64 ./scripts/build.sh          # build/kernel8.img
+./scripts/build-user-aarch64.sh          # build/initramfs-aarch64.cpio
+ARCH=aarch64 ./scripts/run.sh --initrd build/initramfs-aarch64.cpio \
+    --append 'init=/bin/init'
+ARCH=aarch64 ./scripts/test.sh           # the suites that are not x86-64 only
+```
+
+Two suites are skipped there rather than run: the busybox and Alpine images are
+fetched as x86-64 binaries, so on any other machine there is nothing to run.
+
+## Putting it on a Raspberry Pi 4
+
+A Pi 4 boots from one FAT32 partition on an SD card. Its bootloader is in an
+EEPROM on the board and can read nothing else -- not ext4, not GPT -- so
+everything it needs is a plain file on that partition, found by name. There is
+no boot sector to install and nothing to mark bootable.
+
+```sh
+ARCH=aarch64 ./scripts/build.sh
+./scripts/build-user-aarch64.sh
+./scripts/mkcard.sh                      # assemble build/boot and stop
+./scripts/mkcard.sh /dev/disk4           # and write it to that card
+```
+
+Run it once with no argument first and look at what it assembled. With a device
+named it erases that card, so it refuses anything that is not a removable whole
+disk and then asks you to type the path again before it writes. Find the path
+with `diskutil list` on macOS or `lsblk` on Linux, and check the size against
+the card in your hand: naming the wrong one destroys whatever was on it.
+
+What ends up on the card:
+
+```
+start4.elf                 the firmware the EEPROM bootloader loads
+fixup4.dat                 how it splits memory with the video core
+bcm2711-rpi-4-b.dtb        the device tree describing this board
+overlays/disable-bt.dtbo   the change to it described below
+config.txt                 what the firmware reads before anything else
+cmdline.txt                the kernel's command line
+kernel8.img                this kernel, as a flat image
+initramfs-aarch64.cpio     the userland
+```
+
+The first four are Raspberry Pi firmware. They are not in this repository; the
+script fetches them from the Raspberry Pi firmware repository and caches them
+under `build/`.
+
+The lines in `config.txt` that matter:
+
+```
+arm_64bit=1
+enable_uart=1
+dtoverlay=disable-bt
+initramfs initramfs-aarch64.cpio followkernel
+```
+
+`arm_64bit` starts the processor in 64-bit mode and makes the firmware look for
+`kernel8.img`. `enable_uart` turns the serial console on. `initramfs` loads the
+ram disk and tells the kernel where it put it, through the device tree; the
+word takes a space rather than an equals sign, which is a quirk of the file.
+
+`dtoverlay=disable-bt` is the one that is not obvious. This board has two
+serial ports, and the good one is wired to the Bluetooth radio: the pins a
+cable clips onto carry the cut-down one instead. `enable_uart=1` alone does not
+move it. Without the overlay the kernel writes correctly formed bytes into a
+port whose pins go to the radio and the cable shows nothing. The kernel also
+sets those pins itself at start-up, so it works either way, but the overlay is
+what a Linux system would do and leaving it in means the two agree.
+
+To watch it: the two lines cross over, because one end's transmit is the
+other's receive. GPIO 14 is where the Pi transmits, so the adapter's receive
+line goes there; GPIO 15 is where the Pi listens, so the adapter's transmit
+line goes there. Ground goes to any ground pin. Leave the adapter's power line
+unconnected. Read it at 115200 baud, 8 bits, no parity, one stop bit --
+`screen /dev/tty.usbserial-* 115200` on macOS, `screen /dev/ttyUSB0 115200`
+on Linux.
+
+Nothing is written to the card at run time, so the machine comes up the same
+way every time and a bad experiment costs a rebuild rather than a reflash.
 
 ## What the kernel does
 
@@ -278,7 +366,12 @@ kernel/src
   arch/x86_64/        boot trampoline, descriptor tables, PIC and PIT, port
                       I/O, page tables, UART and keyboard, timestamp counter
                       and CMOS clock, trap and system call entry, trap frame,
-                      signal frame, system call numbers
+                      signal frame, system call numbers, multiboot decoder
+  arch/aarch64/       entry from firmware down to EL1, translation tables,
+                      GIC and architected timer, PL011 and its pins, exception
+                      vectors and trap frame, signal frame, system call
+                      numbers, device tree and tag list decoders
+  boot.rs             what a machine looks like, whatever told the kernel
   main.rs             start-up sequence and kernel command line
   mm/                 frame allocator and kernel heap
   syscall/            the Linux system call implementations
@@ -296,6 +389,7 @@ user/c/hello.c        a C program linked against musl
 tools/mkcpio.py       initramfs builder
 tools/drive.py        drives the console over a socket, rendering as a terminal
 scripts/reap-stale.sh clears QEMU instances an earlier run left behind
+scripts/mkcard.sh     assembles the boot partition for a Pi, and writes a card
 tests/suite.sh        in-OS shell and userland test suite
 tests/busybox.sh      in-OS suite driving an upstream busybox
 tests/alpine.sh       in-OS suite run inside an Alpine root filesystem
@@ -305,6 +399,12 @@ tests/alpine.sh       in-OS suite run inside an Alpine root filesystem
 
 Single CPU; no SMP. There is no block device driver and no on-disk filesystem:
 the root filesystem lives in RAM and changes do not survive a reboot.
+
+On the Pi there is no network: the card is on PCIe, and the configuration space
+there is memory-mapped and would have to be found in the device tree, which is
+not written. There is nothing on the board that remembers the time across a
+power cycle, so the clock starts from the newest date on the ram disk rather
+than from the real one.
 
 The TCP is correct on a quiet link and not on a lossy one: no reassembly queue,
 no fast retransmit, no round-trip estimator. There is no DHCP and no resolver,
