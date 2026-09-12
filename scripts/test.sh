@@ -43,9 +43,9 @@ run_interactive() {
       "echo throwaway" "wait:0.4" "\x15" "wait:0.4" "echo line-kill-works\n" "wait:0.6" \
       "yes > /dev/null\n" "wait:1.8" "\x03" "wait:1" \
       "echo survived-interrupt\n" "wait:0.6" \
-      "sleep 1 &\n" "wait:2" \
-      "uptime\n" "wait:0.6" \
-      "exit\n" "wait:2" 2>&1 | tr -d '\r')"
+      "sleep 1 &\n" "wait:2.5" \
+      "uptime\n" "wait:1.5" \
+      "exit\n" "wait:3" 2>&1 | tr -d '\r')"
   echo "$output"
   echo
 
@@ -59,8 +59,13 @@ run_interactive() {
       ok=0
     fi
   done
-  # The clock has to advance while the shell is blocked reading.
-  if echo "$output" | grep -q "up 0 hours, 0 minutes, 0\.0"; then
+  # The clock has to advance while the shell is blocked reading. Require the
+  # line to be there, so a session that never got that far fails rather than
+  # passing by omission.
+  if ! echo "$output" | grep -qE "^up [0-9]+ hours"; then
+    echo "   uptime never reported; the session did not get that far"
+    ok=0
+  elif echo "$output" | grep -q "up 0 hours, 0 minutes, 0\.0"; then
     echo "   the clock did not advance during the session"
     ok=0
   fi

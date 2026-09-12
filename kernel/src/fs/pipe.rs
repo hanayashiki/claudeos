@@ -16,6 +16,9 @@ pub struct Pipe {
     buffer: Spinlock<Buffer>,
     pub readers: AtomicUsize,
     pub writers: AtomicUsize,
+    /// Tasks blocked because the pipe is empty, and because it is full.
+    not_empty: crate::sched::WaitQueue,
+    not_full: crate::sched::WaitQueue,
 }
 
 impl Pipe {
@@ -24,6 +27,8 @@ impl Pipe {
             buffer: Spinlock::new(Buffer { data: alloc::vec::Vec::new(), head: 0 }),
             readers: AtomicUsize::new(0),
             writers: AtomicUsize::new(0),
+            not_empty: crate::sched::WaitQueue::new(),
+            not_full: crate::sched::WaitQueue::new(),
         })
     }
 
@@ -49,6 +54,8 @@ impl Pipe {
                         buffer.data.clear();
                         buffer.head = 0;
                     }
+                    drop(buffer);
+                    self.not_full.wake_all();
                     return Ok(n);
                 }
             }
@@ -59,7 +66,10 @@ impl Pipe {
             if nonblock {
                 return Err(Errno::EAGAIN);
             }
-            crate::sched::yield_now();
+            if crate::sched::has_pending_signal() {
+                return Err(Errno::EINTR);
+            }
+            self.not_empty.wait();
         }
     }
 
@@ -77,13 +87,18 @@ impl Pipe {
                 if used < PIPE_CAPACITY {
                     let n = buf.len().min(PIPE_CAPACITY - used);
                     buffer.data.extend_from_slice(&buf[..n]);
+                    drop(buffer);
+                    self.not_empty.wake_all();
                     return Ok(n);
                 }
             }
             if nonblock {
                 return Err(Errno::EAGAIN);
             }
-            crate::sched::yield_now();
+            if crate::sched::has_pending_signal() {
+                return Err(Errno::EINTR);
+            }
+            self.not_full.wait();
         }
     }
 }
@@ -115,6 +130,9 @@ impl Drop for super::OpenFile {
         if let super::FileBacking::Pipe(pipe, is_write) = &self.backing {
             let counter = if *is_write { &pipe.writers } else { &pipe.readers };
             counter.fetch_sub(1, Ordering::AcqRel);
+            // The other end has to notice that this one is gone.
+            pipe.not_empty.wake_all();
+            pipe.not_full.wake_all();
         }
     }
 }

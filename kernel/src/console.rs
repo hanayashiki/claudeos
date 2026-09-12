@@ -44,6 +44,9 @@ impl Ring {
 
 static INPUT: Spinlock<Ring> = Spinlock::new(Ring::new());
 
+/// Readers blocked waiting for the terminal.
+static WAITING: crate::sched::WaitQueue = crate::sched::WaitQueue::new();
+
 /// The line being edited, and then handed to readers once it is complete.
 struct LineBuffer {
     data: [u8; RING_SIZE],
@@ -110,6 +113,7 @@ pub fn push_byte(byte: u8) {
     }
 
     INPUT.lock().push(byte);
+    WAITING.wake_all();
 }
 
 pub fn available() -> usize {
@@ -167,7 +171,7 @@ pub fn read(buf: &mut [u8]) -> Result<usize, Errno> {
             if crate::sched::has_pending_signal() {
                 return Err(Errno::EINTR);
             }
-            crate::sched::yield_now();
+            WAITING.wait();
         }
     }
 
@@ -205,7 +209,7 @@ pub fn read(buf: &mut [u8]) -> Result<usize, Errno> {
             if crate::sched::has_pending_signal() {
                 return Err(Errno::EINTR);
             }
-            crate::sched::yield_now();
+            WAITING.wait();
         }
     }
 }

@@ -462,6 +462,52 @@ pub fn has_children(parent_pid: u32, want: i32) -> bool {
     })
 }
 
+/// A set of tasks waiting for one condition.
+///
+/// A blocking read used to spin on `yield_now`, which kept a core busy while
+/// the machine had nothing to do. Waiting on a queue lets the scheduler fall
+/// through to the idle task, which halts until an interrupt arrives.
+pub struct WaitQueue {
+    waiters: Spinlock<Vec<u32>>,
+}
+
+impl WaitQueue {
+    pub const fn new() -> WaitQueue {
+        WaitQueue { waiters: Spinlock::new(Vec::new()) }
+    }
+
+    /// Block until the queue is woken. Must be called with no locks held.
+    pub fn wait(&self) {
+        let pid = current().pid;
+        // Enqueue and go to sleep without a window where a wake-up could be
+        // delivered to a task that is not yet marked asleep.
+        disable_interrupts();
+        self.waiters.lock().push(pid);
+        current().state = State::Sleeping;
+        enable_interrupts();
+
+        schedule();
+
+        self.waiters.lock().retain(|waiter| *waiter != pid);
+    }
+
+    pub fn wake_all(&self) {
+        let mut waiters = self.waiters.lock();
+        for pid in waiters.drain(..) {
+            if let Some(task) = find(pid) {
+                if task.state == State::Sleeping {
+                    task.state = State::Runnable;
+                    task.wake_at = 0;
+                }
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.waiters.lock().is_empty()
+    }
+}
+
 /// First entry into user mode for a newly created task.
 pub extern "C" fn user_entry_trampoline() -> ! {
     let task = current();
