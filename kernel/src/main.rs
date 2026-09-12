@@ -19,6 +19,7 @@ mod io;
 mod mm;
 mod multiboot;
 mod net;
+mod pci;
 mod sched;
 mod signal;
 mod sync;
@@ -44,12 +45,20 @@ extern "C" {
 struct BootOptions {
     init: String,
     trace: i64,
+    /// Send one hand-built ARP request for the gateway at boot and report
+    /// what comes back. Off unless the word `nettest` is on the command line,
+    /// so the ordinary suites never see it.
+    nettest: bool,
     args: Vec<String>,
 }
 
 fn parse_cmdline(cmdline: Option<&str>) -> BootOptions {
-    let mut options =
-        BootOptions { init: "/bin/init".to_string(), trace: syscall::TRACE_OFF, args: Vec::new() };
+    let mut options = BootOptions {
+        init: "/bin/init".to_string(),
+        trace: syscall::TRACE_OFF,
+        nettest: false,
+        args: Vec::new(),
+    };
     let Some(cmdline) = cmdline else { return options };
     // The boot loader puts the kernel's own path in the first word.
     for word in cmdline.split_whitespace().skip(1) {
@@ -61,6 +70,8 @@ fn parse_cmdline(cmdline: Option<&str>) -> BootOptions {
             } else {
                 value.parse().unwrap_or(syscall::TRACE_OFF)
             };
+        } else if word == "nettest" {
+            options.nettest = true;
         } else {
             // Anything else is handed to the init process as an argument.
             options.args.push(word.to_string());
@@ -124,6 +135,13 @@ pub extern "C" fn kmain(mb_info_phys: u64, magic: u64) -> ! {
 
     sched::init();
 
+    // Find and bring up the network card before the first process exists. Its
+    // registers are mapped into the kernel half of the page tables, and a new
+    // address space copies the kernel half as it stands at the moment it is
+    // created, so a mapping made later would be missing from it. Finding no
+    // card is the ordinary outcome on a machine booted without one.
+    let nic = net::e1000::probe();
+
     let mut argv = alloc::vec![options.init.clone()];
     argv.extend(options.args.iter().cloned());
     let envp = alloc::vec![
@@ -143,6 +161,15 @@ pub extern "C" fn kmain(mb_info_phys: u64, magic: u64) -> ! {
             println!("claudeos: cannot start {}: {:?}", options.init, err);
             println!("claudeos: filesystem contents:");
             syscall::file::dump_tree("/", 1);
+        }
+    }
+
+    // After init, because the scheduler hands out process ids in order and a
+    // good deal of the system takes pid 1 to be init.
+    if nic {
+        net::e1000::start_task();
+        if options.nettest {
+            net::arptest::start();
         }
     }
 

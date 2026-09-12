@@ -10,6 +10,9 @@
 //! with interrupts masked, so the driver's handler does nothing but move the
 //! frame off the ring and wake the task that calls in here.
 
+pub mod arptest;
+pub mod e1000;
+
 use crate::abi::Errno;
 use crate::sync::Spinlock;
 
