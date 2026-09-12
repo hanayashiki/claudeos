@@ -209,3 +209,87 @@ pub fn expr(args: &[String]) -> i32 {
         }
     }
 }
+
+/// `chmod MODE FILE...` with octal modes and the common symbolic forms.
+pub fn chmod(args: &[String]) -> i32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The mode is the first argument even when it starts with '-', so the
+    // usual flag splitting cannot be used here.
+    let operands: Vec<&String> = args[1..].iter().filter(|a| *a != "--").collect();
+    if operands.len() < 2 {
+        eprintln!("usage: chmod MODE file...");
+        return 2;
+    }
+    let spec = operands[0];
+    let mut status = 0;
+
+    for path in &operands[1..] {
+        let current = match std::fs::metadata(path.as_str()) {
+            Ok(metadata) => metadata.permissions().mode() & 0o7777,
+            Err(err) => {
+                eprintln!("chmod: {}: {}", path, err);
+                status = 1;
+                continue;
+            }
+        };
+        let mode = match parse_mode(spec, current) {
+            Some(mode) => mode,
+            None => {
+                eprintln!("chmod: invalid mode: {}", spec);
+                return 2;
+            }
+        };
+        if let Err(err) = std::fs::set_permissions(path.as_str(), PermissionsExt::from_mode(mode)) {
+            eprintln!("chmod: {}: {}", path, err);
+            status = 1;
+        }
+    }
+    status
+}
+
+fn parse_mode(spec: &str, current: u32) -> Option<u32> {
+    if spec.chars().all(|c| ('0'..='7').contains(&c)) && !spec.is_empty() {
+        return u32::from_str_radix(spec, 8).ok();
+    }
+
+    // [ugoa...][+-=][rwx...]
+    let chars: Vec<char> = spec.chars().collect();
+    let mut index = 0;
+    let mut who = 0u32;
+    while index < chars.len() && matches!(chars[index], 'u' | 'g' | 'o' | 'a') {
+        who |= match chars[index] {
+            'u' => 0o700,
+            'g' => 0o070,
+            'o' => 0o007,
+            _ => 0o777,
+        };
+        index += 1;
+    }
+    if who == 0 {
+        who = 0o777;
+    }
+    let operator = *chars.get(index)?;
+    if !matches!(operator, '+' | '-' | '=') {
+        return None;
+    }
+    index += 1;
+
+    let mut bits = 0u32;
+    while index < chars.len() {
+        bits |= match chars[index] {
+            'r' => 0o444,
+            'w' => 0o222,
+            'x' => 0o111,
+            _ => return None,
+        };
+        index += 1;
+    }
+    let bits = bits & who;
+
+    Some(match operator {
+        '+' => current | bits,
+        '-' => current & !bits,
+        _ => (current & !who) | bits,
+    })
+}

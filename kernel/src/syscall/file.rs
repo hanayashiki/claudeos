@@ -389,6 +389,23 @@ pub fn readlinkat(dirfd: i64, path_addr: u64, out: u64, len: usize) -> SysResult
     Ok(n as u64)
 }
 
+/// Change a file's permission bits, keeping its type bits.
+pub fn chmod(dirfd: i64, path_addr: u64, mode: u32) -> SysResult {
+    let path = resolve_at(dirfd, path_addr)?;
+    let node = fs::lookup(&path)?;
+    let mut inner = node.inner.lock();
+    inner.mode = (inner.mode & S_IFMT) | (mode & 0o7777);
+    Ok(0)
+}
+
+pub fn fchmod(fd: i32, mode: u32) -> SysResult {
+    let file = sched::current().fds.get(fd)?;
+    let node = file.node().ok_or(Errno::EBADF)?;
+    let mut inner = node.inner.lock();
+    inner.mode = (inner.mode & S_IFMT) | (mode & 0o7777);
+    Ok(0)
+}
+
 pub fn truncate(path_addr: u64, len: u64) -> SysResult {
     let path = resolve_at(AT_FDCWD, path_addr)?;
     fs::lookup(&path)?.truncate(len)?;

@@ -1177,6 +1177,11 @@ impl Shell {
 
     /// Search PATH and exec. Only returns if the program could not be started.
     fn exec_external(&self, argv: &[String]) -> i32 {
+        const ENOENT: i64 = -2;
+        const ENOEXEC: i64 = -8;
+        const EACCES: i64 = -13;
+        const EISDIR: i64 = -21;
+
         let envp: Vec<String> = self.env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
         let candidates: Vec<String> = if argv[0].contains('/') {
             vec![argv[0].clone()]
@@ -1184,11 +1189,50 @@ impl Shell {
             let path = self.env.get("PATH").cloned().unwrap_or_else(|| "/bin".into());
             path.split(':').map(|dir| format!("{}/{}", dir, argv[0])).collect()
         };
+
+        // Remember the most specific failure: "not found" is the least
+        // informative answer and should not hide a real one.
+        let mut reason = ENOENT;
         for candidate in &candidates {
-            sys::execve(candidate, argv, &envp);
+            let error = sys::execve(candidate, argv, &envp);
+            if error == ENOEXEC {
+                // Not an executable image. A shell runs such a file itself,
+                // which is what makes a script without a `#!` line work.
+                let mut script = vec!["/bin/sh".to_string(), candidate.clone()];
+                script.extend(argv[1..].iter().cloned());
+                sys::execve("/bin/sh", &script, &envp);
+            }
+            if error != ENOENT {
+                reason = error;
+            }
         }
-        eprintln!("sh: {}: not found", argv[0]);
-        127
+
+        match reason {
+            EACCES => {
+                // execve reports EACCES for a directory too, so say which.
+                let is_dir = candidates
+                    .iter()
+                    .any(|c| std::fs::metadata(c).map(|m| m.is_dir()).unwrap_or(false));
+                if is_dir {
+                    eprintln!("sh: {}: is a directory", argv[0]);
+                } else {
+                    eprintln!("sh: {}: permission denied", argv[0]);
+                }
+                126
+            }
+            EISDIR => {
+                eprintln!("sh: {}: is a directory", argv[0]);
+                126
+            }
+            ENOEXEC => {
+                eprintln!("sh: {}: cannot execute", argv[0]);
+                126
+            }
+            _ => {
+                eprintln!("sh: {}: not found", argv[0]);
+                127
+            }
+        }
     }
 
     fn find_in_path(&self, name: &str) -> Option<String> {

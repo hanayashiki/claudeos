@@ -115,5 +115,14 @@ HELLO
 cp "$ROOT/tests/suite.sh" "$RFS/root/suite.sh"
 cp "$ROOT/tests/busybox.sh" "$RFS/root/busybox.sh"
 
+# Scripts need the execute bit and a #! line to run as ./script.
+for script in "$RFS"/root/*.sh; do
+  if ! head -n 1 "$script" | grep -q '^#!'; then
+    printf '#!/bin/sh\n%s' "$(cat "$script")" > "$script.tmp"
+    mv "$script.tmp" "$script"
+  fi
+  chmod +x "$script"
+done
+
 python3 "$ROOT/tools/mkcpio.py" "$RFS" "$ROOT/build/initramfs.cpio"
 ls -la "$ROOT/build/initramfs.cpio"

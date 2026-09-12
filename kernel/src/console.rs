@@ -44,17 +44,26 @@ impl Ring {
 
 static INPUT: Spinlock<Ring> = Spinlock::new(Ring::new());
 
-/// A completed input line waiting to be handed to readers.
+/// The line being edited, and then handed to readers once it is complete.
 struct LineBuffer {
     data: [u8; RING_SIZE],
     len: usize,
     pos: usize,
+    /// Set once the line has been terminated. Until then the contents are
+    /// still being edited and must not be handed to a reader, or backspace
+    /// would have nothing left to erase.
+    ready: bool,
     /// Set when the line was terminated by Ctrl-D on an empty line.
     eof: bool,
 }
 
-static LINE: Spinlock<LineBuffer> =
-    Spinlock::new(LineBuffer { data: [0; RING_SIZE], len: 0, pos: 0, eof: false });
+static LINE: Spinlock<LineBuffer> = Spinlock::new(LineBuffer {
+    data: [0; RING_SIZE],
+    len: 0,
+    pos: 0,
+    ready: false,
+    eof: false,
+});
 
 pub static TERMIOS: Spinlock<Termios> = Spinlock::new(Termios {
     c_iflag: crate::abi::ICRNL | crate::abi::IXON,
@@ -92,6 +101,7 @@ pub fn push_byte(byte: u8) {
                 let mut line = LINE.lock();
                 line.len = 0;
                 line.pos = 0;
+                line.ready = false;
             }
             echo(b"^C\n");
             crate::sched::signal_foreground(signal);
@@ -104,7 +114,7 @@ pub fn push_byte(byte: u8) {
 
 pub fn available() -> usize {
     let line = LINE.lock();
-    if line.pos < line.len {
+    if line.ready && line.pos < line.len {
         return line.len - line.pos;
     }
     drop(line);
@@ -162,10 +172,10 @@ pub fn read(buf: &mut [u8]) -> Result<usize, Errno> {
     }
 
     loop {
-        // Hand out whatever is left of the current line first.
+        // Hand out whatever is left of the current line, once it is finished.
         {
             let mut line = LINE.lock();
-            if line.pos < line.len {
+            if line.ready && line.pos < line.len {
                 let n = buf.len().min(line.len - line.pos);
                 let pos = line.pos;
                 buf[..n].copy_from_slice(&line.data[pos..pos + n]);
@@ -173,11 +183,20 @@ pub fn read(buf: &mut [u8]) -> Result<usize, Errno> {
                 if line.pos == line.len {
                     line.len = 0;
                     line.pos = 0;
+                    line.ready = false;
                 }
                 return Ok(n);
             }
             if line.eof {
                 line.eof = false;
+                line.ready = false;
+                line.len = 0;
+                line.pos = 0;
+                return Ok(0);
+            }
+            // A finished but empty line reads as end of file.
+            if line.ready && line.len == 0 {
+                line.ready = false;
                 return Ok(0);
             }
         }
@@ -209,6 +228,7 @@ fn gather_line(echo_on: bool) -> bool {
                     line.len = at + 1;
                 }
                 line.pos = 0;
+                line.ready = true;
                 drop(line);
                 if echo_on {
                     echo(b"\n");
@@ -225,12 +245,14 @@ fn gather_line(echo_on: bool) -> bool {
                 }
             }
             0x04 => {
-                // Ctrl-D: end the line, or signal EOF if it is empty.
+                // Ctrl-D: end the line as it stands, or report end of file if
+                // nothing has been typed yet.
                 if line.len == 0 {
                     line.eof = true;
                 } else {
                     line.pos = 0;
                 }
+                line.ready = true;
                 return true;
             }
             0x15 => {

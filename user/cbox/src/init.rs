@@ -49,17 +49,23 @@ pub fn main(args: &[String]) -> i32 {
                     println!("init: script finished with status {}", code);
                     return code;
                 }
-                if code == 0 {
-                    // A clean `exit` from the session shuts the machine down.
-                    println!("init: session ended");
-                    return 0;
+                match sys::signal_of(status) {
+                    // A shell that exited on its own ends the session, whatever
+                    // status it reports; `exit` after a failed command is still
+                    // the user asking to leave.
+                    None => {
+                        println!("init: session ended");
+                        return 0;
+                    }
+                    Some(signal) => {
+                        restarts += 1;
+                        if restarts > 3 {
+                            println!("init: shell keeps dying (signal {}); giving up", signal);
+                            return code;
+                        }
+                        println!("init: shell died on signal {}; restarting", signal);
+                    }
                 }
-                restarts += 1;
-                if restarts > 3 {
-                    println!("init: shell keeps failing (status {}); giving up", code);
-                    return code;
-                }
-                println!("init: shell exited with status {}; restarting", code);
                 break;
             }
         }

@@ -510,6 +510,9 @@ pub fn read_executable(path: &str) -> Result<(Vec<u8>, Option<(String, Option<St
     if node.is_dir() {
         return Err(Errno::EACCES);
     }
+    if node.mode() & 0o111 == 0 {
+        return Err(Errno::EACCES);
+    }
     let data = node.inner.lock().data.clone();
     if data.starts_with(b"#!") {
         let line_end = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
@@ -522,6 +525,9 @@ pub fn read_executable(path: &str) -> Result<(Vec<u8>, Option<(String, Option<St
             return Err(Errno::ENOEXEC);
         }
         let interp_node = crate::fs::lookup(&interp)?;
+        if interp_node.mode() & 0o111 == 0 {
+            return Err(Errno::EACCES);
+        }
         let interp_data = interp_node.inner.lock().data.clone();
         return Ok((interp_data, Some((interp, arg))));
     }

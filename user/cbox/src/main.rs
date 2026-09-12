@@ -14,6 +14,7 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("cat", "concatenate files to standard output"),
     ("cbox", "list the applets in this binary"),
     ("cd", "(shell builtin) change directory"),
+    ("chmod", "change file permission bits"),
     ("clear", "clear the terminal"),
     ("cp", "copy files"),
     ("cut", "select fields from each line"),

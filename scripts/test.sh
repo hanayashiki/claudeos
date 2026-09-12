@@ -37,8 +37,10 @@ run_suite() {
 run_interactive() {
   banner "interactive session"
   local output
-  output="$(python3 "$ROOT/tools/drive.py" --timeout 45 -- \
+  output="$(python3 "$ROOT/tools/drive.py" --timeout 60 -- \
       "wait:2.5" "echo live-input-works\n" "wait:0.6" \
+      "echo abcXY" "wait:0.4" "\x7f\x7f" "wait:0.4" "Z\n" "wait:0.6" \
+      "echo throwaway" "wait:0.4" "\x15" "wait:0.4" "echo line-kill-works\n" "wait:0.6" \
       "yes > /dev/null\n" "wait:1.8" "\x03" "wait:1" \
       "echo survived-interrupt\n" "wait:0.6" \
       "sleep 1 &\n" "wait:2" \
@@ -48,7 +50,10 @@ run_interactive() {
   echo
 
   local ok=1
-  for expected in "live-input-works" "survived-interrupt" "session ended"; do
+  # "^abcZ$" and "^line-kill-works$" only appear if the line discipline erased
+  # characters instead of passing them straight through.
+  for expected in "live-input-works" "^abcZ$" "^line-kill-works$" \
+                  "survived-interrupt" "session ended"; do
     if ! echo "$output" | grep -q "$expected"; then
       echo "   missing expected output: $expected"
       ok=0

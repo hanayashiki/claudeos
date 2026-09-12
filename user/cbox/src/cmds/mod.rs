@@ -63,6 +63,7 @@ pub fn run(name: &str, args: &[String]) -> Option<i32> {
         "dirname" => misc::dirname(args),
         "test" | "[" => misc::test(args),
         "printf" => misc::printf(args),
+        "chmod" => misc::chmod(args),
         "expr" => misc::expr(args),
         "rtest" => rtest::main(args),
 

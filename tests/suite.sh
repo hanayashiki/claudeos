@@ -100,6 +100,27 @@ check "function"          "hi bob"   "$(greet() { echo hi $1; }; greet bob)"
 check "if else"           "small"    "$(if [ 1 -gt 2 ]; then echo big; else echo small; fi)"
 
 echo
+echo "-- scripts --"
+rm -rf /tmp/s
+mkdir -p /tmp/s
+printf '#!/bin/sh\necho shebang-ok\n' > /tmp/s/withbang.sh
+printf 'echo bare-ok\n' > /tmp/s/nobang.sh
+printf '#!/bin/sh\necho "$1 $2"\n' > /tmp/s/args.sh
+printf 'echo nope\n' > /tmp/s/plain.sh
+chmod +x /tmp/s/withbang.sh /tmp/s/nobang.sh /tmp/s/args.sh
+check "script with shebang" "shebang-ok" "$(/tmp/s/withbang.sh)"
+check "script without one"  "bare-ok"    "$(/tmp/s/nobang.sh)"
+check "relative path"       "shebang-ok" "$(cd /tmp/s && ./withbang.sh)"
+check "script arguments"    "a b"        "$(/tmp/s/args.sh a b)"
+check "sh runs a script"    "bare-ok"    "$(sh /tmp/s/nobang.sh)"
+check "not executable"      "126"        "$(/tmp/s/plain.sh 2>/dev/null; echo $?)"
+check "missing command"     "127"        "$(/tmp/s/absent 2>/dev/null; echo $?)"
+check "chmod adds +x"       "nope"       "$(chmod +x /tmp/s/plain.sh; /tmp/s/plain.sh)"
+check "chmod removes x"     "126"        "$(chmod -x /tmp/s/plain.sh; /tmp/s/plain.sh 2>/dev/null; echo $?)"
+check "chmod octal"         "755"        "$(chmod 755 /tmp/s/plain.sh; stat /tmp/s/plain.sh | grep Mode | cut -d' ' -f4 | cut -d/ -f1)"
+rm -rf /tmp/s
+
+echo
 echo "-- system --"
 check "uname"             "Linux"    "$(uname)"
 check "uname -m"          "x86_64"   "$(uname -m)"
