@@ -56,7 +56,7 @@ pub const ELF_MACHINE: u16 = 0xB7;
 
 /// Where this board's registers live. Earlier Pis used a different base, which
 /// is the first thing to change when pointing this at another one.
-pub const PERIPHERAL_BASE: u64 = 0xFE00_0000;
+const PERIPHERAL_BASE: u64 = 0xFE00_0000;
 
 extern "C" {
     static kernel_stack_top: u8;
