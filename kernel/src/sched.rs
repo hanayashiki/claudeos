@@ -336,22 +336,7 @@ pub fn exit_current(status: i32) -> ! {
             }
         }
 
-        if let Some(parent) = find(ppid) {
-            parent.pending_signals |= 1u64 << (SIGCHLD as u64 & 63);
-            if parent.state == State::Sleeping {
-                let target = parent.waiting_for;
-                let matches = match target {
-                    None => false,
-                    Some(-1) => true,
-                    Some(want) if want as u32 == pid => true,
-                    Some(_) => false,
-                };
-                if matches || target == Some(-1) {
-                    parent.state = State::Runnable;
-                    parent.wake_at = 0;
-                }
-            }
-        }
+        notify_parent(ppid);
     }
     loop {
         schedule();
@@ -375,21 +360,84 @@ pub fn raise_on_current(signal: i32) {
     current().pending_signals |= 1u64 << (signal as u64 & 63);
 }
 
+/// Tell `ppid` that one of its children changed state, and wake it if it is
+/// blocked in wait. Takes the task list, so it must not be called from inside
+/// `for_each`.
+pub fn notify_parent(ppid: u32) {
+    if let Some(parent) = find(ppid) {
+        parent.pending_signals |= 1u64 << (SIGCHLD as u64 & 63);
+        if parent.state == State::Sleeping && parent.waiting_for.is_some() {
+            parent.state = State::Runnable;
+            parent.wake_at = 0;
+        }
+    }
+}
+
+/// Make `signal` pending on `task`.
+///
+/// Two of the job-control rules act on the task rather than on the handler: a
+/// continue restarts a stopped task and discards a stop that has not been
+/// taken yet, and a stop discards a continue the same way. Returns the parent
+/// to notify when the task was actually restarted.
+pub fn post_signal(task: &mut Task, signal: i32) -> Option<u32> {
+    const STOPS: u64 = (1 << (SIGSTOP as u64 & 63))
+        | (1 << (SIGTSTP as u64 & 63))
+        | (1 << (SIGTTIN as u64 & 63))
+        | (1 << (SIGTTOU as u64 & 63));
+    let mut restarted = None;
+    if signal == SIGKILL && task.state == State::Stopped {
+        // Nothing else gets a stopped task running again, and a kill it can
+        // never look at is not a kill.
+        task.state = State::Runnable;
+        task.wake_at = 0;
+    }
+    if signal == SIGCONT {
+        task.pending_signals &= !STOPS;
+        if task.state == State::Stopped {
+            task.state = State::Runnable;
+            task.wake_at = 0;
+            task.report_continue = true;
+            restarted = Some(task.ppid);
+        }
+    } else if crate::abi::is_stop_signal(signal) {
+        task.pending_signals &= !(1u64 << (SIGCONT as u64 & 63));
+    }
+    task.pending_signals |= 1u64 << (signal as u64 & 63);
+    if task.state == State::Sleeping {
+        task.state = State::Runnable;
+        task.wake_at = 0;
+    }
+    restarted
+}
+
+/// Stop the running task until something sends it SIGCONT.
+fn stop_current(signal: i32) {
+    let task = current();
+    task.stop_signal = signal;
+    task.report_stop = true;
+    task.state = State::Stopped;
+    let ppid = task.ppid;
+    notify_parent(ppid);
+    schedule();
+}
+
 /// Mark every task in the foreground group as having a pending signal.
 pub fn signal_foreground(signal: i32) {
     let pgid = foreground();
     if pgid == 0 {
         return;
     }
+    let mut parents = Vec::new();
     for_each(|task| {
         if task.pgid == pgid && task.pid != 1 && task.state != State::Zombie {
-            task.pending_signals |= 1u64 << (signal as u64 & 63);
-            if task.state == State::Sleeping {
-                task.state = State::Runnable;
-                task.wake_at = 0;
+            if let Some(ppid) = post_signal(task, signal) {
+                parents.push(ppid);
             }
         }
     });
+    for ppid in parents {
+        notify_parent(ppid);
+    }
 }
 
 /// True when a signal is waiting that the task has not blocked.
@@ -425,8 +473,26 @@ pub fn check_signals() {
         }
         task.pending_signals &= !bit;
 
-        if signal == SIGKILL || signal == SIGSTOP {
+        if signal == SIGKILL {
             exit_current(signal & 0x7F);
+        }
+
+        // Stopping and running a handler both leave the kernel in the middle
+        // of whatever it was doing, so both wait until the task is on its way
+        // back to user mode; until then the signal stays pending.
+        let stops = signal == SIGSTOP || {
+            let action = task.signal_actions[signal as usize];
+            crate::abi::is_stop_signal(signal)
+                && action.handler == crate::signal::SIG_DFL
+        };
+        if stops {
+            let frame = unsafe { &mut *task.trap_frame() };
+            if !frame.from_user() {
+                task.pending_signals |= bit;
+                return;
+            }
+            stop_current(signal);
+            return;
         }
 
         let action = task.signal_actions[signal as usize];
@@ -495,6 +561,35 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
         drop(task);
     }
     Some((pid, code))
+}
+
+/// Report a child that stopped or was continued since the last report. The
+/// child stays where it is; this is a status change, not an exit.
+pub fn child_status_change(
+    parent_pid: u32,
+    want: i32,
+    untraced: bool,
+    continued: bool,
+) -> Option<(u32, i32)> {
+    let tasks = TASKS.lock();
+    for entry in tasks.iter() {
+        let task = entry.get();
+        if task.ppid != parent_pid {
+            continue;
+        }
+        if want > 0 && task.pid != want as u32 {
+            continue;
+        }
+        if untraced && task.report_stop {
+            task.report_stop = false;
+            return Some((task.pid, ((task.stop_signal & 0xFF) << 8) | 0x7F));
+        }
+        if continued && task.report_continue {
+            task.report_continue = false;
+            return Some((task.pid, 0xFFFF));
+        }
+    }
+    None
 }
 
 /// True when the parent has at least one live child matching `want`.

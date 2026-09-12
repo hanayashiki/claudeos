@@ -70,6 +70,7 @@ fn state_char(state: crate::task::State) -> char {
     match state {
         State::Runnable => 'R',
         State::Sleeping => 'S',
+        State::Stopped => 'T',
         State::Zombie => 'Z',
         State::Dead => 'X',
     }
@@ -182,6 +183,7 @@ pub fn render(kind: Generated) -> String {
                 match task.state {
                     crate::task::State::Runnable => "running",
                     crate::task::State::Sleeping => "sleeping",
+                    crate::task::State::Stopped => "stopped",
                     crate::task::State::Zombie => "zombie",
                     crate::task::State::Dead => "dead",
                 },

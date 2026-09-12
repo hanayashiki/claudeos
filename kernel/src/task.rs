@@ -30,6 +30,8 @@ pub enum State {
     Runnable,
     /// Waiting for a wake-up: a tick deadline, a child, or I/O.
     Sleeping,
+    /// Stopped by a job-control signal. Only SIGCONT makes it runnable again.
+    Stopped,
     Zombie,
     Dead,
 }
@@ -106,6 +108,11 @@ pub struct Task {
     pub robust_list: u64,
 
     pub pending_signals: u64,
+    /// The signal that stopped this task, and whether the stop and the
+    /// following continue have been reported to whoever is waiting.
+    pub stop_signal: i32,
+    pub report_stop: bool,
+    pub report_continue: bool,
     pub signal_actions: [crate::signal::SigAction; 64],
     pub signal_mask: u64,
 
@@ -173,6 +180,9 @@ impl Task {
             set_child_tid: 0,
             robust_list: 0,
             pending_signals: 0,
+            stop_signal: 0,
+            report_stop: false,
+            report_continue: false,
             signal_actions: [crate::signal::SigAction::default(); 64],
             signal_mask: 0,
             wake_at: 0,

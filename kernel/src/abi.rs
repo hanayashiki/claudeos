@@ -285,6 +285,7 @@ pub const CLONE_CHILD_SETTID: u64 = 0x01000000;
 // wait4 options
 pub const WNOHANG: u64 = 1;
 pub const WUNTRACED: u64 = 2;
+pub const WCONTINUED: u64 = 8;
 
 // clock ids
 pub const CLOCK_REALTIME: u64 = 0;
@@ -366,6 +367,14 @@ pub const SIGTERM: i32 = 15;
 pub const SIGCHLD: i32 = 17;
 pub const SIGCONT: i32 = 18;
 pub const SIGSTOP: i32 = 19;
+pub const SIGTSTP: i32 = 20;
+pub const SIGTTIN: i32 = 21;
+pub const SIGTTOU: i32 = 22;
+
+/// Signals whose default action is to stop the task.
+pub fn is_stop_signal(signal: i32) -> bool {
+    matches!(signal, SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
+}
 
 /// `struct stat` as x86_64 Linux defines it (144 bytes).
 #[repr(C)]

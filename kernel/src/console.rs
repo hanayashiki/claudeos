@@ -74,8 +74,10 @@ pub static TERMIOS: Spinlock<Termios> = Spinlock::new(Termios {
     c_cflag: 0o2277,
     c_lflag: crate::abi::ISIG | ICANON | ECHO | crate::abi::ECHOE,
     c_line: 0,
-    c_cc: [3, 28, 127, 21, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-           0, 0, 0, 0, 0],
+    // VINTR, VQUIT, VERASE, VKILL, VEOF, VTIME, VMIN, VSWTC, VSTART, VSTOP,
+    // VSUSP, then the rest unset.
+    c_cc: [3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+           0, 0, 0, 0, 0, 0],
     c_ispeed: 38400,
     c_ospeed: 38400,
 });
@@ -86,27 +88,34 @@ pub static TERMIOS: Spinlock<Termios> = Spinlock::new(Termios {
 /// delivered them, because the process that will eventually read the terminal
 /// is usually blocked waiting for the job that needs the signal.
 pub fn push_byte(byte: u8) {
-    let (isig, intr, quit) = {
+    let (isig, intr, quit, susp) = {
         let termios = TERMIOS.lock();
-        (termios.c_lflag & crate::abi::ISIG != 0, termios.c_cc[0], termios.c_cc[1])
+        (
+            termios.c_lflag & crate::abi::ISIG != 0,
+            termios.c_cc[0],
+            termios.c_cc[1],
+            termios.c_cc[10],
+        )
     };
 
     if isig && byte != 0 {
         let signal = if byte == intr {
-            Some(crate::abi::SIGINT)
+            Some((crate::abi::SIGINT, "^C\n"))
         } else if byte == quit {
-            Some(crate::abi::SIGQUIT)
+            Some((crate::abi::SIGQUIT, "^\\\n"))
+        } else if byte == susp {
+            Some((crate::abi::SIGTSTP, "^Z\n"))
         } else {
             None
         };
-        if let Some(signal) = signal {
+        if let Some((signal, mark)) = signal {
             {
                 let mut line = LINE.lock();
                 line.len = 0;
                 line.pos = 0;
                 line.ready = false;
             }
-            echo(b"^C\n");
+            echo(mark.as_bytes());
             crate::sched::signal_foreground(signal);
             return;
         }

@@ -112,6 +112,12 @@ character, so `Ctrl-C` reaches a running job while the shell is blocked waiting
 for it. The shell puts each job in its own process group and hands it the
 terminal, so interrupting a job leaves the shell running.
 
+**Job control.** `Ctrl-Z` stops the foreground job rather than killing it: a
+stopped task leaves the run queue until something sends it `SIGCONT`, and the
+stop and the later continue are reported to whoever is in `wait4` with
+`WUNTRACED` or `WCONTINUED`. The shell has `jobs`, `fg` and `bg`, `kill %1`
+takes a job number, and `ps` shows a stopped task as `T`.
+
 **Filesystem.** An in-memory tree is populated at boot from a cpio archive
 passed as a multiboot module. Character devices (`/dev/null`, `/dev/zero`,
 `/dev/random`, `/dev/console`) and a generated `/proc` (`meminfo`, `uptime`,
@@ -135,6 +141,7 @@ The shell supports pipelines, redirection (`>` `>>` `<` `2>`), here-documents
 quoting, `$VAR` and `${VAR}` expansion, command substitution with `$(...)` and
 backticks, arithmetic with `$((...))`, `if`/`elif`/`else`, `while`, `until`,
 `for`, `case` with alternation patterns, functions with positional parameters,
+`jobs`, `fg`, `bg`,
 and the usual builtins. Word expansion is a single pass, so text a command
 substitution produced is not rescanned.
 
@@ -158,7 +165,7 @@ basename dirname yes true false`.
 `make test` boots the OS once per suite and requires each to report zero
 failures.
 
-- `tests/suite.sh` runs **173 checks** inside the OS, driving the shell through
+- `tests/suite.sh` runs **176 checks** inside the OS, driving the shell through
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
   subprocesses and `/proc`.
@@ -181,8 +188,9 @@ failures.
   loops, `case` and here-documents. Run `make alpine` first; the suite is
   skipped when it is absent.
 - An **interactive session** is driven over the serial console: typing after
-  boot, backspace and Ctrl-U line editing, `Ctrl-C` on a running job, a
-  background job, and the clock advancing while the shell is blocked in a read.
+  boot, backspace and Ctrl-U line editing, `Ctrl-C` on a running job, `Ctrl-Z`
+  followed by `jobs`, `bg` and `kill %1`, and the clock advancing while the
+  shell is blocked in a read.
 
 Every suite is an ordinary Linux program. Nothing in them is aware that they
 are not running on Linux.
@@ -218,6 +226,7 @@ tests/alpine.sh       in-OS suite run inside an Alpine root filesystem
 
 Single CPU; no SMP. There is no block device driver or on-disk filesystem: the
 root filesystem lives in RAM and changes do not survive a reboot. There is no
-networking, so the socket calls return `EAFNOSUPPORT`. Job control stops at process groups and the foreground terminal: `SIGTSTP` and `fg`
-are not implemented. `futex`, `poll` and `select` still wait by re-checking
-rather than by queueing, though they yield or sleep rather than spin.
+networking, so the socket calls return `EAFNOSUPPORT`. `futex`, `poll` and `select` still wait by re-checking
+rather than by queueing, though they yield or sleep rather than spin. A
+background job that reads the terminal takes the input instead of being sent
+`SIGTTIN`.

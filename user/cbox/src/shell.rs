@@ -998,13 +998,29 @@ enum Flow {
     Exit,
 }
 
+/// One pipeline the shell is keeping track of: either running in the
+/// background or stopped in the foreground.
+#[derive(Clone)]
+struct Job {
+    /// The number `%1` refers to. Stays with the job as others finish.
+    id: usize,
+    pgid: i32,
+    /// Every process in the pipeline, so a stop or an exit can be waited for.
+    pids: Vec<i32>,
+    command: String,
+    stopped: bool,
+}
+
 pub struct Shell {
     env: HashMap<String, String>,
     functions: HashMap<String, Vec<Node>>,
     positional: Vec<String>,
     last_status: i32,
     pid: i32,
-    jobs: Vec<(i32, String)>,
+    jobs: Vec<Job>,
+    /// The number given to the next job. Job numbers are not reused while
+    /// older jobs are still listed.
+    next_job: usize,
     exit_code: Option<i32>,
     /// Set once the shell owns the terminal and puts jobs in their own groups.
     job_control: bool,
@@ -1047,6 +1063,7 @@ impl Shell {
             last_status: 0,
             pid: sys::getpid() as i32,
             jobs: Vec::new(),
+            next_job: 1,
             exit_code: None,
             job_control: false,
             shell_pgid: 0,
@@ -1070,6 +1087,7 @@ impl Shell {
             last_status: self.last_status,
             pid: sys::getpid() as i32,
             jobs: Vec::new(),
+            next_job: 1,
             exit_code: None,
             job_control: false,
             shell_pgid: self.shell_pgid,
@@ -1508,39 +1526,34 @@ impl Shell {
             pids.push(pid as i32);
         }
 
+        let description: Vec<String> = commands
+            .iter()
+            .map(|c| c.words.iter().map(|(w, _)| w.clone()).collect::<Vec<_>>().join(" "))
+            .collect();
+        let description = description.join(" | ");
+
         if pipeline.background {
-            let description: Vec<String> = commands
-                .iter()
-                .map(|c| c.words.iter().map(|(w, _)| w.clone()).collect::<Vec<_>>().join(" "))
-                .collect();
             if let Some(pid) = pids.last() {
+                let job = Job {
+                    id: self.next_job,
+                    pgid: if leader == 0 { *pid } else { leader },
+                    pids: pids.clone(),
+                    command: description,
+                    stopped: false,
+                };
+                self.next_job += 1;
                 // Job control chatter belongs on stderr, so it does not end up
                 // inside a command substitution.
-                eprintln!("[{}] {}", self.jobs.len() + 1, pid);
-                self.jobs.push((*pid, description.join(" | ")));
+                eprintln!("[{}] {}", job.id, pid);
+                self.jobs.push(job);
                 self.last_background = Some(*pid);
             }
             self.last_status = 0;
             return Flow::Normal;
         }
 
-        let mut status = 0;
-        let mut interrupted = false;
-        for pid in pids {
-            let (rc, raw) = sys::wait4(pid, 0);
-            if rc >= 0 {
-                status = sys::exit_code_of(raw);
-                if sys::signal_of(raw) == Some(sys::SIGINT) {
-                    interrupted = true;
-                }
-            }
-        }
-        if self.job_control {
-            sys::give_terminal_to(self.shell_pgid);
-        }
-        if interrupted {
-            println!();
-        }
+        let pgid = if leader == 0 { *pids.last().unwrap_or(&0) } else { leader };
+        let status = self.await_foreground(pgid, &pids, &description);
         self.last_status = if pipeline.negated {
             if status == 0 {
                 1
@@ -1551,6 +1564,102 @@ impl Shell {
             status
         };
         Flow::Normal
+    }
+
+    /// Wait for a foreground pipeline and return its exit status. A pipeline
+    /// that stopped instead of exiting is kept as a job; either way the shell
+    /// takes the terminal back before returning.
+    fn await_foreground(&mut self, pgid: i32, pids: &[i32], description: &str) -> i32 {
+        let mut status = 0;
+        let mut interrupted = false;
+        let mut stopped = false;
+        for pid in pids {
+            let (rc, raw) = sys::wait4(*pid, sys::WUNTRACED);
+            if rc < 0 {
+                continue;
+            }
+            if let Some(signal) = sys::stop_signal_of(raw) {
+                stopped = true;
+                status = 128 + signal;
+                continue;
+            }
+            status = sys::exit_code_of(raw);
+            if sys::signal_of(raw) == Some(sys::SIGINT) {
+                interrupted = true;
+            }
+        }
+        if self.job_control {
+            sys::give_terminal_to(self.shell_pgid);
+        }
+        if stopped {
+            let job = Job {
+                id: self.next_job,
+                pgid,
+                pids: pids.to_vec(),
+                command: description.to_string(),
+                stopped: true,
+            };
+            self.next_job += 1;
+            eprintln!("[{}]+  Stopped  {}", job.id, job.command);
+            self.jobs.push(job);
+        } else if interrupted {
+            println!();
+        }
+        status
+    }
+
+    /// Resolve `%1`, `%+`, `%-`, a bare number or a pid to a job. With no
+    /// argument this is the most recent job, which is what `fg` and `bg`
+    /// default to.
+    fn find_job(&self, spec: Option<&String>) -> Option<usize> {
+        let spec = match spec {
+            None => return self.jobs.len().checked_sub(1),
+            Some(spec) => spec.as_str(),
+        };
+        let body = spec.strip_prefix('%').unwrap_or(spec);
+        if body.is_empty() || body == "+" || body == "%" {
+            return self.jobs.len().checked_sub(1);
+        }
+        if body == "-" {
+            return self.jobs.len().checked_sub(2);
+        }
+        if let Ok(number) = body.parse::<usize>() {
+            if spec.starts_with('%') {
+                return self.jobs.iter().position(|j| j.id == number);
+            }
+            return self
+                .jobs
+                .iter()
+                .position(|j| j.pids.contains(&(number as i32)))
+                .or_else(|| self.jobs.iter().position(|j| j.id == number));
+        }
+        self.jobs.iter().position(|j| j.command.starts_with(body))
+    }
+
+    /// `fg` and `bg`: send the job SIGCONT, and for `fg` wait for it again
+    /// with the terminal handed over.
+    fn resume_job(&mut self, spec: Option<&String>, foreground: bool) -> i32 {
+        let index = match self.find_job(spec) {
+            Some(index) => index,
+            None => {
+                eprintln!("{}: no such job", if foreground { "fg" } else { "bg" });
+                return 1;
+            }
+        };
+        let job = self.jobs.remove(index);
+        if foreground {
+            eprintln!("{}", job.command);
+            if self.job_control {
+                sys::give_terminal_to(job.pgid);
+            }
+            sys::kill(-job.pgid, sys::SIGCONT);
+            return self.await_foreground(job.pgid, &job.pids, &job.command);
+        }
+        sys::kill(-job.pgid, sys::SIGCONT);
+        eprintln!("[{}]+ {} &", job.id, job.command);
+        self.last_background = job.pids.last().copied();
+        self.jobs.push(Job { stopped: false, ..job });
+        0
     }
 
     /// Run a builtin, a function, or a compound command in this process, with
@@ -1810,6 +1919,8 @@ impl Shell {
                 self.exit_code = Some(code);
                 return Flow::Exit;
             }
+            "fg" => self.resume_job(argv.get(1), true),
+            "bg" => self.resume_job(argv.get(1), false),
             "kill" => {
                 let mut signal = 15;
                 let mut targets = Vec::new();
@@ -1827,8 +1938,16 @@ impl Shell {
                             "TERM" => 15,
                             "CONT" => 18,
                             "STOP" => 19,
+                            "TSTP" => 20,
                             _ => signal,
                         };
+                        continue;
+                    }
+                    if argument.starts_with('%') {
+                        match self.find_job(Some(argument)) {
+                            Some(index) => targets.push(-self.jobs[index].pgid),
+                            None => eprintln!("kill: {}: no such job", argument),
+                        }
                         continue;
                     }
                     match argument.parse::<i32>() {
@@ -1861,8 +1980,17 @@ impl Shell {
                 }
             }
             "jobs" => {
-                for (index, (pid, description)) in self.jobs.iter().enumerate() {
-                    println!("[{}] {} {}", index + 1, pid, description);
+                let last = self.jobs.len();
+                for (index, job) in self.jobs.iter().enumerate() {
+                    let mark = if index + 1 == last {
+                        '+'
+                    } else if index + 2 == last {
+                        '-'
+                    } else {
+                        ' '
+                    };
+                    let state = if job.stopped { "Stopped" } else { "Running" };
+                    println!("[{}]{}  {}  {}", job.id, mark, state, job.command);
                 }
                 0
             }
@@ -1994,13 +2122,27 @@ impl Shell {
 
     fn reap_background(&mut self) {
         loop {
-            let (pid, status) = sys::wait4(-1, 1 /* WNOHANG */);
+            let (pid, status) = sys::wait4(-1, sys::WNOHANG | sys::WUNTRACED | sys::WCONTINUED);
             if pid <= 0 {
                 break;
             }
-            if let Some(index) = self.jobs.iter().position(|(p, _)| *p == pid as i32) {
-                let (_, description) = self.jobs.remove(index);
-                eprintln!("[done] {} ({})", description, sys::exit_code_of(status));
+            let index = match self.jobs.iter().position(|j| j.pids.contains(&(pid as i32))) {
+                Some(index) => index,
+                None => continue,
+            };
+            if sys::stop_signal_of(status).is_some() {
+                self.jobs[index].stopped = true;
+                eprintln!("[{}]+  Stopped  {}", self.jobs[index].id, self.jobs[index].command);
+                continue;
+            }
+            if sys::is_continued(status) {
+                self.jobs[index].stopped = false;
+                continue;
+            }
+            self.jobs[index].pids.retain(|p| *p != pid as i32);
+            if self.jobs[index].pids.is_empty() {
+                let job = self.jobs.remove(index);
+                eprintln!("[done] {} ({})", job.command, sys::exit_code_of(status));
             }
         }
     }
@@ -2358,6 +2500,7 @@ impl Shell {
 const BUILTINS: &[&str] = &[
     "cd", "exit", "pwd", "export", "unset", "set", "read", "jobs", "kill", "type", "which", ".",
     "source", "help", "history", ":", "local", "wait", "command", "exec", "trap", "shift",
+    "fg", "bg",
 ];
 
 fn is_builtin(name: &str) -> bool {

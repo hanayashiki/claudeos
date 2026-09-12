@@ -197,12 +197,29 @@ pub fn exit_code_of(status: i32) -> i32 {
 
 pub fn signal_of(status: i32) -> Option<i32> {
     let signal = status & 0x7F;
-    if signal == 0 {
+    if signal == 0 || status & 0xFF == 0x7F {
         None
     } else {
         Some(signal)
     }
 }
+
+/// The signal that stopped the child, when the status reports a stop.
+pub fn stop_signal_of(status: i32) -> Option<i32> {
+    if status & 0xFF == 0x7F {
+        Some((status >> 8) & 0xFF)
+    } else {
+        None
+    }
+}
+
+pub fn is_continued(status: i32) -> bool {
+    status == 0xFFFF
+}
+
+pub const WNOHANG: u64 = 1;
+pub const WUNTRACED: u64 = 2;
+pub const WCONTINUED: u64 = 8;
 
 pub const TIOCSPGRP: u64 = 0x5410;
 
@@ -227,6 +244,7 @@ pub const SIGINT: i32 = 2;
 pub const SIGQUIT: i32 = 3;
 #[allow(dead_code)]
 pub const SIGTERM: i32 = 15;
+pub const SIGCONT: i32 = 18;
 pub const SIGTSTP: i32 = 20;
 pub const SIGTTIN: i32 = 21;
 pub const SIGTTOU: i32 = 22;

@@ -44,6 +44,9 @@ run_interactive() {
       "yes > /dev/null\n" "wait:1.8" "\x03" "wait:1" \
       "echo survived-interrupt\n" "wait:0.6" \
       "sleep 1 &\n" "wait:2.5" \
+      "yes > /dev/null\n" "wait:1.5" "\x1a" "wait:1" \
+      "jobs\n" "wait:0.8" "bg\n" "wait:1" "jobs\n" "wait:0.8" \
+      "kill %1\n" "wait:1.5" \
       "uptime\n" "wait:1.5" \
       "exit\n" "wait:3" 2>&1 | tr -d '\r')"
   echo "$output"
@@ -52,8 +55,11 @@ run_interactive() {
   local ok=1
   # "^abcZ$" and "^line-kill-works$" only appear if the line discipline erased
   # characters instead of passing them straight through.
+  # Ctrl-Z has to stop the foreground job, `bg` has to restart it in the
+  # background, and `kill %1` has to reach it by job number.
   for expected in "live-input-works" "^abcZ$" "^line-kill-works$" \
-                  "survived-interrupt" "session ended"; do
+                  "survived-interrupt" "Stopped  yes" "Running  yes" \
+                  "session ended"; do
     if ! echo "$output" | grep -q "$expected"; then
       echo "   missing expected output: $expected"
       ok=0

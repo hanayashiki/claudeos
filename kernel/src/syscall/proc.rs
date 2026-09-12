@@ -287,6 +287,17 @@ pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
             }
             return Ok(child_pid as u64);
         }
+        if let Some((child_pid, status)) = sched::child_status_change(
+            me,
+            pid as i32,
+            options & WUNTRACED != 0,
+            options & WCONTINUED != 0,
+        ) {
+            if status_addr != 0 {
+                uaccess::write_u32(status_addr, status as u32)?;
+            }
+            return Ok(child_pid as u64);
+        }
         if !sched::has_children(me, pid as i32) {
             return Err(Errno::ECHILD);
         }
@@ -312,23 +323,26 @@ pub fn kill(pid: i64, signal: i32) -> SysResult {
         return Ok(0);
     }
     let mut delivered = false;
+    let mut parents = alloc::vec::Vec::new();
     let me = sched::current().pid;
+    let my_pgid = sched::current_pgid();
     sched::for_each(|task| {
         let target = match pid {
             p if p > 0 => task.pid == p as u32,
-            0 => task.pgid == sched::current_pgid(),
+            0 => task.pgid == my_pgid,
             -1 => task.pid != me && task.pid != 0,
             p => task.pgid == (-p) as u32,
         };
         if target && task.state != State::Zombie && task.pid != 0 {
-            task.pending_signals |= 1u64 << (signal as u64 & 63);
-            if task.state == State::Sleeping {
-                task.state = State::Runnable;
-                task.wake_at = 0;
+            if let Some(ppid) = sched::post_signal(task, signal) {
+                parents.push(ppid);
             }
             delivered = true;
         }
     });
+    for ppid in parents {
+        sched::notify_parent(ppid);
+    }
     if delivered {
         sched::check_signals();
         Ok(0)

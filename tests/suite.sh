@@ -174,6 +174,17 @@ check "head -c on a device" "8"          "$(head -c 8 /dev/zero | wc -c)"
 check "background reaped"  "0"           "$(sleep 1 & sleep 2; ps | grep -c ' Z ')"
 
 echo
+echo "-- stopping and continuing --"
+sleep 30 &
+stopped=$!
+kill -STOP $stopped
+check "a stopped job shows T"  "1"  "$(ps | grep -c ' T ')"
+kill -CONT $stopped
+check "continuing clears it"   "0"  "$(ps | grep -c ' T ')"
+kill -9 $stopped
+check "kill reaches a stopped job" "0" "$(kill -STOP $stopped 2>/dev/null; sleep 1; ps | grep -c 'sleep 30')"
+
+echo
 echo "-- syntax errors --"
 printf 'echo before\nfor i in 1 2\necho no do\n' > /tmp/bad.sh
 check "commands before it run" "before"  "$(sh /tmp/bad.sh 2>/dev/null)"
