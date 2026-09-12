@@ -712,7 +712,11 @@ pub fn select(nfds: i32, readfds: u64, writefds: u64, _exceptfds: u64) -> SysRes
 
 /// `struct statfs` as x86_64 Linux defines it (120 bytes).
 fn fill_statfs(out: u64) -> SysResult {
-    let (used, total) = crate::mm::frame::stats();
+    // The root filesystem lives in RAM, so its size is what memory allows and
+    // its free space is what a file could still grow into.
+    let (_, total) = crate::mm::frame::stats();
+    let total_blocks = total as u64;
+    let free_blocks = (crate::mm::file_available_bytes() / crate::mm::PAGE_SIZE) as u64;
     let mut buf = [0u8; 120];
     let put = |buf: &mut [u8], offset: usize, value: u64| {
         buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
@@ -720,9 +724,9 @@ fn fill_statfs(out: u64) -> SysResult {
     const TMPFS_MAGIC: u64 = 0x0102_1994;
     put(&mut buf, 0, TMPFS_MAGIC); // f_type
     put(&mut buf, 8, 4096); // f_bsize
-    put(&mut buf, 16, total as u64); // f_blocks
-    put(&mut buf, 24, (total - used) as u64); // f_bfree
-    put(&mut buf, 32, (total - used) as u64); // f_bavail
+    put(&mut buf, 16, total_blocks); // f_blocks
+    put(&mut buf, 24, free_blocks); // f_bfree
+    put(&mut buf, 32, free_blocks); // f_bavail
     put(&mut buf, 40, 1 << 20); // f_files
     put(&mut buf, 48, 1 << 19); // f_ffree
     put(&mut buf, 64, 255); // f_namelen

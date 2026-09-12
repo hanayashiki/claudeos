@@ -57,7 +57,7 @@ impl Token {
 
 const KEYWORDS: &[&str] = &[
     "if", "then", "elif", "else", "fi", "while", "until", "for", "in", "do", "done", "function",
-    "return", "break", "continue", "case", "esac", "!", "{", "}",
+    "return", "break", "continue", "case", "esac", "{", "}",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2557,7 +2557,7 @@ fn glob(pattern: &str) -> Option<Vec<String>> {
 
 /// Match one character against a `[...]` class, returning the index just past
 /// the closing bracket.
-fn match_class(pattern: &[char], start: usize, c: char) -> Option<(bool, usize)> {
+pub fn match_class(pattern: &[char], start: usize, c: char) -> Option<(bool, usize)> {
     let mut i = start + 1;
     let negated = matches!(pattern.get(i), Some('!') | Some('^'));
     if negated {
@@ -2588,7 +2588,7 @@ fn match_class(pattern: &[char], start: usize, c: char) -> Option<(bool, usize)>
     None
 }
 
-fn matches_pattern(name: &str, pattern: &str) -> bool {
+pub fn matches_pattern(name: &str, pattern: &str) -> bool {
     let n: Vec<char> = name.chars().collect();
     let p: Vec<char> = pattern.chars().collect();
     let (mut ni, mut pi) = (0usize, 0usize);

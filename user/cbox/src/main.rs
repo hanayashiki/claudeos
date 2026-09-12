@@ -46,6 +46,7 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("printf", "format and print arguments"),
     ("ps", "list running processes"),
     ("pwd", "print the working directory"),
+    ("readlink", "print what a symbolic link points at"),
     ("rm", "remove files"),
     ("rtest", "exercise the Rust standard library"),
     ("rmdir", "remove empty directories"),
@@ -80,6 +81,11 @@ pub fn help() {
     println!();
     println!("The shell supports pipelines, && || ; &, redirection with");
     println!("> >> < 2>, globbing, $VARIABLE expansion and quoting.");
+}
+
+/// Shell-style pattern match, shared with `find -name`.
+pub fn shell_glob(name: &str, pattern: &str) -> bool {
+    shell::matches_pattern(name, pattern)
 }
 
 fn main() {

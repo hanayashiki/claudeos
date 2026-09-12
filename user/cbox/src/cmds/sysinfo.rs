@@ -110,17 +110,67 @@ pub fn uptime(_args: &[String]) -> i32 {
     }
 }
 
-pub fn date(_args: &[String]) -> i32 {
+/// Month and day-of-month names, shared by date and by ls -l.
+pub const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// `date [+FORMAT]` with the conversions scripts actually use.
+pub fn date(args: &[String]) -> i32 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    println!("{} (unix time {})", format_time(now), now);
+
+    let format = args.iter().skip(1).find(|a| a.starts_with('+'));
+    let Some(format) = format else {
+        println!("{} (unix time {})", format_time(now), now);
+        return 0;
+    };
+
+    let days = now.div_euclid(86400);
+    let seconds = now.rem_euclid(86400);
+    let (year, month, day) = civil_from_days(days);
+    let (hour, minute, second) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    // 1970-01-01 was a Thursday.
+    let weekday = ((days % 7) + 7 + 4) % 7;
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+    let mut out = String::new();
+    let mut chars = format[1..].chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => out.push_str(&format!("{:04}", year)),
+            Some('y') => out.push_str(&format!("{:02}", year % 100)),
+            Some('m') => out.push_str(&format!("{:02}", month)),
+            Some('d') => out.push_str(&format!("{:02}", day)),
+            Some('H') => out.push_str(&format!("{:02}", hour)),
+            Some('M') => out.push_str(&format!("{:02}", minute)),
+            Some('S') => out.push_str(&format!("{:02}", second)),
+            Some('s') => out.push_str(&now.to_string()),
+            Some('b') | Some('h') => out.push_str(MONTHS[(month - 1) as usize]),
+            Some('a') => out.push_str(DAYS[weekday as usize]),
+            Some('T') => out.push_str(&format!("{:02}:{:02}:{:02}", hour, minute, second)),
+            Some('F') => out.push_str(&format!("{:04}-{:02}-{:02}", year, month, day)),
+            Some('Z') => out.push_str("UTC"),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    println!("{}", out);
     0
 }
 
 /// Format a Unix timestamp as UTC, without pulling in a date library.
-fn format_time(unix: i64) -> String {
+pub fn format_time(unix: i64) -> String {
     let days = unix.div_euclid(86400);
     let seconds = unix.rem_euclid(86400);
     let (year, month, day) = civil_from_days(days);
@@ -138,7 +188,7 @@ fn format_time(unix: i64) -> String {
     )
 }
 
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = z - era * 146097;

@@ -133,6 +133,47 @@ check "seq to file"       "3"        "$(seq 1 3 > /tmp/t/n; wc -l < /tmp/t/n)"
 check "stderr redirect"   ""         "$(cat /tmp/t/missing 2> /dev/null)"
 
 echo
+echo "-- coreutils --"
+rm -rf /tmp/cu; mkdir -p /tmp/cu/d2/d3
+echo a > /tmp/cu/a.txt; echo b > /tmp/cu/d2/b.log; echo c > /tmp/cu/d2/d3/c.txt
+check "find -name"         "2"           "$(find /tmp/cu -name '*.txt' | wc -l)"
+check "find -type d"       "3"           "$(find /tmp/cu -type d | wc -l)"
+check "find -maxdepth"     "3"           "$(find /tmp/cu -maxdepth 1 | wc -l)"
+check "find -exec"         "1"           "$(find /tmp/cu -name '*.log' -exec wc -l {} ';' | tr -s ' ' | cut -d' ' -f2)"
+check "ls -l has an owner" "root"        "$(ls -l /tmp/cu/a.txt | tr -s ' ' | cut -d' ' -f3)"
+check "ls -l has a time"   "1"           "$(ls -l /tmp/cu/a.txt | grep -c ':')"
+check "ls -d"              "/tmp/cu"     "$(ls -d /tmp/cu)"
+check "mtime is set"       "0"           "$(test $(busybox stat -c %Y /tmp/cu/a.txt) -gt 1000000000; echo $?)"
+check "tr escapes"         "a:b:"        "$(printf 'a\nb\n' | tr '\n' ':')"
+check "sort -n with text"  "1 a"         "$(printf '3 c\n1 a\n2 b\n' | sort -n | head -n 1)"
+check "sort -n decimals"   "1.25"        "$(printf '1.5\n1.25\n10\n' | sort -n | head -n 1)"
+check "uniq -d"            "a"           "$(printf 'a\na\nb\n' | uniq -d)"
+check "uniq -u"            "b"           "$(printf 'a\na\nb\n' | uniq -u)"
+check "test -a"            "0"           "$(test -f /tmp/cu/a.txt -a -d /tmp/cu; echo $?)"
+check "test -o"            "0"           "$(test -f /tmp/none -o -d /tmp/cu; echo $?)"
+check "test negation"      "0"           "$(test ! -f /tmp/none; echo $?)"
+check "printf width"       "str|42| 3.14|ff" "$(printf '%s|%d|%5.2f|%x' str 42 3.14159 255)"
+check "echo -e"            "2"           "$(echo -e 'a\nb' | wc -l)"
+check "cut -c"             "bcd"         "$(printf 'abcdef\n' | cut -c2-4)"
+check "cat -e"             "one\$"        "$(printf 'one\n' | cat -e)"
+check "expr length"        "5"           "$(expr length abcde)"
+check "expr divide by 0"   "2"           "$(expr 1 / 0 2>/dev/null; echo $?)"
+check "wc -L"              "4"           "$(printf 'a\nabcd\nab\n' | wc -L)"
+check "readlink"           "cbox"        "$(readlink /bin/ls)"
+check "ln -sf replaces"    "0"           "$(ln -sf /tmp/cu/a.txt /tmp/cu/L; ln -sf /tmp/cu/a.txt /tmp/cu/L; echo $?)"
+check "date +format"       "1"           "$(date +%Y-%m-%d | grep -c '^[0-9][0-9][0-9][0-9]-')"
+check "error has no code"  "0"           "$(ls /nope 2>&1 | grep -c 'os error')"
+check "df tracks files"    "0"           "$(df > /dev/null; echo $?)"
+rm -rf /tmp/cu
+
+echo
+echo "-- endless writers and background jobs --"
+check "yes into head"      "3"           "$(yes | head -3 | wc -l)"
+check "failed write fails" "1"           "$(echo x > /dev/full 2>/dev/null; echo $?)"
+check "head -c on a device" "8"          "$(head -c 8 /dev/zero | wc -c)"
+check "background reaped"  "0"           "$(sleep 1 & sleep 2; ps | grep -c ' Z ')"
+
+echo
 echo "-- devices --"
 check "/dev/null read"    "0"        "$(wc -c < /dev/null)"
 check "/dev/null write"   "0"        "$(echo discard > /dev/null; echo $?)"

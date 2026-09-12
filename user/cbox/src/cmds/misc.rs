@@ -3,9 +3,17 @@
 use super::split_flags;
 
 pub fn yes(args: &[String]) -> i32 {
-    let text = if args.len() > 1 { args[1..].join(" ") } else { "y".to_string() };
+    use std::io::Write;
+    let mut line = if args.len() > 1 { args[1..].join(" ") } else { "y".to_string() };
+    line.push('\n');
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
     loop {
-        println!("{}", text);
+        // Stop when the reader has gone, rather than spinning.
+        if out.write_all(line.as_bytes()).is_err() {
+            return 1;
+        }
     }
 }
 
@@ -41,7 +49,7 @@ pub fn dirname(args: &[String]) -> i32 {
     0
 }
 
-/// `test` / `[`: evaluate a single condition.
+/// `test` / `[`: evaluate a condition, including -a, -o and !.
 pub fn test(args: &[String]) -> i32 {
     let mut operands: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
     if args[0] == "[" {
@@ -51,30 +59,56 @@ pub fn test(args: &[String]) -> i32 {
         }
         operands.pop();
     }
+    if evaluate(&operands) {
+        0
+    } else {
+        1
+    }
+}
 
-    let result = match operands.len() {
+/// -o binds loosest, then -a, then a leading !, then the primaries.
+fn evaluate(terms: &[&str]) -> bool {
+    if terms.is_empty() {
+        return false;
+    }
+    if let Some(index) = terms.iter().position(|t| *t == "-o") {
+        return evaluate(&terms[..index]) || evaluate(&terms[index + 1..]);
+    }
+    if let Some(index) = terms.iter().position(|t| *t == "-a") {
+        return evaluate(&terms[..index]) && evaluate(&terms[index + 1..]);
+    }
+    if terms[0] == "!" {
+        return !evaluate(&terms[1..]);
+    }
+    primary(terms)
+}
+
+fn primary(terms: &[&str]) -> bool {
+    match terms.len() {
         0 => false,
-        1 => !operands[0].is_empty(),
+        1 => !terms[0].is_empty(),
         2 => {
-            let value = operands[1];
-            match operands[0] {
+            let value = terms[1];
+            match terms[0] {
                 "-n" => !value.is_empty(),
                 "-z" => value.is_empty(),
                 "-e" => std::fs::symlink_metadata(value).is_ok(),
                 "-f" => std::fs::metadata(value).map(|m| m.is_file()).unwrap_or(false),
                 "-d" => std::fs::metadata(value).map(|m| m.is_dir()).unwrap_or(false),
+                "-L" | "-h" => std::fs::symlink_metadata(value)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false),
                 "-s" => std::fs::metadata(value).map(|m| m.len() > 0).unwrap_or(false),
                 "-r" | "-w" => std::fs::metadata(value).is_ok(),
                 "-x" => {
                     use std::os::unix::fs::MetadataExt;
                     std::fs::metadata(value).map(|m| m.mode() & 0o111 != 0).unwrap_or(false)
                 }
-                "!" => value.is_empty(),
                 _ => false,
             }
         }
         3 => {
-            let (left, operator, right) = (operands[0], operands[1], operands[2]);
+            let (left, operator, right) = (terms[0], terms[1], terms[2]);
             let numbers = (left.parse::<i64>(), right.parse::<i64>());
             match operator {
                 "=" | "==" => left == right,
@@ -89,15 +123,10 @@ pub fn test(args: &[String]) -> i32 {
             }
         }
         _ => false,
-    };
-    if result {
-        0
-    } else {
-        1
     }
 }
 
-/// `printf FORMAT [ARG...]` with the handful of conversions scripts use.
+/// `printf FORMAT [ARG...]` with the conversions scripts actually use.
 pub fn printf(args: &[String]) -> i32 {
     use std::io::Write;
     let Some(format) = args.get(1) else {
@@ -105,63 +134,164 @@ pub fn printf(args: &[String]) -> i32 {
         return 2;
     };
     let operands = &args[2..];
+    let chars: Vec<char> = format.chars().collect();
     let mut out = String::new();
     let mut next = 0usize;
-    let chars: Vec<char> = format.chars().collect();
     let mut i = 0;
 
     while i < chars.len() {
-        match chars[i] {
-            '\\' if i + 1 < chars.len() => {
-                out.push(match chars[i + 1] {
-                    'n' => '\n',
-                    't' => '\t',
-                    'r' => '\r',
-                    '0' => '\0',
-                    other => other,
-                });
-                i += 2;
-            }
-            '%' if i + 1 < chars.len() => {
-                let conversion = chars[i + 1];
-                let argument = operands.get(next).cloned().unwrap_or_default();
-                match conversion {
-                    '%' => out.push('%'),
-                    's' => {
-                        out.push_str(&argument);
-                        next += 1;
-                    }
-                    'd' | 'i' => {
-                        out.push_str(&argument.trim().parse::<i64>().unwrap_or(0).to_string());
-                        next += 1;
-                    }
-                    'c' => {
-                        out.push(argument.chars().next().unwrap_or(' '));
-                        next += 1;
-                    }
-                    other => {
-                        out.push('%');
-                        out.push(other);
-                    }
-                }
-                i += 2;
-            }
-            c => {
-                out.push(c);
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            out.push_str(&escape_char(&chars, &mut i));
+            continue;
+        }
+        if chars[i] != '%' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        if chars.get(i) == Some(&'%') {
+            out.push('%');
+            i += 1;
+            continue;
+        }
+
+        // [-][width][.precision]conversion
+        let left = chars.get(i) == Some(&'-');
+        if left {
+            i += 1;
+        }
+        let mut width = String::new();
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            width.push(chars[i]);
+            i += 1;
+        }
+        let mut precision = String::new();
+        if chars.get(i) == Some(&'.') {
+            i += 1;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                precision.push(chars[i]);
                 i += 1;
             }
         }
+        let Some(&conversion) = chars.get(i) else { break };
+        i += 1;
+
+        let argument = operands.get(next).cloned().unwrap_or_default();
+        let rendered = match conversion {
+            's' => {
+                next += 1;
+                match precision.parse::<usize>() {
+                    Ok(limit) => argument.chars().take(limit).collect(),
+                    Err(_) => argument,
+                }
+            }
+            'd' | 'i' => {
+                next += 1;
+                argument.trim().parse::<i64>().unwrap_or(0).to_string()
+            }
+            'x' => {
+                next += 1;
+                format!("{:x}", argument.trim().parse::<i64>().unwrap_or(0))
+            }
+            'X' => {
+                next += 1;
+                format!("{:X}", argument.trim().parse::<i64>().unwrap_or(0))
+            }
+            'o' => {
+                next += 1;
+                format!("{:o}", argument.trim().parse::<i64>().unwrap_or(0))
+            }
+            'f' | 'F' => {
+                next += 1;
+                let value = argument.trim().parse::<f64>().unwrap_or(0.0);
+                let places = precision.parse::<usize>().unwrap_or(6);
+                format!("{:.*}", places, value)
+            }
+            'c' => {
+                next += 1;
+                argument.chars().next().map(String::from).unwrap_or_default()
+            }
+            other => {
+                let mut literal = String::from("%");
+                literal.push(other);
+                literal
+            }
+        };
+
+        match width.parse::<usize>() {
+            Ok(width) if left => out.push_str(&format!("{:<1$}", rendered, width)),
+            Ok(width) => out.push_str(&format!("{:>1$}", rendered, width)),
+            Err(_) => out.push_str(&rendered),
+        }
     }
+
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    let _ = handle.write_all(out.as_bytes());
-    let _ = handle.flush();
+    if handle.write_all(out.as_bytes()).is_err() || handle.flush().is_err() {
+        eprintln!("printf: write error");
+        return 1;
+    }
     0
+}
+
+/// Decode one backslash escape, advancing past it.
+fn escape_char(chars: &[char], i: &mut usize) -> String {
+    let next = chars[*i + 1];
+    *i += 2;
+    match next {
+        'n' => "\n".to_string(),
+        't' => "\t".to_string(),
+        'r' => "\r".to_string(),
+        'a' => "\u{07}".to_string(),
+        'b' => "\u{08}".to_string(),
+        'f' => "\u{0c}".to_string(),
+        'v' => "\u{0b}".to_string(),
+        '\\' => "\\".to_string(),
+        '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' => {
+            let mut value = next.to_digit(8).unwrap();
+            let mut taken = 1;
+            while taken < 3 && *i < chars.len() && chars[*i].is_digit(8) {
+                value = value * 8 + chars[*i].to_digit(8).unwrap();
+                *i += 1;
+                taken += 1;
+            }
+            char::from_u32(value).map(String::from).unwrap_or_default()
+        }
+        other => other.to_string(),
+    }
 }
 
 /// `expr` for integer arithmetic and string comparison.
 pub fn expr(args: &[String]) -> i32 {
     let operands: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
+
+    match operands.as_slice() {
+        ["length", text] => {
+            println!("{}", text.chars().count());
+            return if text.is_empty() { 1 } else { 0 };
+        }
+        ["substr", text, start, length] => {
+            let start: usize = start.parse().unwrap_or(1);
+            let length: usize = length.parse().unwrap_or(0);
+            let piece: String =
+                text.chars().skip(start.saturating_sub(1)).take(length).collect();
+            println!("{}", piece);
+            return if piece.is_empty() { 1 } else { 0 };
+        }
+        ["index", text, set] => {
+            let position = text
+                .char_indices()
+                .find(|(_, c)| set.contains(*c))
+                .map(|(index, _)| index + 1)
+                .unwrap_or(0);
+            println!("{}", position);
+            return if position == 0 { 1 } else { 0 };
+        }
+        _ => {}
+    }
+
     if operands.len() != 3 {
         if operands.len() == 1 {
             println!("{}", operands[0]);
@@ -183,8 +313,17 @@ pub fn expr(args: &[String]) -> i32 {
         "+" => numeric(|a, b| a + b),
         "-" => numeric(|a, b| a - b),
         "*" => numeric(|a, b| a * b),
-        "/" => numeric(|a, b| if b == 0 { 0 } else { a / b }),
-        "%" => numeric(|a, b| if b == 0 { 0 } else { a % b }),
+        "/" | "%" => {
+            if right.as_ref().map(|v| *v == 0).unwrap_or(false) {
+                eprintln!("expr: division by zero");
+                return 2;
+            }
+            if operands[1] == "/" {
+                numeric(|a, b| a / b)
+            } else {
+                numeric(|a, b| a % b)
+            }
+        }
         "=" => Some((operands[0] == operands[2]) as i64),
         "!=" => Some((operands[0] != operands[2]) as i64),
         "<" => numeric(|a, b| (a < b) as i64),

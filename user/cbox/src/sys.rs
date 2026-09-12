@@ -295,3 +295,27 @@ pub const TIOCGWINSZ: u64 = 0x5413;
 pub fn ioctl_ptr(fd: i32, request: u64, argument: u64) -> i64 {
     unsafe { syscall3(SYS_IOCTL, fd as u64, request, argument) }
 }
+
+pub const SYS_STATFS: u64 = 137;
+
+/// The fields of `struct statfs` this system needs.
+pub struct StatFs {
+    pub block_size: u64,
+    pub blocks: u64,
+    pub free: u64,
+}
+
+pub fn statfs(path: &str) -> Option<StatFs> {
+    let c = CString::new(path).ok()?;
+    let mut buf = [0u8; 120];
+    let rc = unsafe { syscall2(SYS_STATFS, c.as_ptr() as u64, buf.as_mut_ptr() as u64) };
+    if rc < 0 {
+        return None;
+    }
+    let field = |offset: usize| -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&buf[offset..offset + 8]);
+        u64::from_le_bytes(bytes)
+    };
+    Some(StatFs { block_size: field(8), blocks: field(16), free: field(24) })
+}

@@ -6,36 +6,70 @@ use std::io::{Read, Write};
 pub fn echo(args: &[String]) -> i32 {
     let mut items = &args[1..];
     let mut newline = true;
-    if !items.is_empty() && items[0] == "-n" {
-        newline = false;
+    let mut escapes = false;
+    while let Some(first) = items.first() {
+        match first.as_str() {
+            "-n" => newline = false,
+            "-e" => escapes = true,
+            "-E" => escapes = false,
+            _ => break,
+        }
         items = &items[1..];
     }
-    let text = items.join(" ");
+    let joined = items.join(" ");
+    let text = if escapes { unescape(&joined) } else { joined };
+
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let _ = out.write_all(text.as_bytes());
-    if newline {
-        let _ = out.write_all(b"\n");
+    // A write that fails has to be reported, or `cmd > file || handler` can
+    // never fire.
+    if out.write_all(text.as_bytes()).is_err() {
+        eprintln!("echo: write error");
+        return 1;
     }
-    let _ = out.flush();
+    if newline && out.write_all(b"\n").is_err() {
+        eprintln!("echo: write error");
+        return 1;
+    }
+    if out.flush().is_err() {
+        eprintln!("echo: write error");
+        return 1;
+    }
     0
 }
 
 pub fn wc(args: &[String]) -> i32 {
     let (flags, operands) = split_flags(args);
-    let show_all = !flags.contains('l') && !flags.contains('w') && !flags.contains('c');
+    let show_all = !flags.contains('l')
+        && !flags.contains('w')
+        && !flags.contains('c')
+        && !flags.contains('L');
     let (inputs, mut status) = read_inputs("wc", &operands);
 
-    let mut totals = (0usize, 0usize, 0usize);
+    let mut totals = (0usize, 0usize, 0usize, 0usize);
     for (name, text) in &inputs {
         let lines = text.lines().count();
         let words = text.split_whitespace().count();
         let bytes = text.len();
-        totals = (totals.0 + lines, totals.1 + words, totals.2 + bytes);
-        print_counts(lines, words, bytes, &flags, show_all, if name == "-" { "" } else { name });
+        let longest = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        totals = (
+            totals.0 + lines,
+            totals.1 + words,
+            totals.2 + bytes,
+            totals.3.max(longest),
+        );
+        print_counts(
+            lines,
+            words,
+            bytes,
+            longest,
+            &flags,
+            show_all,
+            if name == "-" { "" } else { name },
+        );
     }
     if inputs.len() > 1 {
-        print_counts(totals.0, totals.1, totals.2, &flags, show_all, "total");
+        print_counts(totals.0, totals.1, totals.2, totals.3, &flags, show_all, "total");
     }
     if inputs.is_empty() {
         status = 1;
@@ -43,7 +77,15 @@ pub fn wc(args: &[String]) -> i32 {
     status
 }
 
-fn print_counts(lines: usize, words: usize, bytes: usize, flags: &str, all: bool, name: &str) {
+fn print_counts(
+    lines: usize,
+    words: usize,
+    bytes: usize,
+    longest: usize,
+    flags: &str,
+    all: bool,
+    name: &str,
+) {
     let mut parts = Vec::new();
     if all || flags.contains('l') {
         parts.push(format!("{:>7}", lines));
@@ -53,6 +95,9 @@ fn print_counts(lines: usize, words: usize, bytes: usize, flags: &str, all: bool
     }
     if all || flags.contains('c') {
         parts.push(format!("{:>7}", bytes));
+    }
+    if flags.contains('L') {
+        parts.push(format!("{:>7}", longest));
     }
     if name.is_empty() {
         // A single requested count prints unpadded, the way a pipeline expects.
@@ -106,6 +151,28 @@ pub fn head(args: &[String]) -> i32 {
         return head_bytes(bytes, &paths);
     }
     let (count, operands) = count_argument(args, 10);
+
+    // Read only as far as needed. Reading to the end first would never return
+    // on an endless producer such as `yes`.
+    if operands.is_empty() {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        let mut taken = 0;
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(line) => {
+                    println!("{}", line);
+                    taken += 1;
+                    if taken >= count {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        return 0;
+    }
+
     let (inputs, status) = read_inputs("head", &operands);
     let many = inputs.len() > 1;
     for (index, (name, text)) in inputs.iter().enumerate() {
@@ -124,23 +191,35 @@ pub fn head(args: &[String]) -> i32 {
 
 fn head_bytes(count: usize, paths: &[String]) -> i32 {
     use std::io::Read;
-    let mut buffer = vec![0u8; count];
-    let (data, status) = if paths.is_empty() {
-        let mut handle = std::io::stdin();
+
+    // Read exactly `count` bytes. Reading the whole file first would never
+    // finish on a character device such as /dev/zero.
+    fn take_bytes(reader: &mut dyn Read, count: usize) -> std::io::Result<Vec<u8>> {
+        let mut buffer = vec![0u8; count];
         let mut filled = 0;
         while filled < count {
-            match handle.read(&mut buffer[filled..]) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => filled += n,
+            match reader.read(&mut buffer[filled..])? {
+                0 => break,
+                n => filled += n,
             }
         }
-        (buffer[..filled].to_vec(), 0)
+        buffer.truncate(filled);
+        Ok(buffer)
+    }
+
+    let (data, status) = if paths.is_empty() {
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        match take_bytes(&mut handle, count) {
+            Ok(bytes) => (bytes, 0),
+            Err(err) => (Vec::new(), fail("head", "-", err)),
+        }
     } else {
-        match std::fs::read(&paths[0]) {
-            Ok(bytes) => {
-                let n = bytes.len().min(count);
-                (bytes[..n].to_vec(), 0)
-            }
+        match std::fs::File::open(&paths[0]) {
+            Ok(mut file) => match take_bytes(&mut file, count) {
+                Ok(bytes) => (bytes, 0),
+                Err(err) => (Vec::new(), fail("head", &paths[0], err)),
+            },
             Err(err) => (Vec::new(), fail("head", &paths[0], err)),
         }
     };
@@ -276,7 +355,12 @@ pub fn sort(args: &[String]) -> i32 {
         lines.extend(text.lines().map(|l| l.to_string()));
     }
     if flags.contains('n') {
-        lines.sort_by_key(|l| l.trim().parse::<i64>().unwrap_or(i64::MIN));
+        // Compare the number a line starts with, ignoring whatever follows.
+        lines.sort_by(|a, b| {
+            leading_number(a)
+                .partial_cmp(&leading_number(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     } else {
         lines.sort();
     }
@@ -292,14 +376,39 @@ pub fn sort(args: &[String]) -> i32 {
     status
 }
 
+/// The number a line begins with, for `sort -n`. Lines without one sort first.
+fn leading_number(line: &str) -> f64 {
+    let text = line.trim_start();
+    let mut end = 0;
+    let bytes = text.as_bytes();
+    if end < bytes.len() && (bytes[end] == b'-' || bytes[end] == b'+') {
+        end += 1;
+    }
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end < bytes.len() && bytes[end] == b'.' {
+        end += 1;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+    }
+    text[..end].parse().unwrap_or(f64::NEG_INFINITY)
+}
+
 pub fn uniq(args: &[String]) -> i32 {
     let (flags, operands) = split_flags(args);
     let (inputs, status) = read_inputs("uniq", &operands);
     let count = flags.contains('c');
+    let only_repeated = flags.contains('d');
+    let only_unique = flags.contains('u');
 
     let mut previous: Option<String> = None;
     let mut repeats = 0usize;
     let emit = |line: &str, repeats: usize| {
+        if (only_repeated && repeats < 2) || (only_unique && repeats > 1) {
+            return;
+        }
         if count {
             println!("{:>7} {}", repeats, line);
         } else {
@@ -331,6 +440,7 @@ pub fn uniq(args: &[String]) -> i32 {
 pub fn cut(args: &[String]) -> i32 {
     let mut delimiter = '\t';
     let mut fields: Vec<usize> = Vec::new();
+    let mut characters: Vec<usize> = Vec::new();
     let mut operands = Vec::new();
     let mut i = 1;
     while i < args.len() {
@@ -347,18 +457,33 @@ pub fn cut(args: &[String]) -> i32 {
         } else if let Some(rest) = arg.strip_prefix("-f") {
             fields = parse_fields(rest);
             i += 1;
+        } else if arg == "-c" && i + 1 < args.len() {
+            characters = parse_fields(&args[i + 1]);
+            i += 2;
+        } else if let Some(rest) = arg.strip_prefix("-c") {
+            characters = parse_fields(rest);
+            i += 1;
         } else {
             operands.push(arg.clone());
             i += 1;
         }
     }
-    if fields.is_empty() {
-        eprintln!("usage: cut -f LIST [-d DELIM] [file...]");
+    if fields.is_empty() && characters.is_empty() {
+        eprintln!("usage: cut -f LIST [-d DELIM] | cut -c LIST  [file...]");
         return 2;
     }
     let (inputs, status) = read_inputs("cut", &operands);
     for (_, text) in &inputs {
         for line in text.lines() {
+            if !characters.is_empty() {
+                let chars: Vec<char> = line.chars().collect();
+                let picked: String = characters
+                    .iter()
+                    .filter_map(|c| chars.get(c.saturating_sub(1)).copied())
+                    .collect();
+                println!("{}", picked);
+                continue;
+            }
             let parts: Vec<&str> = line.split(delimiter).collect();
             let selected: Vec<&str> = fields
                 .iter()
@@ -442,8 +567,48 @@ pub fn tr(args: &[String]) -> i32 {
     0
 }
 
+/// Turn backslash escapes into the characters they stand for.
+fn unescape(spec: &str) -> String {
+    let chars: Vec<char> = spec.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '\\' || i + 1 >= chars.len() {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let next = chars[i + 1];
+        i += 2;
+        match next {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            'f' => out.push('\u{0c}'),
+            'v' => out.push('\u{0b}'),
+            'a' => out.push('\u{07}'),
+            'b' => out.push('\u{08}'),
+            '\\' => out.push('\\'),
+            '0'..='7' => {
+                // An octal escape of up to three digits.
+                let mut value = next.to_digit(8).unwrap();
+                let mut taken = 1;
+                while taken < 3 && i < chars.len() && chars[i].is_digit(8) {
+                    value = value * 8 + chars[i].to_digit(8).unwrap();
+                    i += 1;
+                    taken += 1;
+                }
+                out.push(char::from_u32(value).unwrap_or('\0'));
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Expand `a-z` style ranges and the common character classes.
 fn expand_set(spec: &str) -> Vec<char> {
+    let spec = &unescape(spec);
     let mut out = Vec::new();
     let chars: Vec<char> = spec.chars().collect();
     let mut i = 0;

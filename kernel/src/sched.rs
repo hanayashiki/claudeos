@@ -314,12 +314,27 @@ pub fn exit_current(status: i32) -> ! {
             crate::power_off();
         }
 
-        // Orphans are adopted by init.
+        // Orphans are adopted by init. One that has already exited still
+        // needs reaping, and init is normally asleep in wait4, so it has to be
+        // woken here; nothing else will report the adopted zombie to it.
+        let mut adopted_zombie = false;
         for_each(|other| {
             if other.ppid == pid {
                 other.ppid = 1;
+                if other.state == State::Zombie {
+                    adopted_zombie = true;
+                }
             }
         });
+        if adopted_zombie && ppid != 1 {
+            if let Some(init) = find(1) {
+                init.pending_signals |= 1u64 << (SIGCHLD as u64 & 63);
+                if init.state == State::Sleeping && init.waiting_for.is_some() {
+                    init.state = State::Runnable;
+                    init.wake_at = 0;
+                }
+            }
+        }
 
         if let Some(parent) = find(ppid) {
             parent.pending_signals |= 1u64 << (SIGCHLD as u64 & 63);
@@ -350,6 +365,14 @@ pub fn kill_current(signal: i32) -> ! {
     let pid = current().pid;
     crate::println!("[kernel] pid {} ({}) killed by signal {}", pid, name, signal);
     exit_current(signal & 0x7F)
+}
+
+/// Raise a signal on the running task.
+pub fn raise_on_current(signal: i32) {
+    if !has_current() {
+        return;
+    }
+    current().pending_signals |= 1u64 << (signal as u64 & 63);
 }
 
 /// Mark every task in the foreground group as having a pending signal.

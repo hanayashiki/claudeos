@@ -84,7 +84,7 @@ impl Node {
                 gid: 0,
                 data: Vec::new(),
                 children: BTreeMap::new(),
-                mtime: 0,
+                mtime: crate::time::unix_time(),
             }),
         })
     }
@@ -190,6 +190,7 @@ impl Node {
                     inner.data.resize(end, 0);
                 }
                 inner.data[start..end].copy_from_slice(buf);
+                inner.mtime = crate::time::unix_time();
                 Ok(buf.len())
             }
         }
@@ -205,6 +206,7 @@ impl Node {
             reserve_for(&mut inner.data, target)?;
         }
         inner.data.resize(target, 0);
+        inner.mtime = crate::time::unix_time();
         Ok(())
     }
 

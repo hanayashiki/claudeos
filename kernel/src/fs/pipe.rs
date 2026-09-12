@@ -84,6 +84,10 @@ impl Pipe {
         }
         loop {
             if self.readers.load(Ordering::Acquire) == 0 {
+                // Writing to a pipe nobody is reading raises SIGPIPE, whose
+                // default action ends the writer. Without it a producer such
+                // as `yes` spins forever after its reader has gone.
+                crate::sched::raise_on_current(crate::abi::SIGPIPE);
                 return Err(Errno::EPIPE);
             }
             {

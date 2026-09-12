@@ -23,6 +23,7 @@ pub fn run(name: &str, args: &[String]) -> Option<i32> {
         "du" => fileops::du(args),
         "df" => fileops::df(args),
         "pwd" => fileops::pwd(args),
+        "readlink" => fileops::readlink(args),
         "hexdump" | "xxd" => fileops::hexdump(args),
 
         // text
@@ -74,8 +75,18 @@ pub fn run(name: &str, args: &[String]) -> Option<i32> {
 
 /// Report an error the way a Unix tool does and return a failure status.
 pub fn fail(program: &str, context: &str, err: std::io::Error) -> i32 {
-    eprintln!("{}: {}: {}", program, context, err);
+    eprintln!("{}: {}: {}", program, context, describe(&err));
     1
+}
+
+/// The message without the "(os error N)" tail that Rust appends, which is
+/// not what a Unix tool prints.
+pub fn describe(err: &std::io::Error) -> String {
+    let text = err.to_string();
+    match text.find(" (os error") {
+        Some(index) => text[..index].to_string(),
+        None => text,
+    }
 }
 
 /// Split arguments into flag characters and positional operands.
