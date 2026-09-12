@@ -298,8 +298,10 @@ tests/alpine.sh       in-OS suite run inside an Alpine root filesystem
 
 ## Limitations
 
-Single CPU; no SMP. There is no block device driver or on-disk filesystem: the
-root filesystem lives in RAM and changes do not survive a reboot. There is no
-networking, so the socket calls return `EAFNOSUPPORT`. `futex` still waits by re-checking rather than by queueing,
-though it yields or sleeps rather than spins. There is no name resolution in the kernel and no DHCP, so addresses
-come from the command line.
+Single CPU; no SMP. There is no block device driver and no on-disk filesystem:
+the root filesystem lives in RAM and changes do not survive a reboot.
+
+The TCP is correct on a quiet link and not on a lossy one: no reassembly queue,
+no fast retransmit, no round-trip estimator. There is no DHCP and no resolver,
+so addresses come from the kernel command line. IPv4 only, and fragments are
+dropped rather than reassembled.
