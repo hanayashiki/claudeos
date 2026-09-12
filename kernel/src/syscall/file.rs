@@ -37,7 +37,13 @@ pub fn resolve_str(dirfd: i64, path: &str) -> Result<String, Errno> {
 ///
 /// `/proc/self` names the calling process's own directory, and a few entries
 /// under it are links whose target lies outside /proc.
-fn procfs_override(path: &str) -> Option<String> {
+/// Rewrite a `/proc/self` path, and resolve the magic links under it.
+///
+/// `for_link` is set by readlink, which wants the label a descriptor carries
+/// even when it is not a name. Everything else wants a path it can open or
+/// stat, so a descriptor on a pipe or a socket is left to the entry in the
+/// directory, which is a node of the right kind.
+fn procfs_override_for(path: &str, for_link: bool) -> Option<String> {
     if !path.starts_with("/proc/") && path != "/proc/self" {
         return None;
     }
@@ -62,7 +68,9 @@ fn procfs_override(path: &str) -> Option<String> {
         if let Some(number) = entry.strip_prefix("fd/") {
             if let Ok(fd) = number.parse::<i32>() {
                 if let Ok(file) = task.fds.get(fd) {
-                    return Some(file.path.clone());
+                    if for_link || matches!(file.backing, FileBacking::Node(_)) {
+                        return Some(file.path.clone());
+                    }
                 }
             }
         }
@@ -78,6 +86,10 @@ fn procfs_override(path: &str) -> Option<String> {
     }
 
     rewritten
+}
+
+fn procfs_override(path: &str) -> Option<String> {
+    procfs_override_for(path, false)
 }
 
 pub fn read(fd: i32, buf_addr: u64, len: u64) -> SysResult {
@@ -454,7 +466,7 @@ pub fn mknodat(dirfd: i64, path_addr: u64, mode: u32, _dev: u64) -> SysResult {
 
 pub fn readlinkat(dirfd: i64, path_addr: u64, out: u64, len: usize) -> SysResult {
     let path = resolve_at(dirfd, path_addr)?;
-    let target = match procfs_override(&path) {
+    let target = match procfs_override_for(&path, true) {
         Some(target) => target,
         None => {
             let node = fs::lookup_nofollow(&path)?;
@@ -591,6 +603,8 @@ pub fn ioctl(fd: i32, request: u64, arg: u64) -> SysResult {
                         node.size().saturating_sub(offset)
                     }
                 },
+                FileBacking::Socket(socket) => socket.rx.available() as u64,
+                FileBacking::EventFd(_) | FileBacking::Epoll(_) => 0,
             };
             uaccess::write_u32(arg, available as u32)?;
             return Ok(0);
@@ -643,8 +657,20 @@ pub fn ioctl(fd: i32, request: u64, arg: u64) -> SysResult {
 }
 
 /// How many bytes a descriptor can supply without blocking.
+/// Descriptors an epoll set or a poll call can wait on.
+pub fn ready_to_write(file: &Arc<OpenFile>) -> bool {
+    match &file.backing {
+        FileBacking::Pipe(pipe, is_write) => !*is_write || pipe.writable_now(),
+        FileBacking::Socket(socket) => socket.tx.writable_now(),
+        _ => true,
+    }
+}
+
 fn ready_to_read(file: &Arc<OpenFile>) -> bool {
     match &file.backing {
+        FileBacking::EventFd(event) => event.readable(),
+        FileBacking::Socket(socket) => socket.readable(),
+        FileBacking::Epoll(_) => false,
         FileBacking::Pipe(pipe, is_write) => {
             if *is_write {
                 true
@@ -685,7 +711,7 @@ pub fn poll(fds_addr: u64, count: usize, timeout_ms: i64) -> SysResult {
                         if events & POLLIN != 0 && file.readable() && ready_to_read(&file) {
                             revents |= POLLIN;
                         }
-                        if events & POLLOUT != 0 && file.writable() {
+                        if events & POLLOUT != 0 && file.writable() && ready_to_write(&file) {
                             revents |= POLLOUT;
                         }
                     }
@@ -797,6 +823,276 @@ pub fn statfs(path_addr: u64, out: u64) -> SysResult {
 pub fn fstatfs(fd: i32, out: u64) -> SysResult {
     sched::current().fds.get(fd)?;
     fill_statfs(out)
+}
+
+/// A counter two tasks can wait on. EFD_SEMAPHORE is bit 0 of the flags.
+pub fn eventfd(initial: u32, flags: u32) -> SysResult {
+    const EFD_SEMAPHORE: u32 = 1;
+    const EFD_NONBLOCK: u32 = 0o4000;
+    const EFD_CLOEXEC: u32 = 0o2000;
+    let event = fs::chan::EventFd::new(initial, flags & EFD_SEMAPHORE != 0);
+    let file = Arc::new(OpenFile {
+        backing: FileBacking::EventFd(event),
+        offset: crate::sync::Spinlock::new(0),
+        flags: crate::sync::Spinlock::new(
+            O_RDWR | if flags & EFD_NONBLOCK != 0 { O_NONBLOCK } else { 0 },
+        ),
+        path: alloc::string::String::from("anon_inode:[eventfd]"),
+    });
+    let fd = sched::current().fds.alloc(file, flags & EFD_CLOEXEC != 0)?;
+    Ok(fd as u64)
+}
+
+/// Two connected endpoints. Only AF_UNIX byte streams exist here; there is no
+/// network, so nothing else has anywhere to go.
+pub fn socketpair(domain: u32, kind: u32, _protocol: u32, out: u64) -> SysResult {
+    const AF_UNIX: u32 = 1;
+    const SOCK_STREAM: u32 = 1;
+    const SOCK_SEQPACKET: u32 = 5;
+    const SOCK_CLOEXEC: u32 = 0o2000000;
+    const SOCK_NONBLOCK: u32 = 0o4000;
+    if domain != AF_UNIX {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    let base = kind & 0xF;
+    if base != SOCK_STREAM && base != SOCK_SEQPACKET {
+        return Err(Errno::EPROTONOSUPPORT);
+    }
+    let flags = O_RDWR | if kind & SOCK_NONBLOCK != 0 { O_NONBLOCK } else { 0 };
+    let cloexec = kind & SOCK_CLOEXEC != 0;
+    let (one, two) = fs::chan::Socket::pair();
+    let make = |socket| {
+        Arc::new(OpenFile {
+            backing: FileBacking::Socket(socket),
+            offset: crate::sync::Spinlock::new(0),
+            flags: crate::sync::Spinlock::new(flags),
+            path: alloc::string::String::from("socket:[unix]"),
+        })
+    };
+    let first = sched::current().fds.alloc(make(one), cloexec)?;
+    let second = match sched::current().fds.alloc(make(two), cloexec) {
+        Ok(fd) => fd,
+        Err(err) => {
+            let _ = sched::current().fds.close(first);
+            return Err(err);
+        }
+    };
+    uaccess::write_u32(out, first as u32)?;
+    uaccess::write_u32(out + 4, second as u32)?;
+    Ok(0)
+}
+
+pub fn epoll_create(flags: u32) -> SysResult {
+    const EPOLL_CLOEXEC: u32 = 0o2000000;
+    let file = Arc::new(OpenFile {
+        backing: FileBacking::Epoll(fs::chan::Epoll::new()),
+        offset: crate::sync::Spinlock::new(0),
+        flags: crate::sync::Spinlock::new(0),
+        path: alloc::string::String::from("anon_inode:[eventpoll]"),
+    });
+    let fd = sched::current().fds.alloc(file, flags & EPOLL_CLOEXEC != 0)?;
+    Ok(fd as u64)
+}
+
+/// `struct epoll_event` is packed on x86-64: a 4-byte mask then 8 bytes of
+/// caller data, 12 bytes in all.
+const EPOLL_EVENT_SIZE: u64 = 12;
+
+pub fn epoll_ctl(epfd: i32, op: u32, fd: i32, event_addr: u64) -> SysResult {
+    const EPOLL_CTL_ADD: u32 = 1;
+    const EPOLL_CTL_DEL: u32 = 2;
+    const EPOLL_CTL_MOD: u32 = 3;
+
+    let file = sched::current().fds.get(epfd)?;
+    let set = match &file.backing {
+        FileBacking::Epoll(set) => set.clone(),
+        _ => return Err(Errno::EINVAL),
+    };
+    if epfd == fd {
+        return Err(Errno::EINVAL);
+    }
+    // The descriptor has to exist, whatever is being done with it.
+    sched::current().fds.get(fd)?;
+
+    if op == EPOLL_CTL_DEL {
+        return set.remove(fd).map(|_| 0);
+    }
+    let events = uaccess::read_u32(event_addr)?;
+    let data = uaccess::read_u64(event_addr + 4)?;
+    let watch = fs::chan::Watch { fd, events, data };
+    match op {
+        EPOLL_CTL_ADD => set.add(watch).map(|_| 0),
+        EPOLL_CTL_MOD => set.modify(watch).map(|_| 0),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+pub fn epoll_wait(epfd: i32, events_addr: u64, max: i32, timeout_ms: i64) -> SysResult {
+    const EPOLLIN: u32 = 0x001;
+    const EPOLLOUT: u32 = 0x004;
+    const EPOLLERR: u32 = 0x008;
+    const EPOLLHUP: u32 = 0x010;
+
+    if max <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    let file = sched::current().fds.get(epfd)?;
+    let set = match &file.backing {
+        FileBacking::Epoll(set) => set.clone(),
+        _ => return Err(Errno::EINVAL),
+    };
+    let deadline = if timeout_ms < 0 {
+        u64::MAX
+    } else {
+        crate::trap::ticks() + crate::time::ns_to_ticks(timeout_ms as u64 * 1_000_000)
+    };
+
+    loop {
+        let watches = set.watches.lock().clone();
+        let mut written = 0i32;
+        for watch in watches.iter() {
+            if written >= max {
+                break;
+            }
+            let mut ready = 0u32;
+            match sched::current().fds.get(watch.fd) {
+                Ok(target) => {
+                    if watch.events & EPOLLIN != 0 && target.readable() && ready_to_read(&target) {
+                        ready |= EPOLLIN;
+                    }
+                    if watch.events & EPOLLOUT != 0
+                        && target.writable()
+                        && ready_to_write(&target)
+                    {
+                        ready |= EPOLLOUT;
+                    }
+                    if let FileBacking::Pipe(pipe, is_write) = &target.backing {
+                        let gone = if *is_write {
+                            pipe.readers.load(core::sync::atomic::Ordering::Acquire) == 0
+                        } else {
+                            pipe.writers.load(core::sync::atomic::Ordering::Acquire) == 0
+                        };
+                        if gone {
+                            ready |= EPOLLHUP;
+                        }
+                    }
+                }
+                Err(_) => ready |= EPOLLERR,
+            }
+            if ready == 0 {
+                continue;
+            }
+            let base = events_addr + written as u64 * EPOLL_EVENT_SIZE;
+            uaccess::write_u32(base, ready)?;
+            uaccess::write_u64(base + 4, watch.data)?;
+            written += 1;
+        }
+        if written > 0 {
+            return Ok(written as u64);
+        }
+        if crate::trap::ticks() >= deadline {
+            return Ok(0);
+        }
+        if sched::has_pending_signal() {
+            return Err(Errno::EINTR);
+        }
+        sched::yield_or_sleep();
+    }
+}
+
+/// `sendto` and `recvfrom` on a connected socket are a write and a read; the
+/// address arguments have nowhere to point, since these sockets are pairs
+/// rather than names.
+pub fn sendto(fd: i32, buf: u64, len: usize, addr: u64) -> SysResult {
+    if addr != 0 {
+        return Err(Errno::EISCONN);
+    }
+    write(fd, buf, len as u64)
+}
+
+pub fn recvfrom(fd: i32, buf: u64, len: usize, addr: u64, addrlen: u64) -> SysResult {
+    let n = read(fd, buf, len as u64)?;
+    if addr != 0 && addrlen != 0 {
+        uaccess::write_u32(addrlen, 0)?;
+    }
+    Ok(n)
+}
+
+/// The offsets inside `struct msghdr` on x86-64.
+const MSG_IOV: u64 = 16;
+const MSG_IOVLEN: u64 = 24;
+const MSG_CONTROLLEN: u64 = 40;
+const MSG_FLAGS: u64 = 48;
+
+pub fn sendmsg(fd: i32, msg: u64) -> SysResult {
+    let iov = uaccess::read_u64(msg + MSG_IOV)?;
+    let count = uaccess::read_u64(msg + MSG_IOVLEN)? as usize;
+    // File descriptors cannot be passed: there is no control message handling.
+    if uaccess::read_u64(msg + MSG_CONTROLLEN)? != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    writev(fd, iov, count)
+}
+
+pub fn recvmsg(fd: i32, msg: u64) -> SysResult {
+    let iov = uaccess::read_u64(msg + MSG_IOV)?;
+    let count = uaccess::read_u64(msg + MSG_IOVLEN)? as usize;
+    let n = readv(fd, iov, count)?;
+    uaccess::write_u32(msg + MSG_CONTROLLEN, 0)?;
+    uaccess::write_u32(msg + MSG_FLAGS, 0)?;
+    Ok(n)
+}
+
+/// Close one direction of a socket. Shutting down writing is what makes the
+/// other end see end of file while this one stays open for reading.
+pub fn shutdown(fd: i32, how: u32) -> SysResult {
+    const SHUT_RD: u32 = 0;
+    const SHUT_WR: u32 = 1;
+    const SHUT_RDWR: u32 = 2;
+    let file = sched::current().fds.get(fd)?;
+    let socket = match &file.backing {
+        FileBacking::Socket(socket) => socket.clone(),
+        _ => return Err(Errno::ENOTSOCK),
+    };
+    if how == SHUT_WR || how == SHUT_RDWR {
+        socket.shutdown_write();
+    }
+    if how == SHUT_RD || how == SHUT_RDWR {
+        socket.shutdown_read();
+    }
+    Ok(0)
+}
+
+/// A socket pair has no address. Report the family and an empty path, which
+/// is what a program that asks gets for an unnamed AF_UNIX socket.
+pub fn getsockname(fd: i32, addr: u64, addrlen: u64) -> SysResult {
+    const AF_UNIX: u16 = 1;
+    let file = sched::current().fds.get(fd)?;
+    if !matches!(file.backing, FileBacking::Socket(_)) {
+        return Err(Errno::ENOTSOCK);
+    }
+    if addr != 0 {
+        uaccess::write_bytes(addr, &AF_UNIX.to_le_bytes())?;
+    }
+    if addrlen != 0 {
+        uaccess::write_u32(addrlen, 2)?;
+    }
+    Ok(0)
+}
+
+pub fn getsockopt(fd: i32, value: u64, len: u64) -> SysResult {
+    let file = sched::current().fds.get(fd)?;
+    if !matches!(file.backing, FileBacking::Socket(_)) {
+        return Err(Errno::ENOTSOCK);
+    }
+    // Nothing here has an error to report or a size to negotiate.
+    if value != 0 {
+        uaccess::write_u32(value, 0)?;
+    }
+    if len != 0 {
+        uaccess::write_u32(len, 4)?;
+    }
+    Ok(0)
 }
 
 pub fn memfd_create(name_addr: u64, _flags: u32) -> SysResult {

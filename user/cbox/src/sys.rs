@@ -154,6 +154,44 @@ pub fn klog(buf: &mut [u8]) -> i64 {
     unsafe { syscall3(SYS_SYSLOG, 3, buf.as_mut_ptr() as u64, buf.len() as u64) }
 }
 
+pub const SYS_EVENTFD2: u64 = 290;
+pub const SYS_EPOLL_CREATE1: u64 = 291;
+pub const SYS_EPOLL_CTL: u64 = 233;
+pub const SYS_EPOLL_WAIT: u64 = 232;
+pub const EPOLLIN: u32 = 0x001;
+
+pub fn eventfd(initial: u32, flags: u32) -> i64 {
+    unsafe { syscall2(SYS_EVENTFD2, initial as u64, flags as u64) }
+}
+
+pub fn epoll_create() -> i64 {
+    unsafe { syscall1(SYS_EPOLL_CREATE1, 0) }
+}
+
+/// `struct epoll_event` is packed on x86-64: a 4-byte mask then 8 bytes of
+/// caller data.
+pub fn epoll_add(epfd: i32, fd: i32, events: u32, data: u64) -> i64 {
+    let mut event = [0u8; 12];
+    event[..4].copy_from_slice(&events.to_le_bytes());
+    event[4..].copy_from_slice(&data.to_le_bytes());
+    unsafe {
+        syscall4(SYS_EPOLL_CTL, epfd as u64, 1, fd as u64, event.as_ptr() as u64)
+    }
+}
+
+pub fn epoll_wait(epfd: i32, events: &mut [u8], timeout_ms: i64) -> i64 {
+    let max = events.len() / 12;
+    unsafe {
+        syscall4(
+            SYS_EPOLL_WAIT,
+            epfd as u64,
+            events.as_mut_ptr() as u64,
+            max as u64,
+            timeout_ms as u64,
+        )
+    }
+}
+
 pub fn sync() {
     unsafe { syscall0(SYS_SYNC) };
 }

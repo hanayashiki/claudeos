@@ -5,6 +5,7 @@
 
 pub mod cpio;
 pub mod dev;
+pub mod chan;
 pub mod pipe;
 pub mod procfs;
 
@@ -485,6 +486,9 @@ pub fn readdir(node: &NodeRef) -> Vec<DirEntry> {
 pub enum FileBacking {
     Node(NodeRef),
     Pipe(Arc<pipe::Pipe>, bool),
+    EventFd(Arc<chan::EventFd>),
+    Socket(Arc<chan::Socket>),
+    Epoll(Arc<chan::Epoll>),
 }
 
 pub struct OpenFile {
@@ -524,6 +528,8 @@ impl OpenFile {
     pub fn readable(&self) -> bool {
         match &self.backing {
             FileBacking::Pipe(_, is_write) => !is_write,
+            FileBacking::EventFd(_) | FileBacking::Socket(_) => true,
+            FileBacking::Epoll(_) => false,
             _ => {
                 let access = self.flags() & O_ACCMODE;
                 access == O_RDONLY || access == O_RDWR
@@ -534,6 +540,8 @@ impl OpenFile {
     pub fn writable(&self) -> bool {
         match &self.backing {
             FileBacking::Pipe(_, is_write) => *is_write,
+            FileBacking::EventFd(_) | FileBacking::Socket(_) => true,
+            FileBacking::Epoll(_) => false,
             _ => {
                 let access = self.flags() & O_ACCMODE;
                 access == O_WRONLY || access == O_RDWR
@@ -559,6 +567,9 @@ impl OpenFile {
                 Ok(n)
             }
             FileBacking::Pipe(pipe, _) => pipe.read(buf, self.flags() & O_NONBLOCK != 0),
+            FileBacking::EventFd(event) => event.read(buf, self.flags() & O_NONBLOCK != 0),
+            FileBacking::Socket(socket) => socket.read(buf, self.flags() & O_NONBLOCK != 0),
+            FileBacking::Epoll(_) => Err(Errno::EINVAL),
         }
     }
 
@@ -581,13 +592,16 @@ impl OpenFile {
                 Ok(n)
             }
             FileBacking::Pipe(pipe, _) => pipe.write(buf, self.flags() & O_NONBLOCK != 0),
+            FileBacking::EventFd(event) => event.write(buf, self.flags() & O_NONBLOCK != 0),
+            FileBacking::Socket(socket) => socket.write(buf, self.flags() & O_NONBLOCK != 0),
+            FileBacking::Epoll(_) => Err(Errno::EINVAL),
         }
     }
 
     pub fn seek(&self, pos: i64, whence: u32) -> Result<u64, Errno> {
         let node = match &self.backing {
             FileBacking::Node(node) => node,
-            FileBacking::Pipe(..) => return Err(Errno::ESPIPE),
+            _ => return Err(Errno::ESPIPE),
         };
         if matches!(node.kind, NodeKind::Device(_)) {
             return Ok(0);
@@ -615,6 +629,14 @@ impl OpenFile {
                 st_ino: 0,
                 st_nlink: 1,
                 st_mode: S_IFIFO | 0o600,
+                st_blksize: 4096,
+                ..Default::default()
+            },
+            _ => Stat {
+                st_dev: 0,
+                st_ino: 0,
+                st_nlink: 1,
+                st_mode: S_IFSOCK | 0o600,
                 st_blksize: 4096,
                 ..Default::default()
             },

@@ -462,14 +462,38 @@ pub fn signal_group(pgid: u32, signal: i32) {
 }
 
 /// True when a signal is waiting that the task has not blocked.
+/// True when a signal is waiting that will actually do something.
+///
+/// A blocking call gives up with EINTR when this holds, so a signal that would
+/// be discarded on delivery must not count: SIGCHLD from a finished background
+/// job is pending on most processes most of the time, and treating it as a
+/// reason to fail turns unrelated reads and opens into spurious errors.
 pub fn has_pending_signal() -> bool {
     if !has_current() {
         return false;
     }
     let task = current();
-    let deliverable = task.pending_signals & !task.signal_mask;
-    // SIGKILL cannot be blocked.
-    deliverable != 0 || task.pending_signals & (1u64 << (SIGKILL as u64 & 63)) != 0
+    let mut pending = task.pending_signals & !task.signal_mask;
+    // Neither of these can be blocked.
+    pending |= task.pending_signals
+        & ((1u64 << (SIGKILL as u64 & 63)) | (1u64 << (SIGSTOP as u64 & 63)));
+    if pending == 0 {
+        return false;
+    }
+    for signal in 1..64i32 {
+        if pending & (1u64 << (signal as u64 & 63)) == 0 {
+            continue;
+        }
+        let handler = task.signal_actions[signal as usize].handler;
+        if handler == crate::signal::SIG_IGN {
+            continue;
+        }
+        if handler == crate::signal::SIG_DFL && crate::signal::default_is_ignore(signal) {
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 /// Act on pending signals before returning to user mode. Called once the

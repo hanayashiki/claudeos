@@ -135,6 +135,14 @@ right now.
 **Kernel log.** Everything the kernel prints is also kept in a 16 KiB ring, and
 `syslog` hands it back, so `dmesg` shows the boot messages.
 
+**Waiting on several things.** `eventfd` is a counter two tasks can wait on.
+`socketpair` gives two connected `AF_UNIX` endpoints, each reading what the
+other writes, and `sendto`, `recvfrom`, `sendmsg`, `recvmsg` and `shutdown`
+work on them. `epoll_create1`, `epoll_ctl` and `epoll_wait` watch any mix of
+pipes, sockets, counters and the terminal. Readiness is worked out when the set
+is waited on rather than pushed in from each descriptor, so epoll here is
+level-triggered.
+
 **Console.** A 16550 UART and a PS/2 keyboard feed one input ring. A line
 discipline implements canonical mode with echo, backspace, `Ctrl-C`, `Ctrl-D`
 and `Ctrl-U`, and honours the `termios` settings a program sets through
@@ -176,16 +184,17 @@ sleep clear hexdump basename dirname yes true false`.
 `make test` boots the OS once per suite and requires each to report zero
 failures.
 
-- `tests/suite.sh` runs **187 checks** inside the OS, driving the shell through
+- `tests/suite.sh` runs **190 checks** inside the OS, driving the shell through
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
   subprocesses and `/proc`.
-- The `rtest` applet runs **25 checks** against the Rust standard library:
+- The `rtest` applet runs **35 checks** against the Rust standard library:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
   thread sleep against the monotonic clock, file read/write/seek/append,
   directory iteration, `std::process::Command` capturing a child's output
-  through pipes, and signal handlers running and returning.
+  through pipes, signal handlers running and returning, a `UnixStream` pair
+  carrying bytes both ways, and an epoll set woken by a counter and a socket.
 - `tests/busybox.sh` runs **36 checks** against an upstream busybox binary that
   this project did not build: `awk`, `sed`, `tar` create and extract, `find`,
   `md5sum` and `sha256sum` (whose digests are compared against the ones the
@@ -238,5 +247,7 @@ tests/alpine.sh       in-OS suite run inside an Alpine root filesystem
 
 Single CPU; no SMP. There is no block device driver or on-disk filesystem: the
 root filesystem lives in RAM and changes do not survive a reboot. There is no
-networking, so the socket calls return `EAFNOSUPPORT`. `futex`, `poll` and `select` still wait by re-checking
-rather than by queueing, though they yield or sleep rather than spin.
+networking, so the socket calls return `EAFNOSUPPORT`. `futex`, `poll`, `select` and `epoll_wait` still wait by
+re-checking rather than by queueing, though they yield or sleep rather than
+spin. Sockets are `socketpair` only: there is no `bind` or `connect`, so
+nothing can be reached by name or over a network.

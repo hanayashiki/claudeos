@@ -39,6 +39,92 @@ impl Report {
     }
 }
 
+/// A counter, a connected socket pair, and an epoll set watching both: the
+/// three descriptors a program written against Linux waits on.
+fn event_and_poll(report: &mut Report) {
+    use crate::sys;
+    use std::os::unix::net::UnixStream;
+
+    let (mut left, mut right) = match UnixStream::pair() {
+        Ok(pair) => pair,
+        Err(err) => {
+            report.check("socket pair", false, format!("{}", err));
+            return;
+        }
+    };
+    report.check("socket pair", true, String::new());
+
+    let written = left.write_all(b"over the socket").is_ok();
+    let mut buf = [0u8; 32];
+    let n = right.read(&mut buf).unwrap_or(0);
+    report.check(
+        "socket carries bytes",
+        written && &buf[..n] == b"over the socket",
+        format!("{:?}", String::from_utf8_lossy(&buf[..n])),
+    );
+    // The other direction is a separate stream.
+    let _ = right.write_all(b"and back");
+    let n = left.read(&mut buf).unwrap_or(0);
+    report.check(
+        "socket is two-way",
+        &buf[..n] == b"and back",
+        format!("{:?}", String::from_utf8_lossy(&buf[..n])),
+    );
+
+    let event = sys::eventfd(0, 0);
+    report.check("eventfd opens", event >= 0, format!("{}", event));
+    if event < 0 {
+        return;
+    }
+    let event = event as i32;
+    let added = sys::write(event, &7u64.to_le_bytes());
+    let mut value = [0u8; 8];
+    let read = sys::read(event, &mut value);
+    report.check(
+        "eventfd counts",
+        added == 8 && read == 8 && u64::from_le_bytes(value) == 7,
+        format!("wrote {} read {} value {}", added, read, u64::from_le_bytes(value)),
+    );
+
+    let epoll = sys::epoll_create();
+    report.check("epoll set opens", epoll >= 0, format!("{}", epoll));
+    if epoll < 0 {
+        return;
+    }
+    let epoll = epoll as i32;
+    let socket_fd = {
+        use std::os::unix::io::AsRawFd;
+        right.as_raw_fd()
+    };
+    let ok = sys::epoll_add(epoll, event, sys::EPOLLIN, 1) == 0
+        && sys::epoll_add(epoll, socket_fd, sys::EPOLLIN, 2) == 0;
+    report.check("epoll takes descriptors", ok, String::new());
+
+    // Nothing has arrived on either, so a zero timeout reports nothing.
+    let mut events = [0u8; 24];
+    let idle = sys::epoll_wait(epoll, &mut events, 0);
+    report.check("epoll reports nothing yet", idle == 0, format!("{}", idle));
+
+    // Make the counter ready and wait with no timeout: the wait has to end
+    // because of the counter, not because time passed.
+    sys::write(event, &1u64.to_le_bytes());
+    let count = sys::epoll_wait(epoll, &mut events, -1);
+    let which = u64::from_le_bytes(events[4..12].try_into().unwrap_or([0; 8]));
+    report.check(
+        "epoll wakes for the counter",
+        count == 1 && which == 1,
+        format!("count {} data {}", count, which),
+    );
+
+    // Now the socket as well, and both come back at once.
+    let _ = left.write_all(b"ping");
+    let count = sys::epoll_wait(epoll, &mut events, 100);
+    report.check("epoll reports both", count == 2, format!("{}", count));
+
+    let _ = sys::close(epoll);
+    let _ = sys::close(event);
+}
+
 pub fn main(_args: &[String]) -> i32 {
     let mut report = Report { passed: 0, failed: 0 };
     println!("=== Rust standard library on claudeos ===");
@@ -287,6 +373,10 @@ pub fn main(_args: &[String]) -> i32 {
 
     let args: Vec<String> = std::env::args().collect();
     report.check("argv[0] present", !args.is_empty(), format!("{:?}", args));
+
+    println!();
+    println!("-- waiting on several things at once --");
+    event_and_poll(&mut report);
 
     println!();
     println!("=== {} passed, {} failed ===", report.passed, report.failed);

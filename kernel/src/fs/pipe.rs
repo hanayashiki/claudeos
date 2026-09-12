@@ -16,9 +16,19 @@ pub struct Pipe {
     buffer: Spinlock<Buffer>,
     pub readers: AtomicUsize,
     pub writers: AtomicUsize,
+    /// How many times each side has opened this pipe.
+    ///
+    /// A FIFO's open waits for the other side to turn up. Waiting for the
+    /// count to be non-zero is not enough: the other side can open, write and
+    /// close again before the waiter looks, and then the count is back to
+    /// zero and it waits for something that has already happened. The count
+    /// of opens only ever goes up, so a change in it is proof the rendezvous
+    /// took place.
+    pub reader_opens: AtomicUsize,
+    pub writer_opens: AtomicUsize,
     /// Tasks blocked because the pipe is empty, and because it is full.
-    not_empty: crate::sched::WaitQueue,
-    not_full: crate::sched::WaitQueue,
+    pub(super) not_empty: crate::sched::WaitQueue,
+    pub(super) not_full: crate::sched::WaitQueue,
 }
 
 impl Pipe {
@@ -27,9 +37,23 @@ impl Pipe {
             buffer: Spinlock::new(Buffer { data: alloc::vec::Vec::new(), head: 0 }),
             readers: AtomicUsize::new(0),
             writers: AtomicUsize::new(0),
+            reader_opens: AtomicUsize::new(0),
+            writer_opens: AtomicUsize::new(0),
             not_empty: crate::sched::WaitQueue::new(),
             not_full: crate::sched::WaitQueue::new(),
         })
+    }
+
+    /// Let anyone waiting on this pipe look again.
+    pub fn wake(&self) {
+        self.not_empty.wake_all();
+        self.not_full.wake_all();
+    }
+
+    /// Room for at least one more byte.
+    pub fn writable_now(&self) -> bool {
+        let buffer = self.buffer.lock();
+        buffer.data.len() - buffer.head < PIPE_CAPACITY
     }
 
     pub fn available(&self) -> usize {
@@ -145,15 +169,27 @@ pub fn open_fifo(ino: u64, flags: u32, path: &str) -> Result<Arc<super::OpenFile
     let writing = access == O_WRONLY;
     let both = access == O_RDWR;
 
+    // Read the other side's open count before joining, so an open that
+    // happens from here on is seen as a change even if it has finished by the
+    // time this one looks.
+    let seen = if writing {
+        pipe.reader_opens.load(Ordering::Acquire)
+    } else {
+        pipe.writer_opens.load(Ordering::Acquire)
+    };
+
     if writing {
         if flags & O_NONBLOCK != 0 && pipe.readers.load(Ordering::Acquire) == 0 {
             return Err(Errno::ENXIO);
         }
         pipe.writers.fetch_add(1, Ordering::AcqRel);
+        pipe.writer_opens.fetch_add(1, Ordering::AcqRel);
     } else {
         pipe.readers.fetch_add(1, Ordering::AcqRel);
+        pipe.reader_opens.fetch_add(1, Ordering::AcqRel);
         if both {
             pipe.writers.fetch_add(1, Ordering::AcqRel);
+            pipe.writer_opens.fetch_add(1, Ordering::AcqRel);
         }
     }
     // The end that just arrived may be the one the other side was waiting for.
@@ -169,17 +205,19 @@ pub fn open_fifo(ino: u64, flags: u32, path: &str) -> Result<Arc<super::OpenFile
 
     if !both && flags & O_NONBLOCK == 0 {
         let want = if writing { &pipe.readers } else { &pipe.writers };
+        let opens = if writing { &pipe.reader_opens } else { &pipe.writer_opens };
         let queue = if writing { &pipe.not_full } else { &pipe.not_empty };
+        let arrived = || {
+            want.load(Ordering::Acquire) > 0 || opens.load(Ordering::Acquire) != seen
+        };
         loop {
-            if want.load(Ordering::Acquire) > 0 {
+            if arrived() {
                 break;
             }
             if crate::sched::has_pending_signal() {
                 return Err(Errno::EINTR);
             }
-            queue.wait_until(|| {
-                want.load(Ordering::Acquire) > 0 || crate::sched::has_pending_signal()
-            });
+            queue.wait_until(|| arrived() || crate::sched::has_pending_signal());
         }
     }
     Ok(file)
@@ -209,12 +247,27 @@ pub fn create_pair(flags: u32) -> (Arc<super::OpenFile>, Arc<super::OpenFile>) {
 
 impl Drop for super::OpenFile {
     fn drop(&mut self) {
-        if let super::FileBacking::Pipe(pipe, is_write) = &self.backing {
-            let counter = if *is_write { &pipe.writers } else { &pipe.readers };
-            counter.fetch_sub(1, Ordering::AcqRel);
-            // The other end has to notice that this one is gone.
-            pipe.not_empty.wake_all();
-            pipe.not_full.wake_all();
+        match &self.backing {
+            super::FileBacking::Pipe(pipe, is_write) => {
+                let counter = if *is_write { &pipe.writers } else { &pipe.readers };
+                counter.fetch_sub(1, Ordering::AcqRel);
+                // The other end has to notice that this one is gone.
+                pipe.not_empty.wake_all();
+                pipe.not_full.wake_all();
+            }
+            // A socket end reads one pipe and writes the other, so closing it
+            // takes a reader off one and a writer off the other.
+            super::FileBacking::Socket(socket) => {
+                if socket.owes_reader() {
+                    socket.rx.readers.fetch_sub(1, Ordering::AcqRel);
+                }
+                if socket.owes_writer() {
+                    socket.tx.writers.fetch_sub(1, Ordering::AcqRel);
+                }
+                socket.rx.wake();
+                socket.tx.wake();
+            }
+            _ => {}
         }
     }
 }

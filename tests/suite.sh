@@ -189,8 +189,26 @@ check "the file is still there" "changed" "$(cat /tmp/lk/a)"
 mkfifo /tmp/lk/f
 check "mkfifo makes a fifo"  "0"        "$(test -p /tmp/lk/f; echo $?)"
 check "a fifo carries data"  "through"  "$(echo through > /tmp/lk/f & cat /tmp/lk/f)"
+# The writer can finish before the reader looks, so waiting for a writer to be
+# present is not enough to meet one.
+cat > /tmp/lk/race.sh <<'RACE'
+n=0
+i=0
+while [ $i -lt 20 ]; do
+  rm -f /tmp/lk/r
+  mkfifo /tmp/lk/r
+  sleep 0.01 &
+  v=$(echo x > /tmp/lk/r & cat /tmp/lk/r)
+  if [ "$v" = x ]; then n=$((n + 1)); fi
+  i=$((i + 1))
+done
+echo $n
+RACE
+check "a fifo meets a fast writer" "20"  "$(sh /tmp/lk/race.sh)"
 check "descriptors are listed" "1"      "$(ls /proc/self/fd | grep -c '^0$')"
 check "a descriptor names its file" "/tmp/lk/a" "$(sh -c 'readlink /proc/self/fd/0' < /tmp/lk/a)"
+check "a pipe descriptor is one" "p"    "$(sh -c 'ls -l /proc/self/fd/1' | cut -c1)"
+check "every descriptor is listed" "4"  "$(sh -c 'ls /proc/self/fd' | wc -l)"
 check "dmesg has the boot log" "1"      "$(dmesg | grep -c 'claudeos: booting')"
 rm -rf /tmp/lk
 

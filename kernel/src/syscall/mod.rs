@@ -230,7 +230,29 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         // ---- misc -----------------------------------------------------
         nr::GETRANDOM => proc::getrandom(args[0], args[1] as usize),
         nr::FUTEX => proc::futex(args[0], args[1] as u32, args[2] as u32, args[3]),
-        nr::EPOLL_CREATE1 | nr::EPOLL_CTL | nr::EPOLL_PWAIT => Err(Errno::ENOSYS),
+        nr::EPOLL_CREATE1 => file::epoll_create(args[0] as u32),
+        nr::EPOLL_CREATE => file::epoll_create(0),
+        nr::EPOLL_CTL => file::epoll_ctl(args[0] as i32, args[1] as u32, args[2] as i32, args[3]),
+        nr::EPOLL_WAIT | nr::EPOLL_PWAIT => {
+            file::epoll_wait(args[0] as i32, args[1], args[2] as i32, args[3] as i64)
+        }
+        nr::EVENTFD => file::eventfd(args[0] as u32, 0),
+        nr::EVENTFD2 => file::eventfd(args[0] as u32, args[1] as u32),
+        nr::SOCKETPAIR => {
+            file::socketpair(args[0] as u32, args[1] as u32, args[2] as u32, args[3])
+        }
+        nr::SENDTO => file::sendto(args[0] as i32, args[1], args[2] as usize, args[4]),
+        nr::RECVFROM => {
+            file::recvfrom(args[0] as i32, args[1], args[2] as usize, args[4], args[5])
+        }
+        nr::SENDMSG => file::sendmsg(args[0] as i32, args[1]),
+        nr::RECVMSG => file::recvmsg(args[0] as i32, args[1]),
+        nr::SHUTDOWN => file::shutdown(args[0] as i32, args[1] as u32),
+        nr::SETSOCKOPT => Ok(0),
+        nr::GETSOCKOPT => file::getsockopt(args[0] as i32, args[3], args[4]),
+        nr::GETSOCKNAME | nr::GETPEERNAME => {
+            file::getsockname(args[0] as i32, args[1], args[2])
+        }
         nr::SOCKET => Err(Errno::EAFNOSUPPORT),
         nr::CLOSE_RANGE => file::close_range(args[0] as u32, args[1] as u32),
 

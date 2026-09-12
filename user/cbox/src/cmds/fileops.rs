@@ -26,10 +26,14 @@ fn mode_string(mode: u32, is_dir: bool, is_link: bool) -> String {
         'l'
     } else if is_dir {
         'd'
-    } else if mode & 0o170000 == 0o020000 {
-        'c'
     } else {
-        '-'
+        match mode & 0o170000 {
+            0o020000 => 'c',
+            0o060000 => 'b',
+            0o010000 => 'p',
+            0o140000 => 's',
+            _ => '-',
+        }
     };
     let bit = |shift: u32, ch: char| if mode >> shift & 1 == 1 { ch } else { '-' };
     format!(
@@ -671,6 +675,27 @@ pub fn readlink(args: &[String]) -> i32 {
     status
 }
 
+/// What kind of thing a file is, in the words `stat` uses.
+fn describe(metadata: &fs::Metadata) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    let kind = metadata.file_type();
+    if metadata.is_dir() {
+        "directory"
+    } else if kind.is_symlink() {
+        "symbolic link"
+    } else if kind.is_fifo() {
+        "fifo"
+    } else if kind.is_socket() {
+        "socket"
+    } else if kind.is_char_device() {
+        "character special file"
+    } else if kind.is_block_device() {
+        "block special file"
+    } else {
+        "regular file"
+    }
+}
+
 /// `stat -c`: one line per file, built from the format's `%` escapes.
 fn stat_format(format: &str, path: &str, metadata: &fs::Metadata) -> String {
     let mut out = String::new();
@@ -691,13 +716,7 @@ fn stat_format(format: &str, path: &str, metadata: &fs::Metadata) -> String {
             Some('g') => out.push_str(&metadata.gid().to_string()),
             Some('U') => out.push_str("root"),
             Some('G') => out.push_str("root"),
-            Some('F') => out.push_str(if metadata.is_dir() {
-                "directory"
-            } else if metadata.file_type().is_symlink() {
-                "symbolic link"
-            } else {
-                "regular file"
-            }),
+            Some('F') => out.push_str(describe(metadata)),
             Some('Y') => out.push_str(&metadata.mtime().to_string()),
             Some('y') => out.push_str(&timestamp(metadata.mtime())),
             Some('%') => out.push('%'),
@@ -752,13 +771,7 @@ pub fn stat(args: &[String]) -> i32 {
     for path in &operands {
         match fs::symlink_metadata(path) {
             Ok(metadata) => {
-                let kind = if metadata.is_dir() {
-                    "directory"
-                } else if metadata.file_type().is_symlink() {
-                    "symbolic link"
-                } else {
-                    "regular file"
-                };
+                let kind = describe(&metadata);
                 println!("  File: {}", path);
                 println!("  Size: {:<12} Type: {}", metadata.len(), kind);
                 println!(
