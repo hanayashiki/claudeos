@@ -6,23 +6,16 @@ pub mod heap;
 pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_SIZE_U64: u64 = 4096;
 
-/// Direct map of physical memory, installed by the boot trampoline.
-pub const HHDM_BASE: u64 = 0xFFFF_8000_0000_0000;
-/// Size of the region the boot trampoline direct-maps (low 4 GiB).
-pub const HHDM_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+/// Where the kernel image, the direct map of physical memory and the heap sit
+/// is a property of the machine, so the numbers come from `arch`. They are
+/// named again here because this is where the rest of the kernel looks for
+/// them.
+pub use crate::arch::{
+    HHDM_BASE, HHDM_LIMIT, KERNEL_HEAP_BASE, KERNEL_HEAP_MAX, KERNEL_PHYS_START, KERNEL_VMA,
+};
 
-/// Virtual base the kernel image is linked at.
-pub const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;
-/// Physical address the kernel image is loaded at (see linker.ld: `. = 1M`).
-pub const KERNEL_PHYS_START: u64 = 0x10_0000;
-
-pub const KERNEL_HEAP_BASE: u64 = 0xFFFF_C000_0000_0000;
 /// Mapped at boot; the heap grows from here on demand.
 pub const KERNEL_HEAP_SIZE: usize = 16 * 1024 * 1024;
-/// Ceiling on heap growth. It stays inside the single PDPT the heap's PML4
-/// entry points at, so growing never has to touch a PML4 shared with an
-/// address space that already exists.
-pub const KERNEL_HEAP_MAX: usize = 512 * 1024 * 1024;
 /// Physical memory kept back from the heap for user pages.
 pub const FRAME_RESERVE: usize = 8 * 1024 * 1024;
 

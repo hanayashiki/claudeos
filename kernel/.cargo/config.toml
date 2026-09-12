@@ -10,3 +10,17 @@ rustflags = [
   "-C", "code-model=kernel",
   "-C", "force-frame-pointers=yes",
 ]
+
+# The soft-float variant, because the plain one lets the compiler use the
+# vector and floating point registers inside the kernel. Those registers belong
+# to whichever program was interrupted, and nothing saves them yet.
+#
+# rust-lld refuses -nostartfiles here, so the script alone says what to link.
+[target.aarch64-unknown-none-softfloat]
+rustflags = [
+  "-C", "link-arg=-Tlinker-aarch64.ld",
+  "-C", "link-arg=-zmax-page-size=4096",
+  "-C", "link-arg=-no-pie",
+  "-C", "relocation-model=static",
+  "-C", "force-frame-pointers=yes",
+]

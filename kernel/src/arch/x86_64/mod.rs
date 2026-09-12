@@ -13,6 +13,7 @@ mod clock;
 mod cpu;
 mod io;
 mod keyboard;
+mod multiboot;
 mod signal_frame;
 mod syscall;
 mod task;
@@ -61,8 +62,46 @@ extern "C" {
 }
 
 // ---------------------------------------------------------------------------
+// Where things sit in the address space
+// ---------------------------------------------------------------------------
+
+/// Direct map of physical memory, installed by the boot trampoline.
+pub const HHDM_BASE: u64 = 0xFFFF_8000_0000_0000;
+/// Size of the region the boot trampoline direct-maps (low 4 GiB).
+pub const HHDM_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Virtual base the kernel image is linked at.
+pub const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;
+/// Physical address the kernel image is loaded at (see linker.ld: `. = 1M`).
+pub const KERNEL_PHYS_START: u64 = 0x10_0000;
+
+pub const KERNEL_HEAP_BASE: u64 = 0xFFFF_C000_0000_0000;
+/// Ceiling on heap growth. It stays inside the single PDPT the heap's PML4
+/// entry points at, so growing never has to touch a PML4 shared with an
+/// address space that already exists.
+pub const KERNEL_HEAP_MAX: usize = 512 * 1024 * 1024;
+
+/// Physical memory this machine claims for itself whatever the loader says
+/// about it: the real-mode interrupt table, the BIOS data area, the extended
+/// BIOS data area, video memory and the option ROMs all live under 1 MiB.
+pub const RESERVED_PHYS: &[(u64, u64)] = &[(0, 0x10_0000)];
+
+// ---------------------------------------------------------------------------
 // Bringing the processor up
 // ---------------------------------------------------------------------------
+
+/// Where `boot.s` lands once it has reached the higher half. The loader hands
+/// over a pointer to its info blob and a magic number saying what the blob is;
+/// both are decoded here, before low memory stops being reachable.
+#[no_mangle]
+pub extern "C" fn kmain(mb_info_phys: u64, magic: u64) -> ! {
+    crate::serial::init();
+    if magic as u32 != multiboot::MULTIBOOT_BOOTLOADER_MAGIC {
+        panic!("bad multiboot magic {:#x}", magic);
+    }
+    let boot = unsafe { multiboot::parse(mb_info_phys) };
+    crate::start(&boot)
+}
 
 /// Install the tables the CPU consults on a trap, and name the stack it
 /// switches to when one arrives from user mode. Nothing may fault before this

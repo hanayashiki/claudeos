@@ -10,12 +10,12 @@ use core::panic::PanicInfo;
 mod serial;
 mod abi;
 mod arch;
+mod boot;
 mod console;
 mod elf;
 mod fs;
 mod futex;
 mod mm;
-mod multiboot;
 mod net;
 mod pci;
 mod sched;
@@ -45,7 +45,7 @@ struct BootOptions {
     args: Vec<String>,
 }
 
-fn parse_cmdline(cmdline: Option<&str>) -> BootOptions {
+fn parse_cmdline(cmdline: &str) -> BootOptions {
     let mut options = BootOptions {
         init: "/bin/init".to_string(),
         trace: syscall::TRACE_OFF,
@@ -54,9 +54,7 @@ fn parse_cmdline(cmdline: Option<&str>) -> BootOptions {
         net_test: false,
         args: Vec::new(),
     };
-    let Some(cmdline) = cmdline else { return options };
-    // The boot loader puts the kernel's own path in the first word.
-    for word in cmdline.split_whitespace().skip(1) {
+    for word in cmdline.split_whitespace() {
         if let Some(value) = word.strip_prefix("init=") {
             options.init = value.to_string();
         } else if let Some(value) = word.strip_prefix("trace=") {
@@ -95,22 +93,17 @@ fn parse_cmdline(cmdline: Option<&str>) -> BootOptions {
     options
 }
 
-#[no_mangle]
-pub extern "C" fn kmain(mb_info_phys: u64, magic: u64) -> ! {
-    serial::init();
+/// Where every architecture's entry code arrives, once it has a console to
+/// print on and the machine described in terms the rest of the kernel reads.
+pub fn start(boot: &boot::BootInfo) -> ! {
     println!();
     println!("claudeos: booting");
-
-    if magic as u32 != multiboot::MULTIBOOT_BOOTLOADER_MAGIC {
-        panic!("bad multiboot magic {:#x}", magic);
-    }
-    let boot = unsafe { multiboot::parse(mb_info_phys) };
 
     arch::init_traps();
     trap::init();
     arch::init_cpu();
 
-    mm::frame::init(&boot);
+    mm::frame::init(boot);
     mm::heap::init();
     let (used, total) = mm::frame::stats();
     println!(
@@ -120,9 +113,8 @@ pub extern "C" fn kmain(mb_info_phys: u64, magic: u64) -> ! {
         mm::KERNEL_HEAP_SIZE / (1024 * 1024)
     );
 
-    // The command line lives in low memory and needs the heap to parse.
-    let cmdline = unsafe { multiboot::cstr_at(boot.cmdline_phys) };
-    let options = parse_cmdline(cmdline);
+    // Parsing needs the heap, so it cannot happen any earlier than this.
+    let options = parse_cmdline(boot.cmdline());
 
     arch::init_interrupt_controller();
     arch::init_timer(arch::TICK_HZ);
@@ -140,7 +132,7 @@ pub extern "C" fn kmain(mb_info_phys: u64, magic: u64) -> ! {
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(syscall::TRACE), options.trace) };
 
     fs::init();
-    mount_initramfs(&boot);
+    mount_initramfs(boot);
 
     // Nothing reads low memory through the identity map from here on.
     unsafe { arch::paging::drop_identity_map() };
@@ -207,12 +199,11 @@ pub extern "C" fn kmain(mb_info_phys: u64, magic: u64) -> ! {
     sched::idle_loop();
 }
 
-fn mount_initramfs(boot: &multiboot::BootInfo) {
-    if boot.module_count == 0 {
+fn mount_initramfs(boot: &boot::BootInfo) {
+    let Some(module) = boot.modules().first() else {
         println!("claudeos: no initramfs module supplied");
         return;
-    }
-    let module = boot.modules[0];
+    };
     let virt = mm::phys_to_virt(module.start);
     let archive = unsafe { core::slice::from_raw_parts(virt as *const u8, module.len()) };
     match fs::cpio::extract(archive) {
