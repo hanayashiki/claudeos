@@ -32,11 +32,7 @@ enum Token {
     Amp,
     AndIf,
     OrIf,
-    RedirOut,
-    RedirAppend,
-    RedirIn,
-    RedirErr,
-    RedirErrAppend,
+    Redirect(i32, RedirKind),
     Newline,
     LParen,
     RParen,
@@ -63,6 +59,29 @@ const KEYWORDS: &[&str] = &[
     "if", "then", "elif", "else", "fi", "while", "until", "for", "in", "do", "done", "function",
     "return", "break", "continue", "case", "esac", "!", "{", "}",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirKind {
+    Read,
+    Write,
+    Append,
+    /// `>&` or `<&`: the target is another descriptor.
+    Duplicate,
+}
+
+/// A word made only of digits directly before a redirection names the
+/// descriptor being redirected, so take it off the word being built.
+fn take_pending_fd(current: &mut String, have_word: &mut bool) -> Option<i32> {
+    if !*have_word || current.is_empty() || !current.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let fd = current.parse().ok();
+    if fd.is_some() {
+        current.clear();
+        *have_word = false;
+    }
+    fd
+}
 
 #[derive(Debug)]
 enum LexError {
@@ -253,12 +272,17 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 i += 1;
             }
             '>' => {
+                // A bare digit immediately before '>' names the descriptor.
+                let fd = take_pending_fd(&mut current, &mut have_word);
                 flush!();
                 if chars.get(i + 1) == Some(&'>') {
-                    tokens.push(Token::RedirAppend);
+                    tokens.push(Token::Redirect(fd.unwrap_or(1), RedirKind::Append));
+                    i += 2;
+                } else if chars.get(i + 1) == Some(&'&') {
+                    tokens.push(Token::Redirect(fd.unwrap_or(1), RedirKind::Duplicate));
                     i += 2;
                 } else {
-                    tokens.push(Token::RedirOut);
+                    tokens.push(Token::Redirect(fd.unwrap_or(1), RedirKind::Write));
                     i += 1;
                 }
             }
@@ -336,18 +360,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 resume_after_newline = Some(cursor);
             }
             '<' => {
+                let fd = take_pending_fd(&mut current, &mut have_word);
                 flush!();
-                tokens.push(Token::RedirIn);
+                tokens.push(Token::Redirect(fd.unwrap_or(0), RedirKind::Read));
                 i += 1;
-            }
-            '2' if !have_word && chars.get(i + 1) == Some(&'>') => {
-                if chars.get(i + 2) == Some(&'>') {
-                    tokens.push(Token::RedirErrAppend);
-                    i += 3;
-                } else {
-                    tokens.push(Token::RedirErr);
-                    i += 2;
-                }
             }
             '#' if !have_word => {
                 // Comment to end of line.
@@ -371,15 +387,28 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 // Syntax tree
 // ---------------------------------------------------------------------------
 
+/// Where a redirection sends a stream.
+#[derive(Debug, Clone, PartialEq)]
+enum Target {
+    /// A file, and whether to append to it.
+    File(String, bool),
+    /// Another descriptor, as in `2>&1`.
+    Descriptor(i32),
+}
+
 #[derive(Debug, Clone, Default)]
 struct Command {
     words: Vec<(String, Quoting)>,
     stdin_file: Option<String>,
-    stdout_file: Option<(String, bool)>,
-    stderr_file: Option<(String, bool)>,
+    /// Redirections in the order they were written, since `>f 2>&1` and
+    /// `2>&1 >f` mean different things.
+    redirects: Vec<(i32, Target)>,
     heredoc: Option<(String, bool)>,
-    /// A `( ... )` group, which runs in a child so its effects are discarded.
+    /// A `( ... )` group, or a compound command used as a pipeline element.
     group: Option<Vec<Node>>,
+    /// True when the group came from `( ... )`, which always runs in a child
+    /// so its variables and directory changes do not escape.
+    subshell: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -427,6 +456,8 @@ enum Node {
         word: (String, Quoting),
         arms: Vec<(Vec<(String, Quoting)>, Vec<Node>)>,
     },
+    /// `{ ... }`, which runs in the current shell.
+    Brace(Vec<Node>),
     Break,
     Continue,
     Return(Option<i32>),
@@ -512,18 +543,13 @@ impl<'a> Parser<'a> {
 
     fn parse_statement(&mut self) -> Result<Node, ParseError> {
         match self.peek().and_then(|t| t.keyword()) {
-            Some("if") => self.parse_if(),
-            Some("while") => self.parse_loop(false),
-            Some("until") => self.parse_loop(true),
-            Some("for") => self.parse_for(),
-            Some("case") => self.parse_case(),
             Some("break") => {
                 self.position += 1;
-                Ok(Node::Break)
+                return Ok(Node::Break);
             }
             Some("continue") => {
                 self.position += 1;
-                Ok(Node::Continue)
+                return Ok(Node::Continue);
             }
             Some("return") => {
                 self.position += 1;
@@ -537,26 +563,49 @@ impl<'a> Parser<'a> {
                     }
                     _ => None,
                 };
-                Ok(Node::Return(value))
+                return Ok(Node::Return(value));
             }
-            _ => {
-                // A function definition looks like: name ( ) { ... }
-                if let (Some(Token::Word(name, Quoting::Bare)), Some(Token::LParen), Some(Token::RParen)) = (
-                    self.tokens.get(self.position),
-                    self.tokens.get(self.position + 1),
-                    self.tokens.get(self.position + 2),
-                ) {
-                    let name = name.clone();
-                    self.position += 3;
-                    self.skip_separators();
-                    self.expect_keyword("{")?;
-                    let body = self.parse_block(&["}"])?;
-                    self.expect_keyword("}")?;
-                    return Ok(Node::Function { name, body });
-                }
-                Ok(Node::Run(self.parse_and_or()?))
-            }
+            _ => {}
         }
+
+        // A function definition looks like: name ( ) { ... }
+        if let (Some(Token::Word(name, Quoting::Bare)), Some(Token::LParen), Some(Token::RParen)) = (
+            self.tokens.get(self.position),
+            self.tokens.get(self.position + 1),
+            self.tokens.get(self.position + 2),
+        ) {
+            let name = name.clone();
+            self.position += 3;
+            self.skip_separators();
+            self.expect_keyword("{")?;
+            let body = self.parse_block(&["}"])?;
+            self.expect_keyword("}")?;
+            return Ok(Node::Function { name, body });
+        }
+
+        // Everything else, compound commands included, is a pipeline. Going
+        // through the pipeline parser is what lets `for ...; done | wc -l`
+        // and `while read l; do ...; done < file` work.
+        Ok(Node::Run(self.parse_and_or()?))
+    }
+
+    /// Parse a compound command if one starts here.
+    fn parse_compound(&mut self) -> Result<Option<Node>, ParseError> {
+        let node = match self.peek().and_then(|t| t.keyword()) {
+            Some("if") => self.parse_if()?,
+            Some("while") => self.parse_loop(false)?,
+            Some("until") => self.parse_loop(true)?,
+            Some("for") => self.parse_for()?,
+            Some("case") => self.parse_case()?,
+            Some("{") => {
+                self.position += 1;
+                let body = self.parse_block(&["}"])?;
+                self.expect_keyword("}")?;
+                Node::Brace(body)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(node))
     }
 
     fn parse_if(&mut self) -> Result<Node, ParseError> {
@@ -753,11 +802,21 @@ impl<'a> Parser<'a> {
         if matches!(self.peek(), Some(Token::LParen)) {
             self.position += 1;
             command.group = Some(self.parse_block(&[")"])?);
+            command.subshell = true;
             match self.peek() {
                 Some(Token::RParen) => self.position += 1,
                 None => return Err(ParseError::Incomplete),
                 _ => return Err(ParseError::Message("expected `)`".into())),
             }
+            return self.parse_redirections(command);
+        }
+
+        // A compound command is an element of a pipeline, which is what lets
+        // `seq 1 3 | while read line; do ...; done` connect, and it can carry
+        // its own redirections, as in `done < file`.
+        if let Some(node) = self.parse_compound()? {
+            command.group = Some(vec![node]);
+            return self.parse_redirections(command);
         }
 
         loop {
@@ -772,29 +831,59 @@ impl<'a> Parser<'a> {
                     if *quoting == Quoting::Bare && KEYWORDS.contains(&text.as_str()) {
                         return Ok(command);
                     }
-                    if command.group.is_some() {
-                        return Ok(command);
-                    }
                     command.words.push((text.clone(), *quoting));
                     self.position += 1;
                 }
-                Some(Token::RedirOut) | Some(Token::RedirAppend) => {
-                    let append = matches!(self.peek(), Some(Token::RedirAppend));
-                    self.position += 1;
-                    command.stdout_file = Some((self.take_filename()?, append));
-                }
-                Some(Token::RedirErr) | Some(Token::RedirErrAppend) => {
-                    let append = matches!(self.peek(), Some(Token::RedirErrAppend));
-                    self.position += 1;
-                    command.stderr_file = Some((self.take_filename()?, append));
-                }
-                Some(Token::RedirIn) => {
-                    self.position += 1;
-                    command.stdin_file = Some(self.take_filename()?);
+                Some(Token::Redirect(..)) => {
+                    self.take_redirection(&mut command)?;
                 }
                 _ => return Ok(command),
             }
         }
+    }
+
+    /// Redirections that follow a group or compound command.
+    fn parse_redirections(&mut self, mut command: Command) -> Result<Command, ParseError> {
+        while matches!(self.peek(), Some(Token::Redirect(..))) {
+            self.take_redirection(&mut command)?;
+        }
+        Ok(command)
+    }
+
+    fn take_redirection(&mut self, command: &mut Command) -> Result<(), ParseError> {
+        let Some(Token::Redirect(fd, kind)) = self.peek().cloned() else {
+            return Err(ParseError::Message("expected a redirection".into()));
+        };
+        self.position += 1;
+
+        match kind {
+            RedirKind::Read => {
+                command.stdin_file = Some(self.take_filename()?);
+            }
+            RedirKind::Write | RedirKind::Append => {
+                let path = self.take_filename()?;
+                command
+                    .redirects
+                    .push((fd, Target::File(path, kind == RedirKind::Append)));
+            }
+            RedirKind::Duplicate => {
+                let word = self.take_filename()?;
+                if word == "-" {
+                    command.redirects.push((fd, Target::Descriptor(-1)));
+                } else {
+                    match word.parse::<i32>() {
+                        Ok(target) => command.redirects.push((fd, Target::Descriptor(target))),
+                        Err(_) => {
+                            return Err(ParseError::Message(format!(
+                                "expected a descriptor number after >&, found `{}`",
+                                word
+                            )))
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn take_filename(&mut self) -> Result<String, ParseError> {
@@ -1103,6 +1192,7 @@ impl Shell {
                 self.last_status = 0;
                 Flow::Normal
             }
+            Node::Brace(body) => self.exec_block(body),
             Node::Break => Flow::Break,
             Node::Continue => Flow::Continue,
             Node::Return(code) => {
@@ -1134,17 +1224,19 @@ impl Shell {
             .commands
             .iter()
             .map(|c| self.expand_command(c))
-            .filter(|c| !c.words.is_empty() || c.stdout_file.is_some() || c.group.is_some())
+            .filter(|c| !c.words.is_empty() || !c.redirects.is_empty() || c.group.is_some())
             .collect();
         if commands.is_empty() {
             return Flow::Normal;
         }
 
         // A single builtin or function runs here so it can change our state.
-        if commands.len() == 1 && !pipeline.background && commands[0].group.is_none() {
+        if commands.len() == 1 && !pipeline.background {
             let argv: Vec<String> = commands[0].words.iter().map(|(w, _)| w.clone()).collect();
-            if !argv.is_empty() && (self.functions.contains_key(&argv[0]) || is_builtin(&argv[0]))
-            {
+            let is_local = (commands[0].group.is_some() && !commands[0].subshell)
+                || (!argv.is_empty()
+                    && (self.functions.contains_key(&argv[0]) || is_builtin(&argv[0])));
+            if is_local {
                 let flow = self.run_local(&commands[0], &argv);
                 if pipeline.negated {
                     self.last_status = if self.last_status == 0 { 1 } else { 0 };
@@ -1285,24 +1377,37 @@ impl Shell {
         Flow::Normal
     }
 
-    /// Run a builtin or shell function in this process, with redirections
-    /// applied and then undone.
+    /// Run a builtin, a function, or a compound command in this process, with
+    /// redirections applied and then undone.
     fn run_local(&mut self, command: &Command, argv: &[String]) -> Flow {
-        let saved_out = if command.stdout_file.is_some() { dup_fd(sys::STDOUT) } else { -1 };
-        let saved_in = if command.stdin_file.is_some() || command.heredoc.is_some() {
-            dup_fd(sys::STDIN)
-        } else {
-            -1
-        };
+        // Save whatever the redirections are about to replace.
+        let mut saved: Vec<(i32, i32)> = Vec::new();
+        let mut touched: Vec<i32> = command.redirects.iter().map(|(fd, _)| *fd).collect();
+        if command.stdin_file.is_some() || command.heredoc.is_some() {
+            touched.push(sys::STDIN);
+        }
+        touched.sort();
+        touched.dedup();
+        for fd in &touched {
+            let copy = dup_fd(*fd);
+            if copy >= 0 {
+                saved.push((*fd, copy));
+            }
+        }
+
         if apply_redirections(command).is_err() {
             self.last_status = 1;
+            restore(&saved);
             return Flow::Normal;
         }
 
-        let flow = if let Some(body) = self.functions.get(&argv[0]).cloned() {
-            let saved = std::mem::replace(&mut self.positional, argv[1..].to_vec());
+        let flow = if let Some(group) = &command.group {
+            let group = group.clone();
+            self.exec_block(&group)
+        } else if let Some(body) = self.functions.get(&argv[0]).cloned() {
+            let saved_params = std::mem::replace(&mut self.positional, argv[1..].to_vec());
             let flow = self.exec_block(&body);
-            self.positional = saved;
+            self.positional = saved_params;
             match flow {
                 Flow::Return => Flow::Normal,
                 other => other,
@@ -1312,14 +1417,7 @@ impl Shell {
         };
 
         let _ = std::io::stdout().flush();
-        if saved_out >= 0 {
-            sys::dup2(saved_out, sys::STDOUT);
-            sys::close(saved_out);
-        }
-        if saved_in >= 0 {
-            sys::dup2(saved_in, sys::STDIN);
-            sys::close(saved_in);
-        }
+        restore(&saved);
         flow
     }
 
@@ -1541,14 +1639,26 @@ impl Shell {
     fn expand_command(&mut self, command: &Command) -> Command {
         let mut out = Command {
             stdin_file: command.stdin_file.as_ref().map(|f| self.expand_text(f)),
-            stdout_file: command.stdout_file.as_ref().map(|(f, a)| (self.expand_text(f), *a)),
-            stderr_file: command.stderr_file.as_ref().map(|(f, a)| (self.expand_text(f), *a)),
+            redirects: command
+                .redirects
+                .iter()
+                .map(|(fd, target)| {
+                    let target = match target {
+                        Target::File(path, append) => {
+                            Target::File(self.expand_text(path), *append)
+                        }
+                        other => other.clone(),
+                    };
+                    (*fd, target)
+                })
+                .collect(),
             // An unquoted here-document delimiter means the body is expanded.
             heredoc: command.heredoc.as_ref().map(|(body, quoted)| {
                 let text = if *quoted { body.clone() } else { self.expand_text(body) };
                 (text, *quoted)
             }),
             group: command.group.clone(),
+            subshell: command.subshell,
             words: Vec::new(),
         };
         for (word, quoting) in &command.words {
@@ -1834,6 +1944,13 @@ fn dup_fd(fd: i32) -> i32 {
     }
 }
 
+fn restore(saved: &[(i32, i32)]) {
+    for (fd, copy) in saved {
+        sys::dup2(*copy, *fd);
+        sys::close(*copy);
+    }
+}
+
 fn apply_redirections(command: &Command) -> Result<(), ()> {
     if let Some((body, _)) = &command.heredoc {
         // Staged through a file rather than a pipe, so a body larger than the
@@ -1861,26 +1978,32 @@ fn apply_redirections(command: &Command) -> Result<(), ()> {
         sys::dup2(fd as i32, sys::STDIN);
         sys::close(fd as i32);
     }
-    if let Some((path, append)) = &command.stdout_file {
-        let flags =
-            sys::O_WRONLY | sys::O_CREAT | if *append { sys::O_APPEND } else { sys::O_TRUNC };
-        let fd = sys::open(path, flags, 0o644);
-        if fd < 0 {
-            eprintln!("sh: {}: cannot create", path);
-            return Err(());
+
+    // In order: `>f 2>&1` and `2>&1 >f` do different things.
+    for (fd, target) in &command.redirects {
+        match target {
+            Target::File(path, append) => {
+                let flags = sys::O_WRONLY
+                    | sys::O_CREAT
+                    | if *append { sys::O_APPEND } else { sys::O_TRUNC };
+                let opened = sys::open(path, flags, 0o644);
+                if opened < 0 {
+                    eprintln!("sh: {}: cannot create", path);
+                    return Err(());
+                }
+                sys::dup2(opened as i32, *fd);
+                sys::close(opened as i32);
+            }
+            Target::Descriptor(-1) => {
+                sys::close(*fd);
+            }
+            Target::Descriptor(source) => {
+                if sys::dup2(*source, *fd) < 0 {
+                    eprintln!("sh: {}: bad descriptor", source);
+                    return Err(());
+                }
+            }
         }
-        sys::dup2(fd as i32, sys::STDOUT);
-        sys::close(fd as i32);
-    }
-    if let Some((path, append)) = &command.stderr_file {
-        let flags =
-            sys::O_WRONLY | sys::O_CREAT | if *append { sys::O_APPEND } else { sys::O_TRUNC };
-        let fd = sys::open(path, flags, 0o644);
-        if fd < 0 {
-            return Err(());
-        }
-        sys::dup2(fd as i32, sys::STDERR);
-        sys::close(fd as i32);
     }
     Ok(())
 }

@@ -18,7 +18,14 @@ pub const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;
 pub const KERNEL_PHYS_START: u64 = 0x10_0000;
 
 pub const KERNEL_HEAP_BASE: u64 = 0xFFFF_C000_0000_0000;
-pub const KERNEL_HEAP_SIZE: usize = 32 * 1024 * 1024;
+/// Mapped at boot; the heap grows from here on demand.
+pub const KERNEL_HEAP_SIZE: usize = 16 * 1024 * 1024;
+/// Ceiling on heap growth. It stays inside the single PDPT the heap's PML4
+/// entry points at, so growing never has to touch a PML4 shared with an
+/// address space that already exists.
+pub const KERNEL_HEAP_MAX: usize = 512 * 1024 * 1024;
+/// Physical memory kept back from the heap for user pages.
+pub const FRAME_RESERVE: usize = 8 * 1024 * 1024;
 
 /// Where user mmap allocations start growing up from.
 pub const USER_MMAP_BASE: u64 = 0x0000_7F00_0000_0000;
@@ -32,6 +39,25 @@ extern "C" {
     static __text_end: u8;
     static __rodata_start: u8;
     static __rodata_end: u8;
+}
+
+/// Physical memory not spoken for, minus the reserve kept for user pages.
+///
+/// This deliberately ignores the heap's own free list, because the heap calls
+/// it while holding its lock.
+pub fn available_bytes() -> usize {
+    let (used, total) = frame::stats();
+    let free = (total - used) * PAGE_SIZE;
+    free.saturating_sub(FRAME_RESERVE)
+}
+
+/// What a file may still grow into: unclaimed physical memory plus the space
+/// the heap has already mapped and is not using. Without the second term a
+/// machine that once held a large file could never hold another one, because
+/// the heap does not hand pages back.
+pub fn file_available_bytes() -> usize {
+    let (heap_used, heap_total) = heap::stats();
+    available_bytes() + (heap_total - heap_used)
 }
 
 #[inline]

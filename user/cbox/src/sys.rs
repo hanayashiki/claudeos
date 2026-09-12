@@ -8,6 +8,7 @@ use std::ffi::CString;
 
 pub const STDIN: i32 = 0;
 pub const STDOUT: i32 = 1;
+#[allow(dead_code)]
 pub const STDERR: i32 = 2;
 
 pub const O_RDONLY: u64 = 0;

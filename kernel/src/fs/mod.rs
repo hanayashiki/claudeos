@@ -47,6 +47,32 @@ pub struct Node {
 
 static NEXT_INO: AtomicU64 = AtomicU64::new(1);
 
+/// Make room for `target` bytes of file contents.
+///
+/// Files live in RAM, so a write has to be refused before the allocator runs
+/// the machine out of memory. Growing a vector copies the old contents into a
+/// new allocation, so the peak is the old capacity plus the new one; this
+/// grows by half again when that peak fits and falls back to an exact fit when
+/// memory is tight.
+fn reserve_for(data: &mut Vec<u8>, target: usize) -> Result<(), Errno> {
+    if target <= data.capacity() {
+        return Ok(());
+    }
+    let available = crate::mm::file_available_bytes();
+    let current = data.capacity();
+    let roomy = target.max(current + current / 2);
+
+    if current.saturating_add(roomy) <= available {
+        data.reserve_exact(roomy - data.len());
+        return Ok(());
+    }
+    if current.saturating_add(target) <= available {
+        data.reserve_exact(target - data.len());
+        return Ok(());
+    }
+    Err(Errno::ENOSPC)
+}
+
 impl Node {
     pub fn new(kind: NodeKind, mode: u32) -> NodeRef {
         Arc::new(Node {
@@ -158,10 +184,12 @@ impl Node {
             _ => {
                 let mut inner = self.inner.lock();
                 let start = offset as usize;
-                if start + buf.len() > inner.data.len() {
-                    inner.data.resize(start + buf.len(), 0);
+                let end = start + buf.len();
+                if end > inner.data.len() {
+                    reserve_for(&mut inner.data, end)?;
+                    inner.data.resize(end, 0);
                 }
-                inner.data[start..start + buf.len()].copy_from_slice(buf);
+                inner.data[start..end].copy_from_slice(buf);
                 Ok(buf.len())
             }
         }
@@ -171,7 +199,12 @@ impl Node {
         if self.is_dir() {
             return Err(Errno::EISDIR);
         }
-        self.inner.lock().data.resize(len as usize, 0);
+        let mut inner = self.inner.lock();
+        let target = len as usize;
+        if target > inner.data.len() {
+            reserve_for(&mut inner.data, target)?;
+        }
+        inner.data.resize(target, 0);
         Ok(())
     }
 
