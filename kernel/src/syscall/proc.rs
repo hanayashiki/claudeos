@@ -122,10 +122,20 @@ pub fn fork(
 
     if vfork {
         // vfork's contract: the parent does not run again until the child has
-        // handed back its address space by exec'ing or exiting.
-        let parent = sched::current();
-        parent.state = State::Sleeping;
-        sched::schedule();
+        // handed back its address space by exec'ing or exiting. The child is
+        // already registered and could reach that point first, so the sleep
+        // is set up with interrupts off, where nothing else can run.
+        crate::sync::disable_interrupts();
+        // The child clears the link when it execs or exits, so a link that is
+        // still there means the wake-up has not happened yet.
+        let waiting = sched::find(child_pid).map_or(false, |c| c.vfork_parent.is_some());
+        if waiting {
+            sched::current().state = State::Sleeping;
+        }
+        crate::sync::enable_interrupts();
+        if waiting {
+            sched::schedule();
+        }
     }
     Ok(child_pid as u64)
 }
@@ -328,9 +338,15 @@ pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
         if options & WNOHANG != 0 {
             return Ok(0);
         }
+        // A child can exit between the checks above and this sleep. It would
+        // find the parent runnable, leave the wake-up undelivered, and the
+        // sleep would never end. Interrupts off means nothing else runs in
+        // between, so the state the checks saw is still the state here.
+        crate::sync::disable_interrupts();
         let task = sched::current();
         task.waiting_for = Some(pid as i32);
         task.state = State::Sleeping;
+        crate::sync::enable_interrupts();
         sched::schedule();
         sched::current().waiting_for = None;
         // A signal arriving while blocked interrupts the wait.
@@ -343,9 +359,9 @@ pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
 }
 
 pub fn kill(pid: i64, signal: i32) -> SysResult {
-    if signal == 0 {
-        return Ok(0);
-    }
+    // Signal zero sends nothing and reports whether the target is there,
+    // which is how a program watches something it did not fork.
+    let probe = signal == 0;
     let mut delivered = false;
     let mut parents = alloc::vec::Vec::new();
     let me = sched::current().pid;
@@ -358,8 +374,10 @@ pub fn kill(pid: i64, signal: i32) -> SysResult {
             p => task.pgid == (-p) as u32,
         };
         if target && task.state != State::Zombie && task.pid != 0 {
-            if let Some(ppid) = sched::post_signal(task, signal) {
-                parents.push(ppid);
+            if !probe {
+                if let Some(ppid) = sched::post_signal(task, signal) {
+                    parents.push(ppid);
+                }
             }
             delivered = true;
         }
@@ -367,12 +385,13 @@ pub fn kill(pid: i64, signal: i32) -> SysResult {
     for ppid in parents {
         sched::notify_parent(ppid);
     }
-    if delivered {
-        sched::check_signals();
-        Ok(0)
-    } else {
-        Err(Errno::ESRCH)
+    if !delivered {
+        return Err(Errno::ESRCH);
     }
+    if !probe {
+        sched::check_signals();
+    }
+    Ok(0)
 }
 
 /// `which` is PRIO_PROCESS, PRIO_PGRP or PRIO_USER; only the first selects a
@@ -581,10 +600,40 @@ pub fn nanosleep(req: u64, rem: u64) -> SysResult {
     }
     let total_ns = spec.tv_sec as u64 * 1_000_000_000 + spec.tv_nsec as u64;
     let ticks = crate::time::ns_to_ticks(total_ns);
-    if ticks > 0 {
-        sched::sleep_ticks(ticks);
-    } else {
+    if ticks == 0 {
         sched::yield_now();
+        if rem != 0 {
+            uaccess::write_struct(rem, &Timespec::default())?;
+        }
+        return Ok(0);
+    }
+
+    // Sleep to a deadline rather than for a duration: anything that wakes the
+    // task early, a continue after a suspend among them, leaves the rest of
+    // the time still to run.
+    let deadline = crate::trap::ticks() + ticks;
+    loop {
+        let now = crate::trap::ticks();
+        if now >= deadline {
+            break;
+        }
+        // Being suspended is not the end of the sleep; it resumes afterwards
+        // with whatever time is left.
+        if sched::stop_if_requested() {
+            continue;
+        }
+        if sched::has_pending_signal() {
+            if rem != 0 {
+                let left = crate::time::ticks_to_ns(deadline - now);
+                let spec = Timespec {
+                    tv_sec: (left / 1_000_000_000) as i64,
+                    tv_nsec: (left % 1_000_000_000) as i64,
+                };
+                uaccess::write_struct(rem, &spec)?;
+            }
+            return Err(Errno::EINTR);
+        }
+        sched::sleep_ticks(deadline - now);
     }
     if rem != 0 {
         uaccess::write_struct(rem, &Timespec::default())?;

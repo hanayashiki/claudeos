@@ -9,6 +9,15 @@ use std::io::Write;
 
 const HISTORY_LIMIT: usize = 500;
 
+/// How a line ended.
+pub enum Line {
+    Text(String),
+    /// Ctrl-C: the line is thrown away, and so is whatever it was continuing.
+    Interrupted,
+    /// Ctrl-D on an empty line, or the input running out.
+    EndOfInput,
+}
+
 pub struct Editor {
     history: Vec<String>,
     /// The terminal settings to put back before running a command.
@@ -55,10 +64,13 @@ impl Editor {
     }
 
     /// Read one line. Returns None at end of file.
-    pub fn read_line(&mut self, prompt: &str, completer: &dyn Completer) -> Option<String> {
+    pub fn read_line(&mut self, prompt: &str, completer: &dyn Completer) -> Line {
         if !self.enter_raw() {
             // Not a terminal: fall back to whole lines from the kernel.
-            return read_cooked_line(prompt);
+            return match read_cooked_line(prompt) {
+                Some(line) => Line::Text(line),
+                None => Line::EndOfInput,
+            };
         }
 
         let mut buffer: Vec<char> = Vec::new();
@@ -69,27 +81,24 @@ impl Editor {
         emit(prompt);
         let result = loop {
             let Some(byte) = read_byte() else {
-                break if buffer.is_empty() { None } else { Some(collect(&buffer)) };
+                break if buffer.is_empty() { Line::EndOfInput } else { Line::Text(collect(&buffer)) };
             };
 
             match byte {
                 b'\r' | b'\n' => {
                     emit("\r\n");
-                    break Some(collect(&buffer));
+                    break Line::Text(collect(&buffer));
                 }
                 0x03 => {
-                    // Ctrl-C abandons the line and starts a fresh one.
+                    // Ctrl-C abandons the line, and with it anything the line
+                    // was continuing.
                     emit("^C\r\n");
-                    buffer.clear();
-                    cursor = 0;
-                    browsing = None;
-                    emit(prompt);
-                    continue;
+                    break Line::Interrupted;
                 }
                 0x04 => {
                     if buffer.is_empty() {
                         emit("\r\n");
-                        break None;
+                        break Line::EndOfInput;
                     }
                     if cursor < buffer.len() {
                         buffer.remove(cursor);

@@ -283,6 +283,9 @@ pub fn printf(args: &[String]) -> i32 {
     let mut next = 0usize;
     let mut i = 0;
 
+    // The format is used again from the start while operands are left, so
+    // `printf '%s\n' a b c` prints three lines.
+    loop {
     while i < chars.len() {
         if chars[i] == '\\' && i + 1 < chars.len() {
             out.push_str(&escape_char(&chars, &mut i));
@@ -369,6 +372,13 @@ pub fn printf(args: &[String]) -> i32 {
             Ok(width) => out.push_str(&format!("{:>1$}", rendered, width)),
             Err(_) => out.push_str(&rendered),
         }
+    }
+        // Another pass only if this one used an operand and some are left,
+        // which is also what stops a format with no conversions looping.
+        if next == 0 || next >= operands.len() {
+            break;
+        }
+        i = 0;
     }
 
     let stdout = std::io::stdout();

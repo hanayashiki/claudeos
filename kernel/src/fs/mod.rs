@@ -28,6 +28,9 @@ pub enum NodeKind {
     /// A file whose contents the kernel produces on each read.
     Generated(procfs::Generated),
     Fifo,
+    /// An entry in /proc/<pid>/fd. Opening it is opening that descriptor,
+    /// whatever it is attached to; reading the link gives the name it carries.
+    Fd(u32, i32),
 }
 
 pub struct NodeInner {
@@ -132,6 +135,7 @@ impl Node {
             NodeKind::Device(_) => DT_CHR,
             NodeKind::Generated(_) => DT_REG,
             NodeKind::Fifo => DT_FIFO,
+            NodeKind::Fd(..) => DT_LNK,
         }
     }
 
@@ -215,7 +219,7 @@ impl Node {
     }
 
     pub fn symlink_target(&self) -> Option<String> {
-        if self.kind != NodeKind::Symlink {
+        if self.kind != NodeKind::Symlink && !matches!(self.kind, NodeKind::Fd(..)) {
             return None;
         }
         String::from_utf8(self.inner.lock().data.clone()).ok()
@@ -294,12 +298,24 @@ fn lookup_inner(path: &str, follow_final: bool, depth: usize) -> Result<NodeRef,
             return Err(Errno::ENOTDIR);
         }
         procfs::refresh_dir(&node);
+        // "self" inside /proc is the calling process's own directory. Doing
+        // this here rather than in the syscalls means a symbolic link into
+        // /proc/self resolves too, which is what /dev/stdout is.
+        let own;
+        let mut key: &str = name;
+        if *name == "self" && procfs::is_proc_root(node.ino) {
+            own = alloc::format!("{}", crate::sched::current_pid());
+            key = &own;
+        }
         let child = {
             let inner = node.inner.lock();
-            inner.children.get(*name).cloned()
+            inner.children.get(key).cloned()
         };
         let child = child.ok_or(Errno::ENOENT)?;
 
+        // A descriptor entry is followed to the file it names only when that
+        // file has a name; opening it is handled where the descriptor can be
+        // reached, which path resolution cannot do.
         if child.kind == NodeKind::Symlink && (!is_final || follow_final) {
             let target = child.symlink_target().ok_or(Errno::EIO)?;
             // Resolve the link against the directory that contains it.

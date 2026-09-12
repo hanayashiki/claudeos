@@ -71,7 +71,7 @@ impl Command {
 }
 
 /// Read one address, or nothing when the script does not start with one.
-fn parse_address(chars: &[char], position: &mut usize) -> Option<Address> {
+fn parse_address(chars: &[char], position: &mut usize, extended: bool) -> Option<Address> {
     match chars.get(*position) {
         Some('$') => {
             *position += 1;
@@ -97,7 +97,7 @@ fn parse_address(chars: &[char], position: &mut usize) -> Option<Address> {
                 }
                 pattern.push(c);
             }
-            Some(Address::Match(Regex::new(&pattern, false)))
+            Some(Address::Match(Regex::new(&pattern, extended)))
         }
         Some(c) if c.is_ascii_digit() => {
             let mut number = 0usize;
@@ -139,7 +139,7 @@ fn parse_until(chars: &[char], position: &mut usize, delimiter: char) -> Option<
     None
 }
 
-fn parse_script(script: &str) -> Result<Vec<Command>, String> {
+fn parse_script(script: &str, extended: bool) -> Result<Vec<Command>, String> {
     let chars: Vec<char> = script.chars().collect();
     let mut position = 0;
     let mut commands = Vec::new();
@@ -158,11 +158,11 @@ fn parse_script(script: &str) -> Result<Vec<Command>, String> {
             continue;
         }
 
-        let start = parse_address(&chars, &mut position);
+        let start = parse_address(&chars, &mut position, extended);
         let mut end = None;
         if start.is_some() && chars.get(position) == Some(&',') {
             position += 1;
-            end = parse_address(&chars, &mut position);
+            end = parse_address(&chars, &mut position, extended);
         }
         let mut negated = false;
         while chars.get(position) == Some(&'!') {
@@ -205,7 +205,7 @@ fn parse_script(script: &str) -> Result<Vec<Command>, String> {
                     position += 1;
                 }
                 Action::Substitute {
-                    regex: Regex::new(&pattern, false),
+                    regex: Regex::new(&pattern, extended),
                     replacement,
                     global,
                     which: which.max(1),
@@ -244,9 +244,14 @@ fn parse_script(script: &str) -> Result<Vec<Command>, String> {
     }
 }
 
-/// Expand `&` and `\n` in a replacement. There are no capture groups, so a
-/// backreference to one is not accepted.
-fn expand(replacement: &str, matched: &str) -> String {
+/// Expand a replacement: `&` is the whole match and `\1` to `\9` are the
+/// groups the pattern captured.
+fn expand(
+    replacement: &str,
+    matched: &str,
+    text: &[char],
+    caps: &crate::regex::Captures,
+) -> String {
     let mut out = String::new();
     let mut chars = replacement.chars();
     while let Some(c) = chars.next() {
@@ -257,6 +262,12 @@ fn expand(replacement: &str, matched: &str) -> String {
                 Some('t') => out.push('\t'),
                 Some('&') => out.push('&'),
                 Some('\\') => out.push('\\'),
+                Some(digit) if digit.is_ascii_digit() => {
+                    let index = digit.to_digit(10).unwrap_or(0) as usize;
+                    if let Some(Some((start, end))) = caps.get(index) {
+                        out.extend(text[*start..*end].iter());
+                    }
+                }
                 Some(other) => out.push(other),
                 None => out.push('\\'),
             },
@@ -278,9 +289,10 @@ fn substitute(
     let mut cursor = 0usize;
     let mut seen = 0usize;
     let mut changed = false;
+    let mut caps = crate::regex::Captures::new();
 
     while cursor <= chars.len() {
-        let (start, end) = match regex.find(&chars, cursor) {
+        let (start, end) = match regex.find_captures(&chars, cursor, &mut caps) {
             Some(span) => span,
             None => break,
         };
@@ -289,7 +301,7 @@ fn substitute(
         out.extend(chars[cursor..start].iter());
         let matched: String = chars[start..end].iter().collect();
         if take {
-            out.push_str(&expand(replacement, &matched));
+            out.push_str(&expand(replacement, &matched, &chars, &caps));
             changed = true;
         } else {
             out.push_str(&matched);
@@ -316,6 +328,7 @@ fn substitute(
 pub fn main(args: &[String]) -> i32 {
     let mut quiet = false;
     let mut in_place = false;
+    let mut extended = false;
     let mut scripts: Vec<String> = Vec::new();
     let mut files: Vec<String> = Vec::new();
     // args[0] is the applet name, as it is for every applet here.
@@ -326,7 +339,7 @@ pub fn main(args: &[String]) -> i32 {
         match argument.as_str() {
             "-n" => quiet = true,
             "-i" => in_place = true,
-            "-r" | "-E" => {}
+            "-r" | "-E" => extended = true,
             "-e" => {
                 index += 1;
                 match args.get(index) {
@@ -343,7 +356,7 @@ pub fn main(args: &[String]) -> i32 {
                     match flag {
                         'n' => quiet = true,
                         'i' => in_place = true,
-                        'r' | 'E' => {}
+                        'r' | 'E' => extended = true,
                         other => {
                             eprintln!("sed: unknown option -{}", other);
                             return 2;
@@ -361,7 +374,7 @@ pub fn main(args: &[String]) -> i32 {
         eprintln!("usage: sed [-n] [-i] [-e script] script [file...]");
         return 2;
     }
-    let mut commands = match parse_script(&scripts.join("\n")) {
+    let mut commands = match parse_script(&scripts.join("\n"), extended) {
         Ok(commands) => commands,
         Err(message) => {
             eprintln!("sed: {}", message);

@@ -89,6 +89,51 @@ check "a brace as an argument"  "}"           "$(echo })"
 check "it still ends a command" "2"           "$(i=0; while [ $i -lt 2 ]; do i=$((i + 1)); done; echo $i)"
 
 echo
+echo "-- reading fields --"
+check "read splits"        "a|b c"     "$(printf 'a b c\n' | while read one rest; do echo "$one|$rest"; done)"
+check "read fills three"   "a-b-c"     "$(printf 'a b c\n' | while read x y z; do echo "$x-$y-$z"; done)"
+check "IFS chooses"        "a-b-c"     "$(printf 'a:b:c\n' | while IFS=: read p q r; do echo "$p-$q-$r"; done)"
+check "surrounding space"  "spaced"    "$(printf '   spaced   \n' | while read a; do echo "$a"; done)"
+check "missing fields"     "a--"       "$(printf 'a\n' | while read x y z; do echo "$x-$y-$z"; done)"
+
+echo
+echo "-- status and scope --"
+check "while reports the body" "0"     "$(printf 'x\n' | while read l; do true; done; echo $?)"
+check "while keeps a failure"  "1"     "$(printf 'x\n' | while read l; do false; done; echo $?)"
+check "for with no words"      "0"     "$(for i in; do echo x; done; echo $?)"
+check "quoted parameters"      "<p q> <r>" "$(set -- 'p q' r; for x in "$@"; do printf '<%s> ' "$x"; done | sed 's/ $//')"
+check "no parameters"          "none"  "$(set --; for x in "$@"; do echo item; done; echo none)"
+check "printf reuses"          "3"     "$(printf '%s\n' one two three | wc -l)"
+check "printf without one"     "1"     "$(printf 'plain\n' | wc -l)"
+check "local is local"         "outer" "$(f() { local V=inner; }; V=outer; f; echo $V)"
+check "local restores nothing"  ""     "$(f() { local V=inner; }; unset V; f; echo $V)"
+
+echo
+echo "-- unfinished input --"
+printf 'echo ran\nwhile true\ndo\n  echo body\n' > /tmp/unfinished.sh
+check "the prefix still runs" "ran"    "$(sh /tmp/unfinished.sh 2>/dev/null)"
+check "and it fails"          "2"      "$(sh /tmp/unfinished.sh >/dev/null 2>&1; echo $?)"
+check "and says so"           "1"      "$(sh /tmp/unfinished.sh 2>&1 >/dev/null | grep -c 'end of input')"
+rm -f /tmp/unfinished.sh
+
+echo
+echo "-- sed --"
+check "a group"            "42"        "$(echo 'id=42 end' | sed 's/.*id=\([0-9]*\) .*/\1/')"
+check "two groups"         "b-a"       "$(echo a-b | sed -E 's/(a)-(b)/\2-\1/')"
+check "extended plus"      "Xb"        "$(echo aab | sed -E 's/a+/X/')"
+check "extended alternation" "Zb"      "$(echo aab | sed -E 's/z|aa/Z/')"
+check "basic alternation"  "2"         "$(printf 'cat\ndog\nfox\n' | sed -n '/^\(cat\|dog\)$/p' | wc -l)"
+check "grep -o"            "2"         "$(printf 'foo123bar456\n' | grep -o '[0-9][0-9]*' | wc -l)"
+check "grep -o content"    "123"       "$(printf 'foo123bar456\n' | grep -o '[0-9][0-9]*' | head -n 1)"
+
+echo
+echo "-- signals and jobs --"
+check "kill 0 finds a job" "0"         "$(sleep 5 & p=$!; kill -0 $p; echo $?; kill $p)"
+check "kill 0 misses one"  "1"         "$(kill -0 999999 2>/dev/null; echo $?)"
+check "kill names no job"  "1"         "$(kill %9 2>/dev/null; echo $?)"
+check "no usage for a job" "0"         "$(kill %9 2>&1 | grep -c usage)"
+
+echo
 echo "-- grep patterns --"
 check "anchor start"   "1"  "$(seq 1 100 | grep -c '^42$')"
 check "anchor end"     "10" "$(seq 1 100 | grep -c '0$')"
@@ -249,7 +294,9 @@ RACE
 check "a fifo meets a fast writer" "20"  "$(sh /tmp/lk/race.sh)"
 check "descriptors are listed" "1"      "$(ls /proc/self/fd | grep -c '^0$')"
 check "a descriptor names its file" "/tmp/lk/a" "$(sh -c 'readlink /proc/self/fd/0' < /tmp/lk/a)"
-check "a pipe descriptor is one" "p"    "$(sh -c 'ls -l /proc/self/fd/1' | cut -c1)"
+check "a descriptor is a link" "l"      "$(sh -c 'ls -l /proc/self/fd/1' | cut -c1)"
+check "writing to /dev/stdout"  "out"   "$(sh -c 'echo out > /dev/stdout')"
+check "reading /dev/stdin"      "in"    "$(echo in | sh -c 'cat /dev/stdin')"
 check "every descriptor is listed" "4"  "$(sh -c 'ls /proc/self/fd' | wc -l)"
 check "dmesg has the boot log" "1"      "$(dmesg | grep -c 'claudeos: booting')"
 rm -rf /tmp/lk

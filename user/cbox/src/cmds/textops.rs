@@ -231,7 +231,12 @@ fn head_bytes(count: usize, paths: &[String]) -> i32 {
 }
 
 pub fn tail(args: &[String]) -> i32 {
-    let (count, operands) = count_argument(args, 10);
+    // -f keeps reading; take it out before the operands are worked out, or it
+    // looks like a file name.
+    let follow = args.iter().any(|a| a == "-f" || a == "-F");
+    let kept: Vec<String> =
+        args.iter().filter(|a| *a != "-f" && *a != "-F").cloned().collect();
+    let (count, operands) = count_argument(&kept, 10);
     let (inputs, status) = read_inputs("tail", &operands);
     let many = inputs.len() > 1;
     for (index, (name, text)) in inputs.iter().enumerate() {
@@ -247,13 +252,57 @@ pub fn tail(args: &[String]) -> i32 {
             println!("{}", line);
         }
     }
+    if follow {
+        return follow_files(&operands);
+    }
     status
+}
+
+/// `tail -f`: print what gets appended to each file, until interrupted.
+fn follow_files(paths: &[String]) -> i32 {
+    use std::io::Write;
+    if paths.is_empty() {
+        // Nothing to watch: standard input has already been read to the end.
+        return 0;
+    }
+    let mut sizes: Vec<u64> = paths
+        .iter()
+        .map(|path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+        .collect();
+    loop {
+        let mut moved = false;
+        for (index, path) in paths.iter().enumerate() {
+            let size = match std::fs::metadata(path) {
+                Ok(metadata) => metadata.len(),
+                Err(_) => continue,
+            };
+            if size < sizes[index] {
+                // Truncated: start again from the beginning.
+                sizes[index] = 0;
+            }
+            if size == sizes[index] {
+                continue;
+            }
+            if let Ok(text) = std::fs::read(path) {
+                let from = sizes[index] as usize;
+                if from < text.len() {
+                    let _ = std::io::stdout().write_all(&text[from..]);
+                    let _ = std::io::stdout().flush();
+                }
+            }
+            sizes[index] = size;
+            moved = true;
+        }
+        if !moved {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
 }
 
 pub fn grep(args: &[String]) -> i32 {
     let (flags, operands) = split_flags(args);
     if operands.is_empty() {
-        eprintln!("usage: grep [-cEFilnqrv] pattern [file...]");
+        eprintln!("usage: grep [-cEFilnoqrvw] pattern [file...]");
         return 2;
     }
     let pattern = &operands[0];
@@ -263,6 +312,7 @@ pub fn grep(args: &[String]) -> i32 {
     let count_only = flags.contains('c');
     let quiet = flags.contains('q');
     let names_only = flags.contains('l');
+    let only_matching = flags.contains('o');
     let recursive = flags.contains('r') || flags.contains('R');
 
     // -r turns each directory operand into the files beneath it.
@@ -303,6 +353,28 @@ pub fn grep(args: &[String]) -> i32 {
                 break;
             }
             let prefix = if show_names { format!("{}:", name) } else { String::new() };
+            // -o prints what matched rather than the line it was found on,
+            // once per match.
+            if only_matching {
+                let chars: Vec<char> = haystack.chars().collect();
+                let original: Vec<char> = line.chars().collect();
+                let mut at = 0usize;
+                while let Some((start, end)) = matcher.find(&chars, at) {
+                    if end > start {
+                        let piece: String = original[start..end.min(original.len())].iter().collect();
+                        if number {
+                            println!("{}{}:{}", prefix, index + 1, piece);
+                        } else {
+                            println!("{}{}", prefix, piece);
+                        }
+                    }
+                    at = if end > start { end } else { start + 1 };
+                    if at > chars.len() {
+                        break;
+                    }
+                }
+                continue;
+            }
             if number {
                 println!("{}{}:{}", prefix, index + 1, line);
             } else {

@@ -58,6 +58,7 @@ fn page_fault(frame: &mut TrapFrame) {
             if code & 2 != 0 { " write" } else { " read" },
             if code & 16 != 0 { " instruction-fetch" } else { "" },
         );
+        dump(frame);
         crate::sched::kill_current(11); // SIGSEGV
     }
 

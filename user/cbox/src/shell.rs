@@ -4,7 +4,7 @@
 //! arithmetic substitution, `if`/`while`/`until`/`for`, functions, and
 //! positional parameters.
 
-use crate::edit::{Completer, Editor};
+use crate::edit::{Completer, Editor, Line};
 use crate::sys;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -125,7 +125,11 @@ enum LexError {
     Unterminated,
 }
 
-fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
+/// Split `input` into tokens, returning what was read alongside the first
+/// thing that could not be finished. At a prompt an unfinished construct means
+/// "read another line"; at the end of a file it is an error, and the commands
+/// that were complete still run.
+fn tokenize(input: &str) -> (Vec<Token>, Option<LexError>) {
     let chars: Vec<char> = input.chars().collect();
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -177,7 +181,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     i += 1;
                 }
                 if i >= chars.len() {
-                    return Err(LexError::Unterminated);
+                    return (tokens, Some(LexError::Unterminated));
                 }
                 i += 1;
             }
@@ -212,7 +216,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                             j += 1;
                         }
                         if j >= chars.len() {
-                            return Err(LexError::Unterminated);
+                            return (tokens, Some(LexError::Unterminated));
                         }
                         current.extend(chars[i..=j].iter());
                         i = j + 1;
@@ -222,7 +226,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     i += 1;
                 }
                 if i >= chars.len() {
-                    return Err(LexError::Unterminated);
+                    return (tokens, Some(LexError::Unterminated));
                 }
                 i += 1;
             }
@@ -244,7 +248,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     j += 1;
                 }
                 if j >= chars.len() {
-                    return Err(LexError::Unterminated);
+                    return (tokens, Some(LexError::Unterminated));
                 }
                 current.extend(chars[i..=j].iter());
                 i = j + 1;
@@ -256,7 +260,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     j += 1;
                 }
                 if j >= chars.len() {
-                    return Err(LexError::Unterminated);
+                    return (tokens, Some(LexError::Unterminated));
                 }
                 current.extend(chars[i..=j].iter());
                 i = j + 1;
@@ -366,7 +370,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 }
                 if line_end >= chars.len() {
                     // The body has not been typed yet.
-                    return Err(LexError::Unterminated);
+                    return (tokens, Some(LexError::Unterminated));
                 }
 
                 let mut body = String::new();
@@ -393,7 +397,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     cursor = end + 1;
                 }
                 if !closed {
-                    return Err(LexError::Unterminated);
+                    // The delimiter never arrived. What was written is the
+                    // body; the caller decides whether that is an error.
+                    tokens.push(Token::HereDoc(body, quoted_delimiter));
+                    return (tokens, Some(LexError::Unterminated));
                 }
 
                 tokens.push(Token::HereDoc(body, quoted_delimiter));
@@ -420,7 +427,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     }
     flush!();
     let _ = (have_word, saw_single, saw_other);
-    Ok(tokens)
+    (tokens, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -979,9 +986,11 @@ fn parse(tokens: &[Token]) -> (Vec<Node>, Option<ParseError>) {
                 }
                 nodes.push(node);
             }
-            // An unfinished construct means "read another line", so nothing
-            // runs: the same text is parsed again once the rest arrives.
-            Err(ParseError::Incomplete) => return (Vec::new(), Some(ParseError::Incomplete)),
+            // An unfinished construct means "read another line" at a prompt,
+            // where the caller discards these and parses the whole text again
+            // once the rest arrives. Reading a file, there is no rest, and
+            // what came before the construct still runs.
+            Err(ParseError::Incomplete) => return (nodes, Some(ParseError::Incomplete)),
             Err(error) => return (nodes, Some(error)),
         }
     }
@@ -999,6 +1008,9 @@ enum Flow {
     Continue,
     Return,
     Exit,
+    /// The foreground job was suspended. Whatever was going to run after it
+    /// does not: the user is back at the prompt.
+    Stopped,
 }
 
 /// One pipeline the shell is keeping track of: either running in the
@@ -1047,6 +1059,9 @@ pub struct Shell {
     exit_trap: Option<String>,
     /// Set when expanding a word failed, so the command is not run.
     expansion_failed: bool,
+    /// One frame per function call in progress, holding what each name
+    /// declared `local` meant before the call.
+    locals: Vec<Vec<(String, Option<String>)>>,
 }
 
 impl Shell {
@@ -1079,6 +1094,7 @@ impl Shell {
             condition_depth: 0,
             exit_trap: None,
             expansion_failed: false,
+            locals: Vec::new(),
         }
     }
 
@@ -1103,6 +1119,7 @@ impl Shell {
             condition_depth: 0,
             exit_trap: None,
             expansion_failed: false,
+            locals: Vec::new(),
         }
     }
 
@@ -1161,12 +1178,28 @@ impl Shell {
                 None => {
                     print!("{}", prompt);
                     let _ = std::io::stdout().flush();
-                    read_line()
+                    match read_line() {
+                        Some(line) => Line::Text(line),
+                        None => Line::EndOfInput,
+                    }
                 }
             };
             let line = match line {
-                Some(line) => line,
-                None => {
+                Line::Text(line) => line,
+                Line::Interrupted => {
+                    // Whatever was half-typed goes with the line, including a
+                    // construct that had not been closed yet.
+                    pending.clear();
+                    self.last_status = 130;
+                    continue;
+                }
+                Line::EndOfInput => {
+                    if !pending.is_empty() {
+                        eprintln!("sh: unexpected end of input");
+                        pending.clear();
+                        self.last_status = 2;
+                        continue;
+                    }
                     println!();
                     return self.last_status;
                 }
@@ -1179,7 +1212,7 @@ impl Shell {
             pending.push_str(&line);
             pending.push('\n');
 
-            match self.try_run(&pending) {
+            match self.try_run(&pending, true) {
                 Ok(()) => pending.clear(),
                 Err(true) => {} // incomplete: keep reading
                 Err(false) => pending.clear(),
@@ -1216,34 +1249,55 @@ impl Shell {
     }
 
     pub fn run_text(&mut self, text: &str) {
-        let _ = self.try_run(text);
+        let _ = self.try_run(text, false);
     }
 
+    /// Run `text`. `more_possible` says another line could still arrive, which
+    /// is true at a prompt and false for a file that has been read to the end:
+    /// there, an unclosed construct is an error rather than a reason to wait.
+    ///
     /// Returns Err(true) when the input is incomplete.
-    fn try_run(&mut self, text: &str) -> Result<(), bool> {
-        let tokens = match tokenize(text) {
-            Ok(tokens) => tokens,
-            Err(LexError::Unterminated) => return Err(true),
-        };
+    fn try_run(&mut self, text: &str, more_possible: bool) -> Result<(), bool> {
+        let (tokens, lex_error) = tokenize(text);
+        if lex_error.is_some() && more_possible {
+            return Err(true);
+        }
         if tokens.iter().all(|t| matches!(t, Token::Newline)) {
             return Ok(());
         }
         let (nodes, error) = parse(&tokens);
-        if matches!(error, Some(ParseError::Incomplete)) {
+        if matches!(error, Some(ParseError::Incomplete)) && more_possible {
             return Err(true);
         }
         self.exec_block(&nodes);
-        if let Some(ParseError::Message { line, text }) = error {
-            let origin = if self.script_name == "sh" {
-                String::new()
-            } else {
-                format!("{}: ", self.script_name)
-            };
-            eprintln!("sh: {}line {}: syntax error: {}", origin, line, text);
+        if lex_error.is_some() {
+            eprintln!("{}: syntax error: unexpected end of input", self.origin());
             self.last_status = 2;
             return Err(false);
         }
-        Ok(())
+        match error {
+            Some(ParseError::Message { line, text }) => {
+                eprintln!("{}: line {}: syntax error: {}", self.origin(), line, text);
+                self.last_status = 2;
+                Err(false)
+            }
+            Some(ParseError::Incomplete) => {
+                eprintln!("{}: syntax error: unexpected end of input", self.origin());
+                self.last_status = 2;
+                Err(false)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// How the shell names itself in a diagnostic: the script it is running,
+    /// or just "sh" when it is reading from a terminal.
+    fn origin(&self) -> String {
+        if self.script_name == "sh" {
+            "sh".to_string()
+        } else {
+            format!("sh: {}", self.script_name)
+        }
     }
 
     fn exec_block(&mut self, nodes: &[Node]) -> Flow {
@@ -1280,6 +1334,9 @@ impl Shell {
             }
             Node::Loop { condition, body, until } => {
                 let mut guard = 0u64;
+                // A loop reports what its body last reported, not what the
+                // condition said when it decided to stop.
+                let mut body_status = 0;
                 loop {
                     guard += 1;
                     if guard > 10_000_000 {
@@ -1294,6 +1351,7 @@ impl Shell {
                     }
                     let satisfied = if *until { self.last_status != 0 } else { self.last_status == 0 };
                     if !satisfied {
+                        self.last_status = body_status;
                         return Flow::Normal;
                     }
                     match self.exec_block(body) {
@@ -1301,6 +1359,7 @@ impl Shell {
                         Flow::Continue | Flow::Normal => {}
                         other => return other,
                     }
+                    body_status = self.last_status;
                 }
             }
             Node::For { variable, words, body } => {
@@ -1308,10 +1367,11 @@ impl Shell {
                 for (word, quoting) in words {
                     match quoting {
                         Quoting::Single => items.push(word.clone()),
-                        Quoting::Double => items.push(self.expand_text(word)),
+                        Quoting::Double => items.extend(self.expand_double(word)),
                         Quoting::Bare => items.extend(self.expand_word_bare(word)),
                     }
                 }
+                let ran = !items.is_empty();
                 for item in items {
                     self.env.insert(variable.clone(), item);
                     match self.exec_block(body) {
@@ -1319,6 +1379,9 @@ impl Shell {
                         Flow::Continue | Flow::Normal => {}
                         other => return other,
                     }
+                }
+                if !ran {
+                    self.last_status = 0;
                 }
                 Flow::Normal
             }
@@ -1531,7 +1594,18 @@ impl Shell {
 
         let description: Vec<String> = commands
             .iter()
-            .map(|c| c.words.iter().map(|(w, _)| w.clone()).collect::<Vec<_>>().join(" "))
+            .map(|c| {
+                let words = c.words.iter().map(|(w, _)| w.clone()).collect::<Vec<_>>().join(" ");
+                if !words.is_empty() {
+                    return words;
+                }
+                // A group has no words of its own; name it by its shape.
+                match (&c.group, c.subshell) {
+                    (Some(_), true) => "( ... )".to_string(),
+                    (Some(_), false) => "{ ... }".to_string(),
+                    _ => String::new(),
+                }
+            })
             .collect();
         let description = description.join(" | ");
 
@@ -1559,7 +1633,7 @@ impl Shell {
         }
 
         let pgid = if leader == 0 { *pids.last().unwrap_or(&0) } else { leader };
-        let status = self.await_foreground(pgid, &pids, &description);
+        let (status, stopped) = self.await_foreground(pgid, &pids, &description);
         self.last_status = if pipeline.negated {
             if status == 0 {
                 1
@@ -1569,13 +1643,16 @@ impl Shell {
         } else {
             status
         };
+        if stopped {
+            return Flow::Stopped;
+        }
         Flow::Normal
     }
 
     /// Wait for a foreground pipeline and return its exit status. A pipeline
     /// that stopped instead of exiting is kept as a job; either way the shell
     /// takes the terminal back before returning.
-    fn await_foreground(&mut self, pgid: i32, pids: &[i32], description: &str) -> i32 {
+    fn await_foreground(&mut self, pgid: i32, pids: &[i32], description: &str) -> (i32, bool) {
         let mut status = 0;
         let mut interrupted = false;
         let mut stopped = false;
@@ -1611,7 +1688,7 @@ impl Shell {
         } else if interrupted {
             println!();
         }
-        status
+        (status, stopped)
     }
 
     /// Resolve `%1`, `%+`, `%-`, a bare number or a pid to a job. With no
@@ -1659,7 +1736,8 @@ impl Shell {
                 sys::give_terminal_to(job.pgid);
             }
             sys::kill(-job.pgid, sys::SIGCONT);
-            return self.await_foreground(job.pgid, &job.pids, &job.command);
+            let (status, _) = self.await_foreground(job.pgid, &job.pids, &job.command);
+            return status;
         }
         sys::kill(-job.pgid, sys::SIGCONT);
         eprintln!("[{}]+ {} &", job.id, job.command);
@@ -1707,7 +1785,18 @@ impl Shell {
             self.exec_block(&group)
         } else if let Some(body) = self.functions.get(&argv[0]).cloned() {
             let saved_params = std::mem::replace(&mut self.positional, argv[1..].to_vec());
+            self.locals.push(Vec::new());
             let flow = self.exec_block(&body);
+            for (name, previous) in self.locals.pop().unwrap_or_default().into_iter().rev() {
+                match previous {
+                    Some(value) => {
+                        self.env.insert(name, value);
+                    }
+                    None => {
+                        self.env.remove(&name);
+                    }
+                }
+            }
             self.positional = saved_params;
             match flow {
                 Flow::Return => Flow::Normal,
@@ -1816,10 +1905,23 @@ impl Shell {
             }
             // A local is a plain variable here; there is no function scope.
             "local" => {
+                if self.locals.is_empty() {
+                    eprintln!("sh: local: only meaningful in a function");
+                    return Flow::Normal;
+                }
                 for assignment in &argv[1..] {
-                    if let Some((key, value)) = assignment.split_once('=') {
-                        self.env.insert(key.to_string(), value.to_string());
+                    let (name, value) = match assignment.split_once('=') {
+                        Some((name, value)) => (name.to_string(), value.to_string()),
+                        None => (assignment.clone(), String::new()),
+                    };
+                    // Remember what the name meant outside, so the function
+                    // can put it back on the way out.
+                    if let Some(frame) = self.locals.last_mut() {
+                        if !frame.iter().any(|(seen, _)| *seen == name) {
+                            frame.push((name.clone(), self.env.get(&name).cloned()));
+                        }
                     }
+                    self.env.insert(name, value);
                 }
                 0
             }
@@ -1930,6 +2032,9 @@ impl Shell {
             "kill" => {
                 let mut signal = 15;
                 let mut targets = Vec::new();
+                // Set once an argument named something, so a name that did not
+                // resolve is not reported as a missing argument.
+                let mut named = false;
                 for argument in &argv[1..] {
                     if let Some(rest) = argument.strip_prefix('-') {
                         if let Ok(number) = rest.parse::<i32>() {
@@ -1952,7 +2057,10 @@ impl Shell {
                     if argument.starts_with('%') {
                         match self.find_job(Some(argument)) {
                             Some(index) => targets.push(-self.jobs[index].pgid),
-                            None => eprintln!("kill: {}: no such job", argument),
+                            None => {
+                                eprintln!("sh: kill: {}: no such job", argument);
+                                named = true;
+                            }
                         }
                         continue;
                     }
@@ -1962,8 +2070,10 @@ impl Shell {
                     }
                 }
                 if targets.is_empty() {
-                    eprintln!("usage: kill [-SIGNAL] pid...");
-                    2
+                    if !named {
+                        eprintln!("usage: kill [-SIGNAL] pid...");
+                    }
+                    1
                 } else {
                     let mut status = 0;
                     for pid in targets {
@@ -1976,10 +2086,23 @@ impl Shell {
                 }
             }
             "read" => {
-                let name = argv.get(1).cloned().unwrap_or_else(|| "REPLY".into());
+                // -r is the only option that matters here, and nothing in
+                // this read treats a backslash specially anyway.
+                let names: Vec<String> =
+                    argv[1..].iter().filter(|a| !a.starts_with('-')).cloned().collect();
+                let names = if names.is_empty() { vec!["REPLY".to_string()] } else { names };
                 match read_line() {
                     Some(line) => {
-                        self.env.insert(name, line);
+                        let ifs = self
+                            .env
+                            .get("IFS")
+                            .cloned()
+                            .unwrap_or_else(|| " \t\n".to_string());
+                        let fields = split_fields(&line, &ifs, names.len());
+                        for (index, name) in names.iter().enumerate() {
+                            let value = fields.get(index).cloned().unwrap_or_default();
+                            self.env.insert(name.clone(), value);
+                        }
                         0
                     }
                     None => 1,
@@ -2188,14 +2311,9 @@ impl Shell {
             match quoting {
                 Quoting::Single => out.words.push((word.clone(), Quoting::Single)),
                 Quoting::Double => {
-                    // "$@" becomes one word per parameter.
-                    if word == "$@" {
-                        for parameter in &self.positional {
-                            out.words.push((parameter.clone(), Quoting::Double));
-                        }
-                        continue;
+                    for expanded in self.expand_double(word) {
+                        out.words.push((expanded, Quoting::Double));
                     }
-                    out.words.push((self.expand_text(word), Quoting::Double));
                 }
                 Quoting::Bare => {
                     for expanded in self.expand_word_bare(word) {
@@ -2205,6 +2323,16 @@ impl Shell {
             }
         }
         out
+    }
+
+    /// Expand a double-quoted word. It yields one word, except for `"$@"`,
+    /// which yields one per positional parameter and none at all when there
+    /// are none.
+    fn expand_double(&mut self, word: &str) -> Vec<String> {
+        if word == "$@" {
+            return self.positional.clone();
+        }
+        vec![self.expand_text(word)]
     }
 
     /// Expand a word in one pass.
@@ -2512,6 +2640,47 @@ const BUILTINS: &[&str] = &[
     "source", "help", "history", ":", "local", "wait", "command", "exec", "trap", "shift",
     "fg", "bg",
 ];
+
+/// Split `line` into at most `max` fields on the characters in `ifs`.
+///
+/// Whitespace in IFS runs together and is trimmed from both ends; any other
+/// character in it separates one field from the next on its own. The last
+/// field takes whatever is left, which is what makes `read name rest` work.
+fn split_fields(line: &str, ifs: &str, max: usize) -> Vec<String> {
+    let spaces: Vec<char> = ifs.chars().filter(|c| c.is_whitespace()).collect();
+    let marks: Vec<char> = ifs.chars().filter(|c| !c.is_whitespace()).collect();
+    let is_space = |c: char| spaces.contains(&c);
+    let is_mark = |c: char| marks.contains(&c);
+
+    let chars: Vec<char> = line.chars().collect();
+    let mut fields: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() && is_space(chars[i]) {
+        i += 1;
+    }
+    while i < chars.len() {
+        if fields.len() + 1 == max {
+            let rest: String = chars[i..].iter().collect();
+            fields.push(rest.trim_end_matches(|c: char| is_space(c)).to_string());
+            return fields;
+        }
+        let start = i;
+        while i < chars.len() && !is_space(chars[i]) && !is_mark(chars[i]) {
+            i += 1;
+        }
+        fields.push(chars[start..i].iter().collect());
+        while i < chars.len() && is_space(chars[i]) {
+            i += 1;
+        }
+        if i < chars.len() && is_mark(chars[i]) {
+            i += 1;
+            while i < chars.len() && is_space(chars[i]) {
+                i += 1;
+            }
+        }
+    }
+    fields
+}
 
 fn is_builtin(name: &str) -> bool {
     BUILTINS.contains(&name) || is_assignment(name)

@@ -68,7 +68,7 @@ fn procfs_override_for(path: &str, for_link: bool) -> Option<String> {
         if let Some(number) = entry.strip_prefix("fd/") {
             if let Ok(fd) = number.parse::<i32>() {
                 if let Ok(file) = task.fds.get(fd) {
-                    if for_link || matches!(file.backing, FileBacking::Node(_)) {
+                    if for_link {
                         return Some(file.path.clone());
                     }
                 }
@@ -197,6 +197,19 @@ pub fn openat(dirfd: i64, path_addr: u64, flags: u32, mode: u32) -> SysResult {
         }
         Err(err) => return Err(err),
     };
+
+    // An entry in /proc/<pid>/fd is that descriptor. Opening it hands back
+    // another handle on the same open file, which is what makes a redirection
+    // to /dev/stdout reach the terminal or the pipe stdout is attached to.
+    if let fs::NodeKind::Fd(owner, fd) = node.kind {
+        if owner == sched::current().pid {
+            let file = sched::current().fds.get(fd)?;
+            let cloexec = flags & O_CLOEXEC != 0;
+            let new = sched::current().fds.alloc(file, cloexec)?;
+            return Ok(new as u64);
+        }
+        return Err(Errno::EACCES);
+    }
 
     if flags & O_DIRECTORY != 0 && !node.is_dir() {
         return Err(Errno::ENOTDIR);

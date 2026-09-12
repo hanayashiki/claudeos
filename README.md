@@ -180,6 +180,10 @@ A syntax error names the script, the line and the text that was found, and the
 commands before it still run, the way a shell that reads command by command
 behaves.
 
+`read` splits a line into as many fields as it is given names for, honouring
+IFS, and a reserved word is reserved only where a command can start, so `echo
+done` prints "done".
+
 At the prompt it puts the terminal in raw mode and edits the line itself:
 arrow-key history, left/right cursor movement, Home/End/Delete,
 Ctrl-A/E/B/F/K/U/W/L, a `history` builtin, and tab completion of command names
@@ -193,15 +197,16 @@ kill sleep clear hexdump basename dirname yes true false`.
 
 `grep` and `sed` share a backtracking regex engine written for them: anchors,
 `.`, character classes and `*`, with `-E` adding alternation, groups, `+` and
-`?`. `sed` takes line, `$`, regex and range addresses, `!`, and the `s`, `y`,
-`p`, `d`, `q` and `=` commands, with `-n`, `-e` and `-i`.
+`?`. `sed` takes line, `$`, regex and range addresses, `!`, and the `s`, `y`, `p`,
+`d`, `q` and `=` commands, with `-n`, `-e`, `-E` and `-i`. A group's text can be
+put back with `\1`, and `grep -o` prints what matched rather than the line.
 
 ## Tests
 
 `make test` boots the OS once per suite and requires each to report zero
 failures.
 
-- `tests/suite.sh` runs **219 checks** inside the OS, driving the shell through
+- `tests/suite.sh` runs **249 checks** inside the OS, driving the shell through
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
   subprocesses and `/proc`.

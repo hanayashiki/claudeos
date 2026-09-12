@@ -21,7 +21,17 @@ pub enum Generated {
     PidMaps(u32),
 }
 
+/// The inode of /proc itself, so a lookup can tell when it is there.
+static PROC_ROOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn is_proc_root(ino: u64) -> bool {
+    ino != 0 && PROC_ROOT.load(core::sync::atomic::Ordering::Relaxed) == ino
+}
+
 pub fn populate() {
+    if let Ok(root) = mkdir_p("/proc") {
+        PROC_ROOT.store(root.ino, core::sync::atomic::Ordering::Relaxed);
+    }
     let _ = mkdir_p("/proc");
     let entries = [
         ("/proc/meminfo", Generated::MemInfo),
@@ -62,16 +72,17 @@ pub fn refresh_dir(node: &crate::fs::NodeRef) {
             Some(file) => file,
             None => continue,
         };
-        // A descriptor on a file is a symbolic link to it, which is what
-        // readlink reports and what following the link has to reach. A pipe
-        // has no name to point at, so the entry is a pipe of its own: stat
-        // sees the right type instead of a link to nothing.
-        let entry = match &file.backing {
-            crate::fs::FileBacking::Node(_) if !file.path.is_empty() => {
-                Node::new_symlink(&file.path)
-            }
-            _ => Node::new(NodeKind::Fifo, crate::abi::S_IFIFO | 0o600),
+        // The entry stands for the descriptor itself: opening it opens that
+        // descriptor rather than reopening whatever it is attached to, which
+        // is what makes /dev/stdout work when stdout is a pipe. Reading the
+        // link gives the file's name, or the label a pipe carries instead.
+        let entry = Node::new(NodeKind::Fd(pid, fd as i32), crate::abi::S_IFLNK | 0o777);
+        let target = if file.path.is_empty() {
+            format!("anon_inode:[{}]", fd)
+        } else {
+            file.path.clone()
         };
+        entry.inner.lock().data = target.into_bytes();
         children.insert(format!("{}", fd), entry);
     }
     node.inner.lock().children = children;

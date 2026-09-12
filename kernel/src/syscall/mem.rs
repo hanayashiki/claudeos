@@ -146,8 +146,17 @@ pub fn mprotect(addr: u64, length: u64, prot: u64) -> SysResult {
     let mut page = start;
     while page < end {
         // Only pages that exist are retagged; the rest inherit the new
-        // protection when they fault in.
-        task.space.set_flags(page, bits);
+        // protection when they fault in. A page still shared after a fork
+        // keeps its copy-on-write mark and stays read-only whatever is asked
+        // for: the copy happens when it is written to, as before.
+        if let Some(existing) = task.space.flags_of(page) {
+            let bits = if existing & crate::mm::paging::COW != 0 {
+                (bits & !WRITABLE) | crate::mm::paging::COW
+            } else {
+                bits
+            };
+            task.space.set_flags(page, bits);
+        }
         page += PAGE_SIZE_U64;
     }
 

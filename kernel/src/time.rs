@@ -147,6 +147,10 @@ pub fn unix_time() -> i64 {
     realtime_parts().0
 }
 
+pub fn ticks_to_ns(ticks: u64) -> u64 {
+    ticks * (1_000_000_000 / TICK_HZ as u64)
+}
+
 /// Convert nanoseconds to a whole number of timer ticks, rounding up.
 pub fn ns_to_ticks(ns: u64) -> u64 {
     let per_tick = 1_000_000_000u64 / TICK_HZ as u64;

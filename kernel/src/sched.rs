@@ -61,6 +61,15 @@ pub fn find(pid: u32) -> Option<&'static mut Task> {
     tasks.iter().find(|t| t.get().pid == pid).map(|t| t.get())
 }
 
+/// The running task's pid, or zero before there is one.
+pub fn current_pid() -> u32 {
+    if has_current() {
+        current().pid
+    } else {
+        0
+    }
+}
+
 pub fn task_count() -> usize {
     TASKS.lock().len()
 }
@@ -460,6 +469,29 @@ pub fn stop_for_signal(signal: i32) {
     if task.signal_actions[SIGCONT as usize].handler == crate::signal::SIG_DFL {
         task.pending_signals &= !(1u64 << (SIGCONT as u64 & 63));
     }
+}
+
+/// Take a pending job-control stop here, if there is one. Returns true once
+/// the task has been continued, so the caller can carry on where it was.
+///
+/// A syscall that is waiting for time to pass calls this rather than failing:
+/// being suspended is not an error, and the operation still has the rest of
+/// its wait to do afterwards.
+pub fn stop_if_requested() -> bool {
+    let task = current();
+    for signal in [SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU] {
+        if task.pending_signals & (1u64 << (signal as u64 & 63)) == 0 {
+            continue;
+        }
+        if signal != SIGSTOP
+            && task.signal_actions[signal as usize].handler != crate::signal::SIG_DFL
+        {
+            continue;
+        }
+        stop_for_signal(signal);
+        return true;
+    }
+    false
 }
 
 /// Mark every task in the foreground group as having a pending signal.
