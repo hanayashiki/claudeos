@@ -21,24 +21,114 @@ pub const VECTOR_SYSCALL: u64 = 0x100;
 /// pointer, and the address to carry on at.
 const SWITCH_FRAME_WORDS: u64 = 12;
 
-/// Register state a task owns that the trap frame on its kernel stack does not
-/// hold. On this architecture that is the thread pointer, which is a register
-/// a program writes for itself and the kernel only has to carry from one task
-/// to the next.
+/// The thirty-two vector registers and the two words that control them.
 ///
-/// The floating point and vector registers are not here yet: this kernel is
-/// built with no access to them, so nothing it runs disturbs them, but two
-/// user tasks sharing a core would still see each other's. That is the one
-/// thing this type still owes.
+/// The kernel is built without access to these, so everything in them between
+/// a trap and the next context switch still belongs to the task that was
+/// interrupted. Nothing else preserves them, and compiled user code reaches
+/// for them constantly: the string and memory routines in a C library are
+/// written in terms of them. A task preempted in the middle of one would come
+/// back holding whatever the task that ran in between had left there, and
+/// store that to memory. It shows up as a program quietly producing the wrong
+/// bytes rather than as a crash.
+///
+/// The instructions that reach these registers cannot be written in Rust here,
+/// only in assembly, and the assembler is told about them one block at a time.
+/// Nothing is declared clobbered because the compiler never puts anything of
+/// its own in them.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub struct FpuState {
+    registers: [u128; 32],
+    control: u64,
+    status: u64,
+}
+
+impl FpuState {
+    const fn zeroed() -> FpuState {
+        FpuState { registers: [0; 32], control: 0, status: 0 }
+    }
+
+    #[inline]
+    fn save(&mut self) {
+        let at = self.registers.as_mut_ptr();
+        unsafe {
+            asm!(
+                ".arch_extension fp",
+                "stp q0,  q1,  [{at}, #16 * 0]",
+                "stp q2,  q3,  [{at}, #16 * 2]",
+                "stp q4,  q5,  [{at}, #16 * 4]",
+                "stp q6,  q7,  [{at}, #16 * 6]",
+                "stp q8,  q9,  [{at}, #16 * 8]",
+                "stp q10, q11, [{at}, #16 * 10]",
+                "stp q12, q13, [{at}, #16 * 12]",
+                "stp q14, q15, [{at}, #16 * 14]",
+                "stp q16, q17, [{at}, #16 * 16]",
+                "stp q18, q19, [{at}, #16 * 18]",
+                "stp q20, q21, [{at}, #16 * 20]",
+                "stp q22, q23, [{at}, #16 * 22]",
+                "stp q24, q25, [{at}, #16 * 24]",
+                "stp q26, q27, [{at}, #16 * 26]",
+                "stp q28, q29, [{at}, #16 * 28]",
+                "stp q30, q31, [{at}, #16 * 30]",
+                "mrs {control}, fpcr",
+                "mrs {status}, fpsr",
+                at = in(reg) at,
+                control = out(reg) self.control,
+                status = out(reg) self.status,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[inline]
+    fn restore(&self) {
+        let at = self.registers.as_ptr();
+        unsafe {
+            asm!(
+                ".arch_extension fp",
+                "msr fpcr, {control}",
+                "msr fpsr, {status}",
+                "ldp q0,  q1,  [{at}, #16 * 0]",
+                "ldp q2,  q3,  [{at}, #16 * 2]",
+                "ldp q4,  q5,  [{at}, #16 * 4]",
+                "ldp q6,  q7,  [{at}, #16 * 6]",
+                "ldp q8,  q9,  [{at}, #16 * 8]",
+                "ldp q10, q11, [{at}, #16 * 10]",
+                "ldp q12, q13, [{at}, #16 * 12]",
+                "ldp q14, q15, [{at}, #16 * 14]",
+                "ldp q16, q17, [{at}, #16 * 16]",
+                "ldp q18, q19, [{at}, #16 * 18]",
+                "ldp q20, q21, [{at}, #16 * 20]",
+                "ldp q22, q23, [{at}, #16 * 22]",
+                "ldp q24, q25, [{at}, #16 * 24]",
+                "ldp q26, q27, [{at}, #16 * 26]",
+                "ldp q28, q29, [{at}, #16 * 28]",
+                "ldp q30, q31, [{at}, #16 * 30]",
+                at = in(reg) at,
+                control = in(reg) self.control,
+                status = in(reg) self.status,
+                options(nostack, readonly, preserves_flags),
+            );
+        }
+    }
+}
+
+/// Register state a task owns that the trap frame on its kernel stack does not
+/// hold: the thread pointer, which a program writes for itself and the kernel
+/// only has to carry from one task to the next, and the vector registers.
+/// Carried from task to task by hand at every context switch, because nothing
+/// in the hardware does it.
 #[derive(Clone, Copy)]
 pub struct TaskContext {
     thread_pointer: u64,
+    fpu: FpuState,
 }
 
 impl TaskContext {
     /// What a task that has never run holds.
     pub fn new() -> TaskContext {
-        TaskContext { thread_pointer: 0 }
+        TaskContext { thread_pointer: 0, fpu: FpuState::zeroed() }
     }
 
     /// Copy the state out of the CPU into this record. The caller must be the
@@ -46,11 +136,13 @@ impl TaskContext {
     /// parent's state this way to give to the child.
     pub fn save(&mut self) {
         unsafe { asm!("mrs {}, tpidr_el0", out(reg) self.thread_pointer) };
+        self.fpu.save();
     }
 
     /// Install this record on the CPU.
     pub fn restore(&self) {
         unsafe { asm!("msr tpidr_el0, {}", in(reg) self.thread_pointer) };
+        self.fpu.restore();
     }
 
     /// Point the saved thread pointer at `value` without touching the CPU.
@@ -60,9 +152,11 @@ impl TaskContext {
     }
 
     /// Put the state back to what a freshly loaded program expects and install
-    /// it, which is what exec owes the new image.
+    /// it, which is what exec owes the new image: clean vector registers and
+    /// no thread pointer.
     pub fn reset_for_exec(&mut self) {
         self.thread_pointer = 0;
+        self.fpu = FpuState::zeroed();
         self.restore();
     }
 }
