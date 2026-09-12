@@ -137,10 +137,19 @@ sets those pins itself at start-up, so it works either way, but the overlay is
 what a Linux system would do and leaving it in means the two agree.
 
 To watch it: the two lines cross over, because one end's transmit is the
-other's receive. GPIO 14 is where the Pi transmits, so the adapter's receive
-line goes there; GPIO 15 is where the Pi listens, so the adapter's transmit
-line goes there. Ground goes to any ground pin. Leave the adapter's power line
-unconnected. Read it at 115200 baud, 8 bits, no parity, one stop bit --
+other's receive. The header is labelled by position rather than by these names,
+and the three pins you need sit next to each other on the outer row:
+
+```
+pin 6    ground          -> adapter ground
+pin 8    GPIO 14, TXD0   -> adapter receive
+pin 10   GPIO 15, RXD0   -> adapter transmit
+```
+
+The Pi transmits on GPIO 14, so the adapter's receive line goes there, and it
+listens on GPIO 15, so the adapter's transmit line goes there. Leave the
+adapter's power line unconnected: the Pi has its own supply, and joining the
+two can push current back through the board. Read it at 115200 baud, 8 bits, no parity, one stop bit --
 `screen /dev/tty.usbserial-* 115200` on macOS, `screen /dev/ttyUSB0 115200`
 on Linux.
 
