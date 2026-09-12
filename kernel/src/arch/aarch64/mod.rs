@@ -107,12 +107,18 @@ pub extern "C" fn kmain(handoff: u64) -> ! {
     crate::serial::init();
 
     let mut boot = crate::boot::BootInfo::new();
-    if !fdt::parse(handoff, &mut boot) && !atags::parse(handoff, &mut boot) {
+    let described = if fdt::parse(handoff, &mut boot) {
+        "device tree"
+    } else if atags::parse(handoff, &mut boot) {
+        "tag list"
+    } else {
         // Neither handoff is there, so fall back to what is known about the
         // board: a gigabyte of memory from zero, which is the least a Pi 4
         // has, and no ram disk.
         boot.add_region(0, 1024 * 1024 * 1024, true);
-    }
+        "nothing"
+    };
+    crate::println!("handoff: {} at {:#x}", described, handoff);
     crate::start(&boot)
 }
 

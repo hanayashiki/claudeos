@@ -209,7 +209,10 @@ fn synchronous(frame: &mut TrapFrame) {
 
 fn interrupt(frame: &mut TrapFrame) {
     let line = gic::acknowledge();
-    if line >= gic::SPURIOUS {
+    // Nothing to claim, or a line past the end of the handler table. Either
+    // way there is nothing to end, because a number in that range was never a
+    // claim in the first place.
+    if line >= gic::NOT_A_LINE || line >= IRQ_COUNT as u32 {
         return;
     }
     if line == TIMER_IRQ as u32 {

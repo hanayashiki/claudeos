@@ -13,6 +13,7 @@ const INTERFACE: u64 = GIC_BASE + 0x2000;
 
 const GICD_CTLR: u64 = 0x000;
 const GICD_TYPER: u64 = 0x004;
+const GICD_IGROUPR: u64 = 0x080;
 const GICD_ISENABLER: u64 = 0x100;
 const GICD_ICENABLER: u64 = 0x180;
 const GICD_ICPENDR: u64 = 0x280;
@@ -26,8 +27,12 @@ const GICC_BPR: u64 = 0x008;
 const GICC_IAR: u64 = 0x00C;
 const GICC_EOIR: u64 = 0x010;
 
-/// What the interface reports when it has nothing to give.
-pub const SPURIOUS: u32 = 1023;
+/// The first of the four numbers that are not interrupts. 1023 means there was
+/// nothing to give; 1022 means there was something but this interface was not
+/// allowed to claim it, which is what a group-zero acknowledge gets when the
+/// interrupt is in group one. Neither can be ended, so neither may be treated
+/// as a line number.
+pub const NOT_A_LINE: u32 = 1020;
 
 /// The first interrupt number that is not per-core: everything below this is a
 /// software-generated or private interrupt and belongs to one core.
@@ -82,6 +87,20 @@ pub fn init() {
             dist_write(GICD_ITARGETSR + (word * 4) as u64, 0x0101_0101);
         }
 
+        // Every line in group zero, said out loud rather than left at whatever
+        // the controller reset to. The interface below is enabled for group
+        // zero only, and the two have to agree: a group-zero acknowledge
+        // cannot claim a group-one interrupt, and rather than failing it hands
+        // back 1022. The handler then has an interrupt it can neither name nor
+        // finish, and it arrives again for ever.
+        //
+        // This controller reports no security extensions, so group zero is
+        // delivered as an ordinary interrupt rather than a fast one, which is
+        // what makes the pairing usable at all.
+        for word in 0..(lines / 32) {
+            dist_write(GICD_IGROUPR + (word * 4) as u64, 0);
+        }
+
         dist_write(GICD_CTLR, 1);
 
         // Accept every priority, no sub-priority grouping.
@@ -108,6 +127,9 @@ pub fn mask(irq: u8) {
 /// Take the next interrupt from the controller. Until `end_of_interrupt` is
 /// called with what this returned, no further interrupt of the same or lower
 /// priority is delivered.
+///
+/// A number at or above `SPURIOUS` means there was nothing to claim, which
+/// includes the case of an interrupt this interface is not allowed to take.
 pub fn acknowledge() -> u32 {
     unsafe { cpu_read(GICC_IAR) & 0x3FF }
 }

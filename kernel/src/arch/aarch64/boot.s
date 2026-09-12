@@ -11,6 +11,27 @@
  * selection below needs x0 and only the first core gets any further.
  */
 
+/* The sixty-four byte header an AArch64 Linux image carries, so that a loader
+ * can tell what it has been handed. A loader that does not find the magic at
+ * offset 56 does not believe this is a kernel and boots it some other way, or
+ * not at all. The first two words are executable, because the header is also
+ * the entry point: the loader jumps to offset zero and the branch steps over
+ * the rest of it.
+ */
+.section .text.header, "ax"
+.global _image_start
+_image_start:
+    b    _start                  /* code0 */
+    .long 0                      /* code1 */
+    .quad __phys_start           /* offset from the base of RAM, which is 0 */
+    .quad __image_size           /* including the space .bss needs */
+    .quad 2                      /* little-endian, 4 KiB pages, fixed place */
+    .quad 0                      /* reserved */
+    .quad 0
+    .quad 0
+    .long 0x644d5241             /* "ARM\x64" */
+    .long 0                      /* reserved */
+
 .section .text.boot, "ax"
 .global _start
 _start:

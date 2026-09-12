@@ -1,4 +1,4 @@
-ENTRY(_start)
+ENTRY(_image_start)
 
 KERNEL_VMA = 0xFFFFFFFF80000000;
 
@@ -12,6 +12,9 @@ SECTIONS
      * at: the entry path, the boot stack and the boot page tables. */
     .boot : ALIGN(4K)
     {
+        /* First, because a loader jumps to offset zero of the flat image and
+         * reads the magic at offset 56 of it. */
+        KEEP(*(.text.header))
         KEEP(*(.text.boot))
         KEEP(*(.boot))
         . = ALIGN(4K);
@@ -57,6 +60,11 @@ SECTIONS
 
     __kernel_end_virt = .;
     __kernel_end_phys = . - KERNEL_VMA;
+
+    /* What the image header calls the effective image size: everything the
+     * kernel occupies once it is in memory, which includes the .bss the flat
+     * image does not carry. */
+    __image_size = __kernel_end_phys - __phys_start;
 
     /DISCARD/ :
     {
