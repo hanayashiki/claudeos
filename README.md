@@ -138,6 +138,10 @@ backticks, arithmetic with `$((...))`, `if`/`elif`/`else`, `while`, `until`,
 and the usual builtins. Word expansion is a single pass, so text a command
 substitution produced is not rescanned.
 
+A syntax error names the script, the line and the text that was found, and the
+commands before it still run, the way a shell that reads command by command
+behaves.
+
 At the prompt it puts the terminal in raw mode and edits the line itself:
 arrow-key history, left/right cursor movement, Home/End/Delete,
 Ctrl-A/E/B/F/K/U/W/L, a `history` builtin, and tab completion of command names
@@ -154,7 +158,7 @@ basename dirname yes true false`.
 `make test` boots the OS once per suite and requires each to report zero
 failures.
 
-- `tests/suite.sh` runs **95 checks** inside the OS, driving the shell through
+- `tests/suite.sh` runs **173 checks** inside the OS, driving the shell through
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
   subprocesses and `/proc`.

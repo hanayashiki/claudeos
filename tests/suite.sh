@@ -174,6 +174,16 @@ check "head -c on a device" "8"          "$(head -c 8 /dev/zero | wc -c)"
 check "background reaped"  "0"           "$(sleep 1 & sleep 2; ps | grep -c ' Z ')"
 
 echo
+echo "-- syntax errors --"
+printf 'echo before\nfor i in 1 2\necho no do\n' > /tmp/bad.sh
+check "commands before it run" "before"  "$(sh /tmp/bad.sh 2>/dev/null)"
+check "status is 2"            "2"       "$(sh /tmp/bad.sh >/dev/null 2>&1; echo $?)"
+check "the line is reported"   "1"       "$(sh /tmp/bad.sh 2>&1 >/dev/null | grep -c 'line 3: syntax error')"
+check "the script is named"    "1"       "$(sh /tmp/bad.sh 2>&1 >/dev/null | grep -c 'bad.sh')"
+check "the token is quoted"    "1"       "$(sh /tmp/bad.sh 2>&1 >/dev/null | grep -c 'found .echo.')"
+rm -f /tmp/bad.sh
+
+echo
 echo "-- devices --"
 check "/dev/null read"    "0"        "$(wc -c < /dev/null)"
 check "/dev/null write"   "0"        "$(echo discard > /dev/null; echo $?)"

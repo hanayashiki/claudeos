@@ -55,6 +55,43 @@ impl Token {
     }
 }
 
+/// How a token is named in a diagnostic: the text it was written as, not the
+/// name of its variant.
+impl std::fmt::Display for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Token::Word(text, _) => write!(f, "`{}`", text),
+            Token::Pipe => f.write_str("`|`"),
+            Token::Semi => f.write_str("`;`"),
+            Token::Amp => f.write_str("`&`"),
+            Token::AndIf => f.write_str("`&&`"),
+            Token::OrIf => f.write_str("`||`"),
+            Token::Newline => f.write_str("end of line"),
+            Token::LParen => f.write_str("`(`"),
+            Token::RParen => f.write_str("`)`"),
+            Token::DoubleSemi => f.write_str("`;;`"),
+            Token::HereDoc(_, _) => f.write_str("a here-document"),
+            Token::Redirect(fd, kind) => {
+                let symbol = match kind {
+                    RedirKind::Read => "<",
+                    RedirKind::Write => ">",
+                    RedirKind::Append => ">>",
+                    RedirKind::Duplicate => ">&",
+                };
+                let implied = matches!(
+                    (fd, kind),
+                    (0, RedirKind::Read) | (1, RedirKind::Write) | (1, RedirKind::Append)
+                );
+                if implied {
+                    write!(f, "`{}`", symbol)
+                } else {
+                    write!(f, "`{}{}`", fd, symbol)
+                }
+            }
+        }
+    }
+}
+
 const KEYWORDS: &[&str] = &[
     "if", "then", "elif", "else", "fi", "while", "until", "for", "in", "do", "done", "function",
     "return", "break", "continue", "case", "esac", "{", "}",
@@ -471,7 +508,26 @@ enum ParseError {
     /// The input ends in the middle of a construct; interactively this means
     /// "read another line".
     Incomplete,
-    Message(String),
+    Message { line: usize, text: String },
+}
+
+/// The source line a token sits on. The lexer does not keep positions, so the
+/// line is recovered from the stream: each newline advances one line, and a
+/// here-document stands for its body plus the delimiter line that closes it.
+fn line_of(tokens: &[Token], index: usize) -> usize {
+    let mut line = 1;
+    for token in tokens.iter().take(index) {
+        match token {
+            Token::Newline => line += 1,
+            Token::HereDoc(body, _) => line += body.lines().count() + 1,
+            _ => {}
+        }
+    }
+    line
+}
+
+fn error_at(tokens: &[Token], index: usize, text: String) -> ParseError {
+    ParseError::Message { line: line_of(tokens, index), text }
 }
 
 struct Parser<'a> {
@@ -503,6 +559,10 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn fail(&self, text: String) -> ParseError {
+        error_at(self.tokens, self.position, text)
+    }
+
     fn expect_keyword(&mut self, want: &str) -> Result<(), ParseError> {
         self.skip_separators();
         match self.peek() {
@@ -511,10 +571,10 @@ impl<'a> Parser<'a> {
                 Ok(())
             }
             None => Err(ParseError::Incomplete),
-            Some(token) => Err(ParseError::Message(format!(
-                "expected `{}` but found {:?}",
-                want, token
-            ))),
+            Some(token) => {
+                let found = token.to_string();
+                Err(self.fail(format!("expected `{}` but found {}", want, found)))
+            }
         }
     }
 
@@ -535,10 +595,7 @@ impl<'a> Parser<'a> {
             let before = self.position;
             let node = self.parse_statement()?;
             if self.position == before {
-                return Err(ParseError::Message(format!(
-                    "unexpected {:?}",
-                    self.tokens[self.position]
-                )));
+                return Err(self.fail(format!("unexpected {}", self.tokens[self.position])));
             }
             nodes.push(node);
         }
@@ -638,10 +695,10 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 None => return Err(ParseError::Incomplete),
-                other => {
-                    return Err(ParseError::Message(format!(
-                        "unexpected {:?} inside if",
-                        other
+                _ => {
+                    return Err(self.fail(format!(
+                        "unexpected {} inside `if`",
+                        self.tokens[self.position]
                     )))
                 }
             }
@@ -667,7 +724,7 @@ impl<'a> Parser<'a> {
                 name
             }
             None => return Err(ParseError::Incomplete),
-            _ => return Err(ParseError::Message("expected a name after `for`".into())),
+            _ => return Err(self.fail("expected a name after `for`".into())),
         };
 
         let mut words = Vec::new();
@@ -697,7 +754,7 @@ impl<'a> Parser<'a> {
                 word
             }
             None => return Err(ParseError::Incomplete),
-            _ => return Err(ParseError::Message("expected a word after `case`".into())),
+            _ => return Err(self.fail("expected a word after `case`".into())),
         };
         self.expect_keyword("in")?;
 
@@ -725,7 +782,7 @@ impl<'a> Parser<'a> {
                         self.position += 1;
                     }
                     None => return Err(ParseError::Incomplete),
-                    _ => return Err(ParseError::Message("expected a case pattern".into())),
+                    _ => return Err(self.fail("expected a case pattern".into())),
                 }
                 match self.peek() {
                     Some(Token::Pipe) => self.position += 1,
@@ -735,9 +792,7 @@ impl<'a> Parser<'a> {
                     }
                     None => return Err(ParseError::Incomplete),
                     _ => {
-                        return Err(ParseError::Message(
-                            "expected `)` after a case pattern".into(),
-                        ))
+                        return Err(self.fail("expected `)` after a case pattern".into()))
                     }
                 }
             }
@@ -808,7 +863,7 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 Some(Token::RParen) => self.position += 1,
                 None => return Err(ParseError::Incomplete),
-                _ => return Err(ParseError::Message("expected `)`".into())),
+                _ => return Err(self.fail("expected `)`".into())),
             }
             return self.parse_redirections(command);
         }
@@ -854,7 +909,7 @@ impl<'a> Parser<'a> {
 
     fn take_redirection(&mut self, command: &mut Command) -> Result<(), ParseError> {
         let Some(Token::Redirect(fd, kind)) = self.peek().cloned() else {
-            return Err(ParseError::Message("expected a redirection".into()));
+            return Err(self.fail("expected a redirection".into()));
         };
         self.position += 1;
 
@@ -876,8 +931,8 @@ impl<'a> Parser<'a> {
                     match word.parse::<i32>() {
                         Ok(target) => command.redirects.push((fd, Target::Descriptor(target))),
                         Err(_) => {
-                            return Err(ParseError::Message(format!(
-                                "expected a descriptor number after >&, found `{}`",
+                            return Err(self.fail(format!(
+                                "expected a descriptor number after `>&`, found `{}`",
                                 word
                             )))
                         }
@@ -896,21 +951,37 @@ impl<'a> Parser<'a> {
                 Ok(text)
             }
             None => Err(ParseError::Incomplete),
-            _ => Err(ParseError::Message("expected a file name after a redirection".into())),
+            _ => Err(self.fail("expected a file name after a redirection".into())),
         }
     }
 }
 
-fn parse(tokens: &[Token]) -> Result<Vec<Node>, ParseError> {
+/// Parse the whole input, returning the statements read so far alongside the
+/// error that stopped it. A script runs the commands that precede a syntax
+/// error, the way a shell that reads command by command does.
+fn parse(tokens: &[Token]) -> (Vec<Node>, Option<ParseError>) {
     let mut parser = Parser { tokens, position: 0 };
-    let nodes = parser.parse_block(&[])?;
-    if parser.position < tokens.len() {
-        return Err(ParseError::Message(format!(
-            "unexpected {:?}",
-            tokens[parser.position]
-        )));
+    let mut nodes = Vec::new();
+    loop {
+        parser.skip_separators();
+        if parser.peek().is_none() {
+            return (nodes, None);
+        }
+        let before = parser.position;
+        match parser.parse_statement() {
+            Ok(node) => {
+                if parser.position == before {
+                    let text = format!("unexpected {}", tokens[before]);
+                    return (nodes, Some(error_at(tokens, before, text)));
+                }
+                nodes.push(node);
+            }
+            // An unfinished construct means "read another line", so nothing
+            // runs: the same text is parsed again once the rest arrives.
+            Err(ParseError::Incomplete) => return (Vec::new(), Some(ParseError::Incomplete)),
+            Err(error) => return (nodes, Some(error)),
+        }
     }
-    Ok(nodes)
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,16 +1207,21 @@ impl Shell {
         if tokens.iter().all(|t| matches!(t, Token::Newline)) {
             return Ok(());
         }
-        let nodes = match parse(&tokens) {
-            Ok(nodes) => nodes,
-            Err(ParseError::Incomplete) => return Err(true),
-            Err(ParseError::Message(message)) => {
-                eprintln!("sh: syntax error: {}", message);
-                self.last_status = 2;
-                return Err(false);
-            }
-        };
+        let (nodes, error) = parse(&tokens);
+        if matches!(error, Some(ParseError::Incomplete)) {
+            return Err(true);
+        }
         self.exec_block(&nodes);
+        if let Some(ParseError::Message { line, text }) = error {
+            let origin = if self.script_name == "sh" {
+                String::new()
+            } else {
+                format!("{}: ", self.script_name)
+            };
+            eprintln!("sh: {}line {}: syntax error: {}", origin, line, text);
+            self.last_status = 2;
+            return Err(false);
+        }
         Ok(())
     }
 
