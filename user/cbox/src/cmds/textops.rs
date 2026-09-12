@@ -174,19 +174,32 @@ pub fn tail(args: &[String]) -> i32 {
 pub fn grep(args: &[String]) -> i32 {
     let (flags, operands) = split_flags(args);
     if operands.is_empty() {
-        eprintln!("usage: grep [-in v] pattern [file...]");
+        eprintln!("usage: grep [-cilnqrv] pattern [file...]");
         return 2;
     }
     let pattern = &operands[0];
-    let paths = &operands[1..];
     let ignore_case = flags.contains('i');
     let invert = flags.contains('v');
     let number = flags.contains('n');
     let count_only = flags.contains('c');
+    let quiet = flags.contains('q');
+    let names_only = flags.contains('l');
+    let recursive = flags.contains('r') || flags.contains('R');
+
+    // -r turns each directory operand into the files beneath it.
+    let mut paths: Vec<String> = operands[1..].to_vec();
+    if recursive {
+        let mut expanded = Vec::new();
+        for path in &paths {
+            collect_files(path, &mut expanded);
+        }
+        paths = expanded;
+    }
+    let paths = &paths[..];
 
     let needle = if ignore_case { pattern.to_lowercase() } else { pattern.clone() };
     let (inputs, mut status) = read_inputs("grep", paths);
-    let show_names = inputs.len() > 1;
+    let show_names = inputs.len() > 1 || recursive;
     let mut matched_any = false;
 
     for (name, text) in &inputs {
@@ -199,8 +212,11 @@ pub fn grep(args: &[String]) -> i32 {
             }
             count += 1;
             matched_any = true;
-            if count_only {
+            if count_only || quiet {
                 continue;
+            }
+            if names_only {
+                break;
             }
             let prefix = if show_names { format!("{}:", name) } else { String::new() };
             if number {
@@ -209,7 +225,11 @@ pub fn grep(args: &[String]) -> i32 {
                 println!("{}{}", prefix, line);
             }
         }
-        if count_only {
+        if names_only {
+            if count > 0 {
+                println!("{}", name);
+            }
+        } else if count_only {
             if show_names {
                 println!("{}:{}", name, count);
             } else {
@@ -221,6 +241,26 @@ pub fn grep(args: &[String]) -> i32 {
         status = 1;
     }
     status
+}
+
+/// Expand a path into the regular files beneath it, for grep -r.
+fn collect_files(path: &str, out: &mut Vec<String>) {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {
+            let Ok(entries) = std::fs::read_dir(path) else { return };
+            let mut names: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            names.sort();
+            for name in names {
+                let child = format!("{}/{}", path.trim_end_matches('/'), name);
+                collect_files(&child, out);
+            }
+        }
+        Ok(_) => out.push(path.to_string()),
+        Err(_) => out.push(path.to_string()),
+    }
 }
 
 pub fn sort(args: &[String]) -> i32 {
@@ -344,8 +384,10 @@ fn parse_fields(spec: &str) -> Vec<usize> {
 pub fn tr(args: &[String]) -> i32 {
     let (flags, operands) = split_flags(args);
     let delete = flags.contains('d');
+    let squeeze = flags.contains('s');
+    let complement = flags.contains('c') || flags.contains('C');
     if operands.is_empty() {
-        eprintln!("usage: tr SET1 [SET2]   or   tr -d SET1");
+        eprintln!("usage: tr [-dsc] SET1 [SET2]");
         return 2;
     }
     let set1 = expand_set(&operands[0]);
@@ -355,16 +397,41 @@ pub fn tr(args: &[String]) -> i32 {
     if std::io::stdin().read_to_string(&mut text).is_err() {
         return 1;
     }
+
+    let in_set1 = |c: char| set1.contains(&c) != complement;
+
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        match set1.iter().position(|&s| s == c) {
-            Some(index) if delete => {
-                let _ = index;
+        if delete {
+            if !in_set1(c) {
+                out.push(c);
             }
-            Some(index) => out.push(*set2.get(index).or(set2.last()).unwrap_or(&c)),
-            None => out.push(c),
+            continue;
+        }
+        match set1.iter().position(|&s| s == c) {
+            Some(index) if !complement => {
+                out.push(*set2.get(index).or(set2.last()).unwrap_or(&c))
+            }
+            _ => out.push(c),
         }
     }
+
+    if squeeze {
+        // Runs of a character from the squeeze set collapse to one. The set is
+        // SET2 when translating, SET1 otherwise.
+        let squeeze_set = if set2.is_empty() { &set1 } else { &set2 };
+        let mut collapsed = String::with_capacity(out.len());
+        let mut previous: Option<char> = None;
+        for c in out.chars() {
+            let repeat = previous == Some(c) && squeeze_set.contains(&c);
+            if !repeat {
+                collapsed.push(c);
+            }
+            previous = Some(c);
+        }
+        out = collapsed;
+    }
+
     print!("{}", out);
     let _ = std::io::stdout().flush();
     0
