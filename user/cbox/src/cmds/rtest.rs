@@ -121,6 +121,37 @@ fn event_and_poll(report: &mut Report) {
     let count = sys::epoll_wait(epoll, &mut events, 100);
     report.check("epoll reports both", count == 2, format!("{}", count));
 
+    // Drain both, then time a wait that nothing will satisfy: it has to come
+    // back when the timeout says so, not when a tick happens to land.
+    let mut drain = [0u8; 64];
+    let _ = sys::read(event, &mut value);
+    let _ = right.read(&mut drain);
+    let started = Instant::now();
+    let count = sys::epoll_wait(epoll, &mut events, 300);
+    let waited = started.elapsed();
+    report.check(
+        "epoll waits out its timeout",
+        count == 0 && waited >= Duration::from_millis(250) && waited < Duration::from_millis(900),
+        format!("{} events after {:?}", count, waited),
+    );
+
+    // A wait with no timeout has to end when the other side writes, and
+    // promptly: this is what a program built on a poll loop depends on.
+    let event_copy = event;
+    let waker = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(60));
+        sys::write(event_copy, &1u64.to_le_bytes());
+    });
+    let started = Instant::now();
+    let count = sys::epoll_wait(epoll, &mut events, -1);
+    let waited = started.elapsed();
+    let _ = waker.join();
+    report.check(
+        "epoll wakes on a write",
+        count == 1 && waited < Duration::from_millis(400),
+        format!("{} events after {:?}", count, waited),
+    );
+
     let _ = sys::close(epoll);
     let _ = sys::close(event);
 }

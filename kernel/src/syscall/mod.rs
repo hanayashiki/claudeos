@@ -120,7 +120,10 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::FCNTL => file::fcntl(args[0] as i32, args[1] as u32, args[2]),
         nr::IOCTL => file::ioctl(args[0] as i32, args[1], args[2]),
         nr::POLL | nr::PPOLL => file::poll(args[0], args[1] as usize, args[2] as i64),
-        nr::SELECT | nr::PSELECT6 => file::select(args[0] as i32, args[1], args[2], args[3]),
+        nr::SELECT => {
+            file::select(args[0] as i32, args[1], args[2], args[3], args[4], 1_000)
+        }
+        nr::PSELECT6 => file::select(args[0] as i32, args[1], args[2], args[3], args[4], 1),
         nr::CHMOD => file::chmod(AT_FDCWD, args[0], args[1] as u32),
         nr::FCHMOD => file::fchmod(args[0] as i32, args[1] as u32),
         nr::FCHMODAT => file::chmod(args[0] as i64, args[1], args[2] as u32),

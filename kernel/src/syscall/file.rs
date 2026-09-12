@@ -688,6 +688,18 @@ fn ready_to_read(file: &Arc<OpenFile>) -> bool {
 const POLLIN: i16 = 0x001;
 const POLLOUT: i16 = 0x004;
 
+/// What a descriptor would report right now for the events asked about.
+fn poll_state(file: &Arc<OpenFile>, events: i16) -> i16 {
+    let mut revents = 0i16;
+    if events & POLLIN != 0 && file.readable() && ready_to_read(file) {
+        revents |= POLLIN;
+    }
+    if events & POLLOUT != 0 && file.writable() && ready_to_write(file) {
+        revents |= POLLOUT;
+    }
+    revents
+}
+
 pub fn poll(fds_addr: u64, count: usize, timeout_ms: i64) -> SysResult {
     if count > 1024 {
         return Err(Errno::EINVAL);
@@ -698,94 +710,148 @@ pub fn poll(fds_addr: u64, count: usize, timeout_ms: i64) -> SysResult {
         crate::trap::ticks() + crate::time::ns_to_ticks(timeout_ms as u64 * 1_000_000)
     };
 
+    // Read the request once and hold the descriptors it names. Readiness has
+    // to be testable from inside the sleep, where user memory must not be
+    // touched, and the set being waited on cannot change while this task is
+    // the one waiting.
+    let mut requests: Vec<(i16, Option<Arc<OpenFile>>)> = Vec::with_capacity(count);
+    for i in 0..count {
+        let base = fds_addr + (i * 8) as u64;
+        let fd = uaccess::read_u32(base)? as i32;
+        let events = uaccess::read_u32(base + 4)? as i16;
+        let file = if fd < 0 { None } else { Some(sched::current().fds.get(fd)) };
+        match file {
+            None => requests.push((events, None)),
+            Some(Ok(file)) => requests.push((events, Some(file))),
+            // POLLNVAL, reported without waiting for anything.
+            Some(Err(_)) => requests.push((-1, None)),
+        }
+    }
+
+    let current = |request: &(i16, Option<Arc<OpenFile>>)| -> i16 {
+        match (&request.1, request.0) {
+            (Some(file), events) => poll_state(file, events),
+            (None, -1) => 0x020,
+            (None, _) => 0,
+        }
+    };
+
     loop {
         let mut ready = 0u64;
-        for i in 0..count {
-            let base = fds_addr + (i * 8) as u64;
-            let fd = uaccess::read_u32(base)? as i32;
-            let events = uaccess::read_u32(base + 4)? as i16;
-            let mut revents = 0i16;
-            if fd >= 0 {
-                match sched::current().fds.get(fd) {
-                    Ok(file) => {
-                        if events & POLLIN != 0 && file.readable() && ready_to_read(&file) {
-                            revents |= POLLIN;
-                        }
-                        if events & POLLOUT != 0 && file.writable() && ready_to_write(&file) {
-                            revents |= POLLOUT;
-                        }
-                    }
-                    Err(_) => revents |= 0x020, // POLLNVAL
-                }
-            }
+        for (i, request) in requests.iter().enumerate() {
+            let revents = current(request);
             if revents != 0 {
                 ready += 1;
             }
+            let events = if request.0 < 0 { 0 } else { request.0 };
             // revents is the high half of the second word.
             let packed = ((revents as u16 as u32) << 16) | (events as u16 as u32);
-            uaccess::write_u32(base + 4, packed)?;
+            uaccess::write_u32(fds_addr + (i * 8) as u64 + 4, packed)?;
         }
         if ready > 0 {
             return Ok(ready);
         }
-        if crate::trap::ticks() >= deadline {
-            return Ok(0);
-        }
         if sched::has_pending_signal() {
             return Err(Errno::EINTR);
         }
-        sched::yield_or_sleep();
+        let woke = sched::IO_READY.wait_until_or_at(deadline, || {
+            requests.iter().any(|request| current(request) != 0) || sched::has_pending_signal()
+        });
+        if !woke {
+            return Ok(0);
+        }
     }
 }
 
-pub fn select(nfds: i32, readfds: u64, writefds: u64, _exceptfds: u64) -> SysResult {
+/// `timeout` points at two 64-bit numbers: whole seconds, then a fraction in
+/// units of `fraction_ns` nanoseconds. select counts microseconds there and
+/// pselect6 counts nanoseconds, which is the only difference between them.
+pub fn select(
+    nfds: i32,
+    readfds: u64,
+    writefds: u64,
+    _exceptfds: u64,
+    timeout: u64,
+    fraction_ns: u64,
+) -> SysResult {
     if nfds < 0 || nfds > 1024 {
         return Err(Errno::EINVAL);
     }
+    let deadline = if timeout == 0 {
+        u64::MAX
+    } else {
+        let seconds = uaccess::read_u64(timeout)?;
+        let fraction = uaccess::read_u64(timeout + 8)?;
+        let nanos = seconds
+            .saturating_mul(1_000_000_000)
+            .saturating_add(fraction.saturating_mul(fraction_ns));
+        crate::trap::ticks() + crate::time::ns_to_ticks(nanos)
+    };
     let words = ((nfds as usize) + 63) / 64;
+
+    // Read both sets once, and hold the descriptors they name, so readiness
+    // can be tested from inside the sleep without touching user memory.
+    let mut watched: Vec<(i32, i16, Arc<OpenFile>)> = Vec::new();
+    for fd in 0..nfds {
+        let word = (fd / 64) as usize;
+        let bit = 1u64 << (fd % 64);
+        let mut events = 0i16;
+        if readfds != 0 && uaccess::read_u64(readfds + (word * 8) as u64)? & bit != 0 {
+            events |= POLLIN;
+        }
+        if writefds != 0 && uaccess::read_u64(writefds + (word * 8) as u64)? & bit != 0 {
+            events |= POLLOUT;
+        }
+        if events == 0 {
+            continue;
+        }
+        // A descriptor that is not open is an error for the whole call.
+        let file = sched::current().fds.get(fd)?;
+        watched.push((fd, events, file));
+    }
+
     loop {
         let mut ready = 0u64;
         let mut read_result = vec![0u64; words.max(1)];
         let mut write_result = vec![0u64; words.max(1)];
+        for (fd, events, file) in watched.iter() {
+            let word = (*fd / 64) as usize;
+            let bit = 1u64 << (*fd % 64);
+            let revents = poll_state(file, *events);
+            if revents & POLLIN != 0 {
+                read_result[word] |= bit;
+                ready += 1;
+            }
+            if revents & POLLOUT != 0 {
+                write_result[word] |= bit;
+                ready += 1;
+            }
+        }
 
-        for fd in 0..nfds {
-            let word = (fd / 64) as usize;
-            let bit = 1u64 << (fd % 64);
+        if ready == 0 {
+            if sched::has_pending_signal() {
+                return Err(Errno::EINTR);
+            }
+            let woke = sched::IO_READY.wait_until_or_at(deadline, || {
+                watched
+                    .iter()
+                    .any(|(_, events, file)| poll_state(file, *events) != 0)
+                    || sched::has_pending_signal()
+            });
+            if woke {
+                continue;
+            }
+        }
+
+        for w in 0..words {
             if readfds != 0 {
-                let set = uaccess::read_u64(readfds + (word * 8) as u64)?;
-                if set & bit != 0 {
-                    if let Ok(file) = sched::current().fds.get(fd) {
-                        if ready_to_read(&file) {
-                            read_result[word] |= bit;
-                            ready += 1;
-                        }
-                    }
-                }
+                uaccess::write_u64(readfds + (w * 8) as u64, read_result[w])?;
             }
             if writefds != 0 {
-                let set = uaccess::read_u64(writefds + (word * 8) as u64)?;
-                if set & bit != 0 {
-                    write_result[word] |= bit;
-                    ready += 1;
-                }
+                uaccess::write_u64(writefds + (w * 8) as u64, write_result[w])?;
             }
         }
-
-        if ready > 0 {
-            for w in 0..words {
-                if readfds != 0 {
-                    uaccess::write_u64(readfds + (w * 8) as u64, read_result[w])?;
-                }
-                if writefds != 0 {
-                    uaccess::write_u64(writefds + (w * 8) as u64, write_result[w])?;
-                }
-            }
-            return Ok(ready);
-        }
-        if sched::has_pending_signal() {
-            return Err(Errno::EINTR);
-        }
-        sched::yield_or_sleep();
+        return Ok(ready);
     }
 }
 
@@ -947,56 +1013,68 @@ pub fn epoll_wait(epfd: i32, events_addr: u64, max: i32, timeout_ms: i64) -> Sys
         crate::trap::ticks() + crate::time::ns_to_ticks(timeout_ms as u64 * 1_000_000)
     };
 
+    /// What one watched descriptor would report right now.
+    fn state(file: &Result<Arc<OpenFile>, Errno>, events: u32) -> u32 {
+        let file = match file {
+            Ok(file) => file,
+            Err(_) => return EPOLLERR,
+        };
+        let mut ready = 0u32;
+        if events & EPOLLIN != 0 && file.readable() && ready_to_read(file) {
+            ready |= EPOLLIN;
+        }
+        if events & EPOLLOUT != 0 && file.writable() && ready_to_write(file) {
+            ready |= EPOLLOUT;
+        }
+        if let FileBacking::Pipe(pipe, is_write) = &file.backing {
+            let gone = if *is_write {
+                pipe.readers.load(core::sync::atomic::Ordering::Acquire) == 0
+            } else {
+                pipe.writers.load(core::sync::atomic::Ordering::Acquire) == 0
+            };
+            if gone {
+                ready |= EPOLLHUP;
+            }
+        }
+        ready
+    }
+
     loop {
+        // Hold the descriptors being watched, so readiness can be tested from
+        // inside the sleep without going near user memory or the fd table.
         let watches = set.watches.lock().clone();
+        let held: Vec<(u64, u32, Result<Arc<OpenFile>, Errno>)> = watches
+            .iter()
+            .map(|watch| (watch.data, watch.events, sched::current().fds.get(watch.fd)))
+            .collect();
+
         let mut written = 0i32;
-        for watch in watches.iter() {
+        for (data, events, file) in held.iter() {
             if written >= max {
                 break;
             }
-            let mut ready = 0u32;
-            match sched::current().fds.get(watch.fd) {
-                Ok(target) => {
-                    if watch.events & EPOLLIN != 0 && target.readable() && ready_to_read(&target) {
-                        ready |= EPOLLIN;
-                    }
-                    if watch.events & EPOLLOUT != 0
-                        && target.writable()
-                        && ready_to_write(&target)
-                    {
-                        ready |= EPOLLOUT;
-                    }
-                    if let FileBacking::Pipe(pipe, is_write) = &target.backing {
-                        let gone = if *is_write {
-                            pipe.readers.load(core::sync::atomic::Ordering::Acquire) == 0
-                        } else {
-                            pipe.writers.load(core::sync::atomic::Ordering::Acquire) == 0
-                        };
-                        if gone {
-                            ready |= EPOLLHUP;
-                        }
-                    }
-                }
-                Err(_) => ready |= EPOLLERR,
-            }
+            let ready = state(file, *events);
             if ready == 0 {
                 continue;
             }
             let base = events_addr + written as u64 * EPOLL_EVENT_SIZE;
             uaccess::write_u32(base, ready)?;
-            uaccess::write_u64(base + 4, watch.data)?;
+            uaccess::write_u64(base + 4, *data)?;
             written += 1;
         }
         if written > 0 {
             return Ok(written as u64);
         }
-        if crate::trap::ticks() >= deadline {
-            return Ok(0);
-        }
         if sched::has_pending_signal() {
             return Err(Errno::EINTR);
         }
-        sched::yield_or_sleep();
+        let woke = sched::IO_READY.wait_until_or_at(deadline, || {
+            held.iter().any(|(_, events, file)| state(file, *events) != 0)
+                || sched::has_pending_signal()
+        });
+        if !woke {
+            return Ok(0);
+        }
     }
 }
 

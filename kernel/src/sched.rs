@@ -421,6 +421,19 @@ fn stop_current(signal: i32) {
     schedule();
 }
 
+/// Woken whenever a descriptor changes what it would report to a poll: bytes
+/// arrive or are taken, a counter is posted, an end is closed.
+///
+/// Waiting on one queue per descriptor would mean queueing on several at once,
+/// which nothing here can do. One queue for all of them means a waiter looks
+/// again more often than it has to, but never sleeps through a change.
+pub static IO_READY: WaitQueue = WaitQueue::new();
+
+/// Tell anyone waiting in poll, select or epoll to look again.
+pub fn io_ready() {
+    IO_READY.wake_all();
+}
+
 /// Stop the running task here, rather than on the way back to user mode.
 ///
 /// A syscall that cannot make progress until the job is continued calls this
@@ -679,6 +692,36 @@ impl WaitQueue {
 
             schedule();
 
+            self.waiters.lock().retain(|waiter| *waiter != pid);
+        }
+    }
+
+    /// Block until `ready` holds or the tick count reaches `deadline`.
+    ///
+    /// Returns true when `ready` held. A deadline of `u64::MAX` waits
+    /// indefinitely, which is what a poll with no timeout asks for.
+    pub fn wait_until_or_at(&self, deadline: u64, mut ready: impl FnMut() -> bool) -> bool {
+        let pid = current().pid;
+        loop {
+            disable_interrupts();
+            if ready() {
+                enable_interrupts();
+                return true;
+            }
+            if crate::trap::ticks() >= deadline {
+                enable_interrupts();
+                return false;
+            }
+            self.waiters.lock().push(pid);
+            current().state = State::Sleeping;
+            // The timer wakes a sleeping task when its deadline passes, so the
+            // same sleep serves both the event and the timeout.
+            current().wake_at = if deadline == u64::MAX { 0 } else { deadline };
+            enable_interrupts();
+
+            schedule();
+
+            current().wake_at = 0;
             self.waiters.lock().retain(|waiter| *waiter != pid);
         }
     }

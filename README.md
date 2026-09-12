@@ -141,7 +141,11 @@ other writes, and `sendto`, `recvfrom`, `sendmsg`, `recvmsg` and `shutdown`
 work on them. `epoll_create1`, `epoll_ctl` and `epoll_wait` watch any mix of
 pipes, sockets, counters and the terminal. Readiness is worked out when the set
 is waited on rather than pushed in from each descriptor, so epoll here is
-level-triggered.
+level-triggered. A task in `poll`, `select` or `epoll_wait` sleeps on one queue
+that every readiness change wakes, with the timeout as the sleep's deadline, so
+it neither spins nor waits out a tick to notice a byte that has arrived. The
+condition is re-tested from inside the sleep, on descriptors held across it, so
+a change that lands between the check and the sleep cannot be missed.
 
 **Console.** A 16550 UART and a PS/2 keyboard feed one input ring. A line
 discipline implements canonical mode with echo, backspace, `Ctrl-C`, `Ctrl-D`
@@ -194,13 +198,14 @@ failures.
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
   subprocesses and `/proc`.
-- The `rtest` applet runs **35 checks** against the Rust standard library:
+- The `rtest` applet runs **37 checks** against the Rust standard library:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
   thread sleep against the monotonic clock, file read/write/seek/append,
   directory iteration, `std::process::Command` capturing a child's output
   through pipes, signal handlers running and returning, a `UnixStream` pair
-  carrying bytes both ways, and an epoll set woken by a counter and a socket.
+  carrying bytes both ways, and an epoll set woken by a counter and a socket,
+  timing out when it should and waking promptly when a write arrives.
 - `tests/busybox.sh` runs **36 checks** against an upstream busybox binary that
   this project did not build: `awk`, `sed`, `tar` create and extract, `find`,
   `md5sum` and `sha256sum` (whose digests are compared against the ones the
@@ -253,7 +258,7 @@ tests/alpine.sh       in-OS suite run inside an Alpine root filesystem
 
 Single CPU; no SMP. There is no block device driver or on-disk filesystem: the
 root filesystem lives in RAM and changes do not survive a reboot. There is no
-networking, so the socket calls return `EAFNOSUPPORT`. `futex`, `poll`, `select` and `epoll_wait` still wait by
-re-checking rather than by queueing, though they yield or sleep rather than
-spin. Sockets are `socketpair` only: there is no `bind` or `connect`, so
-nothing can be reached by name or over a network.
+networking, so the socket calls return `EAFNOSUPPORT`. `futex` still waits by re-checking rather than by queueing,
+though it yields or sleeps rather than spins. Sockets are `socketpair` only:
+there is no `bind` or `connect`, so nothing can be reached by name or over a
+network.

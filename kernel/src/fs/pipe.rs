@@ -48,6 +48,7 @@ impl Pipe {
     pub fn wake(&self) {
         self.not_empty.wake_all();
         self.not_full.wake_all();
+        crate::sched::io_ready();
     }
 
     /// Room for at least one more byte.
@@ -79,7 +80,7 @@ impl Pipe {
                         buffer.head = 0;
                     }
                     drop(buffer);
-                    self.not_full.wake_all();
+                    self.wake();
                     return Ok(n);
                 }
             }
@@ -121,7 +122,7 @@ impl Pipe {
                     let n = buf.len().min(PIPE_CAPACITY - used);
                     buffer.data.extend_from_slice(&buf[..n]);
                     drop(buffer);
-                    self.not_empty.wake_all();
+                    self.wake();
                     return Ok(n);
                 }
             }
@@ -193,8 +194,7 @@ pub fn open_fifo(ino: u64, flags: u32, path: &str) -> Result<Arc<super::OpenFile
         }
     }
     // The end that just arrived may be the one the other side was waiting for.
-    pipe.not_empty.wake_all();
-    pipe.not_full.wake_all();
+    pipe.wake();
 
     let file = Arc::new(super::OpenFile {
         backing: super::FileBacking::Pipe(pipe.clone(), writing),
@@ -252,8 +252,7 @@ impl Drop for super::OpenFile {
                 let counter = if *is_write { &pipe.writers } else { &pipe.readers };
                 counter.fetch_sub(1, Ordering::AcqRel);
                 // The other end has to notice that this one is gone.
-                pipe.not_empty.wake_all();
-                pipe.not_full.wake_all();
+                pipe.wake();
             }
             // A socket end reads one pipe and writes the other, so closing it
             // takes a reader off one and a writer off the other.

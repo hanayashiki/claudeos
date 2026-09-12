@@ -123,6 +123,7 @@ pub fn push_byte(byte: u8) {
 
     INPUT.lock().push(byte);
     WAITING.wake_all();
+    crate::sched::io_ready();
 }
 
 pub fn available() -> usize {

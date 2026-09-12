@@ -45,6 +45,7 @@ impl EventFd {
                     drop(count);
                     buf[..8].copy_from_slice(&value.to_le_bytes());
                     self.ready.wake_all();
+                    crate::sched::io_ready();
                     return Ok(8);
                 }
             }
@@ -80,6 +81,7 @@ impl EventFd {
                         *count = sum;
                         drop(count);
                         self.ready.wake_all();
+                        crate::sched::io_ready();
                         return Ok(8);
                     }
                 }
