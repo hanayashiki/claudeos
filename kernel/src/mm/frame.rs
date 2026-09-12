@@ -259,29 +259,96 @@ pub fn init(boot: &BootInfo) {
     *ALLOCATOR.lock() = Some(alloc);
 }
 
-pub fn alloc_frame() -> Option<u64> {
-    ALLOCATOR.lock().as_mut().and_then(|a| a.alloc())
+/// One reference to a physical frame.
+///
+/// A frame is released when its last reference goes, so everything that
+/// records a frame holds one of these, and everything that stops recording it
+/// drops one. Holding the reference in a value rather than counting by hand
+/// is what makes a missed share or a second release a move error instead of a
+/// page handed to two owners.
+///
+/// A page table entry is the one place a reference is recorded where the type
+/// system cannot see it, so `into_recorded` and `from_recorded` mark the two
+/// crossings.
+pub struct Frame(u64);
+
+impl Frame {
+    pub fn addr(&self) -> u64 {
+        self.0
+    }
+
+    /// A second reference to the same frame, for a mapping that shares it.
+    pub fn share(&self) -> Frame {
+        share_frame(self.0);
+        Frame(self.0)
+    }
+
+    /// Give up the handle without releasing the frame: the reference is now
+    /// recorded somewhere else, in practice a page table entry.
+    pub fn into_recorded(self) -> u64 {
+        let addr = self.0;
+        core::mem::forget(self);
+        addr
+    }
+
+    /// Take back a reference that was recorded elsewhere.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be removing exactly one recorded reference, and must
+    /// not use the recorded copy again.
+    pub unsafe fn from_recorded(addr: u64) -> Frame {
+        Frame(addr)
+    }
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        free_frame(self.0);
+    }
+}
+
+impl core::fmt::Debug for Frame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Frame({:#x})", self.0)
+    }
+}
+
+pub fn alloc() -> Option<Frame> {
+    ALLOCATOR.lock().as_mut().and_then(|a| a.alloc()).map(Frame)
 }
 
 /// Allocate a frame and zero it through the direct map.
-pub fn alloc_zeroed_frame() -> Option<u64> {
-    let frame = alloc_frame()?;
-    unsafe { core::ptr::write_bytes(phys_to_virt(frame) as *mut u8, 0, 4096) };
+pub fn alloc_zeroed() -> Option<Frame> {
+    let frame = alloc()?;
+    unsafe { core::ptr::write_bytes(phys_to_virt(frame.addr()) as *mut u8, 0, 4096) };
     Some(frame)
+}
+
+/// One more reference to a frame something else already holds, for a caller
+/// that is about to record it.
+///
+/// # Safety
+///
+/// The frame must be one that is currently allocated, and the caller must
+/// record the reference or drop it.
+pub unsafe fn share_recorded(addr: u64) -> Frame {
+    share_frame(addr);
+    Frame(addr)
 }
 
 pub fn alloc_contiguous(count: usize) -> Option<u64> {
     ALLOCATOR.lock().as_mut().and_then(|a| a.alloc_contiguous(count))
 }
 
-pub fn free_frame(phys: u64) {
+fn free_frame(phys: u64) {
     if let Some(a) = ALLOCATOR.lock().as_mut() {
         a.free(phys);
     }
 }
 
 /// Take an extra reference to a frame that is about to be shared.
-pub fn share_frame(phys: u64) {
+fn share_frame(phys: u64) {
     if let Some(a) = ALLOCATOR.lock().as_mut() {
         a.share(phys);
     }

@@ -59,6 +59,11 @@ fn page_fault(frame: &mut TrapFrame) {
             if code & 16 != 0 { " instruction-fetch" } else { "" },
         );
         dump(frame);
+        // The registers name the memory the program was walking; show it, so
+        // a fault on a structure says what the structure held.
+        for (name, at) in [("r15", frame.r15), ("rbx", frame.rbx), ("rsp", frame.rsp)] {
+            dump_user(name, at);
+        }
         crate::sched::kill_current(11); // SIGSEGV
     }
 
@@ -113,6 +118,34 @@ pub fn unhandled(frame: &mut TrapFrame) {
     println!("[trap] unhandled vector {} rip={:#x}", vector, frame.rip);
     if frame.from_user() {
         crate::sched::kill_current(11);
+    }
+}
+
+/// Four 16-byte lines of user memory at `at`, skipped if it is not mapped.
+fn dump_user(name: &str, at: u64) {
+    let start = at & !0xF;
+    if start < 0x1000 {
+        return;
+    }
+    for line in 0..4u64 {
+        let address = start + line * 16;
+        let mut bytes = [0u8; 16];
+        if crate::uaccess::read_bytes(address, &mut bytes).is_err() {
+            return;
+        }
+        let mut words = [0u64; 2];
+        for (i, word) in words.iter_mut().enumerate() {
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+            *word = u64::from_le_bytes(raw);
+        }
+        println!(
+            "  {} {:#018x}: {:#018x} {:#018x}",
+            if line == 0 { name } else { "   " },
+            address,
+            words[0],
+            words[1]
+        );
     }
 }
 

@@ -3,7 +3,7 @@
 //! Tables are always reached through the direct map, so no recursive mapping
 //! or temporary windows are needed.
 
-use super::frame;
+use super::frame::{self, Frame};
 use super::{page_align_down, phys_to_virt, HHDM_BASE, PAGE_SIZE_U64};
 use core::arch::asm;
 
@@ -75,7 +75,8 @@ impl AddressSpace {
 
     /// Create a fresh address space that shares the kernel half.
     pub fn new_user() -> Option<AddressSpace> {
-        let pml4 = frame::alloc_zeroed_frame()?;
+        // The space owns its top table; `destroy` takes the reference back.
+        let pml4 = frame::alloc_zeroed()?.into_recorded();
         let kernel = Self::current();
         unsafe {
             let src = table_at(kernel.pml4);
@@ -108,7 +109,9 @@ impl AddressSpace {
                 if !create {
                     return Err(MapError::OutOfMemory);
                 }
-                let new = frame::alloc_zeroed_frame().ok_or(MapError::OutOfMemory)?;
+                // The entry above it holds the table's reference from here
+                // on; `free_table` takes it back.
+                let new = frame::alloc_zeroed().ok_or(MapError::OutOfMemory)?.into_recorded();
                 *entry_ptr = new | PRESENT | WRITABLE | (parent_flags & USER);
                 table = new;
             } else {
@@ -127,7 +130,22 @@ impl AddressSpace {
         Ok(table_at(table).add(index_of(virt, 0)))
     }
 
-    pub fn map(&self, virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
+    /// Map `frame` at `virt`. The entry holds the reference from here on, and
+    /// `unmap` or teardown gives it back. A mapping that fails releases it.
+    pub fn map(&self, virt: u64, frame: Frame, flags: u64) -> Result<(), MapError> {
+        let virt = page_align_down(virt);
+        unsafe {
+            let entry = self.entry_for(virt, true, flags)?;
+            *entry = (frame.into_recorded() & ADDR_MASK) | flags | PRESENT;
+        }
+        flush_tlb(virt);
+        Ok(())
+    }
+
+    /// Map memory this address space does not own: the direct map, the kernel
+    /// image, device registers. Only the kernel half is mapped this way, and
+    /// the kernel half is never torn down.
+    pub fn map_fixed(&self, virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
         let virt = page_align_down(virt);
         unsafe {
             let entry = self.entry_for(virt, true, flags)?;
@@ -137,19 +155,18 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Map without requiring the entry to be absent; replaces any existing one.
-    pub fn remap(&self, virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
-        self.map(virt, phys, flags)
-    }
-
     /// Allocate a frame and map it at `virt`.
     pub fn map_new(&self, virt: u64, flags: u64) -> Result<u64, MapError> {
-        let phys = frame::alloc_zeroed_frame().ok_or(MapError::OutOfMemory)?;
-        self.map(virt, phys, flags)?;
+        let frame = frame::alloc_zeroed().ok_or(MapError::OutOfMemory)?;
+        let phys = frame.addr();
+        self.map(virt, frame, flags)?;
         Ok(phys)
     }
 
-    pub fn unmap(&self, virt: u64) -> Option<u64> {
+    /// Take the mapping at `virt` away, handing back the reference the entry
+    /// held. Dropping the result releases the frame.
+    #[must_use = "dropping the frame is what releases it"]
+    pub fn unmap(&self, virt: u64) -> Option<Frame> {
         let virt = page_align_down(virt);
         unsafe {
             let entry = self.entry_for(virt, false, 0).ok()?;
@@ -159,7 +176,7 @@ impl AddressSpace {
             }
             *entry = 0;
             flush_tlb(virt);
-            Some(value & ADDR_MASK)
+            Some(Frame::from_recorded(value & ADDR_MASK))
         }
     }
 
@@ -219,7 +236,7 @@ impl AddressSpace {
     ) -> Result<(), MapError> {
         let pages = super::page_align_up(size) / PAGE_SIZE_U64;
         for i in 0..pages {
-            self.map(virt + i * PAGE_SIZE_U64, phys + i * PAGE_SIZE_U64, flags)?;
+            self.map_fixed(virt + i * PAGE_SIZE_U64, phys + i * PAGE_SIZE_U64, flags)?;
         }
         Ok(())
     }
@@ -254,11 +271,11 @@ impl AddressSpace {
             for i in 0..512 {
                 let entry = *table.add(i);
                 if entry & PRESENT != 0 {
-                    frame::free_frame(entry & ADDR_MASK);
+                    drop(Frame::from_recorded(entry & ADDR_MASK));
                 }
             }
         }
-        frame::free_frame(table_phys);
+        drop(Frame::from_recorded(table_phys));
     }
 
     /// Share every user mapping from `src` with this address space.
@@ -310,8 +327,9 @@ impl AddressSpace {
                             } else {
                                 flags
                             };
-                            frame::share_frame(phys);
-                            self.map(virt, phys, shared)?;
+                            // A second reference for the entry about to be
+                            // written in the child.
+                            self.map(virt, frame::share_recorded(phys), shared)?;
                         }
                     }
                 }
@@ -325,7 +343,7 @@ impl AddressSpace {
     /// Release the PML4 itself. The kernel half is shared, so it is not freed.
     pub fn destroy(self) {
         self.free_user_memory();
-        frame::free_frame(self.pml4);
+        drop(unsafe { Frame::from_recorded(self.pml4) });
     }
 }
 

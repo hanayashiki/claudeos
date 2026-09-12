@@ -401,20 +401,22 @@ impl Task {
                 .is_some();
         }
 
-        let Some(copy) = crate::mm::frame::alloc_frame() else {
+        let Some(copy) = crate::mm::frame::alloc() else {
             return false;
         };
         unsafe {
             core::ptr::copy_nonoverlapping(
                 crate::mm::phys_to_virt(phys) as *const u8,
-                crate::mm::phys_to_virt(copy) as *mut u8,
+                crate::mm::phys_to_virt(copy.addr()) as *mut u8,
                 crate::mm::PAGE_SIZE,
             );
         }
-        crate::mm::frame::free_frame(phys);
-        self.space
-            .map(page, copy, (flags & !COW) | WRITABLE)
-            .is_ok()
+        // Taking the old mapping away hands back the reference this table
+        // held on the shared frame; the copy takes its place.
+        let shared = self.space.unmap(page);
+        let mapped = self.space.map(page, copy, (flags & !COW) | WRITABLE).is_ok();
+        drop(shared);
+        mapped
     }
 
     /// Back `addr`'s page with memory if the heap or a region covers it.

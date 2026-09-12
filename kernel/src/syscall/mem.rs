@@ -32,12 +32,11 @@ pub fn brk(request: u64) -> SysResult {
     }
 
     if new_brk < current_brk {
-        // Shrinking: give the frames back.
+        // Shrinking: give the frames back. Taking the mapping away hands
+        // back the reference the entry held, and dropping it is the release.
         let mut page = new_brk;
         while page < current_brk {
-            if let Some(frame) = task.space.unmap(page) {
-                crate::mm::frame::free_frame(frame);
-            }
+            drop(task.space.unmap(page));
             page += PAGE_SIZE_U64;
         }
     }
@@ -118,9 +117,7 @@ fn unmap_range(addr: u64, len: u64) {
     let end = page_align_up(addr + len);
     let mut page = start;
     while page < end {
-        if let Some(frame) = task.space.unmap(page) {
-            crate::mm::frame::free_frame(frame);
-        }
+        drop(task.space.unmap(page));
         page += PAGE_SIZE_U64;
     }
     task.remove_vma_range(start, end);

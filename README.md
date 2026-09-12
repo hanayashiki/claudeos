@@ -69,7 +69,10 @@ no bootloader to install. The build converts the linked ELF64 to ELF32 with
 the physical load addresses are what it actually uses.
 
 **Memory.** A bitmap frame allocator covers all usable physical memory reported
-by the boot loader's E820 map. Physical memory is also mapped in one piece at
+by the boot loader's E820 map. A frame is handed out as an owned value whose
+`Drop` releases it, and a page table entry is what holds that value, so the
+reference a mapping owns is given back by taking the mapping away rather than
+by remembering to call free. Physical memory is also mapped in one piece at
 `0xFFFF800000000000`, so page tables and frame contents are reachable without
 temporary mappings. On top of that sit a 4-level page table implementation and
 a coalescing kernel heap.
