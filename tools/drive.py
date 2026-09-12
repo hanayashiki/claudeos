@@ -38,6 +38,11 @@ def main():
         else:
             args.pop(0)
 
+    # A guest left spinning starves every later run, so clear any stale one.
+    reaper = os.path.join(ROOT, "scripts", "reap-stale.sh")
+    if os.path.exists(reaper):
+        subprocess.run([reaper, "15"], check=False)
+
     sock_path = os.path.join(tempfile.mkdtemp(), "console.sock")
     command = [
         "qemu-system-x86_64",

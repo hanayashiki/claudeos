@@ -325,6 +325,45 @@ impl Task {
         }
     }
 
+    /// Give this task a private copy of a shared page it is trying to write.
+    /// Returns false when the fault was not a copy-on-write fault.
+    pub fn handle_cow(&mut self, addr: u64) -> bool {
+        use crate::mm::paging::COW;
+        let page = page_align_down(addr);
+        let Some(flags) = self.space.flags_of(page) else {
+            return false;
+        };
+        if flags & COW == 0 {
+            return false;
+        }
+        let Some(phys) = self.space.translate(page).map(page_align_down) else {
+            return false;
+        };
+
+        // The last owner can simply take the page back.
+        if crate::mm::frame::frame_references(phys) <= 1 {
+            return self
+                .space
+                .set_flags(page, (flags & !COW) | WRITABLE)
+                .is_some();
+        }
+
+        let Some(copy) = crate::mm::frame::alloc_frame() else {
+            return false;
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                crate::mm::phys_to_virt(phys) as *const u8,
+                crate::mm::phys_to_virt(copy) as *mut u8,
+                crate::mm::PAGE_SIZE,
+            );
+        }
+        crate::mm::frame::free_frame(phys);
+        self.space
+            .map(page, copy, (flags & !COW) | WRITABLE)
+            .is_ok()
+    }
+
     /// Back `addr`'s page with memory if the heap or a region covers it.
     pub fn fault_in(&mut self, addr: u64) -> bool {
         let page = page_align_down(addr);

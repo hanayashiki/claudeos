@@ -11,6 +11,9 @@ use crate::sync::Spinlock;
 pub struct BitmapAllocator {
     bitmap: *mut u64,
     words: usize,
+    /// One reference count per frame, so a frame shared by copy-on-write is
+    /// only released once its last user lets go.
+    refcounts: *mut u16,
     total_frames: usize,
     used_frames: usize,
     /// Where the next linear search starts, to avoid rescanning from zero.
@@ -43,6 +46,16 @@ impl BitmapAllocator {
         }
     }
 
+    #[inline]
+    fn set_count(&mut self, frame: usize, value: u16) {
+        unsafe { *self.refcounts.add(frame) = value };
+    }
+
+    #[inline]
+    fn count(&self, frame: usize) -> u16 {
+        unsafe { *self.refcounts.add(frame) }
+    }
+
     fn mark_range_used(&mut self, start: u64, end: u64) {
         let first = (start / PAGE_SIZE_U64) as usize;
         let last = (page_align_up(end) / PAGE_SIZE_U64) as usize;
@@ -51,6 +64,8 @@ impl BitmapAllocator {
                 self.used_frames += 1;
             }
             self.set(f);
+            // Never hand these back; one permanent reference keeps them held.
+            self.set_count(f, 1);
         }
     }
 
@@ -82,6 +97,7 @@ impl BitmapAllocator {
                     let frame = w * 64 + bit;
                     if frame < self.total_frames && !self.test(frame) {
                         self.set(frame);
+                        self.set_count(frame, 1);
                         self.used_frames += 1;
                         self.hint = frame + 1;
                         return Some(frame as u64 * PAGE_SIZE_U64);
@@ -112,6 +128,7 @@ impl BitmapAllocator {
                 let first = f + 1 - count;
                 for x in first..=f {
                     self.set(x);
+                    self.set_count(x, 1);
                 }
                 self.used_frames += count;
                 return Some(first as u64 * PAGE_SIZE_U64);
@@ -120,17 +137,38 @@ impl BitmapAllocator {
         None
     }
 
+    /// Drop one reference. The frame is only released when the last goes.
     pub fn free(&mut self, phys: u64) {
         let frame = (phys / PAGE_SIZE_U64) as usize;
-        if frame >= self.total_frames {
+        if frame >= self.total_frames || !self.test(frame) {
             return;
         }
-        if self.test(frame) {
-            self.used_frames -= 1;
-            self.clear(frame);
-            if frame < self.hint {
-                self.hint = frame;
-            }
+        let remaining = self.count(frame).saturating_sub(1);
+        self.set_count(frame, remaining);
+        if remaining > 0 {
+            return;
+        }
+        self.used_frames -= 1;
+        self.clear(frame);
+        if frame < self.hint {
+            self.hint = frame;
+        }
+    }
+
+    pub fn share(&mut self, phys: u64) {
+        let frame = (phys / PAGE_SIZE_U64) as usize;
+        if frame < self.total_frames && self.test(frame) {
+            let count = self.count(frame);
+            self.set_count(frame, count.saturating_add(1));
+        }
+    }
+
+    pub fn references(&self, phys: u64) -> u16 {
+        let frame = (phys / PAGE_SIZE_U64) as usize;
+        if frame < self.total_frames {
+            self.count(frame)
+        } else {
+            0
         }
     }
 
@@ -166,6 +204,8 @@ pub fn init(boot: &BootInfo) {
 
     let total_frames = (max_addr / PAGE_SIZE_U64) as usize;
     let bitmap_bytes = page_align_up(((total_frames + 7) / 8) as u64) as usize;
+    let refcount_bytes = page_align_up((total_frames * 2) as u64) as usize;
+    let metadata_bytes = bitmap_bytes + refcount_bytes;
 
     // The bitmap must not land on the kernel image, the modules, or the
     // multiboot blob, so start looking past all of them.
@@ -176,7 +216,7 @@ pub fn init(boot: &BootInfo) {
             continue;
         }
         let start = page_align_up(r.addr.max(barrier));
-        if start + bitmap_bytes as u64 <= r.end() {
+        if start + metadata_bytes as u64 <= r.end() {
             bitmap_phys = start;
             break;
         }
@@ -184,17 +224,22 @@ pub fn init(boot: &BootInfo) {
     assert!(bitmap_phys != 0, "no room for the frame bitmap");
 
     let bitmap = phys_to_virt(bitmap_phys) as *mut u64;
+    let refcounts = phys_to_virt(bitmap_phys + bitmap_bytes as u64) as *mut u16;
     let words = bitmap_bytes / 8;
-    unsafe { core::ptr::write_bytes(bitmap, 0xFF, bitmap_bytes) };
+    unsafe {
+        core::ptr::write_bytes(bitmap, 0xFF, bitmap_bytes);
+        core::ptr::write_bytes(refcounts, 0, refcount_bytes);
+    }
 
     let mut alloc = BitmapAllocator {
         bitmap,
         words,
+        refcounts,
         total_frames,
         used_frames: total_frames,
         hint: 0,
         bitmap_phys,
-        bitmap_bytes,
+        bitmap_bytes: metadata_bytes,
     };
 
     // Release usable RAM, then take back everything that is already spoken for.
@@ -205,7 +250,7 @@ pub fn init(boot: &BootInfo) {
     }
     alloc.mark_range_used(0, 0x10_0000);
     alloc.mark_range_used(KERNEL_PHYS_START, super::kernel_phys_end());
-    alloc.mark_range_used(bitmap_phys, bitmap_phys + bitmap_bytes as u64);
+    alloc.mark_range_used(bitmap_phys, bitmap_phys + metadata_bytes as u64);
     alloc.mark_range_used(boot.info_phys, boot.reserved_end);
     for m in &boot.modules[..boot.module_count] {
         alloc.mark_range_used(m.start, m.end);
@@ -232,6 +277,20 @@ pub fn alloc_contiguous(count: usize) -> Option<u64> {
 pub fn free_frame(phys: u64) {
     if let Some(a) = ALLOCATOR.lock().as_mut() {
         a.free(phys);
+    }
+}
+
+/// Take an extra reference to a frame that is about to be shared.
+pub fn share_frame(phys: u64) {
+    if let Some(a) = ALLOCATOR.lock().as_mut() {
+        a.share(phys);
+    }
+}
+
+pub fn frame_references(phys: u64) -> u16 {
+    match ALLOCATOR.lock().as_ref() {
+        Some(a) => a.references(phys),
+        None => 0,
     }
 }
 

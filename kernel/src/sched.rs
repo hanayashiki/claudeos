@@ -216,8 +216,12 @@ pub fn handle_user_page_fault(addr: u64, code: u64, _frame: &mut TrapFrame) -> b
     if !has_current() {
         return false;
     }
-    // A protection violation on a present page is never satisfied by mapping.
     if code & 1 != 0 {
+        // The page is present, so the only fault that can be repaired is a
+        // write to a page still shared with another address space.
+        if code & 2 != 0 {
+            return current().handle_cow(addr);
+        }
         return false;
     }
     current().fault_in(addr)

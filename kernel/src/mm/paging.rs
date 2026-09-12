@@ -17,6 +17,9 @@ pub const DIRTY: u64 = 1 << 6;
 pub const HUGE: u64 = 1 << 7;
 pub const GLOBAL: u64 = 1 << 8;
 pub const NO_EXECUTE: u64 = 1 << 63;
+/// Software bit: the page is shared with another address space and must be
+/// copied before it is written to. Bits 9..11 are free for the kernel's use.
+pub const COW: u64 = 1 << 9;
 
 /// Bits software may use freely in a non-present entry.
 pub const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -258,8 +261,11 @@ impl AddressSpace {
         frame::free_frame(table_phys);
     }
 
-    /// Copy every user mapping from `src` into this address space, giving the
-    /// copy its own frames.
+    /// Share every user mapping from `src` with this address space.
+    ///
+    /// Writable pages are made read-only on both sides and marked
+    /// copy-on-write, so a fork costs a page table walk rather than a copy of
+    /// the whole address space; the copy happens per page, only if written to.
     pub fn clone_user_from(&self, src: &AddressSpace) -> Result<(), MapError> {
         unsafe {
             let src_pml4 = table_at(src.pml4);
@@ -282,28 +288,37 @@ impl AddressSpace {
                         }
                         let pt = table_at(e2 & ADDR_MASK);
                         for l in 0..512usize {
-                            let e1 = *pt.add(l);
-                            if e1 & PRESENT == 0 {
+                            let entry = *pt.add(l);
+                            if entry & PRESENT == 0 {
                                 continue;
                             }
-                            let virt = ((i as u64) << 39)
-                                | ((j as u64) << 30)
-                                | ((k as u64) << 21)
-                                | ((l as u64) << 12);
-                            let virt = sign_extend(virt);
-                            let new_frame =
-                                frame::alloc_frame().ok_or(MapError::OutOfMemory)?;
-                            core::ptr::copy_nonoverlapping(
-                                phys_to_virt(e1 & ADDR_MASK) as *const u8,
-                                phys_to_virt(new_frame) as *mut u8,
-                                4096,
+                            let virt = sign_extend(
+                                ((i as u64) << 39)
+                                    | ((j as u64) << 30)
+                                    | ((k as u64) << 21)
+                                    | ((l as u64) << 12),
                             );
-                            self.map(virt, new_frame, e1 & !ADDR_MASK)?;
+                            let phys = entry & ADDR_MASK;
+                            let flags = entry & !ADDR_MASK;
+
+                            let shared = if flags & WRITABLE != 0 {
+                                let shared = (flags & !WRITABLE) | COW;
+                                // The parent loses write access too, or it
+                                // would change pages the child can see.
+                                *pt.add(l) = phys | shared;
+                                shared
+                            } else {
+                                flags
+                            };
+                            frame::share_frame(phys);
+                            self.map(virt, phys, shared)?;
                         }
                     }
                 }
             }
         }
+        // The parent's write permissions just changed underneath it.
+        flush_tlb_all();
         Ok(())
     }
 
