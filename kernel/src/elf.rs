@@ -22,7 +22,7 @@ pub const PF_R: u32 = 4;
 /// Load address given to position-independent executables.
 pub const DYN_BASE: u64 = 0x2000_0000;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LoadedImage {
     pub entry: u64,
     pub phdr_addr: u64,
@@ -36,6 +36,9 @@ pub struct LoadedImage {
     pub tls_filesz: u64,
     pub tls_memsz: u64,
     pub tls_align: u64,
+    /// The mapped segments, as (start, end, PROT_* bits), so the task can
+    /// record them alongside its other regions.
+    pub segments: alloc::vec::Vec<(u64, u64, u64)>,
 }
 
 fn rd16(data: &[u8], off: usize) -> u16 {
@@ -211,6 +214,28 @@ pub fn load(space: &AddressSpace, data: &[u8]) -> Result<LoadedImage, Errno> {
         }
     }
 
+    let mut segments = alloc::vec::Vec::new();
+    for ph in &phdrs {
+        if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
+            continue;
+        }
+        let mut prot = 0u64;
+        if ph.p_flags & PF_R != 0 {
+            prot |= crate::abi::PROT_READ;
+        }
+        if ph.p_flags & PF_W != 0 {
+            prot |= crate::abi::PROT_WRITE;
+        }
+        if ph.p_flags & PF_X != 0 {
+            prot |= crate::abi::PROT_EXEC;
+        }
+        segments.push((
+            page_align_down(base + ph.p_vaddr),
+            page_align_up(base + ph.p_vaddr + ph.p_memsz),
+            prot,
+        ));
+    }
+
     Ok(LoadedImage {
         entry: base + e_entry,
         phdr_addr,
@@ -223,5 +248,6 @@ pub fn load(space: &AddressSpace, data: &[u8]) -> Result<LoadedImage, Errno> {
         tls_filesz: tls.1,
         tls_memsz: tls.2,
         tls_align: tls.3,
+        segments,
     })
 }

@@ -171,7 +171,9 @@ pub fn read(buf: &mut [u8]) -> Result<usize, Errno> {
             if crate::sched::has_pending_signal() {
                 return Err(Errno::EINTR);
             }
-            WAITING.wait();
+            WAITING.wait_until(|| {
+                INPUT.lock().len() > 0 || crate::sched::has_pending_signal()
+            });
         }
     }
 
@@ -209,7 +211,9 @@ pub fn read(buf: &mut [u8]) -> Result<usize, Errno> {
             if crate::sched::has_pending_signal() {
                 return Err(Errno::EINTR);
             }
-            WAITING.wait();
+            WAITING.wait_until(|| {
+                INPUT.lock().len() > 0 || crate::sched::has_pending_signal()
+            });
         }
     }
 }

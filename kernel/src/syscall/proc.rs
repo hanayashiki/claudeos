@@ -181,6 +181,10 @@ pub fn exec_into_current(
     };
 
     task.set_heap_base(image.brk_start);
+    // Record the image so /proc reports it and mmap never lands on top of it.
+    for (start, end, prot) in &image.segments {
+        task.add_vma(*start, *end, *prot, MAP_PRIVATE);
+    }
 
     let sp = match task::build_user_stack(task, &image, &argv, &envp, &exec_path) {
         Ok(sp) => sp,

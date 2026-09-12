@@ -18,6 +18,7 @@ pub enum Generated {
     PidStat(u32),
     PidStatus(u32),
     PidCmdline(u32),
+    PidMaps(u32),
 }
 
 pub fn populate() {
@@ -48,6 +49,7 @@ pub fn add_process(pid: u32) {
         ("stat", Generated::PidStat(pid)),
         ("status", Generated::PidStatus(pid)),
         ("cmdline", Generated::PidCmdline(pid)),
+        ("maps", Generated::PidMaps(pid)),
     ];
     for (name, kind) in files {
         let node = Node::new(NodeKind::Generated(kind), S_IFREG | 0o444);
@@ -57,7 +59,7 @@ pub fn add_process(pid: u32) {
 
 pub fn remove_process(pid: u32) {
     let dir = format!("/proc/{}", pid);
-    for name in ["stat", "status", "cmdline"] {
+    for name in ["stat", "status", "cmdline", "maps"] {
         let _ = unlink(&format!("{}/{}", dir, name), false);
     }
     let _ = unlink(&dir, true);
@@ -192,6 +194,49 @@ pub fn render(kind: Generated) -> String {
                 task.pending_signals,
                 task.signal_mask,
             ),
+            None => String::new(),
+        },
+        Generated::PidMaps(pid) => match crate::sched::find(pid) {
+            Some(task) => {
+                let mut out = String::new();
+                let mut regions = task.snapshot_vmas();
+                regions.sort_by_key(|region| region.start);
+                let (brk_start, brk) = (task.brk_start(), task.brk());
+                let stack_top = crate::mm::USER_STACK_TOP;
+
+                let mut emit = |start: u64, end: u64, prot: u64, label: &str| {
+                    out.push_str(&format!(
+                        "{:012x}-{:012x} {}{}{}p 00000000 00:00 0 {}{}\n",
+                        start,
+                        end,
+                        if prot & crate::abi::PROT_READ != 0 { "r" } else { "-" },
+                        if prot & crate::abi::PROT_WRITE != 0 { "w" } else { "-" },
+                        if prot & crate::abi::PROT_EXEC != 0 { "x" } else { "-" },
+                        if label.is_empty() { "" } else { "                    " },
+                        label,
+                    ));
+                };
+
+                for region in &regions {
+                    let label = if region.end > stack_top - crate::task::STACK_RESERVE
+                        && region.end <= stack_top
+                    {
+                        "[stack]"
+                    } else {
+                        ""
+                    };
+                    emit(region.start, region.end, region.prot, label);
+                }
+                if brk > brk_start {
+                    emit(
+                        brk_start,
+                        brk,
+                        crate::abi::PROT_READ | crate::abi::PROT_WRITE,
+                        "[heap]",
+                    );
+                }
+                out
+            }
             None => String::new(),
         },
         Generated::PidCmdline(pid) => match crate::sched::find(pid) {

@@ -3,6 +3,7 @@
 
 mod cmds;
 mod edit;
+mod regex;
 mod init;
 mod shell;
 mod sys;

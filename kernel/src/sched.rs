@@ -497,19 +497,27 @@ impl WaitQueue {
         WaitQueue { waiters: Spinlock::new(Vec::new()) }
     }
 
-    /// Block until the queue is woken. Must be called with no locks held.
-    pub fn wait(&self) {
+    /// Block until `ready` holds.
+    ///
+    /// The condition is re-checked after this task is on the queue and with
+    /// interrupts off, so a wake-up that arrives between a caller's own check
+    /// and the sleep cannot be missed. `ready` must not block.
+    pub fn wait_until(&self, mut ready: impl FnMut() -> bool) {
         let pid = current().pid;
-        // Enqueue and go to sleep without a window where a wake-up could be
-        // delivered to a task that is not yet marked asleep.
-        disable_interrupts();
-        self.waiters.lock().push(pid);
-        current().state = State::Sleeping;
-        enable_interrupts();
+        loop {
+            disable_interrupts();
+            if ready() {
+                enable_interrupts();
+                return;
+            }
+            self.waiters.lock().push(pid);
+            current().state = State::Sleeping;
+            enable_interrupts();
 
-        schedule();
+            schedule();
 
-        self.waiters.lock().retain(|waiter| *waiter != pid);
+            self.waiters.lock().retain(|waiter| *waiter != pid);
+        }
     }
 
     pub fn wake_all(&self) {

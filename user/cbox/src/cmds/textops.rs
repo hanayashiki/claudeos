@@ -174,7 +174,7 @@ pub fn tail(args: &[String]) -> i32 {
 pub fn grep(args: &[String]) -> i32 {
     let (flags, operands) = split_flags(args);
     if operands.is_empty() {
-        eprintln!("usage: grep [-cilnqrv] pattern [file...]");
+        eprintln!("usage: grep [-cEFilnqrv] pattern [file...]");
         return 2;
     }
     let pattern = &operands[0];
@@ -197,7 +197,12 @@ pub fn grep(args: &[String]) -> i32 {
     }
     let paths = &paths[..];
 
-    let needle = if ignore_case { pattern.to_lowercase() } else { pattern.clone() };
+    let source = if ignore_case { pattern.to_lowercase() } else { pattern.clone() };
+    let matcher = if flags.contains('F') {
+        crate::regex::Regex::literal(&source)
+    } else {
+        crate::regex::Regex::new(&source, flags.contains('E'))
+    };
     let (inputs, mut status) = read_inputs("grep", paths);
     let show_names = inputs.len() > 1 || recursive;
     let mut matched_any = false;
@@ -206,7 +211,7 @@ pub fn grep(args: &[String]) -> i32 {
         let mut count = 0;
         for (index, line) in text.lines().enumerate() {
             let haystack = if ignore_case { line.to_lowercase() } else { line.to_string() };
-            let hit = haystack.contains(&needle);
+            let hit = matcher.is_match(&haystack);
             if hit == invert {
                 continue;
             }

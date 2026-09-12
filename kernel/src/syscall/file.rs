@@ -33,26 +33,51 @@ pub fn resolve_str(dirfd: i64, path: &str) -> Result<String, Errno> {
     Ok(fs::normalize(&file.path, path))
 }
 
-/// Paths under /proc that the kernel answers directly.
+/// Paths under /proc that the kernel answers with something else.
+///
+/// `/proc/self` names the calling process's own directory, and a few entries
+/// under it are links whose target lies outside /proc.
 fn procfs_override(path: &str) -> Option<String> {
-    let task = sched::current();
-    if path == "/proc/self/exe" || path == &alloc::format!("/proc/{}/exe", task.pid) {
-        return Some(task.exe_path.clone());
+    if !path.starts_with("/proc/") && path != "/proc/self" {
+        return None;
     }
-    for prefix in ["/proc/self/fd/", "/proc/self/cwd"] {
-        if let Some(rest) = path.strip_prefix(prefix) {
-            if prefix.ends_with("fd/") {
-                if let Ok(fd) = rest.parse::<i32>() {
-                    if let Ok(file) = task.fds.get(fd) {
-                        return Some(file.path.clone());
-                    }
+    let task = sched::current();
+    let pid = task.pid;
+
+    let rewritten = if path == "/proc/self" {
+        Some(alloc::format!("/proc/{}", pid))
+    } else {
+        path.strip_prefix("/proc/self/")
+            .map(|rest| alloc::format!("/proc/{}/{}", pid, rest))
+    };
+    let effective: &str = rewritten.as_deref().unwrap_or(path);
+
+    let own_prefix = alloc::format!("/proc/{}/", pid);
+    if let Some(entry) = effective.strip_prefix(&own_prefix) {
+        match entry {
+            "exe" => return Some(task.exe_path.clone()),
+            "cwd" => return Some(task.cwd.clone()),
+            _ => {}
+        }
+        if let Some(number) = entry.strip_prefix("fd/") {
+            if let Ok(fd) = number.parse::<i32>() {
+                if let Ok(file) = task.fds.get(fd) {
+                    return Some(file.path.clone());
                 }
-            } else {
-                return Some(task.cwd.clone());
+            }
+        }
+    } else if let Some(rest) = effective.strip_prefix("/proc/") {
+        // Another process's exe link.
+        if let Some((number, "exe")) = rest.split_once('/') {
+            if let Ok(other) = number.parse::<u32>() {
+                if let Some(target) = sched::find(other) {
+                    return Some(target.exe_path.clone());
+                }
             }
         }
     }
-    None
+
+    rewritten
 }
 
 pub fn read(fd: i32, buf_addr: u64, len: u64) -> SysResult {

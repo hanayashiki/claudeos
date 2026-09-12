@@ -69,7 +69,12 @@ impl Pipe {
             if crate::sched::has_pending_signal() {
                 return Err(Errno::EINTR);
             }
-            self.not_empty.wait();
+            self.not_empty.wait_until(|| {
+                let buffer = self.buffer.lock();
+                buffer.data.len() > buffer.head
+                    || self.writers.load(Ordering::Acquire) == 0
+                    || crate::sched::has_pending_signal()
+            });
         }
     }
 
@@ -98,7 +103,12 @@ impl Pipe {
             if crate::sched::has_pending_signal() {
                 return Err(Errno::EINTR);
             }
-            self.not_full.wait();
+            self.not_full.wait_until(|| {
+                let buffer = self.buffer.lock();
+                buffer.data.len() - buffer.head < PIPE_CAPACITY
+                    || self.readers.load(Ordering::Acquire) == 0
+                    || crate::sched::has_pending_signal()
+            });
         }
     }
 }

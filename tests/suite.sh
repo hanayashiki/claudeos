@@ -50,6 +50,25 @@ check "cut"               "b"        "$(echo 'a:b:c' | cut -d: -f2)"
 check "wc -w"             "3"        "$(echo one two three | wc -w)"
 
 echo
+echo "-- grep patterns --"
+check "anchor start"   "1"  "$(seq 1 100 | grep -c '^42$')"
+check "anchor end"     "10" "$(seq 1 100 | grep -c '0$')"
+check "dot"            "2"  "$(printf 'cat\ncot\ncar\n' | grep -c '^c.t$')"
+check "star"           "3"  "$(printf 'ab\naab\naaab\n' | grep -c '^a*b$')"
+check "class"          "2"  "$(printf 'cat\ncot\ncut\n' | grep -c '^c[ao]t$')"
+check "negated class"  "1"  "$(printf 'cat\ncot\ncut\n' | grep -c '^c[^ao]t$')"
+check "range"          "5"  "$(seq 1 20 | grep -c '^1[0-4]$')"
+check "escaped dot"    "1"  "$(printf 'a.b\naxb\n' | grep -c '^a\.b$')"
+check "extended plus"  "2"  "$(printf 'ab\naab\nb\n' | grep -cE '^a+b$')"
+check "extended alt"   "2"  "$(printf 'cat\ndog\nfox\n' | grep -cE '^(cat|dog)$')"
+check "extended opt"   "2"  "$(printf 'color\ncolour\ncolr\n' | grep -cE '^colou?r$')"
+check "fixed strings"  "1"  "$(printf 'a.b\naxb\n' | grep -cF 'a.b')"
+check "invert"         "99" "$(seq 1 100 | grep -vc '^42$')"
+check "ignore case"    "2"  "$(printf 'Cat\ncat\ndog\n' | grep -ci '^cat$')"
+check "quiet status"   "1"  "$(seq 1 10 | grep -q '^99$'; echo $?)"
+check "recursive"      "2"  "$(grep -rl claudeos /etc | wc -l)"
+
+echo
 echo "-- files --"
 mkdir -p /tmp/t
 echo content > /tmp/t/file
