@@ -78,14 +78,16 @@ class Screen:
         if data[index + 1] not in (0x5B, 0x4F):
             return 2
         cursor = index + 2
-        digits = ""
-        while cursor < len(data) and chr(data[cursor]).isdigit():
-            digits += chr(data[cursor])
+        params = ""
+        # Parameters are digits and separators; the sequence ends at a letter.
+        while cursor < len(data) and (chr(data[cursor]).isdigit() or chr(data[cursor]) in ";?"):
+            params += chr(data[cursor])
             cursor += 1
         if cursor >= len(data):
             return None
         final = chr(data[cursor])
-        count = int(digits) if digits else 1
+        leading = params.split(";")[0]
+        count = int(leading) if leading.isdigit() else 1
         if final == "K":
             del self.line[self.column:]
         elif final == "C":

@@ -47,115 +47,307 @@ fn mode_string(mode: u32, is_dir: bool, is_link: bool) -> String {
     )
 }
 
+/// Width of the terminal, or None when output is not going to one.
+fn terminal_width() -> Option<usize> {
+    // struct winsize { u16 row; u16 col; u16 xpixel; u16 ypixel; }
+    let mut size = [0u16; 4];
+    let ok = crate::sys::ioctl_ptr(
+        crate::sys::STDOUT,
+        crate::sys::TIOCGWINSZ,
+        size.as_mut_ptr() as u64,
+    );
+    if ok < 0 {
+        return None;
+    }
+    Some(if size[1] >= 20 { size[1] as usize } else { 80 })
+}
+
+struct Entry {
+    name: String,
+    path: String,
+    metadata: fs::Metadata,
+}
+
 pub fn ls(args: &[String]) -> i32 {
     let (flags, operands) = split_flags(args);
     let long = flags.contains('l');
     let all = flags.contains('a');
-    let one_per_line = flags.contains('1') || long;
+    // Columns are for a person reading a terminal; a pipe gets one per line,
+    // which is what every caller that parses the output expects.
+    let one_per_line = flags.contains('1') || terminal_width().is_none();
+    let classify = flags.contains('F');
+    let reverse = flags.contains('r');
+    let by_time = flags.contains('t');
+    let by_size = flags.contains('S');
+    let human = flags.contains('h');
+    let recurse = flags.contains('R');
 
     let targets: Vec<String> =
         if operands.is_empty() { vec![".".to_string()] } else { operands };
     let mut status = 0;
-    let show_headers = targets.len() > 1;
 
-    for (index, target) in targets.iter().enumerate() {
-        let metadata = match fs::symlink_metadata(target) {
-            Ok(m) => m,
-            Err(err) => {
-                status = fail("ls", target, err);
-                continue;
-            }
-        };
-
-        if !metadata.is_dir() {
-            print_entry(target, target, &metadata, long, one_per_line);
-            if !one_per_line {
-                println!();
-            }
-            continue;
+    // Operands that are not directories are listed together, first.
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+    for target in &targets {
+        match fs::symlink_metadata(target) {
+            Ok(metadata) if metadata.is_dir() => directories.push(target.clone()),
+            Ok(metadata) => files.push(Entry {
+                name: target.clone(),
+                path: target.clone(),
+                metadata,
+            }),
+            Err(err) => status = fail("ls", target, err),
         }
+    }
 
-        if show_headers {
-            if index > 0 {
-                println!();
-            }
-            println!("{}:", target);
-        }
+    let options = ListOptions {
+        long,
+        one_per_line,
+        classify,
+        human,
+        reverse,
+        by_time,
+        by_size,
+    };
 
-        let mut names: Vec<String> = match fs::read_dir(target) {
-            Ok(entries) => entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .filter(|name| all || !name.starts_with('.'))
-                .collect(),
-            Err(err) => {
-                status = fail("ls", target, err);
-                continue;
-            }
-        };
-        names.sort();
+    if !files.is_empty() {
+        sort_entries(&mut files, &options);
+        // Named files get no "total" line; that belongs to a directory listing.
+        print_entries(&files, &options, false);
+    }
 
-        let mut printed = 0;
-        for name in &names {
-            let full = if target == "." {
-                name.clone()
-            } else {
-                format!("{}/{}", target.trim_end_matches('/'), name)
-            };
-            let metadata = match fs::symlink_metadata(&full) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            print_entry(name, &full, &metadata, long, one_per_line);
-            printed += 1;
-            if !one_per_line && printed % 4 == 0 {
-                println!();
-            }
-        }
-        if !one_per_line && printed % 4 != 0 {
-            println!();
+    let show_headers = directories.len() > 1 || !files.is_empty() || recurse;
+    let mut first = files.is_empty();
+    for directory in &directories {
+        if list_directory(directory, all, recurse, &options, show_headers, &mut first).is_err() {
+            status = 1;
         }
     }
     status
 }
 
-fn print_entry(name: &str, full: &str, metadata: &fs::Metadata, long: bool, one: bool) {
-    let is_dir = metadata.is_dir();
-    let is_link = metadata.file_type().is_symlink();
-    let executable = metadata.mode() & 0o111 != 0 && !is_dir;
+struct ListOptions {
+    long: bool,
+    one_per_line: bool,
+    classify: bool,
+    human: bool,
+    reverse: bool,
+    by_time: bool,
+    by_size: bool,
+}
 
-    let colour = if is_dir {
+fn list_directory(
+    path: &str,
+    all: bool,
+    recurse: bool,
+    options: &ListOptions,
+    show_headers: bool,
+    first: &mut bool,
+) -> Result<(), ()> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(err) => {
+            fail("ls", path, err);
+            return Err(());
+        }
+    };
+
+    if show_headers {
+        if !*first {
+            println!();
+        }
+        println!("{}:", path);
+    }
+    *first = false;
+
+    let mut items: Vec<Entry> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !all && name.starts_with('.') {
+            continue;
+        }
+        let full = join(path, &name);
+        if let Ok(metadata) = fs::symlink_metadata(&full) {
+            items.push(Entry { name, path: full, metadata });
+        }
+    }
+    sort_entries(&mut items, options);
+    print_entries(&items, options, true);
+
+    if recurse {
+        let subdirectories: Vec<String> = items
+            .iter()
+            .filter(|e| e.metadata.is_dir())
+            .map(|e| e.path.clone())
+            .collect();
+        for subdirectory in subdirectories {
+            let _ = list_directory(&subdirectory, all, true, options, true, first);
+        }
+    }
+    Ok(())
+}
+
+fn join(directory: &str, name: &str) -> String {
+    if directory == "/" {
+        format!("/{}", name)
+    } else {
+        format!("{}/{}", directory.trim_end_matches('/'), name)
+    }
+}
+
+fn sort_entries(items: &mut [Entry], options: &ListOptions) {
+    if options.by_time {
+        items.sort_by(|a, b| b.metadata.mtime().cmp(&a.metadata.mtime()));
+    } else if options.by_size {
+        items.sort_by(|a, b| b.metadata.len().cmp(&a.metadata.len()));
+    } else {
+        items.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    if options.reverse {
+        items.reverse();
+    }
+}
+
+fn suffix_for(metadata: &fs::Metadata) -> &'static str {
+    if metadata.is_dir() {
+        "/"
+    } else if metadata.file_type().is_symlink() {
+        "@"
+    } else if metadata.mode() & 0o111 != 0 {
+        "*"
+    } else {
+        ""
+    }
+}
+
+fn colour_for(metadata: &fs::Metadata) -> &'static str {
+    if metadata.is_dir() {
         BLUE
-    } else if is_link {
+    } else if metadata.file_type().is_symlink() {
         CYAN
-    } else if executable {
+    } else if metadata.mode() & 0o111 != 0 {
         GREEN
     } else {
         ""
-    };
-    let reset = if colour.is_empty() { "" } else { RESET };
+    }
+}
 
-    if long {
-        let mut suffix = String::new();
-        if is_link {
-            if let Ok(target) = fs::read_link(full) {
-                suffix = format!(" -> {}", target.display());
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["", "K", "M", "G", "T"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{}", bytes)
+    } else if value < 10.0 {
+        format!("{:.1}{}", value, UNITS[unit])
+    } else {
+        format!("{:.0}{}", value, UNITS[unit])
+    }
+}
+
+fn print_entries(items: &[Entry], options: &ListOptions, show_total: bool) {
+    if items.is_empty() {
+        return;
+    }
+
+    if options.long {
+        if show_total {
+            let total: u64 = items.iter().map(|i| (i.metadata.len() + 1023) / 1024).sum();
+            println!("total {}", total);
+        }
+
+        let widest = items
+            .iter()
+            .map(|i| {
+                if options.human {
+                    human_size(i.metadata.len()).len()
+                } else {
+                    i.metadata.len().to_string().len()
+                }
+            })
+            .max()
+            .unwrap_or(1);
+
+        for item in items {
+            let is_link = item.metadata.file_type().is_symlink();
+            let size = if options.human {
+                human_size(item.metadata.len())
+            } else {
+                item.metadata.len().to_string()
+            };
+            let mut trailer = String::new();
+            if is_link {
+                if let Ok(target) = fs::read_link(&item.path) {
+                    trailer = format!(" -> {}", target.display());
+                }
+            }
+            let colour = colour_for(&item.metadata);
+            let reset = if colour.is_empty() { "" } else { RESET };
+            println!(
+                "{} {:>3} {:>width$} {}{}{}{}{}",
+                mode_string(item.metadata.mode(), item.metadata.is_dir(), is_link),
+                item.metadata.nlink(),
+                size,
+                colour,
+                item.name,
+                reset,
+                if options.classify { suffix_for(&item.metadata) } else { "" },
+                trailer,
+                width = widest,
+            );
+        }
+        return;
+    }
+
+    // Decorated names, and the display width of each without escape codes.
+    let cells: Vec<(String, usize)> = items
+        .iter()
+        .map(|item| {
+            let suffix = if options.classify { suffix_for(&item.metadata) } else { "" };
+            let colour = colour_for(&item.metadata);
+            let reset = if colour.is_empty() { "" } else { RESET };
+            let text = format!("{}{}{}{}", colour, item.name, reset, suffix);
+            (text, item.name.chars().count() + suffix.len())
+        })
+        .collect();
+
+    if options.one_per_line {
+        for (text, _) in &cells {
+            println!("{}", text);
+        }
+        return;
+    }
+
+    // Lay the names out in as many columns as the terminal will take, filling
+    // down each column the way ls does.
+    let width = terminal_width().unwrap_or(80);
+    let widest = cells.iter().map(|(_, w)| *w).max().unwrap_or(1);
+    let column_width = widest + 2;
+    let columns = ((width / column_width).max(1)).min(cells.len());
+    let rows = (cells.len() + columns - 1) / columns;
+
+    for row in 0..rows {
+        let mut line = String::new();
+        for column in 0..columns {
+            let index = column * rows + row;
+            if index >= cells.len() {
+                continue;
+            }
+            let (text, display) = &cells[index];
+            line.push_str(text);
+            let last = column == columns - 1 || index + rows >= cells.len();
+            if !last {
+                for _ in *display..column_width {
+                    line.push(' ');
+                }
             }
         }
-        println!(
-            "{} {:>3} {:>8} {}{}{}{}",
-            mode_string(metadata.mode(), is_dir, is_link),
-            metadata.nlink(),
-            metadata.len(),
-            colour,
-            name,
-            reset,
-            suffix
-        );
-    } else if one {
-        println!("{}{}{}", colour, name, reset);
-    } else {
-        print!("{}{:<18}{}", colour, name, reset);
+        println!("{}", line.trim_end());
     }
 }
 

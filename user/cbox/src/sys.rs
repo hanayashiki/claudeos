@@ -287,3 +287,10 @@ pub fn tcsets(fd: i32, termios: &Termios) -> bool {
     };
     rc >= 0
 }
+
+pub const TIOCGWINSZ: u64 = 0x5413;
+
+/// Raw ioctl with a pointer argument.
+pub fn ioctl_ptr(fd: i32, request: u64, argument: u64) -> i64 {
+    unsafe { syscall3(SYS_IOCTL, fd as u64, request, argument) }
+}
