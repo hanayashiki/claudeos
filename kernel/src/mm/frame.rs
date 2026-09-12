@@ -5,7 +5,8 @@
 //! hole large enough to hold it, past everything the boot loader placed.
 
 use super::{page_align_up, phys_to_virt, HHDM_LIMIT, KERNEL_PHYS_START, PAGE_SIZE_U64};
-use crate::multiboot::BootInfo;
+use crate::arch::RESERVED_PHYS;
+use crate::boot::BootInfo;
 use crate::sync::Spinlock;
 
 pub struct BitmapAllocator {
@@ -193,8 +194,8 @@ pub fn init(boot: &BootInfo) {
     // Highest usable physical address, clamped to what the boot trampoline
     // direct-maps; frames above that are unreachable through the HHDM.
     let mut max_addr = 0u64;
-    for r in &boot.regions[..boot.region_count] {
-        if r.is_usable() {
+    for r in boot.regions() {
+        if r.usable {
             max_addr = max_addr.max(r.end());
         }
     }
@@ -207,12 +208,22 @@ pub fn init(boot: &BootInfo) {
     let refcount_bytes = page_align_up((total_frames * 2) as u64) as usize;
     let metadata_bytes = bitmap_bytes + refcount_bytes;
 
-    // The bitmap must not land on the kernel image, the modules, or the
-    // multiboot blob, so start looking past all of them.
-    let barrier = super::kernel_phys_end().max(boot.reserved_end).max(0x10_0000);
+    // The bitmap must not land on the kernel image, the modules, anything the
+    // loader left behind, or memory the machine claims, so start looking past
+    // all of them.
+    let mut barrier = super::kernel_phys_end();
+    for r in boot.reserved() {
+        barrier = barrier.max(r.end);
+    }
+    for m in boot.modules() {
+        barrier = barrier.max(m.end);
+    }
+    for &(_, end) in RESERVED_PHYS {
+        barrier = barrier.max(end);
+    }
     let mut bitmap_phys = 0u64;
-    for r in &boot.regions[..boot.region_count] {
-        if !r.is_usable() {
+    for r in boot.regions() {
+        if !r.usable {
             continue;
         }
         let start = page_align_up(r.addr.max(barrier));
@@ -245,16 +256,20 @@ pub fn init(boot: &BootInfo) {
     };
 
     // Release usable RAM, then take back everything that is already spoken for.
-    for r in &boot.regions[..boot.region_count] {
-        if r.is_usable() {
+    for r in boot.regions() {
+        if r.usable {
             alloc.mark_range_free(r.addr, r.end().min(max_addr));
         }
     }
-    alloc.mark_range_used(0, 0x10_0000);
+    for &(start, end) in RESERVED_PHYS {
+        alloc.mark_range_used(start, end);
+    }
     alloc.mark_range_used(KERNEL_PHYS_START, super::kernel_phys_end());
     alloc.mark_range_used(bitmap_phys, bitmap_phys + metadata_bytes as u64);
-    alloc.mark_range_used(boot.info_phys, boot.reserved_end);
-    for m in &boot.modules[..boot.module_count] {
+    for r in boot.reserved() {
+        alloc.mark_range_used(r.start, r.end);
+    }
+    for m in boot.modules() {
         alloc.mark_range_used(m.start, m.end);
     }
 
