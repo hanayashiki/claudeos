@@ -11,6 +11,13 @@
 //! it. That area is a chain: each record says what it is and how long it is,
 //! and a record of length zero ends the chain. Only one record is written
 //! here, so the chain is that record and its terminator.
+//!
+//! Nothing here is executable. The kernel writes the frame and nothing else,
+//! and the address a handler returns through is one inside the program's own
+//! image, which the loader wrote and made fetchable when it loaded it. There
+//! is no trampoline generated at run time and no page of kernel-supplied code
+//! mapped into a program, so no cache maintenance is owed on this path. A
+//! program that registered no restorer is refused rather than sent somewhere.
 
 use super::task::VECTOR_BYTES;
 use super::trap::TrapFrame;

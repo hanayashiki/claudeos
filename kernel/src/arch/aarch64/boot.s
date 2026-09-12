@@ -145,6 +145,19 @@ build_page_tables:
     ret
 
 enable_mmu:
+    /* Nothing the firmware left in the translation buffers or the instruction
+     * cache is ours, and on the board it will not be what the emulator leaves.
+     * Throw both away before the tables built above start being used.
+     *
+     * The first barrier is what makes those tables visible to the walkers.
+     * They were written with translation off, which makes them ordinary
+     * uncached stores, and the walkers are separate observers of memory. */
+    dsb  ishst
+    tlbi vmalle1
+    ic   iallu
+    dsb  nsh
+    isb
+
     /* Attribute slot zero: ordinary memory, written back, allocating on both
      * read and write. Slot one: device, with no gathering, reordering or
      * early acknowledgement. */
@@ -155,9 +168,6 @@ enable_mmu:
     ldr  x0, =level0
     msr  ttbr0_el1, x0
     msr  ttbr1_el1, x0
-    isb
-    tlbi vmalle1
-    dsb  ish
     isb
     mrs  x0, sctlr_el1
     orr  x0, x0, #(1 << 0)       /* translation on */
