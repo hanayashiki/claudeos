@@ -40,6 +40,11 @@ enum Token {
     Newline,
     LParen,
     RParen,
+    /// `;;`, which ends a case arm.
+    DoubleSemi,
+    /// A here-document body, and whether its delimiter was quoted (which
+    /// suppresses expansion of the body).
+    HereDoc(String, bool),
 }
 
 impl Token {
@@ -56,7 +61,7 @@ impl Token {
 
 const KEYWORDS: &[&str] = &[
     "if", "then", "elif", "else", "fi", "while", "until", "for", "in", "do", "done", "function",
-    "return", "break", "continue", "{", "}",
+    "return", "break", "continue", "case", "esac", "!", "{", "}",
 ];
 
 #[derive(Debug)]
@@ -73,6 +78,9 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     let mut saw_single = false;
     let mut saw_other = false;
     let mut i = 0;
+    // Where to resume after the newline that ends a line carrying a
+    // here-document, so the body is not tokenised as commands.
+    let mut resume_after_newline: Option<usize> = None;
 
     macro_rules! flush {
         () => {
@@ -102,7 +110,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             '\n' => {
                 flush!();
                 tokens.push(Token::Newline);
-                i += 1;
+                i = resume_after_newline.take().unwrap_or(i + 1);
             }
             '\'' => {
                 have_word = true;
@@ -226,8 +234,13 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             }
             ';' => {
                 flush!();
-                tokens.push(Token::Semi);
-                i += 1;
+                if chars.get(i + 1) == Some(&';') {
+                    tokens.push(Token::DoubleSemi);
+                    i += 2;
+                } else {
+                    tokens.push(Token::Semi);
+                    i += 1;
+                }
             }
             '(' => {
                 flush!();
@@ -248,6 +261,79 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     tokens.push(Token::RedirOut);
                     i += 1;
                 }
+            }
+            '<' if chars.get(i + 1) == Some(&'<') => {
+                flush!();
+                i += 2;
+                let strip_tabs = chars.get(i) == Some(&'-');
+                if strip_tabs {
+                    i += 1;
+                }
+                while matches!(chars.get(i), Some(' ') | Some('\t')) {
+                    i += 1;
+                }
+
+                let mut delimiter = String::new();
+                let mut quoted_delimiter = false;
+                match chars.get(i) {
+                    Some(&q @ '\'') | Some(&q @ '"') => {
+                        quoted_delimiter = true;
+                        i += 1;
+                        while i < chars.len() && chars[i] != q {
+                            delimiter.push(chars[i]);
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    _ => {
+                        while i < chars.len()
+                            && !chars[i].is_whitespace()
+                            && !matches!(chars[i], ';' | '|' | '&')
+                        {
+                            delimiter.push(chars[i]);
+                            i += 1;
+                        }
+                    }
+                }
+
+                let mut line_end = i;
+                while line_end < chars.len() && chars[line_end] != '\n' {
+                    line_end += 1;
+                }
+                if line_end >= chars.len() {
+                    // The body has not been typed yet.
+                    return Err(LexError::Unterminated);
+                }
+
+                let mut body = String::new();
+                let mut cursor = line_end + 1;
+                let mut closed = false;
+                while cursor <= chars.len() {
+                    let mut end = cursor;
+                    while end < chars.len() && chars[end] != '\n' {
+                        end += 1;
+                    }
+                    let raw: String = chars[cursor..end].iter().collect();
+                    let line = if strip_tabs { raw.trim_start_matches('\t') } else { &raw };
+                    if line == delimiter {
+                        cursor = end + 1;
+                        closed = true;
+                        break;
+                    }
+                    body.push_str(line);
+                    body.push('\n');
+                    if end >= chars.len() {
+                        cursor = end;
+                        break;
+                    }
+                    cursor = end + 1;
+                }
+                if !closed {
+                    return Err(LexError::Unterminated);
+                }
+
+                tokens.push(Token::HereDoc(body, quoted_delimiter));
+                resume_after_newline = Some(cursor);
             }
             '<' => {
                 flush!();
@@ -291,12 +377,17 @@ struct Command {
     stdin_file: Option<String>,
     stdout_file: Option<(String, bool)>,
     stderr_file: Option<(String, bool)>,
+    heredoc: Option<(String, bool)>,
+    /// A `( ... )` group, which runs in a child so its effects are discarded.
+    group: Option<Vec<Node>>,
 }
 
 #[derive(Debug, Clone)]
 struct Pipeline {
     commands: Vec<Command>,
     background: bool,
+    /// `! pipeline` inverts the status.
+    negated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -332,6 +423,10 @@ enum Node {
         name: String,
         body: Vec<Node>,
     },
+    Case {
+        word: (String, Quoting),
+        arms: Vec<(Vec<(String, Quoting)>, Vec<Node>)>,
+    },
     Break,
     Continue,
     Return(Option<i32>),
@@ -362,6 +457,12 @@ impl<'a> Parser<'a> {
     }
 
     fn at_any_keyword(&self, words: &[&str]) -> bool {
+        if words.contains(&")") && matches!(self.peek(), Some(Token::RParen)) {
+            return true;
+        }
+        if words.contains(&";;") && matches!(self.peek(), Some(Token::DoubleSemi)) {
+            return true;
+        }
         match self.peek() {
             Some(token) => token.keyword().map(|k| words.contains(&k)).unwrap_or(false),
             None => false,
@@ -415,6 +516,7 @@ impl<'a> Parser<'a> {
             Some("while") => self.parse_loop(false),
             Some("until") => self.parse_loop(true),
             Some("for") => self.parse_for(),
+            Some("case") => self.parse_case(),
             Some("break") => {
                 self.position += 1;
                 Ok(Node::Break)
@@ -535,6 +637,69 @@ impl<'a> Parser<'a> {
         Ok(Node::For { variable, words, body })
     }
 
+    fn parse_case(&mut self) -> Result<Node, ParseError> {
+        self.expect_keyword("case")?;
+        let word = match self.peek() {
+            Some(Token::Word(text, quoting)) => {
+                let word = (text.clone(), *quoting);
+                self.position += 1;
+                word
+            }
+            None => return Err(ParseError::Incomplete),
+            _ => return Err(ParseError::Message("expected a word after `case`".into())),
+        };
+        self.expect_keyword("in")?;
+
+        let mut arms = Vec::new();
+        loop {
+            self.skip_separators();
+            match self.peek() {
+                None => return Err(ParseError::Incomplete),
+                Some(token) if token.is_keyword("esac") => {
+                    self.position += 1;
+                    break;
+                }
+                _ => {}
+            }
+
+            // An arm may start with an optional '('.
+            if matches!(self.peek(), Some(Token::LParen)) {
+                self.position += 1;
+            }
+            let mut patterns = Vec::new();
+            loop {
+                match self.peek() {
+                    Some(Token::Word(text, quoting)) => {
+                        patterns.push((text.clone(), *quoting));
+                        self.position += 1;
+                    }
+                    None => return Err(ParseError::Incomplete),
+                    _ => return Err(ParseError::Message("expected a case pattern".into())),
+                }
+                match self.peek() {
+                    Some(Token::Pipe) => self.position += 1,
+                    Some(Token::RParen) => {
+                        self.position += 1;
+                        break;
+                    }
+                    None => return Err(ParseError::Incomplete),
+                    _ => {
+                        return Err(ParseError::Message(
+                            "expected `)` after a case pattern".into(),
+                        ))
+                    }
+                }
+            }
+
+            let body = self.parse_block(&[";;", "esac"])?;
+            if matches!(self.peek(), Some(Token::DoubleSemi)) {
+                self.position += 1;
+            }
+            arms.push((patterns, body));
+        }
+        Ok(Node::Case { word, arms })
+    }
+
     fn parse_and_or(&mut self) -> Result<AndOr, ParseError> {
         let mut items = Vec::new();
         let mut connector = Connector::Always;
@@ -568,23 +733,46 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_pipeline(&mut self) -> Result<Pipeline, ParseError> {
+        let mut negated = false;
+        while matches!(self.peek(), Some(token) if token.is_keyword("!")) {
+            negated = !negated;
+            self.position += 1;
+        }
         let mut commands = vec![self.parse_command()?];
         while matches!(self.peek(), Some(Token::Pipe)) {
             self.position += 1;
             self.skip_newlines_only();
             commands.push(self.parse_command()?);
         }
-        Ok(Pipeline { commands, background: false })
+        Ok(Pipeline { commands, background: false, negated })
     }
 
     fn parse_command(&mut self) -> Result<Command, ParseError> {
         let mut command = Command::default();
+
+        if matches!(self.peek(), Some(Token::LParen)) {
+            self.position += 1;
+            command.group = Some(self.parse_block(&[")"])?);
+            match self.peek() {
+                Some(Token::RParen) => self.position += 1,
+                None => return Err(ParseError::Incomplete),
+                _ => return Err(ParseError::Message("expected `)`".into())),
+            }
+        }
+
         loop {
             match self.peek() {
+                Some(Token::HereDoc(body, quoted)) => {
+                    command.heredoc = Some((body.clone(), *quoted));
+                    self.position += 1;
+                }
                 Some(Token::Word(text, quoting)) => {
                     // A bare keyword ends the command; the statement parser
                     // takes it from there.
                     if *quoting == Quoting::Bare && KEYWORDS.contains(&text.as_str()) {
+                        return Ok(command);
+                    }
+                    if command.group.is_some() {
                         return Ok(command);
                     }
                     command.words.push((text.clone(), *quoting));
@@ -881,8 +1069,8 @@ impl Shell {
                 for (word, quoting) in words {
                     match quoting {
                         Quoting::Single => items.push(word.clone()),
-                        Quoting::Double => items.push(self.substitute(word)),
-                        Quoting::Bare => items.extend(self.expand_word(word)),
+                        Quoting::Double => items.push(self.expand_text(word)),
+                        Quoting::Bare => items.extend(self.expand_word_bare(word)),
                     }
                 }
                 for item in items {
@@ -893,6 +1081,26 @@ impl Shell {
                         other => return other,
                     }
                 }
+                Flow::Normal
+            }
+            Node::Case { word, arms } => {
+                let subject = match word.1 {
+                    Quoting::Single => word.0.clone(),
+                    _ => self.expand_text(&word.0),
+                };
+                for (patterns, body) in arms {
+                    let hit = patterns.iter().any(|(pattern, quoting)| {
+                        let pattern = match quoting {
+                            Quoting::Single => pattern.clone(),
+                            _ => self.expand_text(pattern),
+                        };
+                        matches_pattern(&subject, &pattern)
+                    });
+                    if hit {
+                        return self.exec_block(body);
+                    }
+                }
+                self.last_status = 0;
                 Flow::Normal
             }
             Node::Break => Flow::Break,
@@ -926,18 +1134,22 @@ impl Shell {
             .commands
             .iter()
             .map(|c| self.expand_command(c))
-            .filter(|c| !c.words.is_empty() || c.stdout_file.is_some())
+            .filter(|c| !c.words.is_empty() || c.stdout_file.is_some() || c.group.is_some())
             .collect();
         if commands.is_empty() {
             return Flow::Normal;
         }
 
         // A single builtin or function runs here so it can change our state.
-        if commands.len() == 1 && !pipeline.background {
+        if commands.len() == 1 && !pipeline.background && commands[0].group.is_none() {
             let argv: Vec<String> = commands[0].words.iter().map(|(w, _)| w.clone()).collect();
             if !argv.is_empty() && (self.functions.contains_key(&argv[0]) || is_builtin(&argv[0]))
             {
-                return self.run_local(&commands[0], &argv);
+                let flow = self.run_local(&commands[0], &argv);
+                if pipeline.negated {
+                    self.last_status = if self.last_status == 0 { 1 } else { 0 };
+                }
+                return flow;
             }
         }
 
@@ -984,6 +1196,14 @@ impl Shell {
                 }
                 if apply_redirections(command).is_err() {
                     sys::exit_group(1);
+                }
+                if let Some(group) = &command.group {
+                    // A subshell: its variables and directory changes are the
+                    // child's, and vanish with it.
+                    let mut child = self.fork_copy();
+                    child.exec_block(group);
+                    let _ = std::io::stdout().flush();
+                    sys::exit_group(child.exit_code.unwrap_or(child.last_status));
                 }
                 let argv: Vec<String> = command.words.iter().map(|(w, _)| w.clone()).collect();
                 let mut child = self.fork_copy();
@@ -1053,7 +1273,15 @@ impl Shell {
         if interrupted {
             println!();
         }
-        self.last_status = status;
+        self.last_status = if pipeline.negated {
+            if status == 0 {
+                1
+            } else {
+                0
+            }
+        } else {
+            status
+        };
         Flow::Normal
     }
 
@@ -1061,7 +1289,11 @@ impl Shell {
     /// applied and then undone.
     fn run_local(&mut self, command: &Command, argv: &[String]) -> Flow {
         let saved_out = if command.stdout_file.is_some() { dup_fd(sys::STDOUT) } else { -1 };
-        let saved_in = if command.stdin_file.is_some() { dup_fd(sys::STDIN) } else { -1 };
+        let saved_in = if command.stdin_file.is_some() || command.heredoc.is_some() {
+            dup_fd(sys::STDIN)
+        } else {
+            -1
+        };
         if apply_redirections(command).is_err() {
             self.last_status = 1;
             return Flow::Normal;
@@ -1308,9 +1540,15 @@ impl Shell {
 
     fn expand_command(&mut self, command: &Command) -> Command {
         let mut out = Command {
-            stdin_file: command.stdin_file.as_ref().map(|f| self.substitute_all(f)),
-            stdout_file: command.stdout_file.as_ref().map(|(f, a)| (self.substitute_all(f), *a)),
-            stderr_file: command.stderr_file.as_ref().map(|(f, a)| (self.substitute_all(f), *a)),
+            stdin_file: command.stdin_file.as_ref().map(|f| self.expand_text(f)),
+            stdout_file: command.stdout_file.as_ref().map(|(f, a)| (self.expand_text(f), *a)),
+            stderr_file: command.stderr_file.as_ref().map(|(f, a)| (self.expand_text(f), *a)),
+            // An unquoted here-document delimiter means the body is expanded.
+            heredoc: command.heredoc.as_ref().map(|(body, quoted)| {
+                let text = if *quoted { body.clone() } else { self.expand_text(body) };
+                (text, *quoted)
+            }),
+            group: command.group.clone(),
             words: Vec::new(),
         };
         for (word, quoting) in &command.words {
@@ -1324,10 +1562,10 @@ impl Shell {
                         }
                         continue;
                     }
-                    out.words.push((self.substitute_all(word), Quoting::Double));
+                    out.words.push((self.expand_text(word), Quoting::Double));
                 }
                 Quoting::Bare => {
-                    for expanded in self.expand_word_mut(word) {
+                    for expanded in self.expand_word_bare(word) {
                         out.words.push((expanded, Quoting::Bare));
                     }
                 }
@@ -1336,105 +1574,134 @@ impl Shell {
         out
     }
 
-    fn substitute_all(&mut self, word: &str) -> String {
-        let subbed = self.expand_substitutions(word);
-        self.substitute(&subbed)
+    /// Expand a word in one pass.
+    ///
+    /// Everything happens in a single left-to-right walk, so text produced by
+    /// a command substitution is never rescanned: `$(echo '$HOME')` yields the
+    /// three characters, not the value of HOME.
+    fn expand_text(&mut self, text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+
+        while i < chars.len() {
+            let c = chars[i];
+
+            if c == '~' && i == 0 && (chars.len() == 1 || chars[1] == '/') {
+                out.push_str(self.env.get("HOME").map(|s| s.as_str()).unwrap_or("/root"));
+                i += 1;
+                continue;
+            }
+            if c == '\\' && i + 1 < chars.len() {
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == '`' {
+                if let Some(offset) = chars[i + 1..].iter().position(|&x| x == '`') {
+                    let end = i + 1 + offset;
+                    let inner: String = chars[i + 1..end].iter().collect();
+                    out.push_str(&self.capture(&inner));
+                    i = end + 1;
+                    continue;
+                }
+            }
+            if c == '$' && chars.get(i + 1) == Some(&'(') {
+                // $(( ... )) is arithmetic; $( ... ) runs a command.
+                if chars.get(i + 2) == Some(&'(') {
+                    if let Some(end) = find_close(&chars, i + 3, '(', ')') {
+                        if chars.get(end + 1) == Some(&')') {
+                            let inner: String = chars[i + 3..end].iter().collect();
+                            let expanded = self.expand_text(&inner);
+                            let resolved = self.resolve_names(&expanded);
+                            out.push_str(&arithmetic(&resolved).to_string());
+                            i = end + 2;
+                            continue;
+                        }
+                    }
+                }
+                if let Some(end) = find_close(&chars, i + 2, '(', ')') {
+                    let inner: String = chars[i + 2..end].iter().collect();
+                    out.push_str(&self.capture(&inner));
+                    i = end + 1;
+                    continue;
+                }
+            }
+            if c == '$' && i + 1 < chars.len() {
+                i += 1;
+                match chars[i] {
+                    '?' => {
+                        out.push_str(&self.last_status.to_string());
+                        i += 1;
+                    }
+                    '$' => {
+                        out.push_str(&self.pid.to_string());
+                        i += 1;
+                    }
+                    '#' => {
+                        out.push_str(&self.positional.len().to_string());
+                        i += 1;
+                    }
+                    '@' | '*' => {
+                        out.push_str(&self.positional.join(" "));
+                        i += 1;
+                    }
+                    '0' => {
+                        out.push_str("sh");
+                        i += 1;
+                    }
+                    digit if digit.is_ascii_digit() => {
+                        let index = digit.to_digit(10).unwrap() as usize;
+                        if let Some(value) = self.positional.get(index - 1) {
+                            out.push_str(value);
+                        }
+                        i += 1;
+                    }
+                    '{' => {
+                        i += 1;
+                        let mut name = String::new();
+                        while i < chars.len() && chars[i] != '}' {
+                            name.push(chars[i]);
+                            i += 1;
+                        }
+                        i += 1;
+                        let value = self.lookup(&name).to_string();
+                        out.push_str(&value);
+                    }
+                    letter if letter.is_alphanumeric() || letter == '_' => {
+                        let mut name = String::new();
+                        while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                            name.push(chars[i]);
+                            i += 1;
+                        }
+                        let value = self.lookup(&name).to_string();
+                        out.push_str(&value);
+                    }
+                    _ => out.push('$'),
+                }
+                continue;
+            }
+
+            out.push(c);
+            i += 1;
+        }
+        out
     }
 
-    fn expand_word_mut(&mut self, word: &str) -> Vec<String> {
-        let subbed = self.expand_substitutions(word);
-        let substituted = self.substitute(&subbed);
-        // An unquoted expansion that produced whitespace becomes several words.
-        let fields: Vec<String> = if substituted.contains(char::is_whitespace) {
-            substituted.split_whitespace().map(|f| f.to_string()).collect()
+    /// Expand an unquoted word: substitution, then field splitting, then
+    /// globbing of each field.
+    fn expand_word_bare(&mut self, word: &str) -> Vec<String> {
+        let expanded = self.expand_text(word);
+        let fields: Vec<String> = if expanded.contains(char::is_whitespace) {
+            expanded.split_whitespace().map(|f| f.to_string()).collect()
         } else {
-            vec![substituted]
+            vec![expanded]
         };
         let mut out = Vec::new();
         for field in fields {
             match glob(&field) {
                 Some(matches) if !matches.is_empty() => out.extend(matches),
                 _ => out.push(field),
-            }
-        }
-        out
-    }
-
-    fn expand_word(&self, word: &str) -> Vec<String> {
-        let substituted = self.substitute(word);
-        if !substituted.contains('*') && !substituted.contains('?') {
-            return vec![substituted];
-        }
-        match glob(&substituted) {
-            Some(matches) if !matches.is_empty() => matches,
-            _ => vec![substituted],
-        }
-    }
-
-    /// Substitute variables and positional parameters.
-    fn substitute(&self, word: &str) -> String {
-        let chars: Vec<char> = word.chars().collect();
-        let mut out = String::new();
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i] == '~' && i == 0 && (chars.len() == 1 || chars[1] == '/') {
-                out.push_str(self.env.get("HOME").map(|s| s.as_str()).unwrap_or("/root"));
-                i += 1;
-                continue;
-            }
-            if chars[i] != '$' || i + 1 >= chars.len() {
-                out.push(chars[i]);
-                i += 1;
-                continue;
-            }
-            i += 1;
-            match chars[i] {
-                '?' => {
-                    out.push_str(&self.last_status.to_string());
-                    i += 1;
-                }
-                '$' => {
-                    out.push_str(&self.pid.to_string());
-                    i += 1;
-                }
-                '#' => {
-                    out.push_str(&self.positional.len().to_string());
-                    i += 1;
-                }
-                '@' | '*' => {
-                    out.push_str(&self.positional.join(" "));
-                    i += 1;
-                }
-                '0' => {
-                    out.push_str("sh");
-                    i += 1;
-                }
-                c if c.is_ascii_digit() => {
-                    let index = c.to_digit(10).unwrap() as usize;
-                    if let Some(value) = self.positional.get(index - 1) {
-                        out.push_str(value);
-                    }
-                    i += 1;
-                }
-                '{' => {
-                    i += 1;
-                    let mut name = String::new();
-                    while i < chars.len() && chars[i] != '}' {
-                        name.push(chars[i]);
-                        i += 1;
-                    }
-                    i += 1;
-                    out.push_str(self.lookup(&name));
-                }
-                c if c.is_alphanumeric() || c == '_' => {
-                    let mut name = String::new();
-                    while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
-                        name.push(chars[i]);
-                        i += 1;
-                    }
-                    out.push_str(self.lookup(&name));
-                }
-                _ => out.push('$'),
             }
         }
         out
@@ -1462,53 +1729,6 @@ impl Shell {
                 continue;
             }
             out.push(chars[i]);
-            i += 1;
-        }
-        out
-    }
-
-    /// Replace `$(...)`, backticks and `$((...))`.
-    fn expand_substitutions(&mut self, text: &str) -> String {
-        let chars: Vec<char> = text.chars().collect();
-        let mut out = String::new();
-        let mut i = 0;
-        while i < chars.len() {
-            let c = chars[i];
-            if c == '\\' && i + 1 < chars.len() {
-                out.push(c);
-                out.push(chars[i + 1]);
-                i += 2;
-                continue;
-            }
-            if c == '$' && chars.get(i + 1) == Some(&'(') && chars.get(i + 2) == Some(&'(') {
-                if let Some(end) = find_close(&chars, i + 3, '(', ')') {
-                    if chars.get(end + 1) == Some(&')') {
-                        let inner: String = chars[i + 3..end].iter().collect();
-                        let expanded = self.resolve_names(&self.substitute(&inner));
-                        out.push_str(&arithmetic(&expanded).to_string());
-                        i = end + 2;
-                        continue;
-                    }
-                }
-            }
-            if c == '$' && chars.get(i + 1) == Some(&'(') {
-                if let Some(end) = find_close(&chars, i + 2, '(', ')') {
-                    let inner: String = chars[i + 2..end].iter().collect();
-                    out.push_str(&self.capture(&inner));
-                    i = end + 1;
-                    continue;
-                }
-            }
-            if c == '`' {
-                if let Some(offset) = chars[i + 1..].iter().position(|&x| x == '`') {
-                    let end = i + 1 + offset;
-                    let inner: String = chars[i + 1..end].iter().collect();
-                    out.push_str(&self.capture(&inner));
-                    i = end + 1;
-                    continue;
-                }
-            }
-            out.push(c);
             i += 1;
         }
         out
@@ -1615,6 +1835,23 @@ fn dup_fd(fd: i32) -> i32 {
 }
 
 fn apply_redirections(command: &Command) -> Result<(), ()> {
+    if let Some((body, _)) = &command.heredoc {
+        // Staged through a file rather than a pipe, so a body larger than the
+        // pipe buffer cannot deadlock against a reader that has not started.
+        let path = format!("/tmp/.heredoc-{}", sys::getpid());
+        if std::fs::write(&path, body).is_err() {
+            eprintln!("sh: cannot stage here-document");
+            return Err(());
+        }
+        let fd = sys::open(&path, sys::O_RDONLY, 0);
+        let _ = std::fs::remove_file(&path);
+        if fd < 0 {
+            eprintln!("sh: cannot open here-document");
+            return Err(());
+        }
+        sys::dup2(fd as i32, sys::STDIN);
+        sys::close(fd as i32);
+    }
     if let Some(path) = &command.stdin_file {
         let fd = sys::open(path, sys::O_RDONLY, 0);
         if fd < 0 {

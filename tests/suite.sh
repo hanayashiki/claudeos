@@ -100,6 +100,57 @@ check "function"          "hi bob"   "$(greet() { echo hi $1; }; greet bob)"
 check "if else"           "small"    "$(if [ 1 -gt 2 ]; then echo big; else echo small; fi)"
 
 echo
+echo "-- here-documents, case, negation, subshells --"
+rm -rf /tmp/h
+mkdir -p /tmp/h
+cat > /tmp/h/plain.txt <<EOF
+first line
+second line
+EOF
+check "here-document"      "2"          "$(wc -l < /tmp/h/plain.txt)"
+who=world
+cat > /tmp/h/expanded.txt <<EOF
+hello $who
+EOF
+check "here-doc expands"   "hello world" "$(cat /tmp/h/expanded.txt)"
+cat > /tmp/h/literal.txt <<'EOF'
+hello $who
+EOF
+check "quoted delimiter"   'hello $who' "$(cat /tmp/h/literal.txt)"
+sort <<EOF > /tmp/h/sorted.txt
+charlie
+alpha
+bravo
+EOF
+check "here-doc as stdin"  "alpha"      "$(head -n 1 /tmp/h/sorted.txt)"
+
+kind() {
+  case "$1" in
+    *.txt)   echo text ;;
+    *.sh)    echo script ;;
+    a|b|c)   echo letter ;;
+    "")      echo empty ;;
+    *)       echo other ;;
+  esac
+}
+check "case first arm"     "text"       "$(kind notes.txt)"
+check "case later arm"     "script"     "$(kind run.sh)"
+check "case alternatives"  "letter"     "$(kind b)"
+check "case empty pattern" "empty"      "$(kind '')"
+check "case default"       "other"      "$(kind readme.md)"
+
+check "negate false"       "0"          "$(! false; echo $?)"
+check "negate true"        "1"          "$(! true; echo $?)"
+check "negate in if"       "yes"        "$(if ! false; then echo yes; fi)"
+check "negate a pipeline"  "0"          "$(! seq 1 3 | grep -q 99; echo $?)"
+
+check "subshell variable"  "outer"      "$(v=outer; (v=inner); echo $v)"
+check "subshell directory" "/root"      "$( (cd /tmp) ; pwd )"
+check "subshell output"    "2"          "$( (echo a; echo b) | wc -l )"
+check "subshell status"    "4"          "$( (exit 4) ; echo $? )"
+rm -rf /tmp/h
+
+echo
 echo "-- scripts --"
 rm -rf /tmp/s
 mkdir -p /tmp/s
