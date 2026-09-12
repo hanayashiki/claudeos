@@ -731,10 +731,9 @@ impl<'a> Parser<'a> {
         self.skip_separators();
         if self.at_any_keyword(&["in"]) {
             self.position += 1;
+            // The list runs to the end of the line or to a `;`. A word in it
+            // is a word, so `for w in do done` iterates over those two names.
             while let Some(Token::Word(text, quoting)) = self.peek() {
-                if text == "do" && *quoting == Quoting::Bare {
-                    break;
-                }
                 words.push((text.clone(), *quoting));
                 self.position += 1;
             }
@@ -883,9 +882,13 @@ impl<'a> Parser<'a> {
                     self.position += 1;
                 }
                 Some(Token::Word(text, quoting)) => {
-                    // A bare keyword ends the command; the statement parser
-                    // takes it from there.
-                    if *quoting == Quoting::Bare && KEYWORDS.contains(&text.as_str()) {
+                    // A keyword is only a keyword where a command can start.
+                    // Anywhere else it is an ordinary word, so `echo done`
+                    // prints "done" rather than ending the command.
+                    if command.words.is_empty()
+                        && *quoting == Quoting::Bare
+                        && KEYWORDS.contains(&text.as_str())
+                    {
                         return Ok(command);
                     }
                     command.words.push((text.clone(), *quoting));

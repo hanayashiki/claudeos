@@ -81,6 +81,14 @@ check "stderr to stdout"   "1"           "$(ls /nope > /tmp/b.txt 2>&1; grep -c 
 check "glob class"         "2"           "$(mkdir -p /tmp/gc; cd /tmp/gc; touch aa.txt ab.txt zz.txt; echo [ab][ab].txt | wc -w; cd /root; rm -rf /tmp/gc)"
 
 echo
+echo "-- keywords where a command cannot start --"
+check "keyword as an argument"  "probe done"  "$(echo probe done)"
+check "several of them"         "if then fi"  "$(echo if then fi)"
+check "in a word list"          "dodone"      "$(for w in do done; do printf %s $w; done)"
+check "a brace as an argument"  "}"           "$(echo })"
+check "it still ends a command" "2"           "$(i=0; while [ $i -lt 2 ]; do i=$((i + 1)); done; echo $i)"
+
+echo
 echo "-- grep patterns --"
 check "anchor start"   "1"  "$(seq 1 100 | grep -c '^42$')"
 check "anchor end"     "10" "$(seq 1 100 | grep -c '0$')"

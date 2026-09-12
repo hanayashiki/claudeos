@@ -162,7 +162,8 @@ backticks, arithmetic with `$((...))`, `if`/`elif`/`else`, `while`, `until`,
 `for`, `case` with alternation patterns, functions with positional parameters,
 `jobs`, `fg`, `bg`,
 and the usual builtins. Word expansion is a single pass, so text a command
-substitution produced is not rescanned.
+substitution produced is not rescanned. A reserved word is reserved only where
+a command can start, so `echo done` prints "done".
 
 A syntax error names the script, the line and the text that was found, and the
 commands before it still run, the way a shell that reads command by command
@@ -184,7 +185,7 @@ sleep clear hexdump basename dirname yes true false`.
 `make test` boots the OS once per suite and requires each to report zero
 failures.
 
-- `tests/suite.sh` runs **190 checks** inside the OS, driving the shell through
+- `tests/suite.sh` runs **195 checks** inside the OS, driving the shell through
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
   subprocesses and `/proc`.
