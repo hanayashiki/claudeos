@@ -310,20 +310,29 @@ impl AddressSpace {
     }
 
     /// Release every user mapping and every table that held one.
+    ///
+    /// The whole user half is detached first and the detachment made visible
+    /// before anything under it is handed back. A frame released while a
+    /// mapping to it still exists can be given to another address space and
+    /// written through the old one, and here the walker is allowed to act on
+    /// such an entry speculatively, without any instruction naming that
+    /// address.
     pub fn free_user_memory(&self) {
+        // Entries 0..256 are the low half: everything a program owns.
+        let mut detached = [0u64; 256];
         unsafe {
             let root = table_at(self.root);
-            // Entries 0..256 are the low half: everything a program owns.
-            for i in 0..256 {
-                let entry = *root.add(i);
-                if entry & PRESENT == 0 {
-                    continue;
-                }
-                free_table(entry & ADDR_MASK, 3);
+            for (i, entry) in detached.iter_mut().enumerate() {
+                *entry = *root.add(i);
                 *root.add(i) = 0;
             }
         }
         flush_tlb_all();
+        for entry in detached {
+            if entry & PRESENT != 0 {
+                unsafe { free_table(entry & ADDR_MASK, 3) };
+            }
+        }
     }
 
     /// Give this address space the same user mappings `src` has, shared and

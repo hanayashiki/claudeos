@@ -248,16 +248,24 @@ impl AddressSpace {
     }
 
     /// Free every user frame and page table below the kernel half.
+    ///
+    /// The whole user half is detached first and the detachment made visible
+    /// before anything under it is handed back. A frame released while a
+    /// mapping to it still exists can be given to another address space and
+    /// written through the old one.
     pub fn free_user_memory(&self) {
+        let mut detached = [0u64; 256];
         unsafe {
             let pml4 = table_at(self.pml4);
-            for i in 0..256 {
-                let entry = *pml4.add(i);
-                if entry & PRESENT == 0 {
-                    continue;
-                }
-                self.free_table(entry & ADDR_MASK, 3);
+            for (i, entry) in detached.iter_mut().enumerate() {
+                *entry = *pml4.add(i);
                 *pml4.add(i) = 0;
+            }
+        }
+        flush_tlb_all();
+        for entry in detached {
+            if entry & PRESENT != 0 {
+                unsafe { self.free_table(entry & ADDR_MASK, 3) };
             }
         }
     }
