@@ -6,7 +6,7 @@
 
 use crate::edit::{Completer, Editor};
 use crate::sys;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
 // ---------------------------------------------------------------------------
@@ -150,9 +150,12 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 i += 1;
                 while i < chars.len() && chars[i] != '"' {
                     if chars[i] == '\\' && i + 1 < chars.len() {
-                        i += 1;
-                        current.push(chars[i]);
-                        i += 1;
+                        // The backslash survives into the word; expansion
+                        // decides what it escapes. Dropping it here made
+                        // "\$HOME" expand rather than print a dollar sign.
+                        current.push('\\');
+                        current.push(chars[i + 1]);
+                        i += 2;
                         continue;
                     }
                     // Quoting starts over inside a command substitution, so
@@ -542,32 +545,6 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_statement(&mut self) -> Result<Node, ParseError> {
-        match self.peek().and_then(|t| t.keyword()) {
-            Some("break") => {
-                self.position += 1;
-                return Ok(Node::Break);
-            }
-            Some("continue") => {
-                self.position += 1;
-                return Ok(Node::Continue);
-            }
-            Some("return") => {
-                self.position += 1;
-                let value = match self.peek() {
-                    Some(Token::Word(text, _)) => {
-                        let parsed = text.parse().ok();
-                        if parsed.is_some() {
-                            self.position += 1;
-                        }
-                        parsed
-                    }
-                    _ => None,
-                };
-                return Ok(Node::Return(value));
-            }
-            _ => {}
-        }
-
         // A function definition looks like: name ( ) { ... }
         if let (Some(Token::Word(name, Quoting::Bare)), Some(Token::LParen), Some(Token::RParen)) = (
             self.tokens.get(self.position),
@@ -602,6 +579,31 @@ impl<'a> Parser<'a> {
                 let body = self.parse_block(&["}"])?;
                 self.expect_keyword("}")?;
                 Node::Brace(body)
+            }
+            // These are commands, not statements: `cmd || break` has to reach
+            // the break, and it used to parse as a separate statement that ran
+            // unconditionally.
+            Some("break") => {
+                self.position += 1;
+                Node::Break
+            }
+            Some("continue") => {
+                self.position += 1;
+                Node::Continue
+            }
+            Some("return") => {
+                self.position += 1;
+                let value = match self.peek() {
+                    Some(Token::Word(text, _)) => {
+                        let parsed = text.parse().ok();
+                        if parsed.is_some() {
+                            self.position += 1;
+                        }
+                        parsed
+                    }
+                    _ => None,
+                };
+                Node::Return(value)
             }
             _ => return Ok(None),
         };
@@ -937,6 +939,24 @@ pub struct Shell {
     job_control: bool,
     shell_pgid: i32,
     editor: Option<Editor>,
+    /// Names marked for export. A plain assignment sets a shell variable that
+    /// children do not see; only these are passed on.
+    exported: HashSet<String>,
+    /// What `$0` expands to.
+    script_name: String,
+    /// What `$!` expands to.
+    last_background: Option<i32>,
+    /// Where `cd -` goes back to.
+    previous_dir: Option<String>,
+    /// `set -e`: leave on the first failure outside a condition.
+    errexit: bool,
+    /// How deep we are inside something whose status is being tested, where
+    /// a failure is expected and must not trip `set -e`.
+    condition_depth: usize,
+    /// The command `trap ... EXIT` installed.
+    exit_trap: Option<String>,
+    /// Set when expanding a word failed, so the command is not run.
+    expansion_failed: bool,
 }
 
 impl Shell {
@@ -947,6 +967,8 @@ impl Shell {
         }
         env.entry("PATH".into()).or_insert_with(|| "/bin:/usr/bin".into());
         env.entry("HOME".into()).or_insert_with(|| "/root".into());
+        // Anything inherited from the environment is exported by definition.
+        let exported: HashSet<String> = env.keys().cloned().collect();
         Shell {
             env,
             functions: HashMap::new(),
@@ -958,6 +980,14 @@ impl Shell {
             job_control: false,
             shell_pgid: 0,
             editor: None,
+            exported,
+            script_name: "sh".to_string(),
+            last_background: None,
+            previous_dir: None,
+            errexit: false,
+            condition_depth: 0,
+            exit_trap: None,
+            expansion_failed: false,
         }
     }
 
@@ -973,16 +1003,35 @@ impl Shell {
             job_control: false,
             shell_pgid: self.shell_pgid,
             editor: None,
+            exported: self.exported.clone(),
+            script_name: self.script_name.clone(),
+            last_background: self.last_background,
+            previous_dir: self.previous_dir.clone(),
+            errexit: self.errexit,
+            condition_depth: 0,
+            exit_trap: None,
+            expansion_failed: false,
         }
+    }
+
+    /// The environment a child should see: the exported names only.
+    fn child_env(&self) -> Vec<String> {
+        self.env
+            .iter()
+            .filter(|(name, _)| self.exported.contains(*name))
+            .map(|(name, value)| format!("{}={}", name, value))
+            .collect()
     }
 
     pub fn run(mut self, args: &[String]) -> i32 {
         if args.len() >= 3 && args[1] == "-c" {
+            self.script_name = args.first().cloned().unwrap_or_else(|| "sh".into());
             self.positional = args[3..].to_vec();
             self.run_text(&args[2]);
             return self.exit_code.unwrap_or(self.last_status);
         }
         if args.len() >= 2 && !args[1].starts_with('-') {
+            self.script_name = args[1].clone();
             self.positional = args[2..].to_vec();
             match std::fs::read_to_string(&args[1]) {
                 Ok(text) => {
@@ -1120,7 +1169,9 @@ impl Shell {
             }
             Node::If { branches, otherwise } => {
                 for (condition, body) in branches {
+                    self.condition_depth += 1;
                     let flow = self.exec_block(condition);
+                    self.condition_depth -= 1;
                     if flow != Flow::Normal {
                         return flow;
                     }
@@ -1138,7 +1189,9 @@ impl Shell {
                         eprintln!("sh: loop ran too long, stopping");
                         return Flow::Normal;
                     }
+                    self.condition_depth += 1;
                     let flow = self.exec_block(condition);
+                    self.condition_depth -= 1;
                     if flow != Flow::Normal {
                         return flow;
                     }
@@ -1205,34 +1258,71 @@ impl Shell {
     }
 
     fn exec_and_or(&mut self, and_or: &AndOr) -> Flow {
-        for (connector, pipeline) in &and_or.items {
+        let last = and_or.items.len().saturating_sub(1);
+        for (index, (connector, pipeline)) in and_or.items.iter().enumerate() {
             match connector {
                 Connector::AndThen if self.last_status != 0 => continue,
                 Connector::OrElse if self.last_status == 0 => continue,
                 _ => {}
             }
+            // A pipeline whose status feeds && or || is being tested, so a
+            // failure there is expected and must not trip `set -e`.
+            let tested = index < last || pipeline.negated;
+            if tested {
+                self.condition_depth += 1;
+            }
             let flow = self.exec_pipeline(pipeline);
+            if tested {
+                self.condition_depth -= 1;
+            }
             if flow != Flow::Normal {
                 return flow;
+            }
+            if self.errexit && self.last_status != 0 && self.condition_depth == 0 {
+                self.exit_code = Some(self.last_status);
+                return Flow::Exit;
             }
         }
         Flow::Normal
     }
 
     fn exec_pipeline(&mut self, pipeline: &Pipeline) -> Flow {
+        self.reap_background();
+        self.expansion_failed = false;
         let commands: Vec<Command> = pipeline
             .commands
             .iter()
             .map(|c| self.expand_command(c))
             .filter(|c| !c.words.is_empty() || !c.redirects.is_empty() || c.group.is_some())
             .collect();
+        if self.expansion_failed {
+            // A word could not be expanded, so the command does not run.
+            self.expansion_failed = false;
+            self.last_status = 1;
+            return Flow::Normal;
+        }
         if commands.is_empty() {
             return Flow::Normal;
         }
 
         // A single builtin or function runs here so it can change our state.
+        // `A=1 B=2` on its own sets shell variables; with a command after it
+        // the assignments apply only to that command.
+        if commands.len() == 1 && !pipeline.background && commands[0].group.is_none() {
+            let words: Vec<String> = commands[0].words.iter().map(|(w, _)| w.clone()).collect();
+            if !words.is_empty() && words.iter().all(|w| is_assignment(w)) {
+                for word in &words {
+                    if let Some((name, value)) = word.split_once('=') {
+                        self.env.insert(name.to_string(), value.to_string());
+                    }
+                }
+                self.last_status = 0;
+                return Flow::Normal;
+            }
+        }
+
         if commands.len() == 1 && !pipeline.background {
-            let argv: Vec<String> = commands[0].words.iter().map(|(w, _)| w.clone()).collect();
+            let argv: Vec<String> = strip_assignments(&commands[0]);
             let is_local = (commands[0].group.is_some() && !commands[0].subshell)
                 || (!argv.is_empty()
                     && (self.functions.contains_key(&argv[0]) || is_builtin(&argv[0])));
@@ -1297,8 +1387,15 @@ impl Shell {
                     let _ = std::io::stdout().flush();
                     sys::exit_group(child.exit_code.unwrap_or(child.last_status));
                 }
-                let argv: Vec<String> = command.words.iter().map(|(w, _)| w.clone()).collect();
+                let argv: Vec<String> = strip_assignments(command);
                 let mut child = self.fork_copy();
+                for (name, value) in leading_assignments(command) {
+                    child.env.insert(name.clone(), value);
+                    child.exported.insert(name);
+                }
+                if argv.is_empty() {
+                    sys::exit_group(0);
+                }
                 if child.functions.contains_key(&argv[0]) || is_builtin(&argv[0]) {
                     child.run_local(command, &argv);
                     let _ = std::io::stdout().flush();
@@ -1341,8 +1438,11 @@ impl Shell {
                 .map(|c| c.words.iter().map(|(w, _)| w.clone()).collect::<Vec<_>>().join(" "))
                 .collect();
             if let Some(pid) = pids.last() {
-                println!("[{}] {}", self.jobs.len() + 1, pid);
+                // Job control chatter belongs on stderr, so it does not end up
+                // inside a command substitution.
+                eprintln!("[{}] {}", self.jobs.len() + 1, pid);
                 self.jobs.push((*pid, description.join(" | ")));
+                self.last_background = Some(*pid);
             }
             self.last_status = 0;
             return Flow::Normal;
@@ -1401,6 +1501,16 @@ impl Shell {
             return Flow::Normal;
         }
 
+        let assignments = leading_assignments(command);
+        let restored: Vec<(String, Option<String>)> = assignments
+            .iter()
+            .map(|(name, _)| (name.clone(), self.env.get(name).cloned()))
+            .collect();
+        for (name, value) in &assignments {
+            self.env.insert(name.clone(), value.clone());
+            self.exported.insert(name.clone());
+        }
+
         let flow = if let Some(group) = &command.group {
             let group = group.clone();
             self.exec_block(&group)
@@ -1416,6 +1526,18 @@ impl Shell {
             self.run_builtin(argv)
         };
 
+        for (name, previous) in restored {
+            match previous {
+                Some(value) => {
+                    self.env.insert(name, value);
+                }
+                None => {
+                    self.env.remove(&name);
+                    self.exported.remove(&name);
+                }
+            }
+        }
+
         let _ = std::io::stdout().flush();
         restore(&saved);
         flow
@@ -1424,14 +1546,30 @@ impl Shell {
     fn run_builtin(&mut self, argv: &[String]) -> Flow {
         self.last_status = match argv[0].as_str() {
             "cd" => {
-                let target = argv
-                    .get(1)
-                    .cloned()
-                    .unwrap_or_else(|| self.env.get("HOME").cloned().unwrap_or("/".into()));
+                let here = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "/".into());
+                let requested = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+                let target = match requested {
+                    "" => self.env.get("HOME").cloned().unwrap_or("/".into()),
+                    "-" => match self.previous_dir.clone() {
+                        Some(previous) => {
+                            println!("{}", previous);
+                            previous
+                        }
+                        None => {
+                            eprintln!("cd: OLDPWD not set");
+                            return Flow::Normal;
+                        }
+                    },
+                    other => other.to_string(),
+                };
                 if sys::chdir(&target) < 0 {
                     eprintln!("cd: {}: no such directory", target);
                     1
                 } else {
+                    self.previous_dir = Some(here.clone());
+                    self.env.insert("OLDPWD".into(), here);
                     if let Ok(cwd) = std::env::current_dir() {
                         self.env.insert("PWD".into(), cwd.display().to_string());
                     }
@@ -1440,6 +1578,9 @@ impl Shell {
             }
             "exit" => {
                 let code = argv.get(1).and_then(|a| a.parse().ok()).unwrap_or(self.last_status);
+                if let Some(command) = self.exit_trap.take() {
+                    self.run_text(&command);
+                }
                 self.exit_code = Some(code);
                 return Flow::Exit;
             }
@@ -1454,12 +1595,23 @@ impl Shell {
                 }
             },
             "export" => {
+                if argv.len() == 1 {
+                    let mut names: Vec<&String> = self.exported.iter().collect();
+                    names.sort();
+                    for name in names {
+                        println!("export {}={}", name, self.lookup(name));
+                    }
+                    return Flow::Normal;
+                }
                 for assignment in &argv[1..] {
-                    if let Some((key, value)) = assignment.split_once('=') {
-                        self.env.insert(key.to_string(), value.to_string());
-                        std::env::set_var(key, value);
-                    } else if let Some(value) = self.env.get(assignment).cloned() {
-                        std::env::set_var(assignment, value);
+                    match assignment.split_once('=') {
+                        Some((key, value)) => {
+                            self.env.insert(key.to_string(), value.to_string());
+                            self.exported.insert(key.to_string());
+                        }
+                        None => {
+                            self.exported.insert(assignment.clone());
+                        }
                     }
                 }
                 0
@@ -1467,17 +1619,160 @@ impl Shell {
             "unset" => {
                 for key in &argv[1..] {
                     self.env.remove(key);
-                    std::env::remove_var(key);
+                    self.exported.remove(key);
+                }
+                0
+            }
+            // A local is a plain variable here; there is no function scope.
+            "local" => {
+                for assignment in &argv[1..] {
+                    if let Some((key, value)) = assignment.split_once('=') {
+                        self.env.insert(key.to_string(), value.to_string());
+                    }
                 }
                 0
             }
             "set" => {
-                let mut keys: Vec<&String> = self.env.keys().collect();
-                keys.sort();
-                for key in keys {
-                    println!("{}={}", key, self.env[key]);
+                if argv.len() == 1 {
+                    let mut keys: Vec<&String> = self.env.keys().collect();
+                    keys.sort();
+                    for key in keys {
+                        println!("{}={}", key, self.env[key]);
+                    }
+                    return Flow::Normal;
+                }
+                let mut index = 1;
+                while index < argv.len() {
+                    match argv[index].as_str() {
+                        "--" => {
+                            self.positional = argv[index + 1..].to_vec();
+                            index = argv.len();
+                        }
+                        "-e" => {
+                            self.errexit = true;
+                            index += 1;
+                        }
+                        "+e" => {
+                            self.errexit = false;
+                            index += 1;
+                        }
+                        flag if flag.starts_with('-') || flag.starts_with('+') => {
+                            // Other options are accepted and ignored.
+                            index += 1;
+                        }
+                        _ => {
+                            self.positional = argv[index..].to_vec();
+                            index = argv.len();
+                        }
+                    }
                 }
                 0
+            }
+            "shift" => {
+                let count = argv.get(1).and_then(|a| a.parse().ok()).unwrap_or(1usize);
+                if count <= self.positional.len() {
+                    self.positional.drain(..count);
+                    0
+                } else {
+                    1
+                }
+            }
+            "trap" => {
+                // Only the EXIT trap is honoured; the rest are accepted.
+                if argv.len() >= 3 && argv[2..].iter().any(|s| s == "EXIT" || s == "0") {
+                    self.exit_trap = Some(argv[1].clone());
+                }
+                0
+            }
+            "wait" => {
+                loop {
+                    let (pid, _) = sys::wait4(-1, 0);
+                    if pid <= 0 {
+                        break;
+                    }
+                }
+                0
+            }
+            "command" => {
+                if argv.len() < 2 {
+                    return Flow::Normal;
+                }
+                if argv[1] == "-v" || argv[1] == "-V" {
+                    match argv.get(2) {
+                        Some(name) if is_builtin(name) => println!("{}", name),
+                        Some(name) => match self.find_in_path(name) {
+                            Some(path) => println!("{}", path),
+                            None => {
+                                self.last_status = 1;
+                                return Flow::Normal;
+                            }
+                        },
+                        None => {}
+                    }
+                    return Flow::Normal;
+                }
+                // Run it without consulting the function table.
+                let rest: Vec<String> = argv[1..].to_vec();
+                if is_builtin(&rest[0]) {
+                    return self.run_builtin(&rest);
+                }
+                let pid = sys::fork();
+                if pid == 0 {
+                    let code = self.exec_external(&rest);
+                    sys::exit_group(code);
+                }
+                let (_, status) = sys::wait4(pid as i32, 0);
+                sys::exit_code_of(status)
+            }
+            "exec" => {
+                if argv.len() < 2 {
+                    return Flow::Normal;
+                }
+                let rest: Vec<String> = argv[1..].to_vec();
+                let code = self.exec_external(&rest);
+                // exec_external only returns when the program could not start.
+                self.exit_code = Some(code);
+                return Flow::Exit;
+            }
+            "kill" => {
+                let mut signal = 15;
+                let mut targets = Vec::new();
+                for argument in &argv[1..] {
+                    if let Some(rest) = argument.strip_prefix('-') {
+                        if let Ok(number) = rest.parse::<i32>() {
+                            signal = number;
+                            continue;
+                        }
+                        signal = match rest.trim_start_matches("SIG") {
+                            "HUP" => 1,
+                            "INT" => 2,
+                            "QUIT" => 3,
+                            "KILL" => 9,
+                            "TERM" => 15,
+                            "CONT" => 18,
+                            "STOP" => 19,
+                            _ => signal,
+                        };
+                        continue;
+                    }
+                    match argument.parse::<i32>() {
+                        Ok(pid) => targets.push(pid),
+                        Err(_) => eprintln!("kill: {}: not a process id", argument),
+                    }
+                }
+                if targets.is_empty() {
+                    eprintln!("usage: kill [-SIGNAL] pid...");
+                    2
+                } else {
+                    let mut status = 0;
+                    for pid in targets {
+                        if sys::kill(pid, signal) < 0 {
+                            eprintln!("kill: {}: no such process", pid);
+                            status = 1;
+                        }
+                    }
+                    status
+                }
             }
             "read" => {
                 let name = argv.get(1).cloned().unwrap_or_else(|| "REPLY".into());
@@ -1538,7 +1833,6 @@ impl Shell {
             _ => {
                 if let Some((key, value)) = argv[0].split_once('=') {
                     self.env.insert(key.to_string(), value.to_string());
-                    std::env::set_var(key, value);
                     0
                 } else {
                     127
@@ -1550,12 +1844,13 @@ impl Shell {
 
     /// Search PATH and exec. Only returns if the program could not be started.
     fn exec_external(&self, argv: &[String]) -> i32 {
+        let _ = &self.exported;
         const ENOENT: i64 = -2;
         const ENOEXEC: i64 = -8;
         const EACCES: i64 = -13;
         const EISDIR: i64 = -21;
 
-        let envp: Vec<String> = self.env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        let envp = self.child_env();
         let candidates: Vec<String> = if argv[0].contains('/') {
             vec![argv[0].clone()]
         } else {
@@ -1629,7 +1924,7 @@ impl Shell {
             }
             if let Some(index) = self.jobs.iter().position(|(p, _)| *p == pid as i32) {
                 let (_, description) = self.jobs.remove(index);
-                println!("[done] {} ({})", description, sys::exit_code_of(status));
+                eprintln!("[done] {} ({})", description, sys::exit_code_of(status));
             }
         }
     }
@@ -1703,7 +1998,17 @@ impl Shell {
                 continue;
             }
             if c == '\\' && i + 1 < chars.len() {
-                out.push(chars[i + 1]);
+                // Inside double quotes a backslash is only special before
+                // these; anywhere else both characters stand.
+                let next = chars[i + 1];
+                if matches!(next, '$' | '`' | '"' | '\\' | '\n') {
+                    if next != '\n' {
+                        out.push(next);
+                    }
+                } else {
+                    out.push('\\');
+                    out.push(next);
+                }
                 i += 2;
                 continue;
             }
@@ -1724,7 +2029,13 @@ impl Shell {
                             let inner: String = chars[i + 3..end].iter().collect();
                             let expanded = self.expand_text(&inner);
                             let resolved = self.resolve_names(&expanded);
-                            out.push_str(&arithmetic(&resolved).to_string());
+                            match arithmetic(&resolved) {
+                                Ok(value) => out.push_str(&value.to_string()),
+                                Err(message) => {
+                                    eprintln!("sh: {}", message);
+                                    self.expansion_failed = true;
+                                }
+                            }
                             i = end + 2;
                             continue;
                         }
@@ -1757,7 +2068,13 @@ impl Shell {
                         i += 1;
                     }
                     '0' => {
-                        out.push_str("sh");
+                        out.push_str(&self.script_name);
+                        i += 1;
+                    }
+                    '!' => {
+                        if let Some(pid) = self.last_background {
+                            out.push_str(&pid.to_string());
+                        }
                         i += 1;
                     }
                     digit if digit.is_ascii_digit() => {
@@ -1769,14 +2086,22 @@ impl Shell {
                     }
                     '{' => {
                         i += 1;
-                        let mut name = String::new();
-                        while i < chars.len() && chars[i] != '}' {
-                            name.push(chars[i]);
+                        let mut body = String::new();
+                        let mut depth = 1;
+                        while i < chars.len() {
+                            if chars[i] == '{' {
+                                depth += 1;
+                            } else if chars[i] == '}' {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            body.push(chars[i]);
                             i += 1;
                         }
                         i += 1;
-                        let value = self.lookup(&name).to_string();
-                        out.push_str(&value);
+                        out.push_str(&self.expand_braced(&body));
                     }
                     letter if letter.is_alphanumeric() || letter == '_' => {
                         let mut name = String::new();
@@ -1819,6 +2144,73 @@ impl Shell {
 
     fn lookup(&self, name: &str) -> &str {
         self.env.get(name).map(|s| s.as_str()).unwrap_or("")
+    }
+
+    /// The inside of `${ ... }`: a name, a length, or a name with a modifier.
+    fn expand_braced(&mut self, body: &str) -> String {
+        if let Some(name) = body.strip_prefix('#') {
+            return self.lookup(name).chars().count().to_string();
+        }
+
+        // ${name:-word}, :=, :+, :?  and the same four without the colon.
+        let operators = [":-", ":=", ":+", ":?", "-", "=", "+", "?"];
+        for operator in operators {
+            if let Some(index) = body.find(operator) {
+                // A name never contains an operator character, so the first
+                // hit is the real split point.
+                let name = &body[..index];
+                if name.is_empty() || !is_name(name) {
+                    continue;
+                }
+                let word = &body[index + operator.len()..];
+                let current = self.env.get(name).cloned();
+                let unset_or_empty = match &current {
+                    None => true,
+                    Some(value) => operator.starts_with(':') && value.is_empty(),
+                };
+
+                return match operator.trim_start_matches(':') {
+                    "-" => {
+                        if unset_or_empty {
+                            self.expand_text(word)
+                        } else {
+                            current.unwrap_or_default()
+                        }
+                    }
+                    "=" => {
+                        if unset_or_empty {
+                            let value = self.expand_text(word);
+                            self.env.insert(name.to_string(), value.clone());
+                            value
+                        } else {
+                            current.unwrap_or_default()
+                        }
+                    }
+                    "+" => {
+                        if unset_or_empty {
+                            String::new()
+                        } else {
+                            self.expand_text(word)
+                        }
+                    }
+                    _ => {
+                        if unset_or_empty {
+                            let message = self.expand_text(word);
+                            eprintln!(
+                                "sh: {}: {}",
+                                name,
+                                if message.is_empty() { "parameter not set" } else { &message }
+                            );
+                            self.expansion_failed = true;
+                            String::new()
+                        } else {
+                            current.unwrap_or_default()
+                        }
+                    }
+                };
+            }
+        }
+        self.lookup(body).to_string()
     }
 
     /// Inside `$(( ))` a bare name is a variable reference, so replace each
@@ -1889,11 +2281,41 @@ impl Shell {
 
 const BUILTINS: &[&str] = &[
     "cd", "exit", "pwd", "export", "unset", "set", "read", "jobs", "kill", "type", "which", ".",
-    "source", "help", "history", ":",
+    "source", "help", "history", ":", "local", "wait", "command", "exec", "trap", "shift",
 ];
 
 fn is_builtin(name: &str) -> bool {
-    BUILTINS.contains(&name) || name.contains('=')
+    BUILTINS.contains(&name) || is_assignment(name)
+}
+
+/// A word of the form NAME=value.
+fn is_assignment(word: &str) -> bool {
+    match word.split_once('=') {
+        Some((name, _)) => is_name(name),
+        None => false,
+    }
+}
+
+fn leading_assignments(command: &Command) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (word, _) in &command.words {
+        match word.split_once('=') {
+            Some((name, value)) if is_name(name) => {
+                out.push((name.to_string(), value.to_string()))
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+fn strip_assignments(command: &Command) -> Vec<String> {
+    command
+        .words
+        .iter()
+        .map(|(word, _)| word.clone())
+        .skip_while(|word| is_assignment(word))
+        .collect()
 }
 
 /// Completes command names for the first word and file names elsewhere.
@@ -2026,74 +2448,85 @@ fn find_close(chars: &[char], start: usize, open: char, close: char) -> Option<u
 }
 
 /// Evaluate an integer expression for `$(( ... ))`.
-fn arithmetic(expression: &str) -> i64 {
+fn arithmetic(expression: &str) -> Result<i64, String> {
     let tokens: Vec<char> = expression.chars().filter(|c| !c.is_whitespace()).collect();
     let mut position = 0;
     parse_sum(&tokens, &mut position)
 }
 
-fn parse_sum(tokens: &[char], position: &mut usize) -> i64 {
-    let mut value = parse_product(tokens, position);
+fn parse_sum(tokens: &[char], position: &mut usize) -> Result<i64, String> {
+    let mut value = parse_product(tokens, position)?;
     while *position < tokens.len() {
         match tokens[*position] {
             '+' => {
                 *position += 1;
-                value += parse_product(tokens, position);
+                value = value.wrapping_add(parse_product(tokens, position)?);
             }
             '-' => {
                 *position += 1;
-                value -= parse_product(tokens, position);
+                value = value.wrapping_sub(parse_product(tokens, position)?);
             }
             _ => break,
         }
     }
-    value
+    Ok(value)
 }
 
-fn parse_product(tokens: &[char], position: &mut usize) -> i64 {
-    let mut value = parse_atom(tokens, position);
+fn parse_product(tokens: &[char], position: &mut usize) -> Result<i64, String> {
+    let mut value = parse_atom(tokens, position)?;
     while *position < tokens.len() {
         let operator = tokens[*position];
         if !matches!(operator, '*' | '/' | '%') {
             break;
         }
         *position += 1;
-        let operand = parse_atom(tokens, position);
+        let operand = parse_atom(tokens, position)?;
+        if matches!(operator, '/' | '%') && operand == 0 {
+            return Err("division by 0".to_string());
+        }
         value = match operator {
-            '*' => value * operand,
-            '/' if operand != 0 => value / operand,
-            '%' if operand != 0 => value % operand,
-            _ => value,
+            '*' => value.wrapping_mul(operand),
+            '/' => value / operand,
+            _ => value % operand,
         };
     }
-    value
+    Ok(value)
 }
 
-fn parse_atom(tokens: &[char], position: &mut usize) -> i64 {
+fn parse_atom(tokens: &[char], position: &mut usize) -> Result<i64, String> {
     if *position >= tokens.len() {
-        return 0;
+        return Ok(0);
     }
     match tokens[*position] {
         '(' => {
             *position += 1;
-            let value = parse_sum(tokens, position);
+            let value = parse_sum(tokens, position)?;
             if tokens.get(*position) == Some(&')') {
                 *position += 1;
             }
-            value
+            Ok(value)
         }
         '-' => {
             *position += 1;
-            -parse_atom(tokens, position)
+            Ok(-parse_atom(tokens, position)?)
         }
         _ => {
             let start = *position;
             while *position < tokens.len() && tokens[*position].is_ascii_digit() {
                 *position += 1;
             }
-            tokens[start..*position].iter().collect::<String>().parse().unwrap_or(0)
+            if start == *position {
+                return Err(format!("unexpected `{}` in an expression", tokens[start]));
+            }
+            Ok(tokens[start..*position].iter().collect::<String>().parse().unwrap_or(0))
         }
     }
+}
+
+fn is_name(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && !text.starts_with(|c: char| c.is_ascii_digit())
 }
 
 /// Expand a `*`/`?` pattern against the filesystem.
@@ -2102,7 +2535,8 @@ fn glob(pattern: &str) -> Option<Vec<String>> {
         Some(index) => (&pattern[..index + 1], &pattern[index + 1..]),
         None => ("", pattern),
     };
-    if !file_pattern.contains('*') && !file_pattern.contains('?') {
+    if !file_pattern.contains('*') && !file_pattern.contains('?') && !file_pattern.contains('[')
+    {
         return None;
     }
     let search_dir = if dir.is_empty() { "." } else { dir };
@@ -2121,6 +2555,39 @@ fn glob(pattern: &str) -> Option<Vec<String>> {
     Some(matches)
 }
 
+/// Match one character against a `[...]` class, returning the index just past
+/// the closing bracket.
+fn match_class(pattern: &[char], start: usize, c: char) -> Option<(bool, usize)> {
+    let mut i = start + 1;
+    let negated = matches!(pattern.get(i), Some('!') | Some('^'));
+    if negated {
+        i += 1;
+    }
+    let mut hit = false;
+    let mut first = true;
+    while i < pattern.len() {
+        if pattern[i] == ']' && !first {
+            return Some((hit != negated, i + 1));
+        }
+        first = false;
+        let low = pattern[i];
+        if pattern.get(i + 1) == Some(&'-') && pattern.get(i + 2).is_some_and(|&x| x != ']') {
+            let high = pattern[i + 2];
+            if c >= low && c <= high {
+                hit = true;
+            }
+            i += 3;
+        } else {
+            if c == low {
+                hit = true;
+            }
+            i += 1;
+        }
+    }
+    // No closing bracket: the '[' was a literal.
+    None
+}
+
 fn matches_pattern(name: &str, pattern: &str) -> bool {
     let n: Vec<char> = name.chars().collect();
     let p: Vec<char> = pattern.chars().collect();
@@ -2128,6 +2595,22 @@ fn matches_pattern(name: &str, pattern: &str) -> bool {
     let (mut star, mut backtrack) = (usize::MAX, 0usize);
 
     while ni < n.len() {
+        if pi < p.len() && p[pi] == '[' {
+            if let Some((hit, next)) = match_class(&p, pi, n[ni]) {
+                if hit {
+                    ni += 1;
+                    pi = next;
+                    continue;
+                }
+                if star != usize::MAX {
+                    pi = star + 1;
+                    backtrack += 1;
+                    ni = backtrack;
+                    continue;
+                }
+                return false;
+            }
+        }
         if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
             ni += 1;
             pi += 1;
