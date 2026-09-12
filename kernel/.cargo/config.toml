@@ -10,3 +10,13 @@ rustflags = [
   "-C", "code-model=kernel",
   "-C", "force-frame-pointers=yes",
 ]
+
+# rust-lld refuses -nostartfiles here, so the script alone says what to link.
+[target.aarch64-unknown-none]
+rustflags = [
+  "-C", "link-arg=-Tlinker-aarch64.ld",
+  "-C", "link-arg=-zmax-page-size=4096",
+  "-C", "link-arg=-no-pie",
+  "-C", "relocation-model=static",
+  "-C", "force-frame-pointers=yes",
+]
