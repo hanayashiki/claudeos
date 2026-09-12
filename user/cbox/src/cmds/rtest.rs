@@ -225,8 +225,9 @@ pub fn main(_args: &[String]) -> i32 {
     println!();
     println!("-- signals --");
     unsafe {
-        signal(SIGUSR1, handle_signal as usize);
-        signal(SIGUSR2, handle_signal as usize);
+        let handler = handle_signal as extern "C" fn(i32) as usize;
+        signal(SIGUSR1, handler);
+        signal(SIGUSR2, handler);
     }
     let before = SIGNAL_TOTAL.load(Ordering::SeqCst);
     unsafe {

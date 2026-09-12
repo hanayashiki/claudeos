@@ -79,7 +79,7 @@ pub extern "C" fn kmain(mb_info_phys: u64, magic: u64) -> ! {
     let boot = unsafe { multiboot::parse(mb_info_phys) };
 
     cpu::gdt::init();
-    cpu::gdt::set_kernel_stack(unsafe { core::ptr::addr_of!(kernel_stack_top) as u64 });
+    cpu::gdt::set_kernel_stack(core::ptr::addr_of!(kernel_stack_top) as u64);
     cpu::idt::init();
     trap::init();
     cpu::init_per_cpu();

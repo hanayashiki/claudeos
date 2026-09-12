@@ -254,7 +254,7 @@ pub fn uniq(args: &[String]) -> i32 {
 
     let mut previous: Option<String> = None;
     let mut repeats = 0usize;
-    let mut emit = |line: &str, repeats: usize| {
+    let emit = |line: &str, repeats: usize| {
         if count {
             println!("{:>7} {}", repeats, line);
         } else {

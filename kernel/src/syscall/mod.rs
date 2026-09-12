@@ -16,7 +16,7 @@ extern "C" {
 pub fn init() {
     use crate::cpu::gdt::{STAR_KERNEL_BASE, STAR_USER_BASE};
     msr::write(msr::IA32_STAR, (STAR_USER_BASE << 48) | (STAR_KERNEL_BASE << 32));
-    msr::write(msr::IA32_LSTAR, syscall_entry as usize as u64);
+    msr::write(msr::IA32_LSTAR, syscall_entry as unsafe extern "C" fn() as usize as u64);
     // Clear IF, TF, DF, NT, AC and IOPL on entry so the kernel starts in a
     // known state with interrupts off.
     msr::write(msr::IA32_FMASK, 0x47700);

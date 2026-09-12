@@ -99,7 +99,7 @@ pub fn fork(
             (*dst).rsp = stack;
         }
     }
-    child.prepare_kernel_frame(sched::user_entry_trampoline as usize as u64);
+    child.prepare_kernel_frame(sched::user_entry_trampoline as extern "C" fn() -> ! as usize as u64);
 
     // Only safe to write through these pointers while the address space is
     // shared with the parent we are running in.

@@ -30,4 +30,6 @@ busybox:
 	@./scripts/build-user.sh
 
 clean:
-	rm -rf build kernel/target user/cbox/target
+	@# build/thirdparty holds downloads; keep them so a rebuild stays offline.
+	rm -rf build/kernel.elf build/kernel64.elf build/rootfs build/initramfs.cpio \
+	       build/toolchain build/hello_c.o kernel/target user/cbox/target

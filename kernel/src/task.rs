@@ -384,7 +384,7 @@ pub fn build_user_stack(
     let mut sp = USER_STACK_TOP;
 
     // Strings first, from the very top down.
-    let mut push_bytes = |sp: &mut u64, bytes: &[u8]| -> u64 {
+    let push_bytes = |sp: &mut u64, bytes: &[u8]| -> u64 {
         *sp -= bytes.len() as u64 + 1;
         unsafe {
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), *sp as *mut u8, bytes.len());
@@ -560,7 +560,7 @@ pub fn spawn(
     task.pgid = task.pid;
     attach_console(&mut task)?;
     task.pending_exec = Some((path.to_string(), argv, envp));
-    task.prepare_kernel_frame(user_bootstrap as usize as u64);
+    task.prepare_kernel_frame(user_bootstrap as extern "C" fn() -> ! as usize as u64);
     Ok(crate::sched::register(task))
 }
 

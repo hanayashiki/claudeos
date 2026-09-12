@@ -46,26 +46,22 @@ pub unsafe fn phys_ptr<T>(phys: u64) -> *mut T {
 
 /// Physical address just past the end of the loaded kernel image.
 pub fn kernel_phys_end() -> u64 {
-    let virt = unsafe { core::ptr::addr_of!(__kernel_end_virt) as u64 };
+    let virt = core::ptr::addr_of!(__kernel_end_virt) as u64;
     virt - KERNEL_VMA
 }
 
 pub fn kernel_text_range() -> (u64, u64) {
-    unsafe {
-        (
-            core::ptr::addr_of!(__text_start) as u64,
-            core::ptr::addr_of!(__text_end) as u64,
-        )
-    }
+    (
+        core::ptr::addr_of!(__text_start) as u64,
+        core::ptr::addr_of!(__text_end) as u64,
+    )
 }
 
 pub fn kernel_rodata_range() -> (u64, u64) {
-    unsafe {
-        (
-            core::ptr::addr_of!(__rodata_start) as u64,
-            core::ptr::addr_of!(__rodata_end) as u64,
-        )
-    }
+    (
+        core::ptr::addr_of!(__rodata_start) as u64,
+        core::ptr::addr_of!(__rodata_end) as u64,
+    )
 }
 
 #[inline]

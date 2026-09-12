@@ -59,7 +59,6 @@ fn page_fault(frame: &mut TrapFrame) {
             if code & 16 != 0 { " instruction-fetch" } else { "" },
         );
         crate::sched::kill_current(11); // SIGSEGV
-        return;
     }
 
     // A kernel fault is not recoverable; dump everything useful and stop.
@@ -95,7 +94,6 @@ fn exception(frame: &mut TrapFrame) {
             _ => 11,  // SIGSEGV
         };
         crate::sched::kill_current(signal);
-        return;
     }
 
     println!();

@@ -481,7 +481,7 @@ pub fn df(_args: &[String]) -> i32 {
 pub fn hexdump(args: &[String]) -> i32 {
     let (_, operands) = split_flags(args);
     let mut status = 0;
-    let mut dump = |label: &str, bytes: &[u8]| {
+    let dump = |label: &str, bytes: &[u8]| {
         let _ = label;
         for (offset, chunk) in bytes.chunks(16).enumerate() {
             print!("{:08x}  ", offset * 16);

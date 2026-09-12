@@ -12,6 +12,7 @@ pub const STDERR: i32 = 2;
 
 pub const O_RDONLY: u64 = 0;
 pub const O_WRONLY: u64 = 1;
+#[allow(dead_code)]
 pub const O_RDWR: u64 = 2;
 pub const O_CREAT: u64 = 0o100;
 pub const O_TRUNC: u64 = 0o1000;
@@ -29,6 +30,7 @@ pub const SYS_EXIT_GROUP: u64 = 231;
 pub const SYS_WAIT4: u64 = 61;
 pub const SYS_SETPGID: u64 = 109;
 pub const SYS_GETPID: u64 = 39;
+#[allow(dead_code)]
 pub const SYS_GETPPID: u64 = 110;
 pub const SYS_CHDIR: u64 = 80;
 pub const SYS_KILL: u64 = 62;
@@ -83,6 +85,7 @@ pub fn getpid() -> i64 {
     unsafe { syscall0(SYS_GETPID) }
 }
 
+#[allow(dead_code)]
 pub fn getppid() -> i64 {
     unsafe { syscall0(SYS_GETPPID) }
 }
@@ -117,6 +120,7 @@ pub fn open(path: &str, flags: u64, mode: u64) -> i64 {
     unsafe { syscall3(SYS_OPEN, c.as_ptr() as u64, flags, mode) }
 }
 
+#[allow(dead_code)]
 pub fn write(fd: i32, data: &[u8]) -> i64 {
     unsafe { syscall3(SYS_WRITE, fd as u64, data.as_ptr() as u64, data.len() as u64) }
 }
@@ -220,6 +224,7 @@ pub const SIG_IGN: usize = 1;
 
 pub const SIGINT: i32 = 2;
 pub const SIGQUIT: i32 = 3;
+#[allow(dead_code)]
 pub const SIGTERM: i32 = 15;
 pub const SIGTSTP: i32 = 20;
 pub const SIGTTIN: i32 = 21;

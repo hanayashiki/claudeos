@@ -276,6 +276,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
         }
     }
     flush!();
+    let _ = (have_word, saw_single, saw_other);
     Ok(tokens)
 }
 
