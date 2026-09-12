@@ -18,6 +18,7 @@ mod futex;
 mod io;
 mod mm;
 mod multiboot;
+mod net;
 mod sched;
 mod signal;
 mod sync;
