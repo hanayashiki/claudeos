@@ -83,7 +83,14 @@ pub unsafe fn write_ttbr(phys: u64) {
     // One table serves both bases: the walk takes the same nine bits for the
     // top level whichever register it came from, and the kernel's addresses
     // all land in the upper half of it.
+    //
+    // The leading barrier is what makes whatever was written into this table
+    // visible to the walkers before they are pointed at it; without it they
+    // are entitled to read what was there before. Nothing is left of the
+    // previous space afterwards, because no address space identifiers are in
+    // use and every entry still cached belongs to it.
     asm!(
+        "dsb ishst",
         "msr ttbr0_el1, {table}",
         "msr ttbr1_el1, {table}",
         "isb",
