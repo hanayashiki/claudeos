@@ -22,6 +22,20 @@ pub fn syscall_args(frame: &TrapFrame) -> [u64; 6] {
     [frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5]]
 }
 
+/// What `clone` was asked for, in one order regardless of the machine:
+/// flags, the child's stack, where to write the parent's view of the new
+/// thread id, where to write the child's, and the thread pointer.
+///
+/// This machine hands over the last two the other way round from x86-64: the
+/// thread pointer comes before the child's id. A kernel that reads them in the
+/// other order gives the new thread its parent's thread pointer, and the first
+/// thing the new thread does is find its own thread-local storage already
+/// occupied.
+#[inline]
+pub fn clone_args(args: &[u64; 6]) -> (u64, u64, u64, u64, u64) {
+    (args[0], args[1], args[2], args[4], args[3])
+}
+
 /// Where the result goes on the way back out.
 #[inline]
 pub fn set_syscall_result(frame: &mut TrapFrame, value: u64) {

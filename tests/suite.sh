@@ -230,7 +230,13 @@ check "find -exec"         "1"           "$(find /tmp/cu -name '*.log' -exec wc 
 check "ls -l has an owner" "root"        "$(ls -l /tmp/cu/a.txt | tr -s ' ' | cut -d' ' -f3)"
 check "ls -l has a time"   "1"           "$(ls -l /tmp/cu/a.txt | grep -c ':')"
 check "ls -d"              "/tmp/cu"     "$(ls -d /tmp/cu)"
-check "mtime is set"       "0"           "$(test $(busybox stat -c %Y /tmp/cu/a.txt) -gt 1000000000; echo $?)"
+# The only check here that needs the fetched busybox rather than this
+# project's own tools, because nothing of ours prints a raw timestamp.
+if [ -x /bin/busybox ]; then
+  check "mtime is set"     "0"           "$(test $(busybox stat -c %Y /tmp/cu/a.txt) -gt 1000000000; echo $?)"
+else
+  echo "SKIP  mtime is set (needs upstream busybox)"
+fi
 check "tr escapes"         "a:b:"        "$(printf 'a\nb\n' | tr '\n' ':')"
 check "sort -n with text"  "1 a"         "$(printf '3 c\n1 a\n2 b\n' | sort -n | head -n 1)"
 check "sort -n decimals"   "1.25"        "$(printf '1.5\n1.25\n10\n' | sort -n | head -n 1)"
@@ -414,7 +420,11 @@ rm -rf /tmp/s
 echo
 echo "-- system --"
 check "uname"             "Linux"    "$(uname)"
-check "uname -m"          "x86_64"   "$(uname -m)"
+# Two places in the kernel say what machine this is, and they have to agree.
+# /proc/cpuinfo is written per architecture, so which fields it has says which
+# one is running without this script having to be told.
+if grep -q "^CPU implementer" /proc/cpuinfo; then machine=aarch64; else machine=x86_64; fi
+check "uname -m"          "$machine" "$(uname -m)"
 check "hostname"          "claudeos" "$(hostname)"
 check "whoami"            "root"     "$(whoami)"
 check "proc version"      "1"        "$(grep -c claudeos /proc/version)"

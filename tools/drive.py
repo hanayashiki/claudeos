@@ -141,17 +141,30 @@ def main():
         subprocess.run([reaper, "15"], check=False)
 
     sock_path = os.path.join(tempfile.mkdtemp(), "console.sock")
-    command = [
-        "qemu-system-x86_64",
-        "-kernel", os.path.join(ROOT, "build", "kernel.elf"),
-        "-initrd", initramfs,
+    console = [
         "-chardev", f"socket,id=console,path={sock_path},server=on,wait=off",
         "-serial", "chardev:console",
         "-display", "none",
-        "-m", "512M",
         "-no-reboot",
-        "-cpu", "qemu64,+pdpe1gb,+rdrand,+fsgsbase,+xsave",
     ]
+    if os.environ.get("ARCH") == "aarch64":
+        # The flat image, because only that form gets a ram disk and a command
+        # line, and the first serial port, because that is the PL011.
+        command = [
+            "qemu-system-aarch64",
+            "-M", "raspi4b",
+            "-kernel", os.path.join(ROOT, "build", "kernel8.img"),
+            "-initrd", initramfs,
+        ] + console
+    else:
+        command = [
+            "qemu-system-x86_64",
+            "-kernel", os.path.join(ROOT, "build", "kernel.elf"),
+            "-initrd", initramfs,
+        ] + console + [
+            "-m", "512M",
+            "-cpu", "qemu64,+pdpe1gb,+rdrand,+fsgsbase,+xsave",
+        ]
     if append:
         command += ["-append", append]
     process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

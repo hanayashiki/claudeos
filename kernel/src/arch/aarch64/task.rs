@@ -44,13 +44,52 @@ pub struct FpuState {
     status: u64,
 }
 
+/// Bytes the thirty-two vector registers occupy, which is also how much room
+/// a signal frame sets aside for them.
+pub const VECTOR_BYTES: usize = 512;
+
 impl FpuState {
-    const fn zeroed() -> FpuState {
+    pub(super) const fn zeroed() -> FpuState {
         FpuState { registers: [0; 32], control: 0, status: 0 }
     }
 
+    /// The vector registers as the bytes a signal frame carries. The array is
+    /// sixteen-byte aligned and its elements have no padding, so its bytes are
+    /// the image the architecture describes.
+    pub(super) fn vectors(&self) -> &[u8; VECTOR_BYTES] {
+        unsafe { &*(self.registers.as_ptr() as *const [u8; VECTOR_BYTES]) }
+    }
+
+    pub(super) fn control_word(&self) -> u32 {
+        self.control as u32
+    }
+
+    pub(super) fn status_word(&self) -> u32 {
+        self.status as u32
+    }
+
+    /// Take an image back off the user stack, keeping only the bits a program
+    /// is allowed to set: the rounding mode and the exception masks in one,
+    /// the exception flags in the other. The frame came off the user stack and
+    /// the rest of those words is not a program's to choose.
+    pub(super) fn load(&mut self, vectors: &[u8], control: u32, status: u32) -> bool {
+        if vectors.len() < VECTOR_BYTES {
+            return false;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                vectors.as_ptr(),
+                self.registers.as_mut_ptr() as *mut u8,
+                VECTOR_BYTES,
+            );
+        }
+        self.control = (control & 0x07FF_9F00) as u64;
+        self.status = (status & 0x0800_009F) as u64;
+        true
+    }
+
     #[inline]
-    fn save(&mut self) {
+    pub(super) fn save(&mut self) {
         let at = self.registers.as_mut_ptr();
         unsafe {
             asm!(
@@ -82,7 +121,7 @@ impl FpuState {
     }
 
     #[inline]
-    fn restore(&self) {
+    pub(super) fn restore(&self) {
         let at = self.registers.as_ptr();
         unsafe {
             asm!(
@@ -122,7 +161,7 @@ impl FpuState {
 #[derive(Clone, Copy)]
 pub struct TaskContext {
     thread_pointer: u64,
-    fpu: FpuState,
+    pub(super) fpu: FpuState,
 }
 
 impl TaskContext {

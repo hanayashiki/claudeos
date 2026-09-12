@@ -36,6 +36,17 @@ pub fn syscall_args(frame: &TrapFrame) -> [u64; 6] {
     [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9]
 }
 
+/// What `clone` was asked for, in one order regardless of the machine:
+/// flags, the child's stack, where to write the parent's view of the new
+/// thread id, where to write the child's, and the thread pointer.
+///
+/// The five words arrive in a different order on different ports of Linux,
+/// which is why this is here rather than in the dispatcher.
+#[inline]
+pub fn clone_args(args: &[u64; 6]) -> (u64, u64, u64, u64, u64) {
+    (args[0], args[1], args[2], args[3], args[4])
+}
+
 /// Where the result goes on the way back out.
 #[inline]
 pub fn set_syscall_result(frame: &mut TrapFrame, value: u64) {

@@ -2,8 +2,10 @@
 # Build the kernel. ARCH picks the machine; x86_64 unless told otherwise.
 #
 # x86_64 is handed to QEMU's multiboot loader, which only reads ELF32, so the
-# image is converted. aarch64 is handed to firmware that reads ELF64 directly,
-# and a flat image is written alongside it for boards that want one.
+# image is converted. On aarch64 the flat image is the product: it is the only
+# thing a Pi 4's firmware will load off the card, and it is also the only form
+# QEMU follows the Linux boot protocol for. The ELF is kept beside it for
+# symbols and disassembly and is not what boots.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LLVMBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/host: //p')/bin"

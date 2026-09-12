@@ -244,6 +244,9 @@ pub fn load_at(
                     let src = data.as_ptr().add((ph.p_offset + offset) as usize);
                     core::ptr::copy_nonoverlapping(src, address as *mut u8, chunk as usize);
                 }
+                // These bytes are about to be executed, and on some machines
+                // writing them is not enough to make them fetchable.
+                crate::arch::sync_instruction_cache(address, chunk as usize);
             }
             offset += chunk;
         }

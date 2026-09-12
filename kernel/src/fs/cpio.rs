@@ -31,11 +31,15 @@ pub struct Stats {
     pub dirs: usize,
     pub symlinks: usize,
     pub bytes: usize,
+    /// The latest time any entry in the archive was written, in seconds since
+    /// the epoch. A machine with no clock of its own has this as evidence that
+    /// it is at least this late.
+    pub newest: i64,
 }
 
 /// Unpack `archive` into the filesystem rooted at `/`.
 pub fn extract(archive: &[u8]) -> Result<Stats, &'static str> {
-    let mut stats = Stats { files: 0, dirs: 0, symlinks: 0, bytes: 0 };
+    let mut stats = Stats { files: 0, dirs: 0, symlinks: 0, bytes: 0, newest: 0 };
     let mut pos = 0usize;
 
     while pos + HEADER_SIZE <= archive.len() {
@@ -44,6 +48,7 @@ pub fn extract(archive: &[u8]) -> Result<Stats, &'static str> {
             return Err("bad cpio magic");
         }
         let mode = hex_field(&header[14..22]).ok_or("bad mode")? as u32;
+        let mtime = hex_field(&header[46..54]).unwrap_or(0) as i64;
         let filesize = hex_field(&header[54..62]).ok_or("bad filesize")? as usize;
         let namesize = hex_field(&header[94..102]).ok_or("bad namesize")? as usize;
 
@@ -59,6 +64,7 @@ pub fn extract(archive: &[u8]) -> Result<Stats, &'static str> {
         if name == "TRAILER!!!" {
             break;
         }
+        stats.newest = stats.newest.max(mtime);
 
         let data_start = pos + align4(HEADER_SIZE + namesize);
         let data_end = data_start + filesize;

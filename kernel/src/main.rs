@@ -207,13 +207,18 @@ fn mount_initramfs(boot: &boot::BootInfo) {
     let virt = mm::phys_to_virt(module.start);
     let archive = unsafe { core::slice::from_raw_parts(virt as *const u8, module.len()) };
     match fs::cpio::extract(archive) {
-        Ok(stats) => println!(
-            "initramfs: {} files, {} dirs, {} links, {} KiB",
-            stats.files,
-            stats.dirs,
-            stats.symlinks,
-            stats.bytes / 1024
-        ),
+        Ok(stats) => {
+            // The dates on the archive are the only evidence of the real time
+            // that reaches a board with no clock of its own.
+            time::set_floor(stats.newest);
+            println!(
+                "initramfs: {} files, {} dirs, {} links, {} KiB",
+                stats.files,
+                stats.dirs,
+                stats.symlinks,
+                stats.bytes / 1024
+            );
+        }
         Err(err) => println!("initramfs: failed to unpack: {}", err),
     }
 }

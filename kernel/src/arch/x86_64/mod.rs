@@ -34,7 +34,7 @@ global_asm!(include_str!("syscall_entry.s"), options(att_syntax));
 pub use clock::{cycle_counter, read_wall_clock, WallClock};
 pub use signal_frame::{enter_signal_handler, leave_signal_handler};
 pub use syscall::{
-    arch_prctl, fork_child_frame, init_syscall_entry, set_syscall_result, syscall_args,
+    arch_prctl, clone_args, fork_child_frame, init_syscall_entry, set_syscall_result, syscall_args,
     syscall_number, syscall_result,
 };
 pub use task::{
@@ -124,6 +124,14 @@ pub fn init_cpu() {
 pub fn halt() {
     cpu::halt();
 }
+
+/// Make bytes the kernel has just written fetchable as instructions.
+///
+/// Nothing to do here: this processor keeps its instruction cache coherent
+/// with stores, so writing a page and then jumping into it works without
+/// being told. The call is in the interface because it is not free everywhere.
+#[inline]
+pub fn sync_instruction_cache(_start: u64, _len: usize) {}
 
 // ---------------------------------------------------------------------------
 // Interrupt enable state
