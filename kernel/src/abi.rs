@@ -108,6 +108,7 @@ pub mod nr {
     pub const CLOCK_NANOSLEEP: u64 = 230;
     pub const EXIT_GROUP: u64 = 231;
     pub const EPOLL_CTL: u64 = 233;
+    pub const TKILL: u64 = 200;
     pub const TGKILL: u64 = 234;
     pub const OPENAT: u64 = 257;
     pub const MKDIRAT: u64 = 258;
@@ -302,6 +303,12 @@ pub const F_GETFL: u32 = 3;
 pub const F_SETFL: u32 = 4;
 pub const F_DUPFD_CLOEXEC: u32 = 1030;
 pub const FD_CLOEXEC: u32 = 1;
+
+// Generic descriptor ioctls, used by runtimes to toggle non-blocking mode.
+pub const FIONREAD: u64 = 0x541B;
+pub const FIONBIO: u64 = 0x5421;
+pub const FIOCLEX: u64 = 0x5451;
+pub const FIONCLEX: u64 = 0x5450;
 
 // ioctl requests used by terminal setup.
 pub const TCGETS: u64 = 0x5401;

@@ -43,6 +43,7 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("ps", "list running processes"),
     ("pwd", "print the working directory"),
     ("rm", "remove files"),
+    ("rtest", "exercise the Rust standard library"),
     ("rmdir", "remove empty directories"),
     ("rev", "reverse each line"),
     ("seq", "print a sequence of numbers"),

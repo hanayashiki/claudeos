@@ -12,6 +12,7 @@ use crate::mm::paging::{AddressSpace, NO_EXECUTE, PRESENT, USER, WRITABLE};
 use crate::mm::{page_align_down, page_align_up, PAGE_SIZE_U64, USER_MMAP_BASE, USER_STACK_TOP};
 use alloc::alloc::{alloc, dealloc, Layout};
 use alloc::string::{String, ToString};
+use crate::sync::Spinlock;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -60,6 +61,22 @@ impl Vma {
     }
 }
 
+/// The parts of the address space bookkeeping that threads share. The page
+/// tables themselves are shared through the identical `AddressSpace` value;
+/// this holds the region list and heap bounds that go with them.
+pub struct MemState {
+    pub vmas: Vec<Vma>,
+    pub brk_start: u64,
+    pub brk: u64,
+    pub mmap_top: u64,
+}
+
+impl MemState {
+    pub fn new() -> MemState {
+        MemState { vmas: Vec::new(), brk_start: 0, brk: 0, mmap_top: USER_MMAP_BASE }
+    }
+}
+
 pub struct Task {
     pub pid: u32,
     pub tgid: u32,
@@ -73,16 +90,13 @@ pub struct Task {
     pub kstack_top: u64,
 
     pub space: AddressSpace,
+    /// Shared with every thread running in the same address space.
+    pub mm: Arc<Spinlock<MemState>>,
     pub fds: FdTable,
     pub cwd: String,
     pub name: String,
     /// Path of the running executable, reported through /proc/self/exe.
     pub exe_path: String,
-
-    pub brk_start: u64,
-    pub brk: u64,
-    pub mmap_top: u64,
-    pub vmas: Vec<Vma>,
 
     pub exit_code: i32,
     pub fs_base: u64,
@@ -147,14 +161,11 @@ impl Task {
             kstack,
             kstack_top,
             space,
+            mm: Arc::new(Spinlock::new(MemState::new())),
             fds: FdTable::new(),
             cwd: String::from("/"),
             name: name.to_string(),
             exe_path: String::new(),
-            brk_start: 0,
-            brk: 0,
-            mmap_top: USER_MMAP_BASE,
-            vmas: Vec::new(),
             exit_code: 0,
             fs_base: 0,
             gs_base: 0,
@@ -201,18 +212,57 @@ impl Task {
         self.rsp = frame as u64;
     }
 
-    pub fn add_vma(&mut self, start: u64, end: u64, prot: u64, flags: u64) {
-        self.vmas.push(Vma { start, end, prot, flags });
+    pub fn brk_start(&self) -> u64 {
+        self.mm.lock().brk_start
+    }
+
+    pub fn brk(&self) -> u64 {
+        self.mm.lock().brk
+    }
+
+    pub fn set_brk(&self, value: u64) {
+        self.mm.lock().brk = value;
+    }
+
+    pub fn set_heap_base(&self, value: u64) {
+        let mut mm = self.mm.lock();
+        mm.brk_start = value;
+        mm.brk = value;
+    }
+
+    pub fn add_vma(&self, start: u64, end: u64, prot: u64, flags: u64) {
+        self.mm.lock().vmas.push(Vma { start, end, prot, flags });
     }
 
     pub fn find_vma(&self, addr: u64) -> Option<Vma> {
-        self.vmas.iter().find(|v| v.contains(addr)).copied()
+        self.mm.lock().vmas.iter().find(|v| v.contains(addr)).copied()
+    }
+
+    pub fn clear_vmas(&self) {
+        let mut mm = self.mm.lock();
+        mm.vmas.clear();
+        mm.mmap_top = USER_MMAP_BASE;
+    }
+
+    pub fn snapshot_vmas(&self) -> Vec<Vma> {
+        self.mm.lock().vmas.clone()
+    }
+
+    /// Give every region overlapping `[start, end)` the new protection.
+    pub fn set_vma_prot(&self, start: u64, end: u64, prot: u64) {
+        let mut mm = self.mm.lock();
+        for vma in mm.vmas.iter_mut() {
+            if vma.start < end && start < vma.end {
+                vma.prot = prot;
+            }
+        }
     }
 
     /// Remove `[start, end)` from the recorded regions, splitting as needed.
-    pub fn remove_vma_range(&mut self, start: u64, end: u64) {
+    pub fn remove_vma_range(&self, start: u64, end: u64) {
+        let mut mm = self.mm.lock();
         let mut out: Vec<Vma> = Vec::new();
-        for vma in self.vmas.iter().copied() {
+        for vma in mm.vmas.iter().copied() {
             if vma.end <= start || vma.start >= end {
                 out.push(vma);
                 continue;
@@ -224,24 +274,21 @@ impl Task {
                 out.push(Vma { start: end, ..vma });
             }
         }
-        self.vmas = out;
+        mm.vmas = out;
     }
 
     /// Find a free span of `len` bytes in the mmap area.
-    pub fn find_free_region(&mut self, len: u64) -> u64 {
+    pub fn find_free_region(&self, len: u64) -> u64 {
         let len = page_align_up(len);
-        let mut candidate = self.mmap_top;
+        let mut mm = self.mm.lock();
+        let mut candidate = mm.mmap_top;
         loop {
             let end = candidate + len;
-            let clash = self
-                .vmas
-                .iter()
-                .find(|v| v.start < end && candidate < v.end)
-                .copied();
+            let clash = mm.vmas.iter().find(|v| v.start < end && candidate < v.end).copied();
             match clash {
                 Some(v) => candidate = v.end,
                 None => {
-                    self.mmap_top = end;
+                    mm.mmap_top = end;
                     return candidate;
                 }
             }
@@ -255,13 +302,20 @@ impl Task {
             // Already present: the fault was a protection violation.
             return false;
         }
-        if page >= self.brk_start && page < self.brk {
+        let (in_heap, vma) = {
+            let mm = self.mm.lock();
+            (
+                page >= mm.brk_start && page < mm.brk,
+                mm.vmas.iter().find(|v| v.contains(page)).copied(),
+            )
+        };
+        if in_heap {
             return self
                 .space
                 .map_new(page, PRESENT | WRITABLE | USER | NO_EXECUTE)
                 .is_ok();
         }
-        let Some(vma) = self.find_vma(page) else {
+        let Some(vma) = vma else {
             return false;
         };
         self.space.map_new(page, vma.page_flags()).is_ok()

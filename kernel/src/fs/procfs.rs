@@ -152,7 +152,7 @@ pub fn render(kind: Generated) -> String {
                 task.tgid,
                 task.pid,
                 task.ppid,
-                (task.brk.saturating_sub(task.brk_start)) / 1024,
+                (task.brk().saturating_sub(task.brk_start())) / 1024,
             ),
             None => String::new(),
         },

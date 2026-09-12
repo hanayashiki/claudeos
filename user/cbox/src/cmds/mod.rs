@@ -1,6 +1,7 @@
 //! The coreutils applets.
 
 mod fileops;
+pub mod rtest;
 mod misc;
 mod sysinfo;
 mod textops;
@@ -63,6 +64,7 @@ pub fn run(name: &str, args: &[String]) -> Option<i32> {
         "test" | "[" => misc::test(args),
         "printf" => misc::printf(args),
         "expr" => misc::expr(args),
+        "rtest" => rtest::main(args),
 
         _ => return None,
     };

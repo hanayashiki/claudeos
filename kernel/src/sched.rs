@@ -225,25 +225,47 @@ pub fn handle_user_page_fault(addr: u64, code: u64, _frame: &mut TrapFrame) -> b
 
 /// Terminate the current task. `status` is already encoded the way wait4
 /// reports it: exit codes in bits 8..15, a killing signal in bits 0..6.
+/// Terminate every task in `tgid`'s thread group except the caller, then the
+/// caller itself.
+pub fn exit_group(status: i32) -> ! {
+    let tgid = current().tgid;
+    let me = current().pid;
+    for_each(|task| {
+        if task.tgid == tgid && task.pid != me && task.state != State::Zombie {
+            task.pending_signals |= 1u64 << (SIGKILL as u64 & 63);
+            if task.state == State::Sleeping {
+                task.state = State::Runnable;
+                task.wake_at = 0;
+            }
+        }
+    });
+    exit_current(status)
+}
+
 pub fn exit_current(status: i32) -> ! {
     {
         let task = current();
         task.exit_code = status;
+
+        // A thread that asked for it gets its tid slot cleared so whoever is
+        // joining on it can see that it finished.
+        if task.clear_child_tid != 0 {
+            let address = task.clear_child_tid;
+            task.clear_child_tid = 0;
+            if task.space.translate(address).is_some() {
+                unsafe { core::ptr::write_volatile(address as *mut u32, 0) };
+            }
+        }
         task.fds.entries.clear();
         task.fds.cloexec.clear();
 
-        // Threads share an address space; only the last one out frees it.
-        let pml4 = task.space.pml4;
-        let mut sharers = 0usize;
-        for_each(|other| {
-            if other.space.pml4 == pml4 && other.state != State::Zombie {
-                sharers += 1;
-            }
-        });
-        if sharers <= 1 {
+        // Threads share an address space and its region list; only the last
+        // thread out may tear either of them down.
+        let last_thread = alloc::sync::Arc::strong_count(&task.mm) == 1;
+        if last_thread {
             task.space.free_user_memory();
+            task.clear_vmas();
         }
-        task.vmas.clear();
         task.state = State::Zombie;
 
         let ppid = task.ppid;

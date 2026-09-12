@@ -16,6 +16,7 @@ pub fn main(args: &[String]) -> i32 {
     // Anything after "--" on the kernel command line is run instead of a shell.
     let script: Option<&String> = args.iter().skip(1).find(|a| !a.starts_with('-'));
 
+    let mut restarts = 0;
     loop {
         let child = sys::fork();
         if child == 0 {
@@ -46,6 +47,16 @@ pub fn main(args: &[String]) -> i32 {
                 let code = sys::exit_code_of(status);
                 if script.is_some() {
                     println!("init: script finished with status {}", code);
+                    return code;
+                }
+                if code == 0 {
+                    // A clean `exit` from the session shuts the machine down.
+                    println!("init: session ended");
+                    return 0;
+                }
+                restarts += 1;
+                if restarts > 3 {
+                    println!("init: shell keeps failing (status {}); giving up", code);
                     return code;
                 }
                 println!("init: shell exited with status {}; restarting", code);

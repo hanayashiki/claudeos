@@ -23,7 +23,11 @@ impl Serial {
             outb(self.port + 0, 0x01); // divisor 1 => 115200 baud
             outb(self.port + 1, 0x00);
             outb(self.port + 3, 0x03); // 8 bits, no parity, one stop bit
-            outb(self.port + 2, 0xC7); // enable + clear FIFO, 14-byte threshold
+
+            // The receive FIFOs are deliberately left disabled. Enabling them
+            // makes the emulated UART discard anything already received, which
+            // eats the first keystrokes when input is piped into a fresh boot.
+            // With FIFOs off the sender is held back until each byte is read.
             outb(self.port + 4, 0x0B); // DTR, RTS, OUT2
         }
         self.initialized = true;

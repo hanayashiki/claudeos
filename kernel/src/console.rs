@@ -313,6 +313,9 @@ pub fn keyboard_irq() {
 }
 
 pub fn init() {
+    // Anything that arrived while the kernel was still coming up is sitting
+    // in the UART; move it into the ring before interrupts take over.
+    serial_irq();
     SERIAL.lock().enable_rx_interrupt();
     crate::cpu::pic::unmask(1); // keyboard
     crate::cpu::pic::unmask(4); // COM1

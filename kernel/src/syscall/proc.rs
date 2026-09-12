@@ -57,6 +57,17 @@ pub fn fork(
     };
 
     let mut child = Task::new(&parent.name, space).ok_or(Errno::ENOMEM)?;
+    if share_vm {
+        // Threads must see each other's mappings, so they share one record.
+        child.mm = parent.mm.clone();
+    } else {
+        let source = parent.mm.lock();
+        let mut target = child.mm.lock();
+        target.vmas = source.vmas.clone();
+        target.brk_start = source.brk_start;
+        target.brk = source.brk;
+        target.mmap_top = source.mmap_top;
+    }
     let child_pid = child.pid;
     let is_thread = flags & CLONE_THREAD != 0;
 
@@ -67,10 +78,6 @@ pub fn fork(
     child.exe_path = parent.exe_path.clone();
     child.name = parent.name.clone();
     child.fds = parent.fds.clone_table();
-    child.brk_start = parent.brk_start;
-    child.brk = parent.brk;
-    child.mmap_top = parent.mmap_top;
-    child.vmas = parent.vmas.clone();
     child.umask = parent.umask;
     child.signal_handlers = parent.signal_handlers;
     child.fs_base = if flags & CLONE_SETTLS != 0 {
@@ -156,8 +163,8 @@ pub fn exec_into_current(
     unsafe { new_space.switch_to() };
     let task = sched::current();
     task.space = new_space;
-    task.vmas.clear();
-    task.mmap_top = crate::mm::USER_MMAP_BASE;
+    // exec starts a fresh address space; a shared record must not follow it.
+    task.mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
 
     let image = match elf::load(&new_space, &data) {
         Ok(image) => image,
@@ -169,8 +176,7 @@ pub fn exec_into_current(
         }
     };
 
-    task.brk_start = image.brk_start;
-    task.brk = image.brk_start;
+    task.set_heap_base(image.brk_start);
 
     let sp = match task::build_user_stack(task, &image, &argv, &envp, &exec_path) {
         Ok(sp) => sp,

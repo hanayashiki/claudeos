@@ -21,9 +21,13 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
-fn timer(_frame: &mut TrapFrame) {
+fn timer(frame: &mut TrapFrame) {
     TICKS.fetch_add(1, Ordering::Relaxed);
     pic::end_of_interrupt(0);
+    // A task killed while spinning in user mode notices here.
+    if frame.from_user() {
+        crate::sched::check_signals();
+    }
     crate::sched::on_tick();
 }
 

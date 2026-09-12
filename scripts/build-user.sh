@@ -37,6 +37,18 @@ done
 ln -sf cbox "$RFS/bin/["
 
 
+# A C program built against musl, to show the ABI is not Rust-specific.
+MUSL="$SYSROOT/lib/rustlib/$TARGET/lib/self-contained"
+if command -v clang >/dev/null 2>&1; then
+  clang --target=x86_64-unknown-linux-musl -O2 -ffreestanding -nostdinc \
+        -fno-stack-protector -fno-builtin -c "$ROOT/user/c/hello.c" \
+        -o "$ROOT/build/hello_c.o"
+  "$ROOT/build/toolchain/ld.lld" -o "$RFS/bin/hello_c" --no-pie -e _start \
+        "$MUSL/crt1.o" "$MUSL/crti.o" "$ROOT/build/hello_c.o" \
+        "$MUSL/libc.a" "$MUSL/crtn.o"
+  chmod +x "$RFS/bin/hello_c"
+fi
+
 cat > "$RFS/etc/motd" <<'MOTD'
 Welcome to claudeos.
 
@@ -46,6 +58,7 @@ userland you are talking to was built for x86_64-unknown-linux-musl.
 
 Try:  ls -l /bin | head      ps      free      cat /proc/cpuinfo
       echo hi | tr a-z A-Z   sh /root/demo.sh
+      rtest                  hello_c 60
 MOTD
 
 cat > "$RFS/etc/passwd" <<'PASSWD'
@@ -78,6 +91,9 @@ echo "--- globbing and exit status ---"
 ls /tmp/demo/*.txt
 test -d /tmp/demo && echo "directory exists"
 test -f /nope || echo "missing file reports failure"
+echo
+echo "--- a C program built against musl ---"
+hello_c 60
 echo
 echo "--- system ---"
 uname -a

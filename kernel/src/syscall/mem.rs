@@ -22,18 +22,19 @@ fn prot_to_flags(prot: u64) -> u64 {
 
 pub fn brk(request: u64) -> SysResult {
     let task = sched::current();
-    if request == 0 || request < task.brk_start {
-        return Ok(task.brk);
+    let (brk_start, current_brk) = (task.brk_start(), task.brk());
+    if request == 0 || request < brk_start {
+        return Ok(current_brk);
     }
     let new_brk = page_align_up(request);
     if new_brk > USER_MMAP_BASE {
-        return Ok(task.brk);
+        return Ok(current_brk);
     }
 
-    if new_brk < task.brk {
+    if new_brk < current_brk {
         // Shrinking: give the frames back.
         let mut page = new_brk;
-        while page < task.brk {
+        while page < current_brk {
             if let Some(frame) = task.space.unmap(page) {
                 crate::mm::frame::free_frame(frame);
             }
@@ -41,8 +42,8 @@ pub fn brk(request: u64) -> SysResult {
         }
     }
     // Growth is lazy: pages are faulted in on first touch.
-    task.brk = new_brk;
-    Ok(task.brk)
+    task.set_brk(new_brk);
+    Ok(new_brk)
 }
 
 pub fn mmap(
@@ -150,11 +151,7 @@ pub fn mprotect(addr: u64, length: u64, prot: u64) -> SysResult {
         page += PAGE_SIZE_U64;
     }
 
-    for vma in task.vmas.iter_mut() {
-        if vma.start < end && start < vma.end {
-            vma.prot = prot;
-        }
-    }
+    task.set_vma_prot(start, end, prot);
     Ok(0)
 }
 
@@ -175,7 +172,7 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, _flags: u64) -> SysRe
     let tail_start = old_addr + old_size;
     let tail_end = old_addr + new_size;
     let blocked = task
-        .vmas
+        .snapshot_vmas()
         .iter()
         .any(|v| v.start < tail_end && tail_start < v.end && v.start != vma.start);
     if !blocked {

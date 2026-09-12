@@ -471,6 +471,45 @@ pub fn fcntl(fd: i32, cmd: u32, arg: u64) -> SysResult {
 
 pub fn ioctl(fd: i32, request: u64, arg: u64) -> SysResult {
     let file = sched::current().fds.get(fd)?;
+
+    // These apply to any descriptor, not just terminals.
+    match request {
+        FIONBIO => {
+            let enable = uaccess::read_u32(arg)? != 0;
+            let mut flags = file.flags.lock();
+            if enable {
+                *flags |= O_NONBLOCK;
+            } else {
+                *flags &= !O_NONBLOCK;
+            }
+            return Ok(0);
+        }
+        FIONREAD => {
+            let available = match &file.backing {
+                FileBacking::Pipe(pipe, _) => pipe.available() as u64,
+                FileBacking::Node(node) => match node.kind {
+                    NodeKind::Device(kind) if kind.is_tty() => {
+                        crate::console::available() as u64
+                    }
+                    _ => {
+                        let offset = *file.offset.lock();
+                        node.size().saturating_sub(offset)
+                    }
+                },
+            };
+            uaccess::write_u32(arg, available as u32)?;
+            return Ok(0);
+        }
+        FIOCLEX | FIONCLEX => {
+            let table = &mut sched::current().fds;
+            if (fd as usize) < table.cloexec.len() {
+                table.cloexec[fd as usize] = request == FIOCLEX;
+            }
+            return Ok(0);
+        }
+        _ => {}
+    }
+
     let is_tty = match file.node() {
         Some(node) => matches!(node.kind, NodeKind::Device(kind) if kind.is_tty()),
         None => false,
