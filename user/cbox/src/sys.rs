@@ -246,3 +246,44 @@ pub fn give_terminal_to(pgid: i32) {
         tcsetpgrp(STDIN, pgid);
     }
 }
+
+/// `struct termios` with the x86_64 Linux layout.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Termios {
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cflag: u32,
+    pub c_lflag: u32,
+    pub c_line: u8,
+    pub c_cc: [u8; 32],
+    pub c_ispeed: u32,
+    pub c_ospeed: u32,
+}
+
+pub const TCGETS: u64 = 0x5401;
+pub const TCSETS: u64 = 0x5402;
+
+// c_lflag bits
+pub const ISIG: u32 = 0o000001;
+pub const ICANON: u32 = 0o000002;
+pub const ECHO: u32 = 0o000010;
+
+pub fn tcgets(fd: i32) -> Option<Termios> {
+    let mut termios = Termios::default();
+    let rc = unsafe {
+        syscall3(SYS_IOCTL, fd as u64, TCGETS, &mut termios as *mut Termios as u64)
+    };
+    if rc < 0 {
+        None
+    } else {
+        Some(termios)
+    }
+}
+
+pub fn tcsets(fd: i32, termios: &Termios) -> bool {
+    let rc = unsafe {
+        syscall3(SYS_IOCTL, fd as u64, TCSETS, termios as *const Termios as u64)
+    };
+    rc >= 0
+}

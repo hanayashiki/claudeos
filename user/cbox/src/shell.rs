@@ -4,6 +4,7 @@
 //! arithmetic substitution, `if`/`while`/`until`/`for`, functions, and
 //! positional parameters.
 
+use crate::edit::{Completer, Editor};
 use crate::sys;
 use std::collections::HashMap;
 use std::io::Write;
@@ -658,6 +659,7 @@ pub struct Shell {
     /// Set once the shell owns the terminal and puts jobs in their own groups.
     job_control: bool,
     shell_pgid: i32,
+    editor: Option<Editor>,
 }
 
 impl Shell {
@@ -678,6 +680,7 @@ impl Shell {
             exit_code: None,
             job_control: false,
             shell_pgid: 0,
+            editor: None,
         }
     }
 
@@ -692,6 +695,7 @@ impl Shell {
             exit_code: None,
             job_control: false,
             shell_pgid: self.shell_pgid,
+            editor: None,
         }
     }
 
@@ -724,6 +728,7 @@ impl Shell {
         }
         self.job_control = true;
         self.shell_pgid = sys::own_process_group();
+        self.editor = Some(Editor::new());
         println!();
         println!("claudeos shell -- `help` lists the available commands");
         let mut pending = String::new();
@@ -731,16 +736,28 @@ impl Shell {
         loop {
             self.reap_background();
             let prompt = if pending.is_empty() { self.prompt() } else { "> ".to_string() };
-            print!("{}", prompt);
-            let _ = std::io::stdout().flush();
+            let completer = self.completer();
 
-            let line = match read_line() {
+            let line = match self.editor.as_mut() {
+                Some(editor) => editor.read_line(&prompt, &completer),
+                None => {
+                    print!("{}", prompt);
+                    let _ = std::io::stdout().flush();
+                    read_line()
+                }
+            };
+            let line = match line {
                 Some(line) => line,
                 None => {
                     println!();
                     return self.last_status;
                 }
             };
+            if pending.is_empty() {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.add_history(&line);
+                }
+            }
             pending.push_str(&line);
             pending.push('\n');
 
@@ -753,6 +770,24 @@ impl Shell {
                 return code;
             }
         }
+    }
+
+    /// Snapshot of the names tab completion can offer.
+    fn completer(&self) -> ShellCompleter {
+        let mut commands: Vec<String> = BUILTINS.iter().map(|b| b.to_string()).collect();
+        commands.extend(self.functions.keys().cloned());
+        if let Some(path) = self.env.get("PATH") {
+            for dir in path.split(':') {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        commands.push(entry.file_name().to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        commands.sort();
+        commands.dedup();
+        ShellCompleter { commands }
     }
 
     fn prompt(&self) -> String {
@@ -1161,6 +1196,14 @@ impl Shell {
                 crate::help();
                 0
             }
+            "history" => {
+                if let Some(editor) = self.editor.as_ref() {
+                    for (index, line) in editor.history().iter().enumerate() {
+                        println!("{:>5}  {}", index + 1, line);
+                    }
+                }
+                0
+            }
             ":" => 0,
             _ => {
                 if let Some((key, value)) = argv[0].split_once('=') {
@@ -1514,23 +1557,50 @@ impl Shell {
     }
 }
 
+const BUILTINS: &[&str] = &[
+    "cd", "exit", "pwd", "export", "unset", "set", "read", "jobs", "kill", "type", "which", ".",
+    "source", "help", "history", ":",
+];
+
 fn is_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "cd" | "exit"
-            | "pwd"
-            | "export"
-            | "unset"
-            | "set"
-            | "read"
-            | "jobs"
-            | "type"
-            | "which"
-            | "."
-            | "source"
-            | "help"
-            | ":"
-    ) || name.contains('=')
+    BUILTINS.contains(&name) || name.contains('=')
+}
+
+/// Completes command names for the first word and file names elsewhere.
+struct ShellCompleter {
+    commands: Vec<String>,
+}
+
+impl Completer for ShellCompleter {
+    fn candidates(&self, word: &str, is_command: bool) -> Vec<String> {
+        if is_command && !word.contains('/') {
+            return self
+                .commands
+                .iter()
+                .filter(|name| name.starts_with(word))
+                .cloned()
+                .collect();
+        }
+
+        let (dir, prefix) = match word.rfind('/') {
+            Some(index) => (&word[..index + 1], &word[index + 1..]),
+            None => ("", word),
+        };
+        let search = if dir.is_empty() { "." } else { dir };
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(search) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.starts_with(prefix) || (prefix.is_empty() && name.starts_with('.')) {
+                    continue;
+                }
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                out.push(format!("{}{}{}", dir, name, if is_dir { "/" } else { "" }));
+            }
+        }
+        out.sort();
+        out
+    }
 }
 
 fn dup_fd(fd: i32) -> i32 {

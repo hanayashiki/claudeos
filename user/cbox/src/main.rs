@@ -2,6 +2,7 @@
 //! invoked under, the way busybox does it.
 
 mod cmds;
+mod edit;
 mod init;
 mod shell;
 mod sys;
@@ -31,6 +32,7 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("grep", "select lines matching a pattern"),
     ("head", "print the first lines of a file"),
     ("hexdump", "dump a file in hex"),
+    ("history", "(shell builtin) list recent commands"),
     ("hostname", "print the machine name"),
     ("id", "print the user identity"),
     ("init", "system startup, runs as pid 1"),

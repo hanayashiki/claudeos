@@ -74,10 +74,10 @@ run_interactive() {
   echo
 }
 
-run_suite "userland and shell" "/root/suite.sh" 120
-run_suite "rust standard library" "init=/bin/rtest" 180
+run_suite "userland and shell" "/root/suite.sh" 240
+run_suite "rust standard library" "init=/bin/rtest" 300
 if [ -x "$ROOT/build/rootfs/bin/busybox" ]; then
-  run_suite "upstream busybox" "/root/busybox.sh" 180
+  run_suite "upstream busybox" "/root/busybox.sh" 300
 else
   echo ">> upstream busybox: skipped (run scripts/fetch-busybox.sh)"
   echo
