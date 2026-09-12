@@ -255,7 +255,7 @@ pub fn lseek(fd: i32, offset: i64, whence: u32) -> SysResult {
 pub fn fstat(fd: i32, out: u64) -> SysResult {
     let file = sched::current().fds.get(fd)?;
     let stat = file.stat();
-    uaccess::write_struct(out, &stat)?;
+    uaccess::write_struct(out, &StatAbi::from(&stat))?;
     Ok(0)
 }
 
@@ -274,7 +274,7 @@ pub fn stat_path(dirfd: i64, path_addr: u64, out: u64, flags: u32) -> SysResult 
     } else {
         fs::lookup(&resolved)?
     };
-    uaccess::write_struct(out, &node.stat())?;
+    uaccess::write_struct(out, &StatAbi::from(&node.stat()))?;
     Ok(0)
 }
 
@@ -875,7 +875,8 @@ pub fn select(
     }
 }
 
-/// `struct statfs` as x86_64 Linux defines it (120 bytes).
+/// `struct statfs`: 120 bytes of 64-bit words, the asm-generic layout that
+/// x86-64 and aarch64 both take unchanged.
 fn fill_statfs(out: u64) -> SysResult {
     // The root filesystem lives in RAM, so its size is what memory allows and
     // its free space is what a file could still grow into.
@@ -980,10 +981,6 @@ pub fn epoll_create(flags: u32) -> SysResult {
     Ok(fd as u64)
 }
 
-/// `struct epoll_event` is packed on x86-64: a 4-byte mask then 8 bytes of
-/// caller data, 12 bytes in all.
-const EPOLL_EVENT_SIZE: u64 = 12;
-
 pub fn epoll_ctl(epfd: i32, op: u32, fd: i32, event_addr: u64) -> SysResult {
     const EPOLL_CTL_ADD: u32 = 1;
     const EPOLL_CTL_DEL: u32 = 2;
@@ -1004,7 +1001,7 @@ pub fn epoll_ctl(epfd: i32, op: u32, fd: i32, event_addr: u64) -> SysResult {
         return set.remove(fd).map(|_| 0);
     }
     let events = uaccess::read_u32(event_addr)?;
-    let data = uaccess::read_u64(event_addr + 4)?;
+    let data = uaccess::read_u64(event_addr + EPOLL_EVENT_DATA)?;
     let watch = fs::chan::Watch { fd, events, data };
     match op {
         EPOLL_CTL_ADD => set.add(watch).map(|_| 0),
@@ -1085,7 +1082,7 @@ pub fn epoll_wait(epfd: i32, events_addr: u64, max: i32, timeout_ms: i64) -> Sys
             }
             let base = events_addr + written as u64 * EPOLL_EVENT_SIZE;
             uaccess::write_u32(base, ready)?;
-            uaccess::write_u64(base + 4, *data)?;
+            uaccess::write_u64(base + EPOLL_EVENT_DATA, *data)?;
             written += 1;
         }
         if written > 0 {
@@ -1122,7 +1119,8 @@ pub fn recvfrom(fd: i32, buf: u64, len: usize, addr: u64, addrlen: u64) -> SysRe
     Ok(n)
 }
 
-/// The offsets inside `struct msghdr` on x86-64.
+/// The offsets inside `struct msghdr`. The same on every 64-bit Linux: the
+/// structure is asm-generic and holds only pointers, ints and sizes.
 const MSG_IOV: u64 = 16;
 const MSG_IOVLEN: u64 = 24;
 const MSG_CONTROLLEN: u64 = 40;

@@ -151,7 +151,6 @@ impl Node {
             st_mode: inner.mode,
             st_uid: inner.uid,
             st_gid: inner.gid,
-            __pad0: 0,
             st_rdev: match self.kind {
                 NodeKind::Device(kind) => kind.rdev(),
                 _ => 0,

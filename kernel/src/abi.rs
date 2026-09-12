@@ -1,8 +1,14 @@
 //! Linux userspace ABI: error codes, flags, and the structs that cross the
 //! boundary. The system call numbers differ from one architecture to the next
 //! and live in `arch::nr`.
+//!
+//! Most of what is here is the same whatever the machine is. The handful of
+//! layouts and flag values Linux lets the architecture choose come from
+//! `layout`, at the bottom of this file.
 
 #![allow(non_camel_case_types)]
+
+pub use layout::*;
 
 /// Linux error numbers, returned to userspace as `-errno`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,8 +95,8 @@ pub const O_NOCTTY: u32 = 0o400;
 pub const O_TRUNC: u32 = 0o1000;
 pub const O_APPEND: u32 = 0o2000;
 pub const O_NONBLOCK: u32 = 0o4000;
-pub const O_DIRECTORY: u32 = 0o200000;
-pub const O_NOFOLLOW: u32 = 0o400000;
+// O_DIRECTORY, O_NOFOLLOW, O_DIRECT and O_LARGEFILE are the four open flags
+// whose values the architecture picks; they come from `layout`.
 pub const O_CLOEXEC: u32 = 0o2000000;
 pub const O_PATH: u32 = 0o10000000;
 
@@ -139,12 +145,6 @@ pub const DT_LNK: u8 = 10;
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
 pub const SEEK_END: u32 = 2;
-
-// arch_prctl codes
-pub const ARCH_SET_GS: u64 = 0x1001;
-pub const ARCH_SET_FS: u64 = 0x1002;
-pub const ARCH_GET_FS: u64 = 0x1003;
-pub const ARCH_GET_GS: u64 = 0x1004;
 
 // clone flags
 pub const CLONE_VM: u64 = 0x00000100;
@@ -253,8 +253,9 @@ pub fn is_stop_signal(signal: i32) -> bool {
     matches!(signal, SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
 }
 
-/// `struct stat` as x86_64 Linux defines it (144 bytes).
-#[repr(C)]
+/// What the kernel knows about a file. This is not the structure user code
+/// reads: Linux orders and sizes those fields differently on each machine, so
+/// `stat` and `fstat` convert this into `StatAbi` on the way out.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Stat {
     pub st_dev: u64,
@@ -263,7 +264,6 @@ pub struct Stat {
     pub st_mode: u32,
     pub st_uid: u32,
     pub st_gid: u32,
-    pub __pad0: u32,
     pub st_rdev: u64,
     pub st_size: i64,
     pub st_blksize: i64,
@@ -274,7 +274,6 @@ pub struct Stat {
     pub st_mtime_nsec: i64,
     pub st_ctime: i64,
     pub st_ctime_nsec: i64,
-    pub __unused: [i64; 3],
 }
 
 #[repr(C)]
@@ -327,7 +326,11 @@ pub struct WinSize {
     pub ws_ypixel: u16,
 }
 
-/// `struct termios` with the x86_64 field layout.
+/// `struct termios`, in the shape musl gives it: 32 control characters and the
+/// two speeds, where Linux's own structure has 19 characters and stops after
+/// them. x86-64 and aarch64 both take the asm-generic definition, and musl
+/// gives them both this same userspace one, so a TCGETS fills exactly what the
+/// caller allocated on either.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Termios {
@@ -396,3 +399,177 @@ pub struct SysInfo {
     pub mem_unit: u32,
     pub padding: [u8; 4],
 }
+
+// ---------------------------------------------------------------------------
+// The layouts and flag values the architecture chooses
+//
+// This belongs under `arch/<target>/`, beside the system call numbers, and
+// should move there once the aarch64 branch and this one meet; `arch/` has a
+// single architecture in it while the port is in progress, so the two
+// alternatives sit here behind a `cfg` instead.
+//
+// Everything left in the portable half above was checked against the aarch64
+// definitions and is the same on both machines: timespec, timeval, iovec,
+// rlimit, utsname, winsize, sysinfo, termios, statfs (120 bytes, asm-generic
+// on both), msghdr (iov at 16, iovlen at 24, controllen at 40, flags at 48),
+// linux_dirent64, sockaddr_in, the errno numbers, the signal numbers and the
+// 8-byte signal set, and the PROT_, MAP_, CLONE_, AT_, F_, FUTEX_, CLOCK_ and
+// ioctl constants. `struct sigaction` is the same 32-byte handler/flags/
+// restorer/mask as well: arm64's uapi header defines SA_RESTORER for the sake
+// of AArch32 binaries, which makes asm-generic give the native structure an
+// sa_restorer field too.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+mod layout {
+    use super::Stat;
+
+    // asm-generic/fcntl.h, which x86-64 takes unchanged.
+    pub const O_DIRECT: u32 = 0o40000;
+    pub const O_LARGEFILE: u32 = 0o100000;
+    pub const O_DIRECTORY: u32 = 0o200000;
+    pub const O_NOFOLLOW: u32 = 0o400000;
+
+    // `arch_prctl` codes. The call exists on x86-64 alone: it is how user code
+    // sets the base register its thread-local storage hangs off, and aarch64
+    // writes that register itself.
+    pub const ARCH_SET_GS: u64 = 0x1001;
+    pub const ARCH_SET_FS: u64 = 0x1002;
+    pub const ARCH_GET_FS: u64 = 0x1003;
+    pub const ARCH_GET_GS: u64 = 0x1004;
+
+    /// `struct epoll_event` is declared packed on x86-64 and nowhere else, so
+    /// the 8-byte data word follows the 4-byte mask with no gap.
+    pub const EPOLL_EVENT_SIZE: u64 = 12;
+    pub const EPOLL_EVENT_DATA: u64 = 4;
+
+    /// `struct stat` as x86-64 Linux lays it out.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct StatAbi {
+        pub st_dev: u64,
+        pub st_ino: u64,
+        pub st_nlink: u64,
+        pub st_mode: u32,
+        pub st_uid: u32,
+        pub st_gid: u32,
+        pub __pad0: u32,
+        pub st_rdev: u64,
+        pub st_size: i64,
+        pub st_blksize: i64,
+        pub st_blocks: i64,
+        pub st_atime: i64,
+        pub st_atime_nsec: i64,
+        pub st_mtime: i64,
+        pub st_mtime_nsec: i64,
+        pub st_ctime: i64,
+        pub st_ctime_nsec: i64,
+        pub __unused: [i64; 3],
+    }
+
+    const _: () = assert!(core::mem::size_of::<StatAbi>() == 144);
+
+    impl From<&Stat> for StatAbi {
+        fn from(stat: &Stat) -> Self {
+            StatAbi {
+                st_dev: stat.st_dev,
+                st_ino: stat.st_ino,
+                st_nlink: stat.st_nlink,
+                st_mode: stat.st_mode,
+                st_uid: stat.st_uid,
+                st_gid: stat.st_gid,
+                __pad0: 0,
+                st_rdev: stat.st_rdev,
+                st_size: stat.st_size,
+                st_blksize: stat.st_blksize,
+                st_blocks: stat.st_blocks,
+                st_atime: stat.st_atime,
+                st_atime_nsec: stat.st_atime_nsec,
+                st_mtime: stat.st_mtime,
+                st_mtime_nsec: stat.st_mtime_nsec,
+                st_ctime: stat.st_ctime,
+                st_ctime_nsec: stat.st_ctime_nsec,
+                __unused: [0; 3],
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod layout {
+    use super::Stat;
+
+    // arch/arm64/include/uapi/asm/fcntl.h overrides four of the asm-generic
+    // values, keeping the ones 32-bit ARM uses so an AArch32 binary running in
+    // compatibility mode sees the numbers it was built with. Reusing the
+    // x86-64 values here would make every musl `open` — which always adds
+    // O_LARGEFILE — look like it had asked for O_NOFOLLOW.
+    pub const O_DIRECTORY: u32 = 0o40000;
+    pub const O_NOFOLLOW: u32 = 0o100000;
+    pub const O_DIRECT: u32 = 0o200000;
+    pub const O_LARGEFILE: u32 = 0o400000;
+
+    /// `struct epoll_event` is not packed here, so the data word is aligned to
+    /// 8 and the structure is 16 bytes rather than 12.
+    pub const EPOLL_EVENT_SIZE: u64 = 16;
+    pub const EPOLL_EVENT_DATA: u64 = 8;
+
+    /// `struct stat` as aarch64 Linux lays it out: 128 bytes, from
+    /// asm-generic/stat.h. Beyond the size, three things differ from x86-64's
+    /// version — mode comes before nlink, the padding sits after rdev rather
+    /// than after gid, and nlink and blksize are 32 bits wide.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct StatAbi {
+        pub st_dev: u64,
+        pub st_ino: u64,
+        pub st_mode: u32,
+        pub st_nlink: u32,
+        pub st_uid: u32,
+        pub st_gid: u32,
+        pub st_rdev: u64,
+        pub __pad1: u64,
+        pub st_size: i64,
+        pub st_blksize: i32,
+        pub __pad2: i32,
+        pub st_blocks: i64,
+        pub st_atime: i64,
+        pub st_atime_nsec: i64,
+        pub st_mtime: i64,
+        pub st_mtime_nsec: i64,
+        pub st_ctime: i64,
+        pub st_ctime_nsec: i64,
+        pub __unused: [u32; 2],
+    }
+
+    const _: () = assert!(core::mem::size_of::<StatAbi>() == 128);
+
+    impl From<&Stat> for StatAbi {
+        fn from(stat: &Stat) -> Self {
+            StatAbi {
+                st_dev: stat.st_dev,
+                st_ino: stat.st_ino,
+                st_mode: stat.st_mode,
+                st_nlink: stat.st_nlink as u32,
+                st_uid: stat.st_uid,
+                st_gid: stat.st_gid,
+                st_rdev: stat.st_rdev,
+                __pad1: 0,
+                st_size: stat.st_size,
+                st_blksize: stat.st_blksize as i32,
+                __pad2: 0,
+                st_blocks: stat.st_blocks,
+                st_atime: stat.st_atime,
+                st_atime_nsec: stat.st_atime_nsec,
+                st_mtime: stat.st_mtime,
+                st_mtime_nsec: stat.st_mtime_nsec,
+                st_ctime: stat.st_ctime,
+                st_ctime_nsec: stat.st_ctime_nsec,
+                __unused: [0; 2],
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("this target has no ABI layouts in kernel/src/abi.rs");
