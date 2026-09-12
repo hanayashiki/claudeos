@@ -523,12 +523,13 @@ pub fn futex(uaddr: u64, op: u32, val: u32, timeout: u64) -> SysResult {
                 if sched::has_pending_signal() {
                     return Err(Errno::EINTR);
                 }
-                sched::yield_now();
+                sched::yield_or_sleep();
             }
             Ok(0)
         }
         FUTEX_WAKE => {
-            // Waiters re-read the word themselves, so nothing to do here.
+            // Waiters re-read the word themselves, so handing them the CPU is
+            // all that is needed.
             sched::yield_now();
             Ok(0)
         }

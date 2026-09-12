@@ -180,6 +180,27 @@ pub fn yield_now() {
     schedule();
 }
 
+/// True when some other task could run right now.
+pub fn other_runnable() -> bool {
+    let cur = unsafe { CURRENT };
+    let idle = unsafe { IDLE };
+    let tasks = TASKS.lock();
+    tasks.iter().any(|t| {
+        t.0 != cur && t.0 != idle && t.get().state == State::Runnable
+    })
+}
+
+/// Give up the CPU from a loop that is waiting for something it cannot be
+/// woken for. Hands over to another task when there is one, and otherwise
+/// sleeps for a tick rather than spinning the core.
+pub fn yield_or_sleep() {
+    if other_runnable() {
+        schedule();
+    } else {
+        sleep_ticks(1);
+    }
+}
+
 pub fn on_tick() {
     if !has_current() {
         return;

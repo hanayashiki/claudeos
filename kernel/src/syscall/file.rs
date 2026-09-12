@@ -627,7 +627,10 @@ pub fn poll(fds_addr: u64, count: usize, timeout_ms: i64) -> SysResult {
         if crate::trap::ticks() >= deadline {
             return Ok(0);
         }
-        sched::yield_now();
+        if sched::has_pending_signal() {
+            return Err(Errno::EINTR);
+        }
+        sched::yield_or_sleep();
     }
 }
 
@@ -675,7 +678,10 @@ pub fn select(nfds: i32, readfds: u64, writefds: u64, _exceptfds: u64) -> SysRes
             }
             return Ok(ready);
         }
-        sched::yield_now();
+        if sched::has_pending_signal() {
+            return Err(Errno::EINTR);
+        }
+        sched::yield_or_sleep();
     }
 }
 
