@@ -19,27 +19,87 @@ pub const O_CREAT: u64 = 0o100;
 pub const O_TRUNC: u64 = 0o1000;
 pub const O_APPEND: u64 = 0o2000;
 
-pub const SYS_READ: u64 = 0;
-pub const SYS_WRITE: u64 = 1;
-pub const SYS_OPEN: u64 = 2;
-pub const SYS_CLOSE: u64 = 3;
-pub const SYS_PIPE2: u64 = 293;
-pub const SYS_DUP2: u64 = 33;
-pub const SYS_FORK: u64 = 57;
-pub const SYS_EXECVE: u64 = 59;
-pub const SYS_EXIT_GROUP: u64 = 231;
-pub const SYS_WAIT4: u64 = 61;
-pub const SYS_SETPGID: u64 = 109;
-pub const SYS_GETPID: u64 = 39;
-#[allow(dead_code)]
-pub const SYS_GETPPID: u64 = 110;
-pub const SYS_CHDIR: u64 = 80;
-pub const SYS_KILL: u64 = 62;
-pub const SYS_IOCTL: u64 = 16;
-pub const SYS_SYNC: u64 = 162;
-pub const SYS_MKNOD: u64 = 133;
-pub const SYS_SYSLOG: u64 = 103;
+// The call numbers and the instruction that makes the call are the machine's
+// own. x86-64 keeps its historical table; aarch64 uses the asm-generic one,
+// which dropped every call that a later "at" form replaced, so `open`,
+// `dup2`, `fork`, `mknod` and `epoll_wait` have no number there and the shims
+// further down make the equivalent call instead.
+#[cfg(target_arch = "x86_64")]
+mod numbers {
+    pub const SYS_READ: u64 = 0;
+    pub const SYS_WRITE: u64 = 1;
+    pub const SYS_OPEN: u64 = 2;
+    pub const SYS_CLOSE: u64 = 3;
+    pub const SYS_PIPE2: u64 = 293;
+    pub const SYS_DUP2: u64 = 33;
+    pub const SYS_FORK: u64 = 57;
+    pub const SYS_EXECVE: u64 = 59;
+    pub const SYS_EXIT_GROUP: u64 = 231;
+    pub const SYS_WAIT4: u64 = 61;
+    pub const SYS_SETPGID: u64 = 109;
+    pub const SYS_GETPID: u64 = 39;
+    #[allow(dead_code)]
+    pub const SYS_GETPPID: u64 = 110;
+    pub const SYS_CHDIR: u64 = 80;
+    pub const SYS_KILL: u64 = 62;
+    pub const SYS_IOCTL: u64 = 16;
+    pub const SYS_SYNC: u64 = 162;
+    pub const SYS_MKNOD: u64 = 133;
+    pub const SYS_SYSLOG: u64 = 103;
+    pub const SYS_EVENTFD2: u64 = 290;
+    pub const SYS_EPOLL_CREATE1: u64 = 291;
+    pub const SYS_EPOLL_CTL: u64 = 233;
+    pub const SYS_EPOLL_WAIT: u64 = 232;
+    pub const SYS_STATFS: u64 = 137;
 
+    /// `struct epoll_event` is declared packed on x86-64, so the 8-byte data
+    /// word follows the 4-byte mask with no gap.
+    pub const EPOLL_EVENT_SIZE: usize = 12;
+}
+
+#[cfg(target_arch = "aarch64")]
+mod numbers {
+    pub const SYS_READ: u64 = 63;
+    pub const SYS_WRITE: u64 = 64;
+    pub const SYS_OPENAT: u64 = 56;
+    pub const SYS_CLOSE: u64 = 57;
+    pub const SYS_PIPE2: u64 = 59;
+    pub const SYS_DUP3: u64 = 24;
+    pub const SYS_CLONE: u64 = 220;
+    pub const SYS_EXECVE: u64 = 221;
+    pub const SYS_EXIT_GROUP: u64 = 94;
+    pub const SYS_WAIT4: u64 = 260;
+    pub const SYS_SETPGID: u64 = 154;
+    pub const SYS_GETPID: u64 = 172;
+    #[allow(dead_code)]
+    pub const SYS_GETPPID: u64 = 173;
+    pub const SYS_CHDIR: u64 = 49;
+    pub const SYS_KILL: u64 = 129;
+    pub const SYS_IOCTL: u64 = 29;
+    pub const SYS_SYNC: u64 = 81;
+    pub const SYS_MKNODAT: u64 = 33;
+    pub const SYS_SYSLOG: u64 = 116;
+    pub const SYS_EVENTFD2: u64 = 19;
+    pub const SYS_EPOLL_CREATE1: u64 = 20;
+    pub const SYS_EPOLL_CTL: u64 = 21;
+    pub const SYS_EPOLL_PWAIT: u64 = 22;
+    pub const SYS_STATFS: u64 = 43;
+
+    /// `struct epoll_event` is not packed here, so the data word is aligned to
+    /// 8 and the structure is 16 bytes.
+    pub const EPOLL_EVENT_SIZE: usize = 16;
+}
+
+pub use numbers::*;
+
+/// `openat`, `mknodat` and the rest take this where a path is relative.
+#[cfg(target_arch = "aarch64")]
+const AT_FDCWD: u64 = -100i64 as u64;
+
+// The system call instruction: number in rax and arguments in rdi, rsi, rdx,
+// r10 on x86-64; number in x8 and arguments in x0 upwards on aarch64, which
+// returns in x0 and clobbers nothing else.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn syscall0(n: u64) -> i64 {
     let ret: i64;
@@ -48,6 +108,7 @@ unsafe fn syscall0(n: u64) -> i64 {
     ret
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn syscall1(n: u64, a: u64) -> i64 {
     let ret: i64;
@@ -56,6 +117,7 @@ unsafe fn syscall1(n: u64, a: u64) -> i64 {
     ret
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn syscall2(n: u64, a: u64, b: u64) -> i64 {
     let ret: i64;
@@ -64,6 +126,7 @@ unsafe fn syscall2(n: u64, a: u64, b: u64) -> i64 {
     ret
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn syscall3(n: u64, a: u64, b: u64, c: u64) -> i64 {
     let ret: i64;
@@ -72,6 +135,7 @@ unsafe fn syscall3(n: u64, a: u64, b: u64, c: u64) -> i64 {
     ret
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn syscall4(n: u64, a: u64, b: u64, c: u64, d: u64) -> i64 {
     let ret: i64;
@@ -80,8 +144,68 @@ unsafe fn syscall4(n: u64, a: u64, b: u64, c: u64, d: u64) -> i64 {
     ret
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn syscall0(n: u64) -> i64 {
+    let ret: i64;
+    asm!("svc #0", in("x8") n, lateout("x0") ret, options(nostack));
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn syscall1(n: u64, a: u64) -> i64 {
+    let ret: i64;
+    asm!("svc #0", in("x8") n, inlateout("x0") a => ret, options(nostack));
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn syscall2(n: u64, a: u64, b: u64) -> i64 {
+    let ret: i64;
+    asm!("svc #0", in("x8") n, inlateout("x0") a => ret, in("x1") b, options(nostack));
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn syscall3(n: u64, a: u64, b: u64, c: u64) -> i64 {
+    let ret: i64;
+    asm!("svc #0", in("x8") n, inlateout("x0") a => ret, in("x1") b, in("x2") c,
+         options(nostack));
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn syscall4(n: u64, a: u64, b: u64, c: u64, d: u64) -> i64 {
+    let ret: i64;
+    asm!("svc #0", in("x8") n, inlateout("x0") a => ret, in("x1") b, in("x2") c, in("x3") d,
+         options(nostack));
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn syscall6(n: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> i64 {
+    let ret: i64;
+    asm!("svc #0", in("x8") n, inlateout("x0") a => ret, in("x1") b, in("x2") c, in("x3") d,
+         in("x4") e, in("x5") f, options(nostack));
+    ret
+}
+
+#[cfg(target_arch = "x86_64")]
 pub fn fork() -> i64 {
     unsafe { syscall0(SYS_FORK) }
+}
+
+/// aarch64 has no `fork`; a `clone` whose only flag is the signal to raise on
+/// exit is the same thing.
+#[cfg(target_arch = "aarch64")]
+pub fn fork() -> i64 {
+    const SIGCHLD: u64 = 17;
+    unsafe { syscall4(SYS_CLONE, SIGCHLD, 0, 0, 0) }
 }
 
 pub fn getpid() -> i64 {
@@ -97,8 +221,19 @@ pub fn setpgid(pid: i32, pgid: i32) -> i64 {
     unsafe { syscall2(SYS_SETPGID, pid as u64, pgid as u64) }
 }
 
+#[cfg(target_arch = "x86_64")]
 pub fn dup2(old: i32, new: i32) -> i64 {
     unsafe { syscall2(SYS_DUP2, old as u64, new as u64) }
+}
+
+/// `dup3` with no flags is `dup2`, except that it refuses to duplicate a
+/// descriptor onto itself. The shell never asks for that.
+#[cfg(target_arch = "aarch64")]
+pub fn dup2(old: i32, new: i32) -> i64 {
+    if old == new {
+        return new as i64;
+    }
+    unsafe { syscall3(SYS_DUP3, old as u64, new as u64, 0) }
 }
 
 pub fn close(fd: i32) -> i64 {
@@ -120,7 +255,11 @@ pub fn open(path: &str, flags: u64, mode: u64) -> i64 {
         Ok(c) => c,
         Err(_) => return -22,
     };
-    unsafe { syscall3(SYS_OPEN, c.as_ptr() as u64, flags, mode) }
+    #[cfg(target_arch = "x86_64")]
+    let ret = unsafe { syscall3(SYS_OPEN, c.as_ptr() as u64, flags, mode) };
+    #[cfg(target_arch = "aarch64")]
+    let ret = unsafe { syscall4(SYS_OPENAT, AT_FDCWD, c.as_ptr() as u64, flags, mode) };
+    ret
 }
 
 #[allow(dead_code)]
@@ -146,7 +285,11 @@ pub fn chdir(path: &str) -> i64 {
 
 /// Create a node the open/create path cannot: a named pipe.
 pub fn mknod(path: &CString, mode: u32) -> i64 {
-    unsafe { syscall3(SYS_MKNOD, path.as_ptr() as u64, mode as u64, 0) }
+    #[cfg(target_arch = "x86_64")]
+    let ret = unsafe { syscall3(SYS_MKNOD, path.as_ptr() as u64, mode as u64, 0) };
+    #[cfg(target_arch = "aarch64")]
+    let ret = unsafe { syscall4(SYS_MKNODAT, AT_FDCWD, path.as_ptr() as u64, mode as u64, 0) };
+    ret
 }
 
 /// Read back what the kernel has printed.
@@ -154,10 +297,6 @@ pub fn klog(buf: &mut [u8]) -> i64 {
     unsafe { syscall3(SYS_SYSLOG, 3, buf.as_mut_ptr() as u64, buf.len() as u64) }
 }
 
-pub const SYS_EVENTFD2: u64 = 290;
-pub const SYS_EPOLL_CREATE1: u64 = 291;
-pub const SYS_EPOLL_CTL: u64 = 233;
-pub const SYS_EPOLL_WAIT: u64 = 232;
 pub const EPOLLIN: u32 = 0x001;
 
 pub fn eventfd(initial: u32, flags: u32) -> i64 {
@@ -168,20 +307,21 @@ pub fn epoll_create() -> i64 {
     unsafe { syscall1(SYS_EPOLL_CREATE1, 0) }
 }
 
-/// `struct epoll_event` is packed on x86-64: a 4-byte mask then 8 bytes of
-/// caller data.
+/// A `struct epoll_event`: a 4-byte mask, then 8 bytes of caller data at
+/// whatever offset this machine's packing puts them.
 pub fn epoll_add(epfd: i32, fd: i32, events: u32, data: u64) -> i64 {
-    let mut event = [0u8; 12];
+    let mut event = [0u8; EPOLL_EVENT_SIZE];
     event[..4].copy_from_slice(&events.to_le_bytes());
-    event[4..].copy_from_slice(&data.to_le_bytes());
+    event[EPOLL_EVENT_SIZE - 8..].copy_from_slice(&data.to_le_bytes());
     unsafe {
         syscall4(SYS_EPOLL_CTL, epfd as u64, 1, fd as u64, event.as_ptr() as u64)
     }
 }
 
 pub fn epoll_wait(epfd: i32, events: &mut [u8], timeout_ms: i64) -> i64 {
-    let max = events.len() / 12;
-    unsafe {
+    let max = events.len() / EPOLL_EVENT_SIZE;
+    #[cfg(target_arch = "x86_64")]
+    let ret = unsafe {
         syscall4(
             SYS_EPOLL_WAIT,
             epfd as u64,
@@ -189,7 +329,21 @@ pub fn epoll_wait(epfd: i32, events: &mut [u8], timeout_ms: i64) -> i64 {
             max as u64,
             timeout_ms as u64,
         )
-    }
+    };
+    // aarch64 has only the form that also takes a mask to wait under.
+    #[cfg(target_arch = "aarch64")]
+    let ret = unsafe {
+        syscall6(
+            SYS_EPOLL_PWAIT,
+            epfd as u64,
+            events.as_mut_ptr() as u64,
+            max as u64,
+            timeout_ms as u64,
+            0,
+            0,
+        )
+    };
+    ret
 }
 
 pub fn sync() {
@@ -316,7 +470,8 @@ pub fn give_terminal_to(pgid: i32) {
     }
 }
 
-/// `struct termios` with the x86_64 Linux layout.
+/// `struct termios`. musl lays this out the same way on both machines: the
+/// kernel's own structure stops after `c_cc`, and the two speeds are musl's.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Termios {
@@ -363,8 +518,6 @@ pub const TIOCGWINSZ: u64 = 0x5413;
 pub fn ioctl_ptr(fd: i32, request: u64, argument: u64) -> i64 {
     unsafe { syscall3(SYS_IOCTL, fd as u64, request, argument) }
 }
-
-pub const SYS_STATFS: u64 = 137;
 
 /// The fields of `struct statfs` this system needs.
 pub struct StatFs {

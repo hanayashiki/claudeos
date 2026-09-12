@@ -14,12 +14,16 @@ pub fn uname(args: &[String]) -> i32 {
         .unwrap_or("6.1.0-claudeos")
         .to_string();
 
+    // The machine name is this binary's own target, which is the only machine
+    // it can run on.
+    let machine = std::env::consts::ARCH;
+
     if all {
-        println!("Linux claudeos {} #1 SMP x86_64 claudeos", release);
+        println!("Linux claudeos {} #1 SMP {} claudeos", release, machine);
     } else if flags.contains('r') {
         println!("{}", release);
     } else if flags.contains('m') {
-        println!("x86_64");
+        println!("{}", machine);
     } else if flags.contains('n') {
         println!("claudeos");
     } else {
