@@ -10,10 +10,12 @@ pub fn init() {
         arch::register_trap_handler(vector, exception);
     }
     arch::register_trap_handler(arch::PAGE_FAULT_VECTOR, page_fault);
-    arch::register_irq_handler(arch::TIMER_IRQ, timer);
-    for irq in 1..arch::IRQ_COUNT {
+    for irq in 0..arch::IRQ_COUNT {
         arch::register_irq_handler(irq, device);
     }
+    // Last, because the timer's line is not always outside the range above:
+    // on some machines it is an ordinary device interrupt like any other.
+    arch::register_irq_handler(arch::TIMER_IRQ, timer);
 }
 
 pub fn ticks() -> u64 {

@@ -12,7 +12,7 @@ ARCH="${ARCH:-x86_64}"
 
 case "$ARCH" in
   x86_64)  TARGET=x86_64-unknown-none ;;
-  aarch64) TARGET=aarch64-unknown-none ;;
+  aarch64) TARGET=aarch64-unknown-none-softfloat ;;
   *) echo "unknown ARCH: $ARCH" >&2; exit 1 ;;
 esac
 

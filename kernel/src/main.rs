@@ -54,8 +54,7 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
         net_test: false,
         args: Vec::new(),
     };
-    // The boot loader puts the kernel's own path in the first word.
-    for word in cmdline.split_whitespace().skip(1) {
+    for word in cmdline.split_whitespace() {
         if let Some(value) = word.strip_prefix("init=") {
             options.init = value.to_string();
         } else if let Some(value) = word.strip_prefix("trace=") {

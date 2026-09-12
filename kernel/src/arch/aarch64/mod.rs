@@ -8,6 +8,7 @@
 use core::arch::asm;
 use core::arch::global_asm;
 
+mod atags;
 mod clock;
 mod fdt;
 mod gic;
@@ -94,17 +95,22 @@ pub const RESERVED_PHYS: &[(u64, u64)] = &[(0, KERNEL_PHYS_START)];
 // ---------------------------------------------------------------------------
 
 /// Where `boot.s` lands once translation is on and it is running out of the
-/// higher half. `handoff` is whatever the firmware left in x0, which on a
-/// board following the Linux AArch64 boot protocol is the physical address of
-/// a device tree describing the machine.
+/// higher half.
+///
+/// `handoff` is whatever the firmware left in x0. A board following the Linux
+/// AArch64 boot protocol puts the physical address of a device tree there; a
+/// board with no device tree to give falls back to the older tag list, which
+/// is what QEMU's emulated Pi 4 does. Which one arrived is decided by looking
+/// at what is actually in memory, because nothing else says.
 #[no_mangle]
 pub extern "C" fn kmain(handoff: u64) -> ! {
     crate::serial::init();
 
     let mut boot = crate::boot::BootInfo::new();
-    if !fdt::parse(handoff, &mut boot) {
-        // No device tree, so fall back to what is known about the board: a
-        // gigabyte of memory from zero, which is the least any Pi 4 has.
+    if !fdt::parse(handoff, &mut boot) && !atags::parse(handoff, &mut boot) {
+        // Neither handoff is there, so fall back to what is known about the
+        // board: a gigabyte of memory from zero, which is the least a Pi 4
+        // has, and no ram disk.
         boot.add_region(0, 1024 * 1024 * 1024, true);
     }
     crate::start(&boot)

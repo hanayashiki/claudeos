@@ -37,7 +37,16 @@ pub unsafe fn parse(phys: u64) -> BootInfo {
         let cmdline = rd32(phys + 16) as u64;
         if cmdline != 0 {
             let len = cstr_len(cmdline);
-            info.set_cmdline(core::slice::from_raw_parts(cmdline as *const u8, len));
+            let text = core::slice::from_raw_parts(cmdline as *const u8, len);
+            // Multiboot's command line starts with the path the loader was
+            // told to load, which is not an argument to anything. No other
+            // handoff includes it, so it is dropped here rather than being
+            // skipped over by everything that reads the line.
+            let arguments = match text.iter().position(|&b| b == b' ') {
+                Some(space) => &text[space + 1..],
+                None => &[],
+            };
+            info.set_cmdline(arguments);
             info.reserve(cmdline, cmdline + len as u64 + 1);
         }
     }
