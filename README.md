@@ -58,11 +58,18 @@ temporary mappings. On top of that sit a 4-level page table implementation and
 a coalescing kernel heap.
 
 **Processes.** Each task owns a kernel stack, a file descriptor table, and a
-page table hierarchy whose upper half is shared with the kernel. `fork` copies
-the user half frame by frame; `clone` with `CLONE_VM` shares it, which is what
-threads use. Scheduling is round-robin, preemptive, driven by the 100 Hz timer
-tick. Anonymous memory is demand-paged: `mmap` and `brk` record a region and
-the page fault handler supplies pages on first touch.
+page table hierarchy whose upper half is shared with the kernel. `fork` is
+copy-on-write: the two sides share every writable page read-only until one of
+them writes, and the fault handler hands out the private copy. `clone` with
+`CLONE_VM` shares the address space outright, which is what threads use.
+Scheduling is round-robin, preemptive, driven by the 100 Hz timer tick.
+Anonymous memory is demand-paged: `mmap` and `brk` record a region and the
+page fault handler supplies pages on first touch.
+
+**Blocking.** A task waiting for the terminal or a pipe sleeps on a wait queue
+rather than spinning, so the scheduler reaches the idle task and the CPU halts
+until an interrupt arrives. Sitting at the shell prompt costs about 1% of a
+core, which is the timer tick.
 
 **System calls.** Entry is through `syscall`/`MSR_LSTAR`. The frame the entry
 stub builds has the same layout as the one an interrupt builds, so one code
@@ -98,15 +105,24 @@ and `Ctrl-U`, and honours the `termios` settings a program sets through
 provides about fifty applets chosen by `argv[0]`, the way busybox does. The
 initramfs contains the binary once and a symbolic link per applet.
 
-The shell supports pipelines, redirection (`>` `>>` `<` `2>`), `&&` `||` `;`
-`&`, globbing, single and double quoting, `$VAR` and `${VAR}` expansion,
-command substitution with `$(...)` and backticks, arithmetic with `$((...))`,
-`if`/`elif`/`else`, `while`, `until`, `for`, functions with positional
-parameters, and the usual builtins.
+The shell supports pipelines, redirection (`>` `>>` `<` `2>`), here-documents
+(`<<` and `<<-`, with a quoted delimiter suppressing expansion), `&&` `||` `;`
+`&`, `!` to invert a status, `( ... )` subshells, globbing, single and double
+quoting, `$VAR` and `${VAR}` expansion, command substitution with `$(...)` and
+backticks, arithmetic with `$((...))`, `if`/`elif`/`else`, `while`, `until`,
+`for`, `case` with alternation patterns, functions with positional parameters,
+and the usual builtins. Word expansion is a single pass, so text a command
+substitution produced is not rescanned.
 
-The coreutils cover the common set: `ls cat cp mv rm mkdir rmdir touch ln stat
-find du df echo wc head tail grep sort uniq cut tr tee seq rev printf expr test
-ps free uptime date env id uname hostname mount kill sleep clear hexdump
+At the prompt it puts the terminal in raw mode and edits the line itself:
+arrow-key history, left/right cursor movement, Home/End/Delete,
+Ctrl-A/E/B/F/K/U/W/L, a `history` builtin, and tab completion of command names
+from PATH and of file paths elsewhere. Cooked mode comes back before a command
+runs, so the job owns the terminal.
+
+The coreutils cover the common set: `ls cat cp mv rm mkdir rmdir touch ln chmod
+stat find du df echo wc head tail grep sort uniq cut tr tee seq rev printf expr
+test ps free uptime date env id uname hostname mount kill sleep clear hexdump
 basename dirname yes true false`.
 
 ## Tests
@@ -114,9 +130,10 @@ basename dirname yes true false`.
 `make test` boots the OS once per suite and requires each to report zero
 failures.
 
-- `tests/suite.sh` runs **68 checks** inside the OS, driving the shell through
-  pipelines, redirection, globbing, control flow, functions, file operations,
-  devices, subprocesses and `/proc`.
+- `tests/suite.sh` runs **95 checks** inside the OS, driving the shell through
+  pipelines, redirection, here-documents, globbing, control flow, `case`,
+  subshells, functions, file and script execution, `chmod`, devices,
+  subprocesses and `/proc`.
 - The `rtest` applet runs **25 checks** against the Rust standard library:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
@@ -130,8 +147,8 @@ failures.
   busybox's own `ash` shell running loops, pipelines and arithmetic. Run
   `make busybox` first to fetch it; the suite is skipped when it is absent.
 - An **interactive session** is driven over the serial console: typing after
-  boot, `Ctrl-C` on a running job, a background job, and the clock advancing
-  while the shell is blocked in a read.
+  boot, backspace and Ctrl-U line editing, `Ctrl-C` on a running job, a
+  background job, and the clock advancing while the shell is blocked in a read.
 
 Every suite is an ordinary Linux program. Nothing in them is aware that they
 are not running on Linux.
@@ -153,10 +170,11 @@ kernel/src
   console.rs          input ring and terminal line discipline
   signal.rs           signal frames, delivery and rt_sigreturn
 
-user/cbox             the multicall userland binary
+user/cbox             the multicall userland binary (shell, init, coreutils)
 user/c/hello.c        a C program linked against musl
 tools/mkcpio.py       initramfs builder
-tools/drive.py        drives the console over a socket for interactive tests
+tools/drive.py        drives the console over a socket, rendering as a terminal
+scripts/reap-stale.sh clears QEMU instances an earlier run left behind
 tests/suite.sh        in-OS shell and userland test suite
 tests/busybox.sh      in-OS suite driving an upstream busybox
 ```
@@ -168,4 +186,5 @@ root filesystem lives in RAM and changes do not survive a reboot. There is no
 networking, so the socket calls return `EAFNOSUPPORT`. Dynamically linked
 executables are rejected; only static and static-PIE ELF binaries load. Job
 control stops at process groups and the foreground terminal: `SIGTSTP` and `fg`
-are not implemented. `futex` waits by polling rather than by queueing waiters.
+are not implemented. `futex`, `poll` and `select` still wait by re-checking
+rather than by queueing, though they yield or sleep rather than spin.
