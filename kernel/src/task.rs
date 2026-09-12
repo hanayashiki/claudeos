@@ -671,7 +671,7 @@ pub fn read_executable(
 /// Entry point for a task created by the kernel rather than by fork: load the
 /// program it was created for, then drop into user mode.
 pub extern "C" fn user_bootstrap() -> ! {
-    let task = crate::sched::current();
+    let mut task = crate::sched::current();
     let Some((path, argv, envp)) = task.pending_exec.take() else {
         crate::println!("[kernel] bootstrap task has no program");
         crate::sched::exit_current(1 << 8);

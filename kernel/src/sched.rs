@@ -17,11 +17,36 @@ static mut IDLE: *mut Task = core::ptr::null_mut();
 static TASKS: Spinlock<Vec<TaskPtr>> = Spinlock::new(Vec::new());
 static FOREGROUND_PGID: Spinlock<u32> = Spinlock::new(0);
 
-pub fn current() -> &'static mut Task {
-    unsafe {
-        debug_assert!(!CURRENT.is_null());
-        &mut *CURRENT
+/// The task the CPU is running, as a guard rather than a reference.
+///
+/// Which task that is changes at every context switch, so handing out a
+/// `&'static mut Task` says something that is not true: the borrow would
+/// outlive the state it describes. The guard reads the current task on each
+/// use and cannot be stored anywhere with a longer life.
+pub struct Current(());
+
+impl core::ops::Deref for Current {
+    type Target = Task;
+
+    fn deref(&self) -> &Task {
+        unsafe {
+            debug_assert!(!CURRENT.is_null());
+            &*CURRENT
+        }
     }
+}
+
+impl core::ops::DerefMut for Current {
+    fn deref_mut(&mut self) -> &mut Task {
+        unsafe {
+            debug_assert!(!CURRENT.is_null());
+            &mut *CURRENT
+        }
+    }
+}
+
+pub fn current() -> Current {
+    Current(())
 }
 
 pub fn current_ptr() -> *mut Task {
@@ -230,7 +255,7 @@ pub fn on_tick() {
 
 /// Put the current task to sleep for `ticks` timer ticks.
 pub fn sleep_ticks(ticks: u64) {
-    let task = current();
+    let mut task = current();
     task.wake_at = crate::trap::ticks() + ticks.max(1);
     task.state = State::Sleeping;
     schedule();
@@ -289,7 +314,7 @@ pub fn exit_group(status: i32) -> ! {
 
 pub fn exit_current(status: i32) -> ! {
     {
-        let task = current();
+        let mut task = current();
         task.exit_code = status;
 
         // A thread that asked for it gets its tid slot cleared so whoever is
@@ -432,7 +457,7 @@ pub fn post_signal(task: &mut Task, signal: i32) -> Option<u32> {
 
 /// Stop the running task until something sends it SIGCONT.
 fn stop_current(signal: i32) {
-    let task = current();
+    let mut task = current();
     task.stop_signal = signal;
     task.report_stop = true;
     task.state = State::Stopped;
@@ -465,7 +490,7 @@ pub fn stop_for_signal(signal: i32) {
     // The continue that restarted this task has now had its default action,
     // which is to do exactly that. Leaving it pending would make the caller
     // think a signal is waiting and give up on what it was doing.
-    let task = current();
+    let mut task = current();
     if task.signal_actions[SIGCONT as usize].handler == crate::signal::SIG_DFL {
         task.pending_signals &= !(1u64 << (SIGCONT as u64 & 63));
     }
@@ -558,7 +583,7 @@ pub fn check_signals() {
     if !has_current() {
         return;
     }
-    let task = current();
+    let mut task = current();
     if task.pending_signals == 0 {
         return;
     }
@@ -617,7 +642,7 @@ pub fn check_signals() {
         if action.flags & crate::signal::SA_RESETHAND != 0 {
             task.signal_actions[signal as usize] = crate::signal::SigAction::default();
         }
-        if !crate::signal::deliver(task, signal, &action, frame) {
+        if !crate::signal::deliver(&mut task, signal, &action, frame) {
             exit_current(SIGSEGV & 0x7F);
         }
         return;

@@ -45,7 +45,7 @@ pub fn fork(
     child_tid: u64,
     tls: u64,
 ) -> SysResult {
-    let parent = sched::current();
+    let mut parent = sched::current();
     let share_vm = flags & CLONE_VM != 0;
 
     let space = if share_vm {
@@ -174,7 +174,7 @@ pub fn exec_into_current(
     // The task's recorded address space is the authority a context switch
     // restores CR3 from, so it has to be updated before CR3 is, or a
     // preemption in between would put the old page tables back underneath us.
-    let task = sched::current();
+    let mut task = sched::current();
     task.space = new_space;
     // exec starts a fresh address space; a shared record must not follow it.
     task.mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
@@ -256,7 +256,7 @@ pub fn exec_into_current(
         }
     }
 
-    let sp = match task::build_user_stack(task, &image, &argv, &envp, &exec_path, interp_base) {
+    let sp = match task::build_user_stack(&mut task, &image, &argv, &envp, &exec_path, interp_base) {
         Ok(sp) => sp,
         Err(err) => {
             task.space = old_space;
@@ -293,7 +293,7 @@ pub fn exec_into_current(
         }
     }
 
-    task::set_user_entry(task, entry, sp);
+    task::set_user_entry(&mut task, entry, sp);
     Ok(())
 }
 
@@ -343,7 +343,7 @@ pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
         // sleep would never end. Interrupts off means nothing else runs in
         // between, so the state the checks saw is still the state here.
         crate::sync::disable_interrupts();
-        let task = sched::current();
+        let mut task = sched::current();
         task.waiting_for = Some(pid as i32);
         task.state = State::Sleeping;
         crate::sync::enable_interrupts();
@@ -652,7 +652,7 @@ pub fn rt_sigaction(signal: usize, act: u64, old: u64) -> SysResult {
     if signal == 0 || signal >= 64 || signal == SIGKILL as usize || signal == SIGSTOP as usize {
         return Err(Errno::EINVAL);
     }
-    let task = sched::current();
+    let mut task = sched::current();
     if old != 0 {
         // struct sigaction: handler, flags, restorer, mask.
         let existing = task.signal_actions[signal];
@@ -682,11 +682,11 @@ pub fn rt_sigaction(signal: usize, act: u64, old: u64) -> SysResult {
 }
 
 pub fn rt_sigreturn(frame: &mut TrapFrame) -> SysResult {
-    crate::signal::sigreturn(sched::current(), frame)
+    crate::signal::sigreturn(&mut sched::current(), frame)
 }
 
 pub fn rt_sigprocmask(how: u32, set: u64, old: u64) -> SysResult {
-    let task = sched::current();
+    let mut task = sched::current();
     if old != 0 {
         uaccess::write_u64(old, task.signal_mask)?;
     }

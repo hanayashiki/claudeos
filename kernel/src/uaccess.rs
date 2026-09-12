@@ -20,7 +20,7 @@ pub fn validate(addr: u64, len: u64, write: bool) -> Result<(), Errno> {
         return Err(Errno::EFAULT);
     }
 
-    let task = crate::sched::current();
+    let mut task = crate::sched::current();
     let mut page = page_align_down(addr);
     while page < end {
         match task.space.flags_of(page) {
@@ -39,7 +39,7 @@ pub fn validate(addr: u64, len: u64, write: bool) -> Result<(), Errno> {
                 if !task.fault_in(page) {
                     return Err(Errno::EFAULT);
                 }
-                if write && !writable(task, page) {
+                if write && !writable(&task, page) {
                     return Err(Errno::EFAULT);
                 }
             }

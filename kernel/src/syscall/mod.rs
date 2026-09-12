@@ -131,7 +131,7 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::CHOWN | nr::FCHOWN | nr::LCHOWN | nr::FCHOWNAT => Ok(0),
         nr::FSYNC | nr::SYNC | nr::MSYNC => Ok(0),
         nr::UMASK => {
-            let task = sched::current();
+            let mut task = sched::current();
             let old = task.umask;
             task.umask = args[0] as u32 & 0o777;
             Ok(old as u64)

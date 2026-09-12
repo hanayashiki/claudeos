@@ -7,7 +7,6 @@
 use crate::sched;
 use crate::task::State;
 use crate::sync::{disable_interrupts, enable_interrupts, Spinlock};
-use crate::task::Task;
 use alloc::vec::Vec;
 
 /// What identifies a futex: the address space it lives in and the address
@@ -87,7 +86,7 @@ pub fn sleep_until(key: Key, deadline: u64) -> bool {
         enable_interrupts();
         return false;
     }
-    let task: &mut Task = sched::current();
+    let mut task = sched::current();
     task.state = State::Sleeping;
     task.wake_at = if deadline == u64::MAX { 0 } else { deadline };
     enable_interrupts();
