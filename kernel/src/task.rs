@@ -244,6 +244,36 @@ impl Task {
         mm.mmap_top = USER_MMAP_BASE;
     }
 
+    /// Total size of every recorded region plus the heap, for /proc reporting.
+    pub fn virtual_size(&self) -> u64 {
+        let mm = self.mm.lock();
+        let regions: u64 = mm.vmas.iter().map(|v| v.end - v.start).sum();
+        regions + mm.brk.saturating_sub(mm.brk_start)
+    }
+
+    /// Pages actually backed by memory right now.
+    pub fn resident_pages(&self) -> u64 {
+        let mm = self.mm.lock();
+        let mut pages = 0u64;
+        for vma in mm.vmas.iter() {
+            let mut page = vma.start;
+            while page < vma.end {
+                if self.space.translate(page).is_some() {
+                    pages += 1;
+                }
+                page += PAGE_SIZE_U64;
+            }
+        }
+        let mut page = mm.brk_start;
+        while page < mm.brk {
+            if self.space.translate(page).is_some() {
+                pages += 1;
+            }
+            page += PAGE_SIZE_U64;
+        }
+        pages
+    }
+
     pub fn snapshot_vmas(&self) -> Vec<Vma> {
         self.mm.lock().vmas.clone()
     }

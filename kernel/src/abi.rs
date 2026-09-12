@@ -65,6 +65,10 @@ pub mod nr {
     pub const READLINK: u64 = 89;
     pub const CHMOD: u64 = 90;
     pub const FCHMOD: u64 = 91;
+    pub const CHOWN: u64 = 92;
+    pub const FCHOWN: u64 = 93;
+    pub const LCHOWN: u64 = 94;
+    pub const FCHOWNAT: u64 = 260;
     pub const UMASK: u64 = 95;
     pub const GETTIMEOFDAY: u64 = 96;
     pub const GETRLIMIT: u64 = 97;

@@ -49,6 +49,13 @@ if command -v clang >/dev/null 2>&1; then
   chmod +x "$RFS/bin/hello_c"
 fi
 
+# An upstream busybox, if scripts/fetch-busybox.sh has been run. It is a
+# binary this project did not build, so it is the strictest ABI test here.
+if [ -x "$ROOT/build/thirdparty/busybox" ]; then
+  cp "$ROOT/build/thirdparty/busybox" "$RFS/bin/busybox"
+  chmod +x "$RFS/bin/busybox"
+fi
+
 cat > "$RFS/etc/motd" <<'MOTD'
 Welcome to claudeos.
 
@@ -106,6 +113,7 @@ This file came from the initramfs, unpacked by the kernel at boot.
 HELLO
 
 cp "$ROOT/tests/suite.sh" "$RFS/root/suite.sh"
+cp "$ROOT/tests/busybox.sh" "$RFS/root/busybox.sh"
 
 python3 "$ROOT/tools/mkcpio.py" "$RFS" "$ROOT/build/initramfs.cpio"
 ls -la "$ROOT/build/initramfs.cpio"

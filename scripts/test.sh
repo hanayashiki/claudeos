@@ -1,17 +1,21 @@
 #!/bin/bash
-# Boot the OS twice: once for the shell/userland suite and once for the
-# standard-library suite. Both must report zero failures.
+# Boot the OS once per suite. Every suite must report zero failures.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 status=0
 
+banner() {
+  echo "=============================================================="
+  echo "  $1"
+  echo "=============================================================="
+}
+
+# Run a script or program inside the OS and require "N passed, 0 failed".
 run_suite() {
   local name="$1" append="$2" timeout="$3"
-  echo "=============================================================="
-  echo "  $name"
-  echo "=============================================================="
+  banner "$name"
   local output
   output="$("$ROOT/scripts/run.sh" --timeout "$timeout" \
       --initrd "$ROOT/build/initramfs.cpio" --append "$append" 2>&1 | tr -d '\r')"
@@ -28,12 +32,10 @@ run_suite() {
 }
 
 # An interactive session: typing after boot, Ctrl-C on a running job, and a
-# background job. These only work if interrupts reach the kernel during a
-# blocking read, so they are worth checking separately.
+# background job. These only work if interrupts reach the kernel while a
+# process is blocked in a read.
 run_interactive() {
-  echo "=============================================================="
-  echo "  interactive session"
-  echo "=============================================================="
+  banner "interactive session"
   local output
   output="$(python3 "$ROOT/tools/drive.py" --timeout 45 -- \
       "wait:2.5" "echo live-input-works\n" "wait:0.6" \
@@ -69,6 +71,12 @@ run_interactive() {
 
 run_suite "userland and shell" "/root/suite.sh" 120
 run_suite "rust standard library" "init=/bin/rtest" 180
+if [ -x "$ROOT/build/rootfs/bin/busybox" ]; then
+  run_suite "upstream busybox" "/root/busybox.sh" 180
+else
+  echo ">> upstream busybox: skipped (run scripts/fetch-busybox.sh)"
+  echo
+fi
 run_interactive
 
 if [ $status -eq 0 ]; then

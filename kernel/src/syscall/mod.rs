@@ -105,6 +105,8 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::POLL | nr::PPOLL => file::poll(args[0], args[1] as usize, args[2] as i64),
         nr::SELECT | nr::PSELECT6 => file::select(args[0] as i32, args[1], args[2], args[3]),
         nr::CHMOD | nr::FCHMOD | nr::FCHMODAT => Ok(0),
+        // Everything runs as root on a single-user system.
+        nr::CHOWN | nr::FCHOWN | nr::LCHOWN | nr::FCHOWNAT => Ok(0),
         nr::FSYNC | nr::SYNC | nr::MSYNC => Ok(0),
         nr::UMASK => {
             let task = sched::current();
@@ -112,7 +114,8 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
             task.umask = args[0] as u32 & 0o777;
             Ok(old as u64)
         }
-        nr::STATFS | nr::FSTATFS => Err(Errno::ENOSYS),
+        nr::STATFS => file::statfs(args[0], args[1]),
+        nr::FSTATFS => file::fstatfs(args[0] as i32, args[1]),
         nr::UTIMENSAT => Ok(0),
         nr::MEMFD_CREATE => file::memfd_create(args[0], args[1] as u32),
         nr::SENDFILE => file::sendfile(args[0] as i32, args[1] as i32, args[2], args[3] as usize),

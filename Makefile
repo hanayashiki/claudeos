@@ -6,7 +6,7 @@
 #   make demo       run the scripted tour
 #   make clean      remove build products
 
-.PHONY: all kernel user run test demo clean
+.PHONY: all kernel user run test demo busybox clean
 
 all: kernel user
 
@@ -24,6 +24,10 @@ test: all
 
 demo: all
 	@./scripts/run.sh --timeout 120 --initrd build/initramfs.cpio --append /root/demo.sh
+
+busybox:
+	@./scripts/fetch-busybox.sh
+	@./scripts/build-user.sh
 
 clean:
 	rm -rf build kernel/target user/cbox/target

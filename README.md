@@ -4,10 +4,11 @@ An x86-64 operating system kernel written from scratch in Rust that implements
 enough of the Linux system call interface to run unmodified static Linux
 binaries.
 
-A stock `rustc --target x86_64-unknown-linux-musl` executable, or a C program
-linked against musl, runs on it without changes. The userland shipped here is
-built that way: it is an ordinary Linux program, not something written against
-a private kernel interface.
+A stock `rustc --target x86_64-unknown-linux-musl` executable, a C program
+linked against musl, or an upstream busybox binary downloaded from busybox.net
+all run on it without changes. The userland shipped here is built that way: it
+is an ordinary Linux program, not something written against a private kernel
+interface.
 
 ```
 claudeos:/root# uname -a
@@ -34,8 +35,9 @@ brew install qemu            # or your platform's package manager
 
 make                         # build the kernel and the userland
 make run                     # boot into an interactive shell
-make test                    # run both self-test suites
+make test                    # run every self-test suite
 make demo                    # run the scripted tour
+make busybox                 # fetch an upstream busybox to test against
 ```
 
 `make run` gives a shell on the serial console. `exit` powers the machine off.
@@ -109,7 +111,7 @@ basename dirname yes true false`.
 
 ## Tests
 
-`make test` boots the OS twice and requires both suites to report zero
+`make test` boots the OS once per suite and requires each to report zero
 failures.
 
 - `tests/suite.sh` runs **68 checks** inside the OS, driving the shell through
@@ -121,12 +123,18 @@ failures.
   thread sleep against the monotonic clock, file read/write/seek/append,
   directory iteration, `std::process::Command` capturing a child's output
   through pipes, and signal handlers running and returning.
+- `tests/busybox.sh` runs **36 checks** against an upstream busybox binary that
+  this project did not build: `awk`, `sed`, `tar` create and extract, `find`,
+  `md5sum` and `sha256sum` (whose digests are compared against the ones the
+  host computes for the same input), `ps`, `df`, `xargs`, `timeout`, and
+  busybox's own `ash` shell running loops, pipelines and arithmetic. Run
+  `make busybox` first to fetch it; the suite is skipped when it is absent.
 - An **interactive session** is driven over the serial console: typing after
   boot, `Ctrl-C` on a running job, a background job, and the clock advancing
   while the shell is blocked in a read.
 
-Both suites are ordinary Linux programs. Nothing in them is aware that they are
-not running on Linux.
+Every suite is an ordinary Linux program. Nothing in them is aware that they
+are not running on Linux.
 
 ## Layout
 
@@ -150,6 +158,7 @@ user/c/hello.c        a C program linked against musl
 tools/mkcpio.py       initramfs builder
 tools/drive.py        drives the console over a socket for interactive tests
 tests/suite.sh        in-OS shell and userland test suite
+tests/busybox.sh      in-OS suite driving an upstream busybox
 ```
 
 ## Limitations

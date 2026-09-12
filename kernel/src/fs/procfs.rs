@@ -133,26 +133,64 @@ pub fn render(kind: Generated) -> String {
             out
         }
         Generated::PidStat(pid) => match crate::sched::find(pid) {
-            Some(task) => format!(
-                "{} ({}) {} {} {} 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n",
-                task.pid,
-                task.name,
-                state_char(task.state),
-                task.ppid,
-                task.pgid
-            ),
+            Some(task) => {
+                // Readers skip to fields by counting separators, so all 52
+                // fields Linux documents have to be present.
+                let vsize = task.virtual_size();
+                let rss = task.resident_pages();
+                let ticks = crate::trap::ticks();
+                let mut out = String::new();
+                out.push_str(&format!(
+                    "{} ({}) {} {} {} {} 0 -1 0 ",
+                    task.pid,
+                    task.name,
+                    state_char(task.state),
+                    task.ppid,
+                    task.pgid,
+                    task.pgid, // session
+                ));
+                // minflt cminflt majflt cmajflt utime stime cutime cstime
+                out.push_str(&format!("0 0 0 0 {} 0 0 0 ", ticks));
+                // priority nice num_threads itrealvalue starttime
+                out.push_str("20 0 1 0 0 ");
+                // vsize rss rsslim
+                out.push_str(&format!("{} {} 18446744073709551615 ", vsize, rss));
+                // startcode endcode startstack kstkesp kstkeip
+                out.push_str("0 0 0 0 0 ");
+                // signal blocked sigignore sigcatch wchan nswap cnswap
+                out.push_str(&format!("{} {} 0 0 0 0 0 ", task.pending_signals, task.signal_mask));
+                // exit_signal processor rt_priority policy delayacct_blkio
+                out.push_str("17 0 0 0 0 ");
+                // guest_time cguest_time start_data end_data start_brk
+                out.push_str(&format!("0 0 0 0 {} ", task.brk_start()));
+                // arg_start arg_end env_start env_end exit_code
+                out.push_str("0 0 0 0 0\n");
+                out
+            }
             None => String::new(),
         },
         Generated::PidStatus(pid) => match crate::sched::find(pid) {
             Some(task) => format!(
-                "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n\
-                 Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nVmBrk:\t{} kB\n",
+                "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n\
+                 Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\n\
+                 VmSize:\t{} kB\nVmRSS:\t{} kB\nVmData:\t{} kB\n\
+                 SigPnd:\t{:016x}\nSigBlk:\t{:016x}\n",
                 task.name,
                 state_char(task.state),
+                match task.state {
+                    crate::task::State::Runnable => "running",
+                    crate::task::State::Sleeping => "sleeping",
+                    crate::task::State::Zombie => "zombie",
+                    crate::task::State::Dead => "dead",
+                },
                 task.tgid,
                 task.pid,
                 task.ppid,
+                task.virtual_size() / 1024,
+                task.resident_pages() * 4,
                 (task.brk().saturating_sub(task.brk_start())) / 1024,
+                task.pending_signals,
+                task.signal_mask,
             ),
             None => String::new(),
         },

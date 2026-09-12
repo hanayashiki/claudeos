@@ -305,6 +305,9 @@ pub fn split_parent(path: &str) -> Result<(NodeRef, String), Errno> {
 }
 
 pub fn create(path: &str, mode: u32) -> Result<NodeRef, Errno> {
+    if path == "/" {
+        return Err(Errno::EISDIR);
+    }
     let (parent, name) = split_parent(path)?;
     let mut inner = parent.inner.lock();
     if let Some(existing) = inner.children.get(&name) {
@@ -316,6 +319,11 @@ pub fn create(path: &str, mode: u32) -> Result<NodeRef, Errno> {
 }
 
 pub fn mkdir(path: &str, mode: u32) -> Result<NodeRef, Errno> {
+    // The root always exists; `mkdir -p` walks down from it and expects the
+    // "already there" answer rather than a malformed-path one.
+    if path == "/" {
+        return Err(Errno::EEXIST);
+    }
     let (parent, name) = split_parent(path)?;
     let mut inner = parent.inner.lock();
     if inner.children.contains_key(&name) {
@@ -359,6 +367,9 @@ pub fn link_node(path: &str, node: NodeRef) -> Result<(), Errno> {
 }
 
 pub fn unlink(path: &str, want_dir: bool) -> Result<(), Errno> {
+    if path == "/" {
+        return Err(Errno::EBUSY);
+    }
     let (parent, name) = split_parent(path)?;
     let mut inner = parent.inner.lock();
     let node = inner.children.get(&name).ok_or(Errno::ENOENT)?.clone();

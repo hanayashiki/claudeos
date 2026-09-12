@@ -12,11 +12,20 @@ use std::io::Write;
 // Tokens
 // ---------------------------------------------------------------------------
 
+/// How a word was quoted, which decides what expansion it gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Quoting {
+    /// Expanded, split into fields, and globbed.
+    Bare,
+    /// Expanded, but kept as one word.
+    Double,
+    /// Taken literally.
+    Single,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
-    /// A word, and whether any part of it was quoted (quoted words are never
-    /// keywords and are never split into glob matches).
-    Word(String, bool),
+    Word(String, Quoting),
     Pipe,
     Semi,
     Amp,
@@ -35,7 +44,7 @@ enum Token {
 impl Token {
     fn keyword(&self) -> Option<&str> {
         match self {
-            Token::Word(text, false) => Some(text.as_str()),
+            Token::Word(text, Quoting::Bare) => Some(text.as_str()),
             _ => None,
         }
     }
@@ -59,15 +68,25 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut have_word = false;
-    let mut quoted = false;
+    // A word is literal only when every part of it came from single quotes.
+    let mut saw_single = false;
+    let mut saw_other = false;
     let mut i = 0;
 
     macro_rules! flush {
         () => {
             if have_word {
-                tokens.push(Token::Word(std::mem::take(&mut current), quoted));
+                let quoting = if saw_single && !saw_other {
+                    Quoting::Single
+                } else if saw_single || saw_other {
+                    Quoting::Double
+                } else {
+                    Quoting::Bare
+                };
+                tokens.push(Token::Word(std::mem::take(&mut current), quoting));
                 have_word = false;
-                quoted = false;
+                saw_single = false;
+                saw_other = false;
             }
         };
     }
@@ -86,7 +105,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             }
             '\'' => {
                 have_word = true;
-                quoted = true;
+                saw_single = true;
                 i += 1;
                 while i < chars.len() && chars[i] != '\'' {
                     current.push(chars[i]);
@@ -99,7 +118,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             }
             '"' => {
                 have_word = true;
-                quoted = true;
+                saw_other = true;
                 i += 1;
                 while i < chars.len() && chars[i] != '"' {
                     if chars[i] == '\\' && i + 1 < chars.len() {
@@ -180,7 +199,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     continue;
                 }
                 have_word = true;
-                quoted = true;
+                saw_other = true;
                 current.push(chars[i + 1]);
                 i += 2;
             }
@@ -266,7 +285,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 
 #[derive(Debug, Clone, Default)]
 struct Command {
-    words: Vec<(String, bool)>,
+    words: Vec<(String, Quoting)>,
     stdin_file: Option<String>,
     stdout_file: Option<(String, bool)>,
     stderr_file: Option<(String, bool)>,
@@ -304,7 +323,7 @@ enum Node {
     },
     For {
         variable: String,
-        words: Vec<(String, bool)>,
+        words: Vec<(String, Quoting)>,
         body: Vec<Node>,
     },
     Function {
@@ -418,7 +437,7 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 // A function definition looks like: name ( ) { ... }
-                if let (Some(Token::Word(name, false)), Some(Token::LParen), Some(Token::RParen)) = (
+                if let (Some(Token::Word(name, Quoting::Bare)), Some(Token::LParen), Some(Token::RParen)) = (
                     self.tokens.get(self.position),
                     self.tokens.get(self.position + 1),
                     self.tokens.get(self.position + 2),
@@ -500,11 +519,11 @@ impl<'a> Parser<'a> {
         self.skip_separators();
         if self.at_any_keyword(&["in"]) {
             self.position += 1;
-            while let Some(Token::Word(text, quoted)) = self.peek() {
-                if matches!(text.as_str(), "do") && !*quoted {
+            while let Some(Token::Word(text, quoting)) = self.peek() {
+                if text == "do" && *quoting == Quoting::Bare {
                     break;
                 }
-                words.push((text.clone(), *quoted));
+                words.push((text.clone(), *quoting));
                 self.position += 1;
             }
         }
@@ -560,17 +579,13 @@ impl<'a> Parser<'a> {
         let mut command = Command::default();
         loop {
             match self.peek() {
-                Some(Token::Word(text, quoted)) => {
-                    // A keyword ends the command unless it is the first word
-                    // and therefore just a program name.
-                    if !*quoted && command.words.is_empty() && KEYWORDS.contains(&text.as_str()) {
-                        // Let the statement parser deal with it.
+                Some(Token::Word(text, quoting)) => {
+                    // A bare keyword ends the command; the statement parser
+                    // takes it from there.
+                    if *quoting == Quoting::Bare && KEYWORDS.contains(&text.as_str()) {
                         return Ok(command);
                     }
-                    if !*quoted && !command.words.is_empty() && KEYWORDS.contains(&text.as_str()) {
-                        return Ok(command);
-                    }
-                    command.words.push((text.clone(), *quoted));
+                    command.words.push((text.clone(), *quoting));
                     self.position += 1;
                 }
                 Some(Token::RedirOut) | Some(Token::RedirAppend) => {
@@ -827,11 +842,11 @@ impl Shell {
             }
             Node::For { variable, words, body } => {
                 let mut items = Vec::new();
-                for (word, quoted) in words {
-                    if *quoted {
-                        items.push(self.substitute(word));
-                    } else {
-                        items.extend(self.expand_word(word));
+                for (word, quoting) in words {
+                    match quoting {
+                        Quoting::Single => items.push(word.clone()),
+                        Quoting::Double => items.push(self.substitute(word)),
+                        Quoting::Bare => items.extend(self.expand_word(word)),
                     }
                 }
                 for item in items {
@@ -1210,12 +1225,23 @@ impl Shell {
             stderr_file: command.stderr_file.as_ref().map(|(f, a)| (self.substitute_all(f), *a)),
             words: Vec::new(),
         };
-        for (word, quoted) in &command.words {
-            if *quoted {
-                out.words.push((self.substitute_all(word), true));
-            } else {
-                for expanded in self.expand_word_mut(word) {
-                    out.words.push((expanded, false));
+        for (word, quoting) in &command.words {
+            match quoting {
+                Quoting::Single => out.words.push((word.clone(), Quoting::Single)),
+                Quoting::Double => {
+                    // "$@" becomes one word per parameter.
+                    if word == "$@" {
+                        for parameter in &self.positional {
+                            out.words.push((parameter.clone(), Quoting::Double));
+                        }
+                        continue;
+                    }
+                    out.words.push((self.substitute_all(word), Quoting::Double));
+                }
+                Quoting::Bare => {
+                    for expanded in self.expand_word_mut(word) {
+                        out.words.push((expanded, Quoting::Bare));
+                    }
                 }
             }
         }

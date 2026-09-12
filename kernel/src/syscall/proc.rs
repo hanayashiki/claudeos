@@ -160,11 +160,15 @@ pub fn exec_into_current(
 
     // Everything below runs against the new address space; the kernel half is
     // shared so the stack and heap stay valid across the switch.
-    unsafe { new_space.switch_to() };
+    //
+    // The task's recorded address space is the authority a context switch
+    // restores CR3 from, so it has to be updated before CR3 is, or a
+    // preemption in between would put the old page tables back underneath us.
     let task = sched::current();
     task.space = new_space;
     // exec starts a fresh address space; a shared record must not follow it.
     task.mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
+    unsafe { new_space.switch_to() };
 
     let image = match elf::load(&new_space, &data) {
         Ok(image) => image,
