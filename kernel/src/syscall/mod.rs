@@ -149,7 +149,10 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         // ---- process --------------------------------------------------
         nr::FORK => proc::fork(frame, 0, 0, 0, 0, 0),
         nr::VFORK => proc::fork(frame, 0, 0, 0, 0, 0),
-        nr::CLONE => proc::fork(frame, args[0], args[1], args[2], args[3], args[4]),
+        nr::CLONE => {
+            let (flags, stack, parent_tid, child_tid, tls) = arch::clone_args(args);
+            proc::fork(frame, flags, stack, parent_tid, child_tid, tls)
+        }
         nr::EXECVE => proc::execve(args[0], args[1], args[2], frame),
         nr::EXIT => sched::exit_current((args[0] as i32 & 0xFF) << 8),
         nr::EXIT_GROUP => sched::exit_group((args[0] as i32 & 0xFF) << 8),

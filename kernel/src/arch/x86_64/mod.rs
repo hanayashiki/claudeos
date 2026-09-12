@@ -34,7 +34,7 @@ global_asm!(include_str!("syscall_entry.s"), options(att_syntax));
 pub use clock::{cycle_counter, read_wall_clock, WallClock};
 pub use signal_frame::{enter_signal_handler, leave_signal_handler};
 pub use syscall::{
-    arch_prctl, fork_child_frame, init_syscall_entry, set_syscall_result, syscall_args,
+    arch_prctl, clone_args, fork_child_frame, init_syscall_entry, set_syscall_result, syscall_args,
     syscall_number, syscall_result,
 };
 pub use task::{
