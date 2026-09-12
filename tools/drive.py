@@ -6,7 +6,8 @@ start-up, so the console is exposed as a unix socket instead and this script
 connects to it.
 
 Usage:
-    drive.py [--timeout SECS] [--initramfs FILE] [--raw] -- <step> [<step> ...]
+    drive.py [--timeout SECS] [--initramfs FILE] [--append CMDLINE] [--raw]
+             -- <step> [<step> ...]
 
 Each step is either text to send (backslash escapes are interpreted) or
 "wait:SECONDS" to pause.
@@ -116,6 +117,7 @@ def main():
     args = sys.argv[1:]
     timeout = 60
     initramfs = os.path.join(ROOT, "build", "initramfs.cpio")
+    append = None
     raw = False
 
     while args and args[0].startswith("--"):
@@ -123,6 +125,8 @@ def main():
             timeout, args = int(args[1]), args[2:]
         elif args[0] == "--initramfs":
             initramfs, args = args[1], args[2:]
+        elif args[0] == "--append":
+            append, args = args[1], args[2:]
         elif args[0] == "--raw":
             raw, args = True, args[1:]
         elif args[0] == "--":
@@ -148,6 +152,8 @@ def main():
         "-no-reboot",
         "-cpu", "qemu64,+pdpe1gb,+rdrand,+fsgsbase,+xsave",
     ]
+    if append:
+        command += ["-append", append]
     process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     # Wait for QEMU to create the socket.

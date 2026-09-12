@@ -6,7 +6,7 @@
 #   make demo       run the scripted tour
 #   make clean      remove build products
 
-.PHONY: all kernel user run test demo busybox clean
+.PHONY: all kernel user run test demo busybox alpine clean
 
 all: kernel user
 
@@ -29,7 +29,11 @@ busybox:
 	@./scripts/fetch-busybox.sh
 	@./scripts/build-user.sh
 
+alpine: kernel
+	@./scripts/fetch-alpine.sh
+
 clean:
 	@# build/thirdparty holds downloads; keep them so a rebuild stays offline.
 	rm -rf build/kernel.elf build/kernel64.elf build/rootfs build/initramfs.cpio \
-	       build/toolchain build/hello_c.o kernel/target user/cbox/target
+	       build/alpine-rootfs build/alpine.cpio build/toolchain build/hello_c.o \
+	       kernel/target user/cbox/target

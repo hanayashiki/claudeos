@@ -186,7 +186,43 @@ pub fn exec_into_current(
         task.add_vma(*start, *end, *prot, MAP_PRIVATE);
     }
 
-    let sp = match task::build_user_stack(task, &image, &argv, &envp, &exec_path) {
+    // A dynamically linked program names an interpreter that has to be loaded
+    // alongside it; control starts there, and it finds the program through
+    // AT_PHDR and AT_ENTRY.
+    let mut entry = image.entry;
+    let mut interp_base = 0u64;
+    if let Some(interp_path) = image.interp.clone() {
+        let loaded = crate::fs::lookup(&interp_path)
+            .map_err(|_| Errno::ENOENT)
+            .and_then(|node| {
+                let data = node.inner.lock().data.clone();
+                elf::load_at(&new_space, &data, Some(elf::INTERP_BASE))
+            });
+        match loaded {
+            Ok(interp_image) => {
+                for (start, end, prot) in &interp_image.segments {
+                    task.add_vma(*start, *end, *prot, MAP_PRIVATE);
+                }
+                task.set_heap_base(image.brk_start.max(interp_image.brk_start));
+                interp_base = interp_image.base;
+                entry = interp_image.entry;
+            }
+            Err(err) => {
+                crate::println!(
+                    "[exec] {}: cannot load interpreter {}: {:?}",
+                    exec_path,
+                    interp_path,
+                    err
+                );
+                task.space = old_space;
+                unsafe { old_space.switch_to() };
+                new_space.destroy();
+                return Err(Errno::ENOENT);
+            }
+        }
+    }
+
+    let sp = match task::build_user_stack(task, &image, &argv, &envp, &exec_path, interp_base) {
         Ok(sp) => sp,
         Err(err) => {
             task.space = old_space;
@@ -223,7 +259,7 @@ pub fn exec_into_current(
         }
     }
 
-    task::set_user_entry(task, image.entry, sp);
+    task::set_user_entry(task, entry, sp);
     Ok(())
 }
 

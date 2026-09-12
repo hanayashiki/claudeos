@@ -21,6 +21,8 @@ pub const PF_R: u32 = 4;
 
 /// Load address given to position-independent executables.
 pub const DYN_BASE: u64 = 0x2000_0000;
+/// Load address given to a program interpreter (the dynamic linker).
+pub const INTERP_BASE: u64 = 0x7000_0000;
 
 #[derive(Debug, Clone)]
 pub struct LoadedImage {
@@ -31,7 +33,8 @@ pub struct LoadedImage {
     pub base: u64,
     /// First page-aligned address past every loaded segment; brk starts here.
     pub brk_start: u64,
-    pub interp_offset: Option<(usize, usize)>,
+    /// Path of the program interpreter, for a dynamically linked executable.
+    pub interp: Option<alloc::string::String>,
     pub tls_vaddr: u64,
     pub tls_filesz: u64,
     pub tls_memsz: u64,
@@ -108,6 +111,15 @@ pub fn program_headers(data: &[u8]) -> Result<alloc::vec::Vec<ProgramHeader>, Er
 /// Map `data`'s PT_LOAD segments into `space`, which must be the active
 /// address space so the segment contents can be written directly.
 pub fn load(space: &AddressSpace, data: &[u8]) -> Result<LoadedImage, Errno> {
+    load_at(space, data, None)
+}
+
+/// As `load`, but with an explicit load address for a relocatable image.
+pub fn load_at(
+    space: &AddressSpace,
+    data: &[u8],
+    base_override: Option<u64>,
+) -> Result<LoadedImage, Errno> {
     let e_type = validate(data)?;
     let phdrs = program_headers(data)?;
     let e_entry = rd64(data, 24);
@@ -115,7 +127,11 @@ pub fn load(space: &AddressSpace, data: &[u8]) -> Result<LoadedImage, Errno> {
     let phentsize = rd16(data, 54) as u64;
     let phnum = rd16(data, 56) as u64;
 
-    let base = if e_type == ET_DYN { DYN_BASE } else { 0 };
+    let base = match base_override {
+        Some(base) if e_type == ET_DYN => base,
+        _ if e_type == ET_DYN => DYN_BASE,
+        _ => 0,
+    };
 
     // Collect the final protection for every page first: two segments may
     // share a page when the linker did not pad them apart.
@@ -203,11 +219,15 @@ pub fn load(space: &AddressSpace, data: &[u8]) -> Result<LoadedImage, Errno> {
         }
     }
 
-    let mut interp_offset = None;
+    let mut interp = None;
     let mut tls = (0u64, 0u64, 0u64, 0u64);
     for ph in &phdrs {
         if ph.p_type == PT_INTERP {
-            interp_offset = Some((ph.p_offset as usize, ph.p_filesz as usize));
+            let start = ph.p_offset as usize;
+            let end = (start + ph.p_filesz as usize).min(data.len());
+            if let Ok(text) = core::str::from_utf8(&data[start..end]) {
+                interp = Some(alloc::string::String::from(text.trim_end_matches('\0')));
+            }
         }
         if ph.p_type == PT_TLS {
             tls = (base + ph.p_vaddr, ph.p_filesz, ph.p_memsz, ph.p_align.max(1));
@@ -243,7 +263,7 @@ pub fn load(space: &AddressSpace, data: &[u8]) -> Result<LoadedImage, Errno> {
         phnum,
         base,
         brk_start: page_align_up(brk_start),
-        interp_offset,
+        interp,
         tls_vaddr: tls.0,
         tls_filesz: tls.1,
         tls_memsz: tls.2,

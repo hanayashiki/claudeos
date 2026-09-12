@@ -14,11 +14,11 @@ banner() {
 
 # Run a script or program inside the OS and require "N passed, 0 failed".
 run_suite() {
-  local name="$1" append="$2" timeout="$3"
+  local name="$1" append="$2" timeout="$3" image="${4:-$ROOT/build/initramfs.cpio}"
   banner "$name"
   local output
   output="$("$ROOT/scripts/run.sh" --timeout "$timeout" \
-      --initrd "$ROOT/build/initramfs.cpio" --append "$append" 2>&1 | tr -d '\r')"
+      --initrd "$image" --append "$append" 2>&1 | tr -d '\r')"
   echo "$output"
   echo
 
@@ -85,6 +85,13 @@ if [ -x "$ROOT/build/rootfs/bin/busybox" ]; then
   run_suite "upstream busybox" "/root/busybox.sh" 300
 else
   echo ">> upstream busybox: skipped (run scripts/fetch-busybox.sh)"
+  echo
+fi
+if [ -f "$ROOT/build/alpine.cpio" ]; then
+  run_suite "alpine linux userland" "init=/bin/sh /root/alpine.sh" 300 \
+      "$ROOT/build/alpine.cpio"
+else
+  echo ">> alpine linux userland: skipped (run scripts/fetch-alpine.sh)"
   echo
 fi
 run_interactive

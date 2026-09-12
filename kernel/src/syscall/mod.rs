@@ -24,8 +24,11 @@ pub fn init() {
     msr::write(msr::IA32_EFER, efer | msr::EFER_SCE);
 }
 
-/// Set to a syscall number to trace it, or `u64::MAX` to trace everything.
-pub static mut TRACE: u64 = 0;
+/// Which system calls to log: -1 for none, -2 for all, otherwise the number
+/// of the one to follow. A signed sentinel keeps 0 (read) traceable.
+pub static mut TRACE: i64 = -1;
+pub const TRACE_OFF: i64 = -1;
+pub const TRACE_ALL: i64 = -2;
 
 #[no_mangle]
 pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
@@ -33,24 +36,29 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
     let args = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9];
 
     let trace = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(TRACE)) };
-    if trace == u64::MAX || (trace != 0 && trace == number) {
-        crate::println!(
-            "[syscall] pid={} {} ({}) args={:#x} {:#x} {:#x} {:#x}",
-            sched::current().pid,
-            number,
-            name_of(number),
-            args[0],
-            args[1],
-            args[2],
-            args[3]
-        );
-    }
+    let traced = trace == TRACE_ALL || (trace >= 0 && trace as u64 == number);
 
     let result = handle(number, &args, frame);
     frame.rax = match result {
         Ok(value) => value,
         Err(err) => err.as_ret(),
     };
+
+    if traced {
+        crate::println!(
+            "[syscall] pid={} {}({:#x}, {:#x}, {:#x}, {:#x}) = {}",
+            sched::current().pid,
+            name_of(number),
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            match result {
+                Ok(value) => alloc::format!("{}", value as i64),
+                Err(err) => alloc::format!("-{:?}", err),
+            }
+        );
+    }
 
     sched::check_signals();
 }

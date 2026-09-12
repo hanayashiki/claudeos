@@ -4,11 +4,21 @@ An x86-64 operating system kernel written from scratch in Rust that implements
 enough of the Linux system call interface to run unmodified static Linux
 binaries.
 
-A stock `rustc --target x86_64-unknown-linux-musl` executable, a C program
-linked against musl, or an upstream busybox binary downloaded from busybox.net
-all run on it without changes. The userland shipped here is built that way: it
-is an ordinary Linux program, not something written against a private kernel
-interface.
+It boots an unmodified Alpine Linux root filesystem. It also runs a stock
+`rustc --target x86_64-unknown-linux-musl` executable, a C program linked
+against musl, and an upstream busybox binary downloaded from busybox.net. The
+userland shipped here is built the same way: an ordinary Linux program, not
+something written against a private kernel interface.
+
+```
+claudeos: starting /bin/sh as pid 1
+/ # cat /etc/alpine-release
+3.19.1
+/ # busybox | head -n 1
+BusyBox v1.36.1 (2023-11-07 18:53:09 UTC) multi-call binary.
+/ # echo hello | gzip | gunzip
+hello
+```
 
 ```
 claudeos:/root# uname -a
@@ -38,6 +48,13 @@ make run                     # boot into an interactive shell
 make test                    # run every self-test suite
 make demo                    # run the scripted tour
 make busybox                 # fetch an upstream busybox to test against
+make alpine                  # fetch an Alpine root filesystem to boot
+```
+
+After `make alpine`, boot into Alpine itself:
+
+```sh
+./scripts/run.sh --initrd build/alpine.cpio --append 'init=/bin/sh'
 ```
 
 `make run` gives a shell on the serial console. `exit` powers the machine off.
@@ -79,6 +96,13 @@ read does not shut out the device it is waiting for. Around 130 Linux system
 call numbers are implemented, including the file, memory, process, thread,
 signal, and time groups that a libc start-up sequence and a threaded program
 actually exercise.
+
+**Programs.** The ELF loader takes static executables, static-PIE, and
+dynamically linked ones. For the last, it loads the program interpreter the
+binary names, reports the interpreter's load address in `AT_BASE` and the
+program's own entry in `AT_ENTRY`, and starts execution in the interpreter,
+which then relocates and runs the program. That is what lets Alpine's musl
+loader bring up Alpine's userland.
 
 **Signals.** A handler installed with `rt_sigaction` is really entered: the
 kernel writes the same `rt_sigframe` Linux does onto the user stack, points the
@@ -146,6 +170,12 @@ failures.
   host computes for the same input), `ps`, `df`, `xargs`, `timeout`, and
   busybox's own `ash` shell running loops, pipelines and arithmetic. Run
   `make busybox` first to fetch it; the suite is skipped when it is absent.
+- `tests/alpine.sh` runs **29 checks** inside an unmodified Alpine Linux root
+  filesystem, where every program is dynamically linked and loaded by Alpine's
+  own musl loader: `awk`, `sed`, `tar` with gzip, `md5sum` and `sha256sum`
+  against digests the host computes, `find`, `stat`, `ps`, and ash running
+  loops, `case` and here-documents. Run `make alpine` first; the suite is
+  skipped when it is absent.
 - An **interactive session** is driven over the serial console: typing after
   boot, backspace and Ctrl-U line editing, `Ctrl-C` on a running job, a
   background job, and the clock advancing while the shell is blocked in a read.
@@ -177,14 +207,13 @@ tools/drive.py        drives the console over a socket, rendering as a terminal
 scripts/reap-stale.sh clears QEMU instances an earlier run left behind
 tests/suite.sh        in-OS shell and userland test suite
 tests/busybox.sh      in-OS suite driving an upstream busybox
+tests/alpine.sh       in-OS suite run inside an Alpine root filesystem
 ```
 
 ## Limitations
 
 Single CPU; no SMP. There is no block device driver or on-disk filesystem: the
 root filesystem lives in RAM and changes do not survive a reboot. There is no
-networking, so the socket calls return `EAFNOSUPPORT`. Dynamically linked
-executables are rejected; only static and static-PIE ELF binaries load. Job
-control stops at process groups and the foreground terminal: `SIGTSTP` and `fg`
+networking, so the socket calls return `EAFNOSUPPORT`. Job control stops at process groups and the foreground terminal: `SIGTSTP` and `fg`
 are not implemented. `futex`, `poll` and `select` still wait by re-checking
 rather than by queueing, though they yield or sleep rather than spin.

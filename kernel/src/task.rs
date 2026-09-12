@@ -406,6 +406,7 @@ pub fn build_user_stack(
     argv: &[String],
     envp: &[String],
     exec_path: &str,
+    interp_base: u64,
 ) -> Result<u64, Errno> {
     let stack_low = USER_STACK_TOP - STACK_RESERVE;
     task.add_vma(stack_low, USER_STACK_TOP, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
@@ -462,7 +463,7 @@ pub fn build_user_stack(
         (AT_PHENT, image.phent),
         (AT_PHNUM, image.phnum),
         (AT_PAGESZ, PAGE_SIZE_U64),
-        (AT_BASE, 0),
+        (AT_BASE, interp_base),
         (AT_FLAGS, 0),
         (AT_ENTRY, image.entry),
         (AT_UID, 0),

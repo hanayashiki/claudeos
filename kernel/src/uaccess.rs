@@ -26,24 +26,31 @@ pub fn validate(addr: u64, len: u64, write: bool) -> Result<(), Errno> {
         match task.space.flags_of(page) {
             Some(flags) => {
                 if write && flags & WRITABLE == 0 {
-                    return Err(Errno::EFAULT);
+                    // A page shared after a fork is read-only until someone
+                    // writes to it. The kernel writing on the task's behalf
+                    // counts, so take the private copy here rather than
+                    // reporting a bad address.
+                    if !task.handle_cow(page) {
+                        return Err(Errno::EFAULT);
+                    }
                 }
             }
             None => {
                 if !task.fault_in(page) {
                     return Err(Errno::EFAULT);
                 }
-                if write {
-                    match task.space.flags_of(page) {
-                        Some(flags) if flags & WRITABLE != 0 => {}
-                        _ => return Err(Errno::EFAULT),
-                    }
+                if write && !writable(task, page) {
+                    return Err(Errno::EFAULT);
                 }
             }
         }
         page += PAGE_SIZE_U64;
     }
     Ok(())
+}
+
+fn writable(task: &crate::task::Task, page: u64) -> bool {
+    matches!(task.space.flags_of(page), Some(flags) if flags & WRITABLE != 0)
 }
 
 pub fn read_bytes(addr: u64, buf: &mut [u8]) -> Result<(), Errno> {

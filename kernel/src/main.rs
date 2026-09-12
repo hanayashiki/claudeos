@@ -41,13 +41,13 @@ extern "C" {
 /// Options parsed out of the boot loader command line.
 struct BootOptions {
     init: String,
-    trace: u64,
+    trace: i64,
     args: Vec<String>,
 }
 
 fn parse_cmdline(cmdline: Option<&str>) -> BootOptions {
     let mut options =
-        BootOptions { init: "/bin/init".to_string(), trace: 0, args: Vec::new() };
+        BootOptions { init: "/bin/init".to_string(), trace: syscall::TRACE_OFF, args: Vec::new() };
     let Some(cmdline) = cmdline else { return options };
     // The boot loader puts the kernel's own path in the first word.
     for word in cmdline.split_whitespace().skip(1) {
@@ -55,9 +55,9 @@ fn parse_cmdline(cmdline: Option<&str>) -> BootOptions {
             options.init = value.to_string();
         } else if let Some(value) = word.strip_prefix("trace=") {
             options.trace = if value == "all" {
-                u64::MAX
+                syscall::TRACE_ALL
             } else {
-                value.parse().unwrap_or(0)
+                value.parse().unwrap_or(syscall::TRACE_OFF)
             };
         } else {
             // Anything else is handed to the init process as an argument.
