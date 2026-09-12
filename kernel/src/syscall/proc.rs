@@ -136,7 +136,7 @@ pub fn exec_into_current(
     mut argv: Vec<String>,
     envp: Vec<String>,
 ) -> Result<(), Errno> {
-    let (data, shebang) = task::read_executable(path)?;
+    let (node, shebang) = task::read_executable(path)?;
     let mut exec_path = path.to_string();
 
     if let Some((interp, extra)) = shebang {
@@ -153,7 +153,7 @@ pub fn exec_into_current(
         exec_path = interp;
     }
 
-    elf::validate(&data)?;
+    elf::validate(&node.inner.lock().data)?;
 
     let old_space = sched::current().space;
     let new_space = AddressSpace::new_user().ok_or(Errno::ENOMEM)?;
@@ -170,7 +170,9 @@ pub fn exec_into_current(
     task.mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
     unsafe { new_space.switch_to() };
 
-    let image = match elf::load(&new_space, &data) {
+    // The file stays locked while its headers are read and its first pages
+    // are assembled; the rest arrives through the fault handler later.
+    let image = match elf::load_at(&new_space, &node.inner.lock().data, None, Some(node.clone())) {
         Ok(image) => image,
         Err(err) => {
             task.space = old_space;
@@ -182,8 +184,19 @@ pub fn exec_into_current(
 
     task.set_heap_base(image.brk_start);
     // Record the image so /proc reports it and mmap never lands on top of it.
-    for (start, end, prot) in &image.segments {
-        task.add_vma(*start, *end, *prot, MAP_PRIVATE);
+    // A segment that names a file has not been read in: its pages come from
+    // there as the program reaches them.
+    for segment in &image.segments {
+        match &segment.file {
+            Some(file) => task.add_file_vma(
+                segment.start,
+                segment.end,
+                segment.prot,
+                MAP_PRIVATE,
+                file.clone(),
+            ),
+            None => task.add_vma(segment.start, segment.end, segment.prot, MAP_PRIVATE),
+        }
     }
 
     // A dynamically linked program names an interpreter that has to be loaded
@@ -196,12 +209,23 @@ pub fn exec_into_current(
             .map_err(|_| Errno::ENOENT)
             .and_then(|node| {
                 let data = node.inner.lock().data.clone();
-                elf::load_at(&new_space, &data, Some(elf::INTERP_BASE))
+                elf::load_at(&new_space, &data, Some(elf::INTERP_BASE), Some(node.clone()))
             });
         match loaded {
             Ok(interp_image) => {
-                for (start, end, prot) in &interp_image.segments {
-                    task.add_vma(*start, *end, *prot, MAP_PRIVATE);
+                for segment in &interp_image.segments {
+                    match &segment.file {
+                        Some(file) => task.add_file_vma(
+                            segment.start,
+                            segment.end,
+                            segment.prot,
+                            MAP_PRIVATE,
+                            file.clone(),
+                        ),
+                        None => {
+                            task.add_vma(segment.start, segment.end, segment.prot, MAP_PRIVATE)
+                        }
+                    }
                 }
                 task.set_heap_base(image.brk_start.max(interp_image.brk_start));
                 interp_base = interp_image.base;
@@ -643,23 +667,40 @@ pub fn futex(uaddr: u64, op: u32, val: u32, timeout: u64) -> SysResult {
                 let ns = spec.tv_sec as u64 * 1_000_000_000 + spec.tv_nsec as u64;
                 crate::trap::ticks() + crate::time::ns_to_ticks(ns)
             };
-            while uaccess::read_u32(uaddr)? == val {
-                if crate::trap::ticks() >= deadline {
+            let key = crate::futex::futex_key(uaddr);
+            loop {
+                // Register first: a wake that lands between the read below and
+                // the sleep is then a flag on the registration, not a wake-up
+                // nobody received.
+                crate::futex::register(key);
+                let result = (|| -> Result<Option<u64>, Errno> {
+                    if uaccess::read_u32(uaddr)? != val {
+                        return Ok(Some(0));
+                    }
+                    if sched::has_pending_signal() {
+                        return Err(Errno::EINTR);
+                    }
+                    Ok(None)
+                })();
+                match result {
+                    Err(err) => {
+                        crate::futex::unregister(key);
+                        return Err(err);
+                    }
+                    Ok(Some(value)) => {
+                        crate::futex::unregister(key);
+                        return Ok(value);
+                    }
+                    Ok(None) => {}
+                }
+                let in_time = crate::futex::sleep_until(key, deadline);
+                crate::futex::unregister(key);
+                if !in_time {
                     return Err(Errno::ETIMEDOUT);
                 }
-                if sched::has_pending_signal() {
-                    return Err(Errno::EINTR);
-                }
-                sched::yield_or_sleep();
             }
-            Ok(0)
         }
-        FUTEX_WAKE => {
-            // Waiters re-read the word themselves, so handing them the CPU is
-            // all that is needed.
-            sched::yield_now();
-            Ok(0)
-        }
+        FUTEX_WAKE => Ok(crate::futex::wake(crate::futex::futex_key(uaddr), val) as u64),
         _ => Err(Errno::ENOSYS),
     }
 }

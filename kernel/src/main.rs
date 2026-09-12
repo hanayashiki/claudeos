@@ -14,6 +14,7 @@ mod console;
 mod cpu;
 mod elf;
 mod fs;
+mod futex;
 mod io;
 mod mm;
 mod multiboot;
@@ -104,6 +105,12 @@ pub extern "C" fn kmain(mb_info_phys: u64, magic: u64) -> ! {
     time::init();
     console::init();
     cpu::pic::unmask(0);
+    // Measure the timestamp counter against the tick. This has to happen
+    // before there is anything to schedule, or the calibration loop is
+    // preempted and measures the whole system instead of itself.
+    sync::enable_interrupts();
+    time::calibrate();
+    sync::disable_interrupts();
 
     syscall::init();
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(syscall::TRACE), options.trace) };

@@ -3,7 +3,7 @@
 use crate::abi::Errno;
 use crate::mm::paging::{AddressSpace, NO_EXECUTE, PRESENT, USER, WRITABLE};
 use crate::mm::{page_align_down, page_align_up, PAGE_SIZE_U64};
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 
 pub const ET_EXEC: u16 = 2;
 pub const ET_DYN: u16 = 3;
@@ -39,9 +39,18 @@ pub struct LoadedImage {
     pub tls_filesz: u64,
     pub tls_memsz: u64,
     pub tls_align: u64,
-    /// The mapped segments, as (start, end, PROT_* bits), so the task can
-    /// record them alongside its other regions.
-    pub segments: alloc::vec::Vec<(u64, u64, u64)>,
+    /// The mapped segments, so the task can record them alongside its other
+    /// regions. A segment with a file mapping has not been read in yet: its
+    /// pages arrive as the program reaches them.
+    pub segments: alloc::vec::Vec<Segment>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Segment {
+    pub start: u64,
+    pub end: u64,
+    pub prot: u64,
+    pub file: Option<crate::task::FileMap>,
 }
 
 fn rd16(data: &[u8], off: usize) -> u16 {
@@ -111,14 +120,17 @@ pub fn program_headers(data: &[u8]) -> Result<alloc::vec::Vec<ProgramHeader>, Er
 /// Map `data`'s PT_LOAD segments into `space`, which must be the active
 /// address space so the segment contents can be written directly.
 pub fn load(space: &AddressSpace, data: &[u8]) -> Result<LoadedImage, Errno> {
-    load_at(space, data, None)
+    load_at(space, data, None, None)
 }
 
-/// As `load`, but with an explicit load address for a relocatable image.
+/// As `load`, but with an explicit load address for a relocatable image, and
+/// with the file the image came from so its pages can be read in on demand
+/// rather than copied here.
 pub fn load_at(
     space: &AddressSpace,
     data: &[u8],
     base_override: Option<u64>,
+    node: Option<crate::fs::NodeRef>,
 ) -> Result<LoadedImage, Errno> {
     let e_type = validate(data)?;
     let phdrs = program_headers(data)?;
@@ -161,8 +173,52 @@ pub fn load_at(
         return Err(Errno::ENOEXEC);
     }
 
-    // Map every page writable so the contents can be copied in, then tighten.
+    // Pages that cannot be left to a fault: a partial head or tail, anything
+    // past the file's contents, and any page two segments share. A page in
+    // one of those cases has to be assembled from more than one source, and
+    // the fault handler only knows how to fill a page from one.
+    let mut eager: BTreeSet<u64> = BTreeSet::new();
+    for ph in &phdrs {
+        if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
+            continue;
+        }
+        let start = base + ph.p_vaddr;
+        let file_end = start + ph.p_filesz;
+        let end = page_align_up(start + ph.p_memsz);
+        eager.insert(page_align_down(start));
+        let mut page = page_align_down(file_end);
+        while page < end {
+            eager.insert(page);
+            page += PAGE_SIZE_U64;
+        }
+    }
+    // A page inside more than one segment has to be assembled here too.
+    let mut seen: BTreeMap<u64, usize> = BTreeMap::new();
+    for (index, ph) in phdrs.iter().enumerate() {
+        if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
+            continue;
+        }
+        let mut page = page_align_down(base + ph.p_vaddr);
+        let end = page_align_up(base + ph.p_vaddr + ph.p_memsz);
+        while page < end {
+            match seen.insert(page, index) {
+                Some(other) if other != index => {
+                    eager.insert(page);
+                }
+                _ => {}
+            }
+            page += PAGE_SIZE_U64;
+        }
+    }
+    // Without a file to read from later, everything has to be read now.
+    if node.is_none() {
+        eager.extend(page_flags.keys().copied());
+    }
+
     for page in page_flags.keys() {
+        if !eager.contains(page) {
+            continue;
+        }
         space
             .map_new(*page, PRESENT | WRITABLE | USER)
             .map_err(|_| Errno::ENOMEM)?;
@@ -177,19 +233,27 @@ pub fn load_at(
         if file_end > data.len() {
             return Err(Errno::ENOEXEC);
         }
-        unsafe {
-            let src = data.as_ptr().add(ph.p_offset as usize);
-            core::ptr::copy_nonoverlapping(src, dest as *mut u8, ph.p_filesz as usize);
-            // .bss and any partial tail page must read as zero.
-            let zero_from = dest + ph.p_filesz;
-            let zero_len = ph.p_memsz - ph.p_filesz;
-            if zero_len > 0 {
-                core::ptr::write_bytes(zero_from as *mut u8, 0, zero_len as usize);
+        // Copy only what lands in a page that was mapped here. A fresh frame
+        // is already zero, so .bss needs nothing written.
+        let mut offset = 0u64;
+        while offset < ph.p_filesz {
+            let address = dest + offset;
+            let page = page_align_down(address);
+            let chunk = (page + PAGE_SIZE_U64 - address).min(ph.p_filesz - offset);
+            if eager.contains(&page) {
+                unsafe {
+                    let src = data.as_ptr().add((ph.p_offset + offset) as usize);
+                    core::ptr::copy_nonoverlapping(src, address as *mut u8, chunk as usize);
+                }
             }
+            offset += chunk;
         }
     }
 
     for (page, flags) in &page_flags {
+        if !eager.contains(page) {
+            continue;
+        }
         let mut bits = PRESENT | USER;
         if flags & PF_W != 0 {
             bits |= WRITABLE;
@@ -249,11 +313,16 @@ pub fn load_at(
         if ph.p_flags & PF_X != 0 {
             prot |= crate::abi::PROT_EXEC;
         }
-        segments.push((
-            page_align_down(base + ph.p_vaddr),
-            page_align_up(base + ph.p_vaddr + ph.p_memsz),
-            prot,
-        ));
+        let start = page_align_down(base + ph.p_vaddr);
+        let end = page_align_up(base + ph.p_vaddr + ph.p_memsz);
+        // The region's file mapping is described from its page-aligned start,
+        // which is where the fault handler measures from.
+        let file = node.as_ref().map(|node| crate::task::FileMap {
+            node: node.clone(),
+            offset: ph.p_offset - (base + ph.p_vaddr - start),
+            length: ph.p_filesz + (base + ph.p_vaddr - start),
+        });
+        segments.push(Segment { start, end, prot, file });
     }
 
     Ok(LoadedImage {

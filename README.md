@@ -83,6 +83,10 @@ Scheduling is round-robin, preemptive, driven by the 100 Hz timer tick.
 Anonymous memory is demand-paged: `mmap` and `brk` record a region and the
 page fault handler supplies pages on first touch.
 
+**Time.** The timestamp counter is calibrated against the timer tick at boot,
+so `CLOCK_MONOTONIC` has real resolution rather than the 10 ms of the tick. The
+tick still drives scheduling and timeouts.
+
 **Blocking.** A task waiting for the terminal or a pipe sleeps on a wait queue
 rather than spinning, so the scheduler reaches the idle task and the CPU halts
 until an interrupt arrives. Sitting at the shell prompt costs about 1% of a
@@ -98,7 +102,10 @@ signal, and time groups that a libc start-up sequence and a threaded program
 actually exercise.
 
 **Programs.** The ELF loader takes static executables, static-PIE, and
-dynamically linked ones. For the last, it loads the program interpreter the
+dynamically linked ones. A program is not copied into memory at `exec`: its
+pages are read from the file as it reaches them, and only the pages an image
+cannot leave to a fault, a partial head or tail and anything past the file's
+contents, are assembled up front. For the last, it loads the program interpreter the
 binary names, reports the interpreter's load address in `AT_BASE` and the
 program's own entry in `AT_ENTRY`, and starts execution in the interpreter,
 which then relocates and runs the program. That is what lets Alpine's musl

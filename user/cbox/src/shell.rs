@@ -1545,9 +1545,12 @@ impl Shell {
                     stopped: false,
                 };
                 self.next_job += 1;
-                // Job control chatter belongs on stderr, so it does not end up
-                // inside a command substitution.
-                eprintln!("[{}] {}", job.id, pid);
+                // Only a person at a terminal is told about jobs starting and
+                // finishing; a script would have the notices land in its
+                // output, which is not what a shell does.
+                if self.job_control {
+                    eprintln!("[{}] {}", job.id, pid);
+                }
                 self.jobs.push(job);
                 self.last_background = Some(*pid);
             }
@@ -2135,7 +2138,9 @@ impl Shell {
             };
             if sys::stop_signal_of(status).is_some() {
                 self.jobs[index].stopped = true;
-                eprintln!("[{}]+  Stopped  {}", self.jobs[index].id, self.jobs[index].command);
+                if self.job_control {
+                    eprintln!("[{}]+  Stopped  {}", self.jobs[index].id, self.jobs[index].command);
+                }
                 continue;
             }
             if sys::is_continued(status) {
@@ -2145,7 +2150,9 @@ impl Shell {
             self.jobs[index].pids.retain(|p| *p != pid as i32);
             if self.jobs[index].pids.is_empty() {
                 let job = self.jobs.remove(index);
-                eprintln!("[done] {} ({})", job.command, sys::exit_code_of(status));
+                if self.job_control {
+                    eprintln!("[done] {} ({})", job.command, sys::exit_code_of(status));
+                }
             }
         }
     }

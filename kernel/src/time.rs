@@ -1,13 +1,62 @@
 //! Wall clock and monotonic time.
 //!
-//! The CMOS real-time clock is read once at boot; from there on time advances
-//! with the timer tick.
+//! The CMOS real-time clock is read once at boot. Elapsed time comes from the
+//! timestamp counter, calibrated against the timer tick, because a clock that
+//! only advances 100 times a second cannot measure anything a program is
+//! likely to be timing.
 
 use crate::cpu::pit::TICK_HZ;
 use crate::io::{inb, outb};
 use crate::sync::Spinlock;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 static BOOT_UNIX_TIME: Spinlock<i64> = Spinlock::new(0);
+
+/// Timestamp counter reading at the end of calibration, and how many of its
+/// units make a second. Zero means calibration has not run, and time falls
+/// back to the tick count.
+static TSC_BASE: AtomicU64 = AtomicU64::new(0);
+static TSC_PER_SECOND: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn rdtsc() -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
+    }
+    ((high as u64) << 32) | low as u64
+}
+
+/// Measure the timestamp counter against the timer tick.
+///
+/// Called once interrupts are on and the tick is running. Ticks are the only
+/// other clock, so the calibration is no better than a tick: it waits for a
+/// tick edge, counts over several ticks, and divides.
+pub fn calibrate() {
+    const TICKS: u64 = 5;
+    let start_tick = crate::trap::ticks();
+    while crate::trap::ticks() == start_tick {
+        core::hint::spin_loop();
+    }
+    let begin_tick = crate::trap::ticks();
+    let begin = rdtsc();
+    while crate::trap::ticks() < begin_tick + TICKS {
+        core::hint::spin_loop();
+    }
+    let elapsed_ticks = crate::trap::ticks() - begin_tick;
+    let elapsed = rdtsc() - begin;
+    if elapsed_ticks == 0 || elapsed == 0 {
+        return;
+    }
+    let per_second = elapsed * TICK_HZ as u64 / elapsed_ticks;
+    // The counter's zero is whenever the machine started; take the reading at
+    // the end of calibration as the base and add the time already elapsed.
+    TSC_PER_SECOND.store(per_second, Ordering::Release);
+    let elapsed_ns = crate::trap::ticks() * (1_000_000_000 / TICK_HZ as u64);
+    let base = rdtsc().saturating_sub(elapsed_ns * per_second / 1_000_000_000);
+    TSC_BASE.store(base, Ordering::Release);
+}
 
 const CMOS_ADDRESS: u16 = 0x70;
 const CMOS_DATA: u16 = 0x71;
@@ -74,7 +123,12 @@ pub fn init() {
 
 /// Nanoseconds since boot.
 pub fn monotonic_ns() -> u64 {
-    crate::trap::ticks() * (1_000_000_000 / TICK_HZ as u64)
+    let per_second = TSC_PER_SECOND.load(Ordering::Acquire);
+    if per_second == 0 {
+        return crate::trap::ticks() * (1_000_000_000 / TICK_HZ as u64);
+    }
+    let elapsed = rdtsc().saturating_sub(TSC_BASE.load(Ordering::Acquire));
+    (elapsed as u128 * 1_000_000_000u128 / per_second as u128) as u64
 }
 
 pub fn monotonic_parts() -> (i64, i64) {

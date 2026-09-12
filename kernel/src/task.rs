@@ -36,13 +36,35 @@ pub enum State {
     Dead,
 }
 
+/// Where a region's contents come from, for a region backed by a file.
+///
+/// An executable is not copied into memory at exec: the pages are filled one
+/// at a time from the file as the program reaches them, which is most of what
+/// makes starting a program cheap.
+#[derive(Clone)]
+pub struct FileMap {
+    pub node: crate::fs::NodeRef,
+    /// Offset in the file of the region's first byte.
+    pub offset: u64,
+    /// Bytes from the start of the region that come from the file. Anything
+    /// past this reads as zero, which is what .bss is.
+    pub length: u64,
+}
+
+impl core::fmt::Debug for FileMap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "FileMap {{ offset: {:#x}, length: {:#x} }}", self.offset, self.length)
+    }
+}
+
 /// A region of the user address space, used to fault pages in on demand.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Vma {
     pub start: u64,
     pub end: u64,
     pub prot: u64,
     pub flags: u64,
+    pub file: Option<FileMap>,
 }
 
 impl Vma {
@@ -245,11 +267,15 @@ impl Task {
     }
 
     pub fn add_vma(&self, start: u64, end: u64, prot: u64, flags: u64) {
-        self.mm.lock().vmas.push(Vma { start, end, prot, flags });
+        self.mm.lock().vmas.push(Vma { start, end, prot, flags, file: None });
+    }
+
+    pub fn add_file_vma(&self, start: u64, end: u64, prot: u64, flags: u64, file: FileMap) {
+        self.mm.lock().vmas.push(Vma { start, end, prot, flags, file: Some(file) });
     }
 
     pub fn find_vma(&self, addr: u64) -> Option<Vma> {
-        self.mm.lock().vmas.iter().find(|v| v.contains(addr)).copied()
+        self.mm.lock().vmas.iter().find(|v| v.contains(addr)).cloned()
     }
 
     pub fn clear_vmas(&self) {
@@ -306,16 +332,29 @@ impl Task {
     pub fn remove_vma_range(&self, start: u64, end: u64) {
         let mut mm = self.mm.lock();
         let mut out: Vec<Vma> = Vec::new();
-        for vma in mm.vmas.iter().copied() {
+        for vma in mm.vmas.iter().cloned() {
             if vma.end <= start || vma.start >= end {
                 out.push(vma);
                 continue;
             }
             if vma.start < start {
-                out.push(Vma { end: start, ..vma });
+                let mut head = vma.clone();
+                head.end = start;
+                if let Some(file) = &mut head.file {
+                    file.length = file.length.min(start - vma.start);
+                }
+                out.push(head);
             }
             if vma.end > end {
-                out.push(Vma { start: end, ..vma });
+                let mut tail = vma.clone();
+                tail.start = end;
+                // The tail begins further into the file than the whole did.
+                if let Some(file) = &mut tail.file {
+                    let skipped = end - vma.start;
+                    file.offset += skipped;
+                    file.length = file.length.saturating_sub(skipped);
+                }
+                out.push(tail);
             }
         }
         mm.vmas = out;
@@ -328,9 +367,9 @@ impl Task {
         let mut candidate = mm.mmap_top;
         loop {
             let end = candidate + len;
-            let clash = mm.vmas.iter().find(|v| v.start < end && candidate < v.end).copied();
+            let clash = mm.vmas.iter().find(|v| v.start < end && candidate < v.end).map(|v| v.end);
             match clash {
-                Some(v) => candidate = v.end,
+                Some(v) => candidate = v,
                 None => {
                     mm.mmap_top = end;
                     return candidate;
@@ -389,7 +428,7 @@ impl Task {
             let mm = self.mm.lock();
             (
                 page >= mm.brk_start && page < mm.brk,
-                mm.vmas.iter().find(|v| v.contains(page)).copied(),
+                mm.vmas.iter().find(|v| v.contains(page)).cloned(),
             )
         };
         if in_heap {
@@ -401,7 +440,34 @@ impl Task {
         let Some(vma) = vma else {
             return false;
         };
-        self.space.map_new(page, vma.page_flags()).is_ok()
+        let Some(file) = &vma.file else {
+            return self.space.map_new(page, vma.page_flags()).is_ok();
+        };
+
+        // A page of an executable: map it writable, fill it from the file,
+        // then give it the protection the segment asked for. A fresh frame is
+        // already zero, so the part past the file's contents needs nothing.
+        if self.space.map_new(page, PRESENT | WRITABLE | USER).is_err() {
+            return false;
+        }
+        let into = page - vma.start;
+        if into < file.length {
+            let want = (file.length - into).min(PAGE_SIZE_U64) as usize;
+            let from = (file.offset + into) as usize;
+            let data = file.node.inner.lock();
+            let available = data.data.len().saturating_sub(from).min(want);
+            if available > 0 {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        data.data.as_ptr().add(from),
+                        page as *mut u8,
+                        available,
+                    );
+                }
+            }
+        }
+        self.space.set_flags(page, vma.page_flags());
+        true
     }
 
     pub fn free_kernel_stack(&mut self) {
@@ -559,7 +625,12 @@ pub fn attach_console(task: &mut Task) -> Result<(), Errno> {
 }
 
 /// Read a file's contents, following a `#!` line if present.
-pub fn read_executable(path: &str) -> Result<(Vec<u8>, Option<(String, Option<String>)>), Errno> {
+/// Find the file exec should run: the named one, or the interpreter its `#!`
+/// line names. The file itself is not read here; exec reads what it needs
+/// straight out of the node, and the pages come from there afterwards.
+pub fn read_executable(
+    path: &str,
+) -> Result<(crate::fs::NodeRef, Option<(String, Option<String>)>), Errno> {
     let node = crate::fs::lookup(path)?;
     if node.is_dir() {
         return Err(Errno::EACCES);
@@ -567,25 +638,32 @@ pub fn read_executable(path: &str) -> Result<(Vec<u8>, Option<(String, Option<St
     if node.mode() & 0o111 == 0 {
         return Err(Errno::EACCES);
     }
-    let data = node.inner.lock().data.clone();
-    if data.starts_with(b"#!") {
-        let line_end = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
-        let line = core::str::from_utf8(&data[2..line_end]).map_err(|_| Errno::ENOEXEC)?;
-        let line = line.trim();
-        let mut parts = line.splitn(2, char::is_whitespace);
-        let interp = parts.next().unwrap_or("").trim().to_string();
-        let arg = parts.next().map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
-        if interp.is_empty() {
-            return Err(Errno::ENOEXEC);
+    let shebang = {
+        let inner = node.inner.lock();
+        let data = &inner.data;
+        if data.starts_with(b"#!") {
+            let line_end = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
+            let line = core::str::from_utf8(&data[2..line_end]).map_err(|_| Errno::ENOEXEC)?;
+            let line = line.trim();
+            let mut parts = line.splitn(2, char::is_whitespace);
+            let interp = parts.next().unwrap_or("").trim().to_string();
+            let arg = parts.next().map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
+            if interp.is_empty() {
+                return Err(Errno::ENOEXEC);
+            }
+            Some((interp, arg))
+        } else {
+            None
         }
+    };
+    if let Some((interp, arg)) = shebang {
         let interp_node = crate::fs::lookup(&interp)?;
         if interp_node.mode() & 0o111 == 0 {
             return Err(Errno::EACCES);
         }
-        let interp_data = interp_node.inner.lock().data.clone();
-        return Ok((interp_data, Some((interp, arg))));
+        return Ok((interp_node, Some((interp, arg))));
     }
-    Ok((data, None))
+    Ok((node, None))
 }
 
 /// Entry point for a task created by the kernel rather than by fork: load the

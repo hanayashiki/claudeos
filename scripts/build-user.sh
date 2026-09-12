@@ -13,7 +13,7 @@ mkdir -p "$ROOT/build/toolchain"
 ln -sf "$LLVMBIN/rust-lld" "$ROOT/build/toolchain/ld.lld"
 
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$ROOT/build/toolchain/ld.lld"
-export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
+export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static -C relocation-model=static"
 
 cd "$ROOT/user/cbox"
 cargo build --release --target "$TARGET"

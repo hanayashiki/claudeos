@@ -140,9 +140,16 @@ pub fn render(kind: Generated) -> String {
             )
         }
         Generated::Uptime => {
+            // Seconds since boot, then seconds spent with nothing to run.
             let ns = crate::time::monotonic_ns();
-            format!("{}.{:02} {}.{:02}\n", ns / 1_000_000_000, (ns / 10_000_000) % 100,
-                    ns / 1_000_000_000, (ns / 10_000_000) % 100)
+            let idle = crate::sched::idle_ticks() * (1_000_000_000 / crate::cpu::pit::TICK_HZ as u64);
+            format!(
+                "{}.{:02} {}.{:02}\n",
+                ns / 1_000_000_000,
+                (ns / 10_000_000) % 100,
+                idle / 1_000_000_000,
+                (idle / 10_000_000) % 100
+            )
         }
         Generated::Version => String::from(
             "Linux version 6.1.0-claudeos (claudeos) #1 SMP x86_64\n",

@@ -201,9 +201,20 @@ pub fn yield_or_sleep() {
     }
 }
 
+/// Ticks that found the machine with nothing to run. The difference between
+/// this and the uptime is the time something was actually on the CPU.
+static IDLE_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn idle_ticks() -> u64 {
+    IDLE_TICKS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn on_tick() {
     if !has_current() {
         return;
+    }
+    if unsafe { CURRENT == IDLE } {
+        IDLE_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     schedule();
 }
