@@ -27,7 +27,7 @@
 //! second exchange to show what the round trip costs once the card is past
 //! that window.
 
-use crate::mm::paging::AddressSpace;
+use crate::arch::paging::AddressSpace;
 use crate::sched;
 use crate::sync::Spinlock;
 use crate::task::Task;
@@ -168,7 +168,7 @@ fn exchange(request: &[u8]) -> Option<([u8; 6], u64)> {
 extern "C" fn run() -> ! {
     let Some(nic) = crate::net::interface() else {
         crate::println!("[nettest] no interface attached");
-        crate::power_off();
+        crate::arch::power_off();
     };
     let mac = nic.mac();
     let request = build_request(&mac, GUEST_IP, GATEWAY_IP);
@@ -192,7 +192,7 @@ extern "C" fn run() -> ! {
         crate::println!("[nettest] no arp reply from {}", format_ip(&GATEWAY_IP));
         crate::println!("=== 0 passed, 1 failed ===");
         report_counters();
-        crate::power_off();
+        crate::arch::power_off();
     };
     crate::println!("[nettest] {} is at {}", format_ip(&GATEWAY_IP), format_mac(&gateway));
 
@@ -216,7 +216,7 @@ extern "C" fn run() -> ! {
         }
     }
     report_counters();
-    crate::power_off();
+    crate::arch::power_off();
 }
 
 fn report_counters() {

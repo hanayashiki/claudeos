@@ -1,34 +1,23 @@
 //! Wall clock and monotonic time.
 //!
-//! The CMOS real-time clock is read once at boot. Elapsed time comes from the
-//! timestamp counter, calibrated against the timer tick, because a clock that
-//! only advances 100 times a second cannot measure anything a program is
-//! likely to be timing.
+//! The machine's real-time clock is read once at boot. Elapsed time comes from
+//! the CPU's free-running cycle counter, calibrated against the timer tick,
+//! because a clock that only advances 100 times a second cannot measure
+//! anything a program is likely to be timing.
 
-use crate::cpu::pit::TICK_HZ;
-use crate::io::{inb, outb};
+use crate::arch::{cycle_counter, TICK_HZ};
 use crate::sync::Spinlock;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 static BOOT_UNIX_TIME: Spinlock<i64> = Spinlock::new(0);
 
-/// Timestamp counter reading at the end of calibration, and how many of its
-/// units make a second. Zero means calibration has not run, and time falls
-/// back to the tick count.
-static TSC_BASE: AtomicU64 = AtomicU64::new(0);
-static TSC_PER_SECOND: AtomicU64 = AtomicU64::new(0);
+/// Cycle counter reading at the end of calibration, and how many of its units
+/// make a second. Zero means calibration has not run, and time falls back to
+/// the tick count.
+static CYCLES_BASE: AtomicU64 = AtomicU64::new(0);
+static CYCLES_PER_SECOND: AtomicU64 = AtomicU64::new(0);
 
-#[inline]
-fn rdtsc() -> u64 {
-    let low: u32;
-    let high: u32;
-    unsafe {
-        core::arch::asm!("rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
-    }
-    ((high as u64) << 32) | low as u64
-}
-
-/// Measure the timestamp counter against the timer tick.
+/// Measure the cycle counter against the timer tick.
 ///
 /// Called once interrupts are on and the tick is running. Ticks are the only
 /// other clock, so the calibration is no better than a tick: it waits for a
@@ -40,38 +29,22 @@ pub fn calibrate() {
         core::hint::spin_loop();
     }
     let begin_tick = crate::trap::ticks();
-    let begin = rdtsc();
+    let begin = cycle_counter();
     while crate::trap::ticks() < begin_tick + TICKS {
         core::hint::spin_loop();
     }
     let elapsed_ticks = crate::trap::ticks() - begin_tick;
-    let elapsed = rdtsc() - begin;
+    let elapsed = cycle_counter() - begin;
     if elapsed_ticks == 0 || elapsed == 0 {
         return;
     }
     let per_second = elapsed * TICK_HZ as u64 / elapsed_ticks;
     // The counter's zero is whenever the machine started; take the reading at
     // the end of calibration as the base and add the time already elapsed.
-    TSC_PER_SECOND.store(per_second, Ordering::Release);
+    CYCLES_PER_SECOND.store(per_second, Ordering::Release);
     let elapsed_ns = crate::trap::ticks() * (1_000_000_000 / TICK_HZ as u64);
-    let base = rdtsc().saturating_sub(elapsed_ns * per_second / 1_000_000_000);
-    TSC_BASE.store(base, Ordering::Release);
-}
-
-const CMOS_ADDRESS: u16 = 0x70;
-const CMOS_DATA: u16 = 0x71;
-
-unsafe fn cmos_read(register: u8) -> u8 {
-    outb(CMOS_ADDRESS, register);
-    inb(CMOS_DATA)
-}
-
-unsafe fn update_in_progress() -> bool {
-    cmos_read(0x0A) & 0x80 != 0
-}
-
-fn bcd_to_binary(value: u8) -> u8 {
-    (value & 0x0F) + ((value >> 4) * 10)
+    let base = cycle_counter().saturating_sub(elapsed_ns * per_second / 1_000_000_000);
+    CYCLES_BASE.store(base, Ordering::Release);
 }
 
 /// Days since the Unix epoch for a civil date (Howard Hinnant's algorithm).
@@ -86,48 +59,19 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 }
 
 pub fn init() {
-    unsafe {
-        let mut spins = 0;
-        while update_in_progress() && spins < 1_000_000 {
-            spins += 1;
-        }
-        let second = cmos_read(0x00);
-        let minute = cmos_read(0x02);
-        let hour = cmos_read(0x04);
-        let day = cmos_read(0x07);
-        let month = cmos_read(0x08);
-        let year = cmos_read(0x09);
-        let century = cmos_read(0x32);
-        let status_b = cmos_read(0x0B);
-
-        let binary = status_b & 0x04 != 0;
-        let conv = |v: u8| if binary { v } else { bcd_to_binary(v) };
-
-        let mut hour_value = if binary { hour & 0x7F } else { bcd_to_binary(hour & 0x7F) };
-        // In 12-hour mode the high bit of the hour register means PM.
-        if status_b & 0x02 == 0 && hour & 0x80 != 0 {
-            hour_value = (hour_value % 12) + 12;
-        }
-
-        let century_value = if century == 0 { 20 } else { conv(century) as i64 };
-        let full_year = century_value * 100 + conv(year) as i64;
-
-        let days = days_from_civil(full_year, conv(month) as i64, conv(day) as i64);
-        let unix = days * 86400
-            + hour_value as i64 * 3600
-            + conv(minute) as i64 * 60
-            + conv(second) as i64;
-        *BOOT_UNIX_TIME.lock() = unix;
-    }
+    let now = crate::arch::read_wall_clock();
+    let days = days_from_civil(now.year, now.month, now.day);
+    *BOOT_UNIX_TIME.lock() =
+        days * 86400 + now.hour * 3600 + now.minute * 60 + now.second;
 }
 
 /// Nanoseconds since boot.
 pub fn monotonic_ns() -> u64 {
-    let per_second = TSC_PER_SECOND.load(Ordering::Acquire);
+    let per_second = CYCLES_PER_SECOND.load(Ordering::Acquire);
     if per_second == 0 {
         return crate::trap::ticks() * (1_000_000_000 / TICK_HZ as u64);
     }
-    let elapsed = rdtsc().saturating_sub(TSC_BASE.load(Ordering::Acquire));
+    let elapsed = cycle_counter().saturating_sub(CYCLES_BASE.load(Ordering::Acquire));
     (elapsed as u128 * 1_000_000_000u128 / per_second as u128) as u64
 }
 

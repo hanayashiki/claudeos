@@ -1,19 +1,18 @@
 //! Exception and IRQ handling.
 
-use crate::cpu::idt::{register, TrapFrame, EXCEPTION_NAMES};
-use crate::cpu::{pic, read_cr2};
+use crate::arch::{self, TrapFrame};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
 
 pub fn init() {
-    for vector in 0..32u8 {
-        register(vector, exception);
+    for vector in 0..arch::EXCEPTION_COUNT {
+        arch::register_trap_handler(vector, exception);
     }
-    register(14, page_fault);
-    register(pic::PIC1_OFFSET, timer);
-    for irq in 1..16u8 {
-        register(pic::PIC1_OFFSET + irq, spurious);
+    arch::register_trap_handler(arch::PAGE_FAULT_VECTOR, page_fault);
+    arch::register_irq_handler(arch::TIMER_IRQ, timer);
+    for irq in 1..arch::IRQ_COUNT {
+        arch::register_irq_handler(irq, device);
     }
 }
 
@@ -23,7 +22,7 @@ pub fn ticks() -> u64 {
 
 fn timer(frame: &mut TrapFrame) {
     TICKS.fetch_add(1, Ordering::Relaxed);
-    pic::end_of_interrupt(0);
+    arch::end_of_interrupt(arch::TIMER_IRQ);
     // A task killed while spinning in user mode notices here.
     if frame.from_user() {
         crate::sched::check_signals();
@@ -31,37 +30,37 @@ fn timer(frame: &mut TrapFrame) {
     crate::sched::on_tick();
 }
 
-fn spurious(frame: &mut TrapFrame) {
-    let irq = (frame.vector - pic::PIC1_OFFSET as u64) as u8;
-    if irq == 4 || irq == 3 {
+fn device(frame: &mut TrapFrame) {
+    let Some(irq) = arch::vector_irq(arch::trap_vector(frame)) else { return };
+    if irq == arch::SERIAL_IRQ || irq == arch::SERIAL_IRQ_ALT {
         crate::console::serial_irq();
-    } else if irq == 1 {
+    } else if irq == arch::KEYBOARD_IRQ {
         crate::console::keyboard_irq();
     }
-    pic::end_of_interrupt(irq);
+    arch::end_of_interrupt(irq);
 }
 
 fn page_fault(frame: &mut TrapFrame) {
-    let addr = read_cr2();
-    let code = frame.error_code;
+    let fault = arch::page_fault(frame);
+    let addr = fault.address;
 
     if frame.from_user() {
-        if crate::sched::handle_user_page_fault(addr, code, frame) {
+        if crate::sched::handle_user_page_fault(&fault) {
             return;
         }
         println!(
             "[trap] user page fault at {:#x} rip={:#x} code={:#x}{}{}{}",
             addr,
-            frame.rip,
-            code,
-            if code & 1 != 0 { " protection" } else { " not-present" },
-            if code & 2 != 0 { " write" } else { " read" },
-            if code & 16 != 0 { " instruction-fetch" } else { "" },
+            arch::instruction_pointer(frame),
+            fault.raw,
+            if fault.present { " protection" } else { " not-present" },
+            if fault.write { " write" } else { " read" },
+            if fault.instruction_fetch { " instruction-fetch" } else { "" },
         );
         dump(frame);
         // The registers name the memory the program was walking; show it, so
         // a fault on a structure says what the structure held.
-        for (name, at) in [("r15", frame.r15), ("rbx", frame.rbx), ("rsp", frame.rsp)] {
+        for (name, at) in arch::fault_probe_registers(frame) {
             dump_user(name, at);
         }
         dump_regions(addr);
@@ -72,51 +71,47 @@ fn page_fault(frame: &mut TrapFrame) {
     println!();
     println!("KERNEL PAGE FAULT");
     println!("  address : {:#018x}", addr);
-    println!("  rip     : {:#018x}", frame.rip);
+    println!("  rip     : {:#018x}", arch::instruction_pointer(frame));
     println!(
         "  cause   : {}{}{}{}",
-        if code & 1 != 0 { "protection-violation " } else { "not-present " },
-        if code & 2 != 0 { "write " } else { "read " },
-        if code & 4 != 0 { "user " } else { "kernel " },
-        if code & 16 != 0 { "instruction-fetch" } else { "" },
+        if fault.present { "protection-violation " } else { "not-present " },
+        if fault.write { "write " } else { "read " },
+        if fault.user { "user " } else { "kernel " },
+        if fault.instruction_fetch { "instruction-fetch" } else { "" },
     );
     dump(frame);
     panic!("unrecoverable kernel page fault");
 }
 
 fn exception(frame: &mut TrapFrame) {
-    let vector = frame.vector as usize;
-    let name = EXCEPTION_NAMES.get(vector).copied().unwrap_or("unknown");
+    let vector = arch::trap_vector(frame);
+    let name = arch::exception_name(vector);
 
     if frame.from_user() {
         println!(
             "[trap] user exception {} ({}) rip={:#x} err={:#x}",
-            vector, name, frame.rip, frame.error_code
+            vector,
+            name,
+            arch::instruction_pointer(frame),
+            arch::trap_error_code(frame)
         );
-        let signal = match vector {
-            0 => 8,   // SIGFPE
-            3 => 5,   // SIGTRAP
-            4 => 8,   // SIGFPE
-            6 => 4,   // SIGILL
-            _ => 11,  // SIGSEGV
-        };
-        crate::sched::kill_current(signal);
+        crate::sched::kill_current(arch::exception_signal(vector));
     }
 
     println!();
     println!("KERNEL EXCEPTION {} ({})", vector, name);
-    println!("  error code: {:#x}", frame.error_code);
+    println!("  error code: {:#x}", arch::trap_error_code(frame));
     dump(frame);
     panic!("unhandled kernel exception {}", vector);
 }
 
 pub fn unhandled(frame: &mut TrapFrame) {
-    let vector = frame.vector;
-    if (32..48).contains(&vector) {
-        pic::end_of_interrupt((vector - 32) as u8);
+    let vector = arch::trap_vector(frame);
+    if let Some(irq) = arch::vector_irq(vector) {
+        arch::end_of_interrupt(irq);
         return;
     }
-    println!("[trap] unhandled vector {} rip={:#x}", vector, frame.rip);
+    println!("[trap] unhandled vector {} rip={:#x}", vector, arch::instruction_pointer(frame));
     if frame.from_user() {
         crate::sched::kill_current(11);
     }
@@ -177,11 +172,5 @@ fn dump_user(name: &str, at: u64) {
 }
 
 pub fn dump(frame: &TrapFrame) {
-    println!("  rip {:#018x}  cs  {:#06x}  rflags {:#018x}", frame.rip, frame.cs, frame.rflags);
-    println!("  rsp {:#018x}  ss  {:#06x}", frame.rsp, frame.ss);
-    println!("  rax {:#018x}  rbx {:#018x}  rcx {:#018x}", frame.rax, frame.rbx, frame.rcx);
-    println!("  rdx {:#018x}  rsi {:#018x}  rdi {:#018x}", frame.rdx, frame.rsi, frame.rdi);
-    println!("  rbp {:#018x}  r8  {:#018x}  r9  {:#018x}", frame.rbp, frame.r8, frame.r9);
-    println!("  r10 {:#018x}  r11 {:#018x}  r12 {:#018x}", frame.r10, frame.r11, frame.r12);
-    println!("  r13 {:#018x}  r14 {:#018x}  r15 {:#018x}", frame.r13, frame.r14, frame.r15);
+    arch::dump_registers(frame);
 }

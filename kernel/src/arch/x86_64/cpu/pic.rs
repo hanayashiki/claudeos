@@ -1,6 +1,6 @@
 //! 8259A programmable interrupt controller.
 
-use crate::io::{inb, io_wait, outb};
+use super::super::io::{inb, io_wait, outb};
 
 const PIC1_COMMAND: u16 = 0x20;
 const PIC1_DATA: u16 = 0x21;

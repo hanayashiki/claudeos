@@ -26,10 +26,9 @@
 //! with interrupts on and may allocate, take locks, and transmit replies.
 
 use crate::abi::Errno;
-use crate::cpu::idt::TrapFrame;
-use crate::cpu::pic;
+use crate::arch::{self, TrapFrame};
 use crate::mm::frame::alloc_contiguous;
-use crate::mm::paging::AddressSpace;
+use crate::arch::paging::AddressSpace;
 use crate::mm::{phys_to_virt, PAGE_SIZE};
 use crate::net::Interface;
 use crate::pci;
@@ -774,9 +773,9 @@ pub fn probe() -> bool {
 
     // Only now is it safe for the card to interrupt: the ring, the queue and
     // the handler's view of the device are all in place.
-    crate::cpu::idt::register(pic::PIC1_OFFSET + dev.irq_line, interrupt);
+    arch::register_irq_handler(dev.irq_line, interrupt);
     card.write(IMS, INT_RXT0 | INT_RXDMT0 | INT_RXO | INT_LSC);
-    pic::unmask(dev.irq_line);
+    arch::unmask_irq(dev.irq_line);
     card.enable_rx();
 
     // The link comes up in microseconds on an emulated card; wait a little so
@@ -806,18 +805,18 @@ pub fn probe() -> bool {
 /// wakes the network task. Everything the protocols do happens in that task,
 /// with interrupts on.
 fn interrupt(frame: &mut TrapFrame) {
-    let irq = (frame.vector - pic::PIC1_OFFSET as u64) as u8;
+    let Some(irq) = arch::vector_irq(arch::trap_vector(frame)) else { return };
     if let Some(card) = device() {
         card.handle_interrupt();
     }
     // PCI interrupt lines are shared, and on this machine they can land on a
     // line the console also uses. Pass it on rather than swallowing it.
-    match irq {
-        1 => crate::console::keyboard_irq(),
-        3 | 4 => crate::console::serial_irq(),
-        _ => {}
+    if irq == arch::KEYBOARD_IRQ {
+        crate::console::keyboard_irq();
+    } else if irq == arch::SERIAL_IRQ || irq == arch::SERIAL_IRQ_ALT {
+        crate::console::serial_irq();
     }
-    pic::end_of_interrupt(irq);
+    arch::end_of_interrupt(irq);
 }
 
 // ---------------------------------------------------------------------------

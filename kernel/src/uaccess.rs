@@ -5,7 +5,7 @@
 //! allocated here, so the kernel never takes a page fault on a user pointer.
 
 use crate::abi::Errno;
-use crate::mm::paging::{is_user_addr, WRITABLE};
+use crate::arch::paging::{is_user_addr, WRITABLE};
 use crate::mm::{page_align_down, PAGE_SIZE_U64};
 use alloc::string::String;
 use alloc::vec::Vec;

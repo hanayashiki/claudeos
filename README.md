@@ -273,18 +273,23 @@ are not running on Linux.
 
 ```
 kernel/src
-  boot.s              multiboot header, 32-bit trampoline into long mode
+  arch/               everything that only makes sense on one instruction set
+  arch/mod.rs         picks the target and re-exports it as `arch`
+  arch/x86_64/        boot trampoline, descriptor tables, PIC and PIT, port
+                      I/O, page tables, UART and keyboard, timestamp counter
+                      and CMOS clock, trap and system call entry, trap frame,
+                      signal frame, system call numbers
   main.rs             start-up sequence and kernel command line
-  mm/                 frame allocator, page tables, kernel heap
-  cpu/                GDT and TSS, IDT and stubs, PIC, PIT, MSRs
-  syscall/            entry stub and the Linux system call implementations
+  mm/                 frame allocator and kernel heap
+  syscall/            the Linux system call implementations
   fs/                 in-memory filesystem, devices, pipes, cpio, /proc
   elf.rs              ELF64 loader for static and static-PIE executables
   task.rs             task control block, user stack and auxiliary vector
   sched.rs            round-robin scheduler, exit and reaping
   uaccess.rs          validated copying between kernel and user memory
   console.rs          input ring and terminal line discipline
-  signal.rs           signal frames, delivery and rt_sigreturn
+  signal.rs           signal dispositions and default actions
+  trap.rs             exception and interrupt handling
 
 user/cbox             the multicall userland binary (shell, init, coreutils)
 user/c/hello.c        a C program linked against musl

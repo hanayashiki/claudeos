@@ -1,4 +1,7 @@
-//! Linux x86_64 system call dispatch.
+//! Linux system call dispatch.
+//!
+//! The numbers are per-architecture and come from `arch::nr`; so does the way
+//! a call arrives and the way its result goes back.
 
 pub mod file;
 pub mod mem;
@@ -6,23 +9,11 @@ pub mod net;
 pub mod proc;
 
 use crate::abi::*;
-use crate::cpu::idt::TrapFrame;
-use crate::cpu::msr;
+use crate::arch::{self, nr, TrapFrame};
 use crate::sched;
 
-extern "C" {
-    fn syscall_entry();
-}
-
 pub fn init() {
-    use crate::cpu::gdt::{STAR_KERNEL_BASE, STAR_USER_BASE};
-    msr::write(msr::IA32_STAR, (STAR_USER_BASE << 48) | (STAR_KERNEL_BASE << 32));
-    msr::write(msr::IA32_LSTAR, syscall_entry as unsafe extern "C" fn() as usize as u64);
-    // Clear IF, TF, DF, NT, AC and IOPL on entry so the kernel starts in a
-    // known state with interrupts off.
-    msr::write(msr::IA32_FMASK, 0x47700);
-    let efer = msr::read(msr::IA32_EFER);
-    msr::write(msr::IA32_EFER, efer | msr::EFER_SCE);
+    arch::init_syscall_entry();
 }
 
 /// Which system calls to log: -1 for none, -2 for all, otherwise the number
@@ -33,17 +24,20 @@ pub const TRACE_ALL: i64 = -2;
 
 #[no_mangle]
 pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
-    let number = frame.rax;
-    let args = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9];
+    let number = arch::syscall_number(frame);
+    let args = arch::syscall_args(frame);
 
     let trace = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(TRACE)) };
     let traced = trace == TRACE_ALL || (trace >= 0 && trace as u64 == number);
 
     let result = handle(number, &args, frame);
-    frame.rax = match result {
-        Ok(value) => value,
-        Err(err) => err.as_ret(),
-    };
+    arch::set_syscall_result(
+        frame,
+        match result {
+            Ok(value) => value,
+            Err(err) => err.as_ret(),
+        },
+    );
 
     if traced {
         crate::println!(
@@ -176,7 +170,7 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
             sched::yield_now();
             Ok(0)
         }
-        nr::ARCH_PRCTL => proc::arch_prctl(args[0], args[1]),
+        nr::ARCH_PRCTL => arch::arch_prctl(args[0], args[1]),
         nr::SET_TID_ADDRESS => {
             sched::current().clear_child_tid = args[0];
             Ok(sched::current().pid as u64)
@@ -294,7 +288,7 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
                 sched::current().pid,
                 number,
                 name_of(number),
-                frame.rip
+                arch::instruction_pointer(frame)
             );
             Err(Errno::ENOSYS)
         }

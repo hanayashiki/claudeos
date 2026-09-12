@@ -1,16 +1,11 @@
 //! Round-robin scheduler.
 
 use crate::abi::*;
-use crate::cpu::idt::{enter_user_mode, TrapFrame};
-use crate::cpu::{gdt, msr, per_cpu};
+use crate::arch;
 use crate::sync::{disable_interrupts, enable_interrupts, interrupts_enabled, Spinlock};
 use crate::task::{State, Task, TaskPtr};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-
-extern "C" {
-    fn switch_context(save_rsp: *mut u64, new_rsp: u64);
-}
 
 static mut CURRENT: *mut Task = core::ptr::null_mut();
 static mut IDLE: *mut Task = core::ptr::null_mut();
@@ -59,7 +54,7 @@ pub fn has_current() -> bool {
 
 /// Adopt the boot context as the idle task.
 pub fn init() {
-    let space = crate::mm::paging::AddressSpace::current();
+    let space = arch::paging::AddressSpace::current();
     let mut idle = Task::new("idle", space).expect("idle task");
     idle.pid = 0;
     idle.tgid = 0;
@@ -118,13 +113,13 @@ pub fn current_pgid() -> u32 {
     current().pgid
 }
 
-/// True when a task other than the current one is running on `pml4`.
-pub fn space_in_use(pml4: u64) -> bool {
+/// True when a task other than the current one is running on `space`.
+pub fn space_in_use(space: arch::paging::AddressSpace) -> bool {
     let cur = unsafe { CURRENT };
     let tasks = TASKS.lock();
     tasks
         .iter()
-        .any(|t| t.0 != cur && t.get().space.pml4 == pml4 && t.get().state != State::Zombie)
+        .any(|t| t.0 != cur && t.get().space == space && t.get().state != State::Zombie)
 }
 
 fn pick_next() -> Option<*mut Task> {
@@ -179,29 +174,24 @@ unsafe fn switch_to(next: *mut Task) {
     let prev_task = &mut *prev;
     let next_task = &mut *next;
 
-    // The user's FS/GS bases live in MSRs; carry them with the task.
-    prev_task.fs_base = msr::read(msr::IA32_FS_BASE);
-    prev_task.gs_base = msr::read(msr::IA32_KERNEL_GS_BASE);
-    msr::write(msr::IA32_FS_BASE, next_task.fs_base);
-    msr::write(msr::IA32_KERNEL_GS_BASE, next_task.gs_base);
-
-    // So do the floating point and vector registers. The kernel never uses
-    // them, so what is in them here is still the outgoing task's.
-    prev_task.fpu.save();
-    next_task.fpu.restore();
+    // The registers the trap frame does not hold, the thread pointer and the
+    // floating point and vector file among them, are carried across by hand.
+    // The kernel never touches the latter, so what is in them here is still
+    // the outgoing task's.
+    prev_task.cpu.save();
+    next_task.cpu.restore();
 
     // Entry from user mode must land on the incoming task's kernel stack.
-    gdt::set_kernel_stack(next_task.kstack_top);
-    per_cpu().kernel_rsp = next_task.kstack_top;
-    per_cpu().current = next as u64;
+    arch::set_kernel_entry_stack(next_task.kstack_top);
+    arch::set_current_task(next as u64);
 
-    if next_task.space.pml4 != prev_task.space.pml4 {
+    if next_task.space != prev_task.space {
         next_task.space.switch_to();
     }
 
     CURRENT = next;
     prev_task.started = true;
-    switch_context(&mut prev_task.rsp, next_task.rsp);
+    arch::switch_context(&mut prev_task.kernel_sp, next_task.kernel_sp);
 }
 
 pub fn schedule() {
@@ -282,20 +272,21 @@ pub fn wake(pid: u32) {
     }
 }
 
-/// Hand `addr` to the current task's region list to be backed with memory.
-pub fn handle_user_page_fault(addr: u64, code: u64, _frame: &mut TrapFrame) -> bool {
+/// Hand the faulting address to the current task's region list to be backed
+/// with memory.
+pub fn handle_user_page_fault(fault: &arch::PageFault) -> bool {
     if !has_current() {
         return false;
     }
-    if code & 1 != 0 {
+    if fault.present {
         // The page is present, so the only fault that can be repaired is a
         // write to a page still shared with another address space.
-        if code & 2 != 0 {
-            return current().handle_cow(addr);
+        if fault.write {
+            return current().handle_cow(fault.address);
         }
         return false;
     }
-    current().fault_in(addr)
+    current().fault_in(fault.address)
 }
 
 /// Terminate the current task. `status` is already encoded the way wait4
@@ -358,7 +349,7 @@ pub fn exit_current(status: i32) -> ! {
                 "claudeos: init exited with status {:#x}; powering off",
                 task.exit_code
             );
-            crate::power_off();
+            arch::power_off();
         }
 
         // Becoming a zombie takes this task off the run queue for good, so
@@ -407,7 +398,7 @@ pub fn exit_current(status: i32) -> ! {
     }
     loop {
         schedule();
-        crate::cpu::halt();
+        arch::halt();
     }
 }
 
@@ -696,10 +687,10 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
     crate::fs::procfs::remove_process(pid);
     unsafe {
         let mut task = Box::from_raw(ptr);
-        let pml4 = task.space.pml4;
+        let space = task.space;
         let shared = {
             let tasks = TASKS.lock();
-            tasks.iter().any(|t| t.get().space.pml4 == pml4)
+            tasks.iter().any(|t| t.get().space == space)
         };
         if !shared {
             task.space.destroy();
@@ -862,14 +853,14 @@ impl WaitQueue {
 pub extern "C" fn user_entry_trampoline() -> ! {
     let task = current();
     let frame = task.trap_frame();
-    unsafe { enter_user_mode(frame) }
+    unsafe { arch::return_to_user(frame) }
 }
 
 /// Idle loop: run when nothing else can.
 pub fn idle_loop() -> ! {
     loop {
         enable_interrupts();
-        crate::cpu::halt();
+        arch::halt();
         schedule();
     }
 }

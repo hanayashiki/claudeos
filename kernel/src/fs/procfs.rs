@@ -153,7 +153,7 @@ pub fn render(kind: Generated) -> String {
         Generated::Uptime => {
             // Seconds since boot, then seconds spent with nothing to run.
             let ns = crate::time::monotonic_ns();
-            let idle = crate::sched::idle_ticks() * (1_000_000_000 / crate::cpu::pit::TICK_HZ as u64);
+            let idle = crate::sched::idle_ticks() * (1_000_000_000 / crate::arch::TICK_HZ as u64);
             format!(
                 "{}.{:02} {}.{:02}\n",
                 ns / 1_000_000_000,
@@ -162,21 +162,11 @@ pub fn render(kind: Generated) -> String {
                 (idle / 10_000_000) % 100
             )
         }
-        Generated::Version => String::from(
-            "Linux version 6.1.0-claudeos (claudeos) #1 SMP x86_64\n",
+        Generated::Version => format!(
+            "Linux version 6.1.0-claudeos (claudeos) #1 SMP {}\n",
+            crate::arch::MACHINE
         ),
-        Generated::CpuInfo => {
-            let mut out = String::from("processor\t: 0\nvendor_id\t: ");
-            let leaf = crate::cpu::cpuid(0, 0);
-            let mut vendor = [0u8; 12];
-            vendor[0..4].copy_from_slice(&leaf.ebx.to_le_bytes());
-            vendor[4..8].copy_from_slice(&leaf.edx.to_le_bytes());
-            vendor[8..12].copy_from_slice(&leaf.ecx.to_le_bytes());
-            out.push_str(core::str::from_utf8(&vendor).unwrap_or("unknown"));
-            out.push_str("\ncpu family\t: 6\nmodel name\t: claudeos virtual CPU\n");
-            out.push_str("flags\t\t: fpu tsc msr pae cx8 apic sse sse2 syscall nx lm\n\n");
-            out
-        }
+        Generated::CpuInfo => crate::arch::cpu_info_text(),
         Generated::Mounts => String::from(
             "rootfs / rootfs rw 0 0\nproc /proc proc rw 0 0\ndevtmpfs /dev devtmpfs rw 0 0\n",
         ),

@@ -1,7 +1,7 @@
 //! Memory-related system calls.
 
 use crate::abi::*;
-use crate::mm::paging::{NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::arch::paging::{NO_EXECUTE, PRESENT, USER, WRITABLE};
 use crate::mm::{page_align_down, page_align_up, PAGE_SIZE_U64, USER_MMAP_BASE};
 use crate::sched;
 use crate::uaccess;
@@ -147,8 +147,8 @@ pub fn mprotect(addr: u64, length: u64, prot: u64) -> SysResult {
         // keeps its copy-on-write mark and stays read-only whatever is asked
         // for: the copy happens when it is written to, as before.
         if let Some(existing) = task.space.flags_of(page) {
-            let bits = if existing & crate::mm::paging::COW != 0 {
-                (bits & !WRITABLE) | crate::mm::paging::COW
+            let bits = if existing & crate::arch::paging::COW != 0 {
+                (bits & !WRITABLE) | crate::arch::paging::COW
             } else {
                 bits
             };

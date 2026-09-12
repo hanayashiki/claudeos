@@ -1,13 +1,12 @@
 //! ELF64 program loader for static executables.
 
 use crate::abi::Errno;
-use crate::mm::paging::{AddressSpace, NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::arch::paging::{AddressSpace, NO_EXECUTE, PRESENT, USER, WRITABLE};
 use crate::mm::{page_align_down, page_align_up, PAGE_SIZE_U64};
 use alloc::collections::{BTreeMap, BTreeSet};
 
 pub const ET_EXEC: u16 = 2;
 pub const ET_DYN: u16 = 3;
-pub const EM_X86_64: u16 = 0x3E;
 
 pub const PT_LOAD: u32 = 1;
 pub const PT_DYNAMIC: u32 = 2;
@@ -75,7 +74,7 @@ pub struct ProgramHeader {
     pub p_align: u64,
 }
 
-/// Check that `data` is a 64-bit little-endian x86-64 ELF we can run.
+/// Check that `data` is a 64-bit little-endian ELF for this machine.
 pub fn validate(data: &[u8]) -> Result<u16, Errno> {
     if data.len() < 64 || &data[0..4] != b"\x7FELF" {
         return Err(Errno::ENOEXEC);
@@ -85,7 +84,7 @@ pub fn validate(data: &[u8]) -> Result<u16, Errno> {
     }
     let e_type = rd16(data, 16);
     let e_machine = rd16(data, 18);
-    if e_machine != EM_X86_64 {
+    if e_machine != crate::arch::ELF_MACHINE {
         return Err(Errno::ENOEXEC);
     }
     if e_type != ET_EXEC && e_type != ET_DYN {

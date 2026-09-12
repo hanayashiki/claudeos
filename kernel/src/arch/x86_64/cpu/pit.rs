@@ -1,6 +1,6 @@
 //! 8254 programmable interval timer, used as the scheduler tick.
 
-use crate::io::outb;
+use super::super::io::outb;
 
 const CHANNEL0: u16 = 0x40;
 const COMMAND: u16 = 0x43;

@@ -1,41 +1,14 @@
 //! Process, time and signal system calls.
 
 use crate::abi::*;
-use crate::cpu::idt::TrapFrame;
-use crate::cpu::msr;
+use crate::arch::paging::AddressSpace;
+use crate::arch::{self, TrapFrame};
 use crate::elf;
-use crate::mm::paging::AddressSpace;
 use crate::sched;
 use crate::task::{self, State, Task};
 use crate::uaccess;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-
-pub fn arch_prctl(code: u64, addr: u64) -> SysResult {
-    match code {
-        ARCH_SET_FS => {
-            msr::write(msr::IA32_FS_BASE, addr);
-            sched::current().fs_base = addr;
-            Ok(0)
-        }
-        ARCH_SET_GS => {
-            // The user GS base lives in KERNEL_GS_BASE while we are in the
-            // kernel; swapgs puts it back on the way out.
-            msr::write(msr::IA32_KERNEL_GS_BASE, addr);
-            sched::current().gs_base = addr;
-            Ok(0)
-        }
-        ARCH_GET_FS => {
-            uaccess::write_u64(addr, msr::read(msr::IA32_FS_BASE))?;
-            Ok(0)
-        }
-        ARCH_GET_GS => {
-            uaccess::write_u64(addr, msr::read(msr::IA32_KERNEL_GS_BASE))?;
-            Ok(0)
-        }
-        _ => Err(Errno::EINVAL),
-    }
-}
 
 pub fn fork(
     frame: &TrapFrame,
@@ -80,28 +53,19 @@ pub fn fork(
     child.fds = parent.fds.clone_table();
     child.umask = parent.umask;
     child.signal_actions = parent.signal_actions;
-    child.fs_base = if flags & CLONE_SETTLS != 0 {
-        tls
-    } else {
-        msr::read(msr::IA32_FS_BASE)
-    };
-    child.gs_base = msr::read(msr::IA32_KERNEL_GS_BASE);
-    // The child carries on from the same instruction, so it needs the same
-    // floating point and vector registers the parent has right now.
-    child.fpu.save();
+    // The child carries on from the same instruction, so it starts on the
+    // registers the parent is holding right now, thread pointer included
+    // unless the caller named a new one.
+    child.cpu.save();
+    if flags & CLONE_SETTLS != 0 {
+        child.cpu.set_thread_pointer(tls);
+    }
     if flags & CLONE_CHILD_CLEARTID != 0 {
         child.clear_child_tid = child_tid;
     }
 
     // The child resumes from the same point with a zero return value.
-    unsafe {
-        let dst = child.trap_frame();
-        core::ptr::write(dst, *frame);
-        (*dst).rax = 0;
-        if stack != 0 {
-            (*dst).rsp = stack;
-        }
-    }
+    unsafe { arch::fork_child_frame(&mut *child.trap_frame(), frame, stack) };
     child.prepare_kernel_frame(sched::user_entry_trampoline as extern "C" fn() -> ! as usize as u64);
 
     // Only safe to write through these pointers while the address space is
@@ -181,8 +145,9 @@ pub fn exec_into_current(
     // shared so the stack and heap stay valid across the switch.
     //
     // The task's recorded address space is the authority a context switch
-    // restores CR3 from, so it has to be updated before CR3 is, or a
-    // preemption in between would put the old page tables back underneath us.
+    // restores the page table root from, so it has to be updated before the
+    // CPU's is, or a preemption in between would put the old page tables back
+    // underneath us.
     let mut task = sched::current();
     task.space = new_space;
     // exec starts a fresh address space; a shared record must not follow it.
@@ -277,7 +242,7 @@ pub fn exec_into_current(
 
     // The old image is unreachable from this task. Under CLONE_VM another
     // task is still running on it, so only the last user tears it down.
-    if old_space.pml4 != new_space.pml4 && !sched::space_in_use(old_space.pml4) {
+    if old_space != new_space && !sched::space_in_use(old_space) {
         old_space.destroy();
     }
 
@@ -287,12 +252,9 @@ pub fn exec_into_current(
     }
 
     task.fds.close_on_exec();
-    // A new program starts with a clean x87 and SSE state, not the one the
-    // program that called exec left behind.
-    task.fpu = crate::task::FpuState::initial();
-    task.fpu.restore();
-    task.fs_base = 0;
-    msr::write(msr::IA32_FS_BASE, 0);
+    // A new program starts on a clean register file, not the one the program
+    // that called exec left behind.
+    task.cpu.reset_for_exec();
     task.name = exec_path
         .rsplit('/')
         .next()
@@ -322,7 +284,7 @@ pub fn execve(path_addr: u64, argv_addr: u64, envp_addr: u64, frame: &mut TrapFr
     // frame back to the entry stub.
     let new_frame = sched::current().trap_frame();
     unsafe { *frame = *new_frame };
-    Ok(frame.rax)
+    Ok(arch::syscall_result(frame))
 }
 
 pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
@@ -526,7 +488,7 @@ pub fn uname(out: u64) -> SysResult {
     // Programs gate features on the release number, so report a modern one.
     fill(&mut uts.release, "6.1.0-claudeos");
     fill(&mut uts.version, "#1 claudeos");
-    fill(&mut uts.machine, "x86_64");
+    fill(&mut uts.machine, crate::arch::MACHINE);
     fill(&mut uts.domainname, "(none)");
     uaccess::write_struct(out, &uts)?;
     Ok(0)
@@ -603,7 +565,7 @@ pub fn clock_gettime(clock: u64, out: u64) -> SysResult {
 
 pub fn clock_getres(_clock: u64, out: u64) -> SysResult {
     if out != 0 {
-        let res = Timespec { tv_sec: 0, tv_nsec: 1_000_000_000 / crate::cpu::pit::TICK_HZ as i64 };
+        let res = Timespec { tv_sec: 0, tv_nsec: 1_000_000_000 / arch::TICK_HZ as i64 };
         uaccess::write_struct(out, &res)?;
     }
     Ok(0)

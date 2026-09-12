@@ -1,36 +1,22 @@
-//! PCI configuration space, through the legacy address and data ports.
+//! PCI configuration space.
 //!
 //! Every PCI function has 256 bytes of configuration space laid out by the
 //! specification: vendor and device identifiers, a command register, six base
 //! address registers naming the memory or port ranges the function decodes,
-//! and the interrupt line the chipset routes it to. That space is not memory
-//! mapped on a machine this old; it is reached one aligned 32-bit word at a
-//! time by writing the word's address to port 0xCF8 and then reading or
-//! writing port 0xCFC.
-//!
-//! The address written to 0xCF8 is
-//!
-//!     bit 31      enable (nothing happens without it)
-//!     bits 30..24 reserved, zero
-//!     bits 23..16 bus
-//!     bits 15..11 device
-//!     bits 10..8  function
-//!     bits 7..2   word offset within the function's config space
-//!     bits 1..0   zero: the port pair only moves whole words
+//! and the interrupt line the chipset routes it to. How a machine reaches that
+//! space differs from one to the next, so the aligned 32-bit reads and writes
+//! come from `arch`; everything the fields mean is here.
 //!
 //! There is no way to ask which slots are populated, so finding a card means
 //! reading the vendor id of every function of every device of every bus and
 //! taking 0xFFFF, which is what the bus returns when nothing answers, as
 //! "empty".
 
-use crate::io::{inl, outl};
-use crate::mm::paging::{AddressSpace, NO_CACHE, NO_EXECUTE, PRESENT, WRITABLE};
+use crate::arch::paging::{AddressSpace, NO_CACHE, NO_EXECUTE, PRESENT, WRITABLE};
+use crate::arch::{pci_config_read32, pci_config_write32};
 use crate::mm::{page_align_up, PAGE_SIZE_U64};
 use crate::sync::Spinlock;
 use alloc::vec::Vec;
-
-const CONFIG_ADDRESS: u16 = 0xCF8;
-const CONFIG_DATA: u16 = 0xCFC;
 
 /// Offsets into a function's configuration space header (type 0).
 pub const VENDOR_ID: u8 = 0x00;
@@ -51,33 +37,18 @@ pub const CMD_BUS_MASTER: u16 = 1 << 2;
 /// Set to stop the function raising its legacy interrupt; must stay clear.
 pub const CMD_INTX_DISABLE: u16 = 1 << 10;
 
-#[inline]
-fn address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
-    1 << 31
-        | (bus as u32) << 16
-        | (device as u32 & 0x1F) << 11
-        | (function as u32 & 0x07) << 8
-        | (offset as u32 & 0xFC)
-}
-
 /// Read the aligned 32-bit word containing `offset`.
 pub fn read32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
-    unsafe {
-        outl(CONFIG_ADDRESS, address(bus, device, function, offset));
-        inl(CONFIG_DATA)
-    }
+    pci_config_read32(bus, device, function, offset)
 }
 
 pub fn write32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
-    unsafe {
-        outl(CONFIG_ADDRESS, address(bus, device, function, offset));
-        outl(CONFIG_DATA, value);
-    }
+    pci_config_write32(bus, device, function, offset, value);
 }
 
 pub fn read16(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
-    // The port pair only moves whole words, so a 16-bit field is the half of
-    // one word that bit 1 of the offset selects.
+    // Configuration space only moves whole words, so a 16-bit field is the
+    // half of one word that bit 1 of the offset selects.
     let word = read32(bus, device, function, offset);
     (word >> ((offset as u32 & 2) * 8)) as u16
 }

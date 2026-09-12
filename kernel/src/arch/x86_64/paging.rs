@@ -3,8 +3,8 @@
 //! Tables are always reached through the direct map, so no recursive mapping
 //! or temporary windows are needed.
 
-use super::frame::{self, Frame};
-use super::{page_align_down, phys_to_virt, HHDM_BASE, PAGE_SIZE_U64};
+use crate::mm::frame::{self, Frame};
+use crate::mm::{page_align_down, page_align_up, phys_to_virt, HHDM_BASE, PAGE_SIZE_U64};
 use core::arch::asm;
 
 pub const PRESENT: u64 = 1 << 0;
@@ -69,6 +69,12 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
+    /// A number that tells this address space apart from every other one alive
+    /// at the same moment, for anything that has to key on which one it is.
+    pub fn id(&self) -> u64 {
+        self.pml4
+    }
+
     pub fn current() -> AddressSpace {
         AddressSpace { pml4: read_cr3() }
     }
@@ -234,7 +240,7 @@ impl AddressSpace {
         size: u64,
         flags: u64,
     ) -> Result<(), MapError> {
-        let pages = super::page_align_up(size) / PAGE_SIZE_U64;
+        let pages = page_align_up(size) / PAGE_SIZE_U64;
         for i in 0..pages {
             self.map_fixed(virt + i * PAGE_SIZE_U64, phys + i * PAGE_SIZE_U64, flags)?;
         }
@@ -369,5 +375,5 @@ pub fn is_user_addr(virt: u64) -> bool {
 
 #[inline]
 pub fn is_hhdm_addr(virt: u64) -> bool {
-    virt >= HHDM_BASE && virt < HHDM_BASE + super::HHDM_LIMIT
+    virt >= HHDM_BASE && virt < HHDM_BASE + crate::mm::HHDM_LIMIT
 }

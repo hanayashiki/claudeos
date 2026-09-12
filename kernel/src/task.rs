@@ -6,9 +6,9 @@
 //! to hold across a context switch.
 
 use crate::abi::*;
-use crate::cpu::idt::TrapFrame;
+use crate::arch::paging::{AddressSpace, NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::arch::{self, TaskContext, TrapFrame};
 use crate::fs::{FdTable, OpenFile};
-use crate::mm::paging::{AddressSpace, NO_EXECUTE, PRESENT, USER, WRITABLE};
 use crate::mm::{page_align_down, page_align_up, PAGE_SIZE_U64, USER_MMAP_BASE, USER_STACK_TOP};
 use alloc::alloc::{alloc, dealloc, Layout};
 use alloc::string::{String, ToString};
@@ -17,73 +17,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// The x87, MMX and SSE register file, as `fxsave` lays it out.
-///
-/// The kernel is built without SSE and never touches these registers, so
-/// everything in them between a trap and the next context switch still belongs
-/// to the task that was interrupted. Nothing else preserves them, so a task
-/// preempted in the middle of an SSE memcpy would come back holding whatever
-/// the task that ran in between had left in `xmm0`, and store that to memory.
-#[repr(C, align(16))]
-#[derive(Clone, Copy)]
-pub struct FpuState([u8; 512]);
-
-impl FpuState {
-    /// The state a program starts with: x87 precision control set the way the
-    /// ABI asks for, and every SSE exception masked.
-    pub fn initial() -> FpuState {
-        let mut state = FpuState([0; 512]);
-        state.0[0..2].copy_from_slice(&0x037Fu16.to_le_bytes()); // FCW
-        state.0[24..28].copy_from_slice(&0x0000_1F80u32.to_le_bytes()); // MXCSR
-        state.0[28..32].copy_from_slice(&0x0000_FFFFu32.to_le_bytes()); // MXCSR_MASK
-        state
-    }
-
-    /// Take the registers as they stand into this buffer.
-    #[inline]
-    pub fn save(&mut self) {
-        unsafe {
-            core::arch::asm!(
-                "fxsave64 [{}]",
-                in(reg) self.0.as_mut_ptr(),
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    pub fn bytes(&self) -> &[u8; 512] {
-        &self.0
-    }
-
-    /// Take a saved image back, rejecting the control-word bits the hardware
-    /// would fault on: the image came off the user stack.
-    pub fn from_bytes(&mut self, src: &[u8]) -> bool {
-        if src.len() < 512 {
-            return false;
-        }
-        self.0.copy_from_slice(&src[..512]);
-        let mut mxcsr = [0u8; 4];
-        mxcsr.copy_from_slice(&self.0[24..28]);
-        let value = u32::from_le_bytes(mxcsr) & 0x0000_FFBF;
-        self.0[24..28].copy_from_slice(&value.to_le_bytes());
-        true
-    }
-
-    /// Put this buffer back into the registers.
-    #[inline]
-    pub fn restore(&self) {
-        unsafe {
-            core::arch::asm!(
-                "fxrstor64 [{}]",
-                in(reg) self.0.as_ptr(),
-                options(nostack, readonly, preserves_flags),
-            );
-        }
-    }
-}
-
 pub const KERNEL_STACK_SIZE: usize = 32 * 1024;
-pub const TRAP_FRAME_SIZE: usize = core::mem::size_of::<TrapFrame>();
 
 /// Total address range reserved for the main thread stack.
 pub const STACK_RESERVE: u64 = 8 * 1024 * 1024;
@@ -174,7 +108,7 @@ pub struct Task {
     pub state: State,
 
     /// Saved kernel stack pointer between context switches.
-    pub rsp: u64,
+    pub kernel_sp: u64,
     kstack: *mut u8,
     pub kstack_top: u64,
 
@@ -188,10 +122,8 @@ pub struct Task {
     pub exe_path: String,
 
     pub exit_code: i32,
-    pub fs_base: u64,
-    pub gs_base: u64,
-    /// Floating point and vector registers, carried across context switches.
-    pub fpu: FpuState,
+    /// Registers only this architecture has, carried across context switches.
+    pub cpu: TaskContext,
     pub clear_child_tid: u64,
     pub set_child_tid: u64,
     pub robust_list: u64,
@@ -256,7 +188,7 @@ impl Task {
             ppid: 0,
             pgid: pid,
             state: State::Runnable,
-            rsp: 0,
+            kernel_sp: 0,
             kstack,
             kstack_top,
             space,
@@ -266,9 +198,7 @@ impl Task {
             name: name.to_string(),
             exe_path: String::new(),
             exit_code: 0,
-            fs_base: 0,
-            gs_base: 0,
-            fpu: FpuState::initial(),
+            cpu: TaskContext::new(),
             clear_child_tid: 0,
             set_child_tid: 0,
             robust_list: 0,
@@ -292,28 +222,13 @@ impl Task {
     /// The user register frame, which always sits at the top of the kernel
     /// stack because both entry paths start with RSP at `kstack_top`.
     pub fn trap_frame(&self) -> *mut TrapFrame {
-        (self.kstack_top - TRAP_FRAME_SIZE as u64) as *mut TrapFrame
+        arch::trap_frame_at(self.kstack_top)
     }
 
     /// Lay out the kernel stack so the first context switch into this task
     /// lands in `entry`.
     pub fn prepare_kernel_frame(&mut self, entry: u64) {
-        // Leave the trap frame area untouched and build the switch frame below it.
-        let base = self.kstack_top - TRAP_FRAME_SIZE as u64;
-        let frame = (base - 8 * 8) as *mut u64;
-        unsafe {
-            // Mirrors what switch_context pops: rflags, r15, r14, r13, r12,
-            // rbx, rbp, then the address it returns to.
-            *frame.add(0) = 0x0000_0002; // rflags with interrupts off
-            *frame.add(1) = 0; // r15
-            *frame.add(2) = 0; // r14
-            *frame.add(3) = 0; // r13
-            *frame.add(4) = 0; // r12
-            *frame.add(5) = 0; // rbx
-            *frame.add(6) = 0; // rbp
-            *frame.add(7) = entry;
-        }
-        self.rsp = frame as u64;
+        self.kernel_sp = arch::prepare_kernel_entry(self.kstack_top, entry);
     }
 
     pub fn brk_start(&self) -> u64 {
@@ -449,7 +364,7 @@ impl Task {
     /// Give this task a private copy of a shared page it is trying to write.
     /// Returns false when the fault was not a copy-on-write fault.
     pub fn handle_cow(&mut self, addr: u64) -> bool {
-        use crate::mm::paging::COW;
+        use crate::arch::paging::COW;
         let page = page_align_down(addr);
         let Some(flags) = self.space.flags_of(page) else {
             return false;
@@ -595,7 +510,7 @@ pub fn build_user_stack(
     }
     argv_addrs.reverse();
 
-    let platform_addr = push_bytes(&mut sp, b"x86_64");
+    let platform_addr = push_bytes(&mut sp, crate::arch::MACHINE.as_bytes());
     let execfn_addr = push_bytes(&mut sp, exec_path.as_bytes());
 
     // 16 bytes of randomness for AT_RANDOM (stack guard, pointer mangling).
@@ -671,15 +586,7 @@ pub fn build_user_stack(
 /// Populate a task's trap frame so it starts at `entry` with stack `sp`.
 pub fn set_user_entry(task: &mut Task, entry: u64, sp: u64) {
     let frame = task.trap_frame();
-    unsafe {
-        core::ptr::write_bytes(frame as *mut u8, 0, TRAP_FRAME_SIZE);
-        (*frame).rip = entry;
-        (*frame).cs = crate::cpu::gdt::USER_CODE as u64;
-        (*frame).rflags = 0x202; // interrupts enabled
-        (*frame).rsp = sp;
-        (*frame).ss = crate::cpu::gdt::USER_DATA as u64;
-        (*frame).vector = 0x100;
-    }
+    unsafe { arch::start_user_at(&mut *frame, entry, sp) };
 }
 
 /// Open the standard descriptors on the console.
@@ -749,9 +656,8 @@ pub extern "C" fn user_bootstrap() -> ! {
         crate::sched::exit_current(1 << 8);
     }
     let task = crate::sched::current();
-    crate::cpu::gdt::set_kernel_stack(task.kstack_top);
-    crate::cpu::per_cpu().kernel_rsp = task.kstack_top;
-    unsafe { crate::cpu::idt::enter_user_mode(task.trap_frame()) }
+    arch::set_kernel_entry_stack(task.kstack_top);
+    unsafe { arch::return_to_user(task.trap_frame()) }
 }
 
 /// Create a task that will run `path` once scheduled.
@@ -761,7 +667,7 @@ pub fn spawn(
     envp: Vec<String>,
     parent_pid: u32,
 ) -> Result<u32, Errno> {
-    let space = crate::mm::paging::AddressSpace::new_user().ok_or(Errno::ENOMEM)?;
+    let space = crate::arch::paging::AddressSpace::new_user().ok_or(Errno::ENOMEM)?;
     let name = path.rsplit('/').next().unwrap_or(path);
     let mut task = Task::new(name, space).ok_or(Errno::ENOMEM)?;
     task.ppid = parent_pid;

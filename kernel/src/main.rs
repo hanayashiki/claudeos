@@ -4,18 +4,16 @@
 
 extern crate alloc;
 
-use core::arch::global_asm;
 use core::panic::PanicInfo;
 
 #[macro_use]
 mod serial;
 mod abi;
+mod arch;
 mod console;
-mod cpu;
 mod elf;
 mod fs;
 mod futex;
-mod io;
 mod mm;
 mod multiboot;
 mod net;
@@ -31,15 +29,6 @@ mod uaccess;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-
-global_asm!(include_str!("boot.s"), options(att_syntax));
-global_asm!(include_str!("cpu/interrupts.s"), options(att_syntax));
-global_asm!(include_str!("switch.s"), options(att_syntax));
-global_asm!(include_str!("syscall/entry.s"), options(att_syntax));
-
-extern "C" {
-    static kernel_stack_top: u8;
-}
 
 /// Options parsed out of the boot loader command line.
 struct BootOptions {
@@ -117,12 +106,9 @@ pub extern "C" fn kmain(mb_info_phys: u64, magic: u64) -> ! {
     }
     let boot = unsafe { multiboot::parse(mb_info_phys) };
 
-    cpu::gdt::init();
-    cpu::gdt::set_kernel_stack(core::ptr::addr_of!(kernel_stack_top) as u64);
-    cpu::idt::init();
+    arch::init_traps();
     trap::init();
-    cpu::init_per_cpu();
-    cpu::init_sse();
+    arch::init_cpu();
 
     mm::frame::init(&boot);
     mm::heap::init();
@@ -138,14 +124,14 @@ pub extern "C" fn kmain(mb_info_phys: u64, magic: u64) -> ! {
     let cmdline = unsafe { multiboot::cstr_at(boot.cmdline_phys) };
     let options = parse_cmdline(cmdline);
 
-    cpu::pic::init();
-    cpu::pit::init(cpu::pit::TICK_HZ);
+    arch::init_interrupt_controller();
+    arch::init_timer(arch::TICK_HZ);
     time::init();
     console::init();
-    cpu::pic::unmask(0);
-    // Measure the timestamp counter against the tick. This has to happen
-    // before there is anything to schedule, or the calibration loop is
-    // preempted and measures the whole system instead of itself.
+    arch::unmask_irq(arch::TIMER_IRQ);
+    // Measure the cycle counter against the tick. This has to happen before
+    // there is anything to schedule, or the calibration loop is preempted and
+    // measures the whole system instead of itself.
     sync::enable_interrupts();
     time::calibrate();
     sync::disable_interrupts();
@@ -157,7 +143,7 @@ pub extern "C" fn kmain(mb_info_phys: u64, magic: u64) -> ! {
     mount_initramfs(&boot);
 
     // Nothing reads low memory through the identity map from here on.
-    unsafe { mm::paging::drop_identity_map() };
+    unsafe { arch::paging::drop_identity_map() };
 
     sched::init();
 
@@ -183,7 +169,7 @@ pub extern "C" fn kmain(mb_info_phys: u64, magic: u64) -> ! {
             "claudeos: network self test {}",
             if passed { "passed" } else { "FAILED" }
         );
-        power_off();
+        arch::power_off();
     }
 
     let mut argv = alloc::vec![options.init.clone()];
@@ -241,29 +227,6 @@ fn mount_initramfs(boot: &multiboot::BootInfo) {
     }
 }
 
-/// Ask QEMU's isa-debug-exit device to terminate with `code`.
-pub fn qemu_exit(code: u32) -> ! {
-    unsafe { io::outl(0xf4, code) };
-    loop {
-        cpu::halt();
-    }
-}
-
-/// Shut the machine down. Tries the ACPI sleep register QEMU exposes, then
-/// the debug-exit device, then simply stops.
-pub fn power_off() -> ! {
-    unsafe {
-        io::outw(0x604, 0x2000); // QEMU / modern ACPI
-        io::outw(0xB004, 0x2000); // older QEMU
-        io::outw(0x4004, 0x3400); // virt machines
-        io::outl(0xf4, 0);
-    }
-    sync::disable_interrupts();
-    loop {
-        cpu::halt();
-    }
-}
-
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     sync::disable_interrupts();
@@ -274,6 +237,6 @@ fn panic(info: &PanicInfo) -> ! {
         println!("  in pid {} ({})", task.pid, task.name);
     }
     loop {
-        cpu::halt();
+        arch::halt();
     }
 }

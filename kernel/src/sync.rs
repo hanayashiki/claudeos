@@ -1,28 +1,12 @@
 //! Interrupt-safe spinlocks.
 
-use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-#[inline]
-pub fn interrupts_enabled() -> bool {
-    let flags: u64;
-    unsafe {
-        asm!("pushfq; pop {}", out(reg) flags, options(nomem, preserves_flags));
-    }
-    flags & (1 << 9) != 0
-}
-
-#[inline]
-pub fn disable_interrupts() {
-    unsafe { asm!("cli", options(nomem, nostack)) };
-}
-
-#[inline]
-pub fn enable_interrupts() {
-    unsafe { asm!("sti", options(nomem, nostack)) };
-}
+/// Turning interrupts off and back on is the machine's own instruction; these
+/// are named here because every lock in the kernel is built on them.
+pub use crate::arch::{disable_interrupts, enable_interrupts, interrupts_enabled};
 
 /// Run `f` with interrupts disabled, restoring the previous state after.
 pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {

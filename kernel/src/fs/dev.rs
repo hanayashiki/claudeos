@@ -56,17 +56,11 @@ pub fn populate() {
 
 static RNG_STATE: AtomicU64 = AtomicU64::new(0x2545F4914F6CDD1D);
 
-/// xorshift64*, seeded from the timestamp counter at first use.
+/// xorshift64*, seeded from the CPU's cycle counter at first use.
 pub fn random_u64() -> u64 {
     let mut x = RNG_STATE.load(Ordering::Relaxed);
     if x == 0x2545F4914F6CDD1D {
-        let tsc: u64;
-        unsafe {
-            core::arch::asm!("rdtsc", out("eax") _, out("edx") _, options(nomem, nostack));
-            core::arch::asm!("rdtsc; shl rdx, 32; or rax, rdx", out("rax") tsc, out("rdx") _,
-                             options(nomem, nostack));
-        }
-        x ^= tsc.wrapping_mul(0x9E3779B97F4A7C15);
+        x ^= crate::arch::cycle_counter().wrapping_mul(0x9E3779B97F4A7C15);
     }
     x ^= x << 13;
     x ^= x >> 7;
