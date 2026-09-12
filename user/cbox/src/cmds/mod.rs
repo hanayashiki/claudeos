@@ -3,6 +3,7 @@
 mod fileops;
 pub mod rtest;
 mod misc;
+mod sed;
 mod sysinfo;
 mod textops;
 
@@ -45,6 +46,8 @@ pub fn run(name: &str, args: &[String]) -> Option<i32> {
         "uname" => sysinfo::uname(args),
         "ps" => sysinfo::ps(args),
         "dmesg" => sysinfo::dmesg(args),
+        "sed" => sed::main(args),
+        "xargs" => misc::xargs(args),
         "free" => sysinfo::free(args),
         "uptime" => sysinfo::uptime(args),
         "date" => sysinfo::date(args),

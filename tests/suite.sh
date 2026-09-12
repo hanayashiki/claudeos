@@ -108,6 +108,40 @@ check "quiet status"   "1"  "$(seq 1 10 | grep -q '^99$'; echo $?)"
 check "recursive"      "2"  "$(grep -rl claudeos /etc | wc -l)"
 
 echo
+echo "-- sed --"
+check "substitute"        "hi there"  "$(echo hi world | sed 's/world/there/')"
+check "global"            "bbb"       "$(echo aaa | sed 's/a/b/g')"
+check "the second one"    "aba"       "$(echo aaa | sed 's/a/b/2')"
+check "the whole match"   "[cat]"     "$(echo cat | sed 's/c.t/[&]/')"
+check "anchored"          "Xb"        "$(printf 'ab\nba\n' | sed 's/^a/X/' | head -n 1)"
+check "delete a line"     "4"         "$(seq 1 5 | sed '2d' | wc -l)"
+check "print one line"    "3"         "$(seq 1 5 | sed -n '3p')"
+check "the last line"     "5"         "$(seq 1 5 | sed -n '$p')"
+check "a range"           "3"         "$(seq 1 10 | sed -n '3,5p' | wc -l)"
+check "a pattern address" "2"         "$(printf 'one\ntwo\nthree\n' | sed -n '/^t/p' | wc -l)"
+check "negated"           "3"         "$(seq 1 4 | sed -n '2!p' | wc -l)"
+check "quit early"        "3"         "$(seq 1 10 | sed '3q' | wc -l)"
+check "line numbers"      "2"         "$(printf 'a\nb\n' | sed -n '=' | tail -n 1)"
+check "transliterate"     "xyz"       "$(echo abc | sed 'y/abc/xyz/')"
+check "two scripts"       "1b3"       "$(echo abc | sed -e 's/a/1/' -e 's/c/3/')"
+check "another delimiter" "/opt/bin"  "$(echo /usr/bin | sed 's|/usr|/opt|')"
+check "a character class" "ab"        "$(echo a1b2 | sed 's/[0-9]//g')"
+check "substitute and print" "A"      "$(printf 'a\nb\n' | sed -n 's/a/A/p')"
+rm -f /tmp/sed.txt
+printf 'one\ntwo\n' > /tmp/sed.txt
+sed -i 's/one/1/' /tmp/sed.txt
+check "in place"          "1"         "$(head -n 1 /tmp/sed.txt)"
+rm -f /tmp/sed.txt
+
+echo
+echo "-- xargs --"
+check "one line"          "args: 1 2 3" "$(echo '1 2 3' | xargs echo args:)"
+check "one at a time"     "3"           "$(printf 'a\nb\nc\n' | xargs -n 1 echo | wc -l)"
+check "replacing a marker" "[x]"        "$(printf 'x\n' | xargs -I {} echo '[{}]')"
+check "nothing to do"     "0"           "$(echo '' | xargs -r echo ran | wc -l)"
+check "quotes group"      "one two"     "$(echo \"'one two'\" | xargs -n 1 echo | head -n 1)"
+
+echo
 echo "-- files --"
 mkdir -p /tmp/t
 echo content > /tmp/t/file

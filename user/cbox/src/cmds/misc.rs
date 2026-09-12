@@ -83,6 +83,136 @@ fn evaluate(terms: &[&str]) -> bool {
     primary(terms)
 }
 
+/// Split standard input into the items xargs will pass on. Quotes group
+/// words, which is what keeps a name with a space in it in one piece.
+fn split_items(text: &str, separator: Option<char>) -> Vec<String> {
+    if let Some(separator) = separator {
+        return text
+            .split(separator)
+            .filter(|piece| !piece.is_empty())
+            .map(|piece| piece.to_string())
+            .collect();
+    }
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    started = true;
+                }
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                        started = true;
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if started || !current.is_empty() {
+                        items.push(std::mem::take(&mut current));
+                        started = false;
+                    }
+                }
+                c => {
+                    current.push(c);
+                    started = true;
+                }
+            },
+        }
+    }
+    if started || !current.is_empty() {
+        items.push(current);
+    }
+    items
+}
+
+/// Build a command line out of what came in on standard input.
+pub fn xargs(args: &[String]) -> i32 {
+    use std::io::Read;
+    let mut separator = None;
+    let mut per_run = usize::MAX;
+    let mut replace: Option<String> = None;
+    let mut no_run_if_empty = false;
+    let mut command: Vec<String> = Vec::new();
+    let mut index = 1;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "-0" | "--null" => separator = Some('\0'),
+            "-r" | "--no-run-if-empty" => no_run_if_empty = true,
+            "-n" => {
+                index += 1;
+                per_run = args.get(index).and_then(|n| n.parse().ok()).unwrap_or(usize::MAX);
+            }
+            "-I" => {
+                index += 1;
+                replace = args.get(index).cloned();
+            }
+            _ => break,
+        }
+        index += 1;
+    }
+    command.extend_from_slice(&args[index..]);
+    if command.is_empty() {
+        command.push("echo".to_string());
+    }
+
+    let mut text = String::new();
+    if std::io::stdin().read_to_string(&mut text).is_err() {
+        eprintln!("xargs: cannot read input");
+        return 1;
+    }
+    let items = split_items(&text, separator);
+    if items.is_empty() && (no_run_if_empty || replace.is_some()) {
+        return 0;
+    }
+
+    // -I runs the command once per item, with the marker replaced.
+    if let Some(marker) = replace {
+        let mut status = 0;
+        for item in &items {
+            let argv: Vec<String> = command
+                .iter()
+                .map(|word| word.replace(&marker, item))
+                .collect();
+            status = run_command(&argv);
+        }
+        return status;
+    }
+
+    let chunks: Vec<&[String]> = if per_run == usize::MAX || items.is_empty() {
+        vec![&items[..]]
+    } else {
+        items.chunks(per_run).collect()
+    };
+    let mut status = 0;
+    for chunk in chunks {
+        if chunk.is_empty() && no_run_if_empty {
+            continue;
+        }
+        let mut argv = command.clone();
+        argv.extend(chunk.iter().cloned());
+        status = run_command(&argv);
+    }
+    status
+}
+
+fn run_command(argv: &[String]) -> i32 {
+    match std::process::Command::new(&argv[0]).args(&argv[1..]).status() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(err) => {
+            eprintln!("xargs: {}: {}", argv[0], err);
+            127
+        }
+    }
+}
+
 fn primary(terms: &[&str]) -> bool {
     match terms.len() {
         0 => false,

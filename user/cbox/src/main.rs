@@ -30,6 +30,8 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("false", "exit with a failure status"),
     ("find", "walk a directory tree"),
     ("dmesg", "print the kernel log"),
+    ("sed", "edit a stream of text"),
+    ("xargs", "build a command line from input"),
     ("free", "report memory use"),
     ("grep", "select lines matching a pattern"),
     ("head", "print the first lines of a file"),

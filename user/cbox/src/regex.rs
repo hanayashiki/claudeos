@@ -210,6 +210,27 @@ impl Regex {
         }
     }
 
+    /// The first place `text` matches, as a half-open range of character
+    /// positions. Leftmost first, and greedy from there.
+    pub fn find(&self, text: &[char], from: usize) -> Option<(usize, usize)> {
+        for start in from..=text.len() {
+            for branch in &self.branches {
+                if branch.anchored_start && start != 0 {
+                    continue;
+                }
+                if branch.anchored_end {
+                    // `$` pins the end, so a match that reaches it ends there.
+                    if match_branch(&branch.pieces, text, start, true) {
+                        return Some((start, text.len()));
+                    }
+                } else if let Some(end) = match_pieces(&branch.pieces, text, start) {
+                    return Some((start, end));
+                }
+            }
+        }
+        None
+    }
+
     pub fn is_match(&self, text: &str) -> bool {
         let chars: Vec<char> = text.chars().collect();
         for branch in &self.branches {

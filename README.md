@@ -176,16 +176,21 @@ from PATH and of file paths elsewhere. Cooked mode comes back before a command
 runs, so the job owns the terminal.
 
 The coreutils cover the common set: `ls cat cp mv rm mkdir rmdir touch ln mkfifo
-chmod stat find du df echo wc head tail grep sort uniq cut tr tee seq rev
-printf expr test ps free uptime dmesg date env id uname hostname mount kill
-sleep clear hexdump basename dirname yes true false`.
+chmod stat find du df echo wc head tail grep sed xargs sort uniq cut tr tee
+seq rev printf expr test ps free uptime dmesg date env id uname hostname mount
+kill sleep clear hexdump basename dirname yes true false`.
+
+`grep` and `sed` share a backtracking regex engine written for them: anchors,
+`.`, character classes and `*`, with `-E` adding alternation, groups, `+` and
+`?`. `sed` takes line, `$`, regex and range addresses, `!`, and the `s`, `y`,
+`p`, `d`, `q` and `=` commands, with `-n`, `-e` and `-i`.
 
 ## Tests
 
 `make test` boots the OS once per suite and requires each to report zero
 failures.
 
-- `tests/suite.sh` runs **195 checks** inside the OS, driving the shell through
+- `tests/suite.sh` runs **219 checks** inside the OS, driving the shell through
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
   subprocesses and `/proc`.
