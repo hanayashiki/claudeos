@@ -421,9 +421,30 @@ fn stop_current(signal: i32) {
     schedule();
 }
 
+/// Stop the running task here, rather than on the way back to user mode.
+///
+/// A syscall that cannot make progress until the job is continued calls this
+/// instead of failing, so the operation resumes where it left off. Only safe
+/// from a point in the kernel that holds no locks.
+pub fn stop_for_signal(signal: i32) {
+    current().pending_signals &= !(1u64 << (signal as u64 & 63));
+    stop_current(signal);
+    // The continue that restarted this task has now had its default action,
+    // which is to do exactly that. Leaving it pending would make the caller
+    // think a signal is waiting and give up on what it was doing.
+    let task = current();
+    if task.signal_actions[SIGCONT as usize].handler == crate::signal::SIG_DFL {
+        task.pending_signals &= !(1u64 << (SIGCONT as u64 & 63));
+    }
+}
+
 /// Mark every task in the foreground group as having a pending signal.
 pub fn signal_foreground(signal: i32) {
-    let pgid = foreground();
+    signal_group(foreground(), signal);
+}
+
+/// Mark every task in `pgid` as having a pending signal.
+pub fn signal_group(pgid: u32, signal: i32) {
     if pgid == 0 {
         return;
     }

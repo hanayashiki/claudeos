@@ -149,10 +149,42 @@ fn echo(bytes: &[u8]) {
 }
 
 /// Read from the console, honouring the current terminal settings.
+/// A process that is not in the terminal's foreground group must not take the
+/// input the foreground job is waiting for. It is stopped with SIGTTIN and
+/// picks the read up again once it is continued in the foreground.
+fn claim_terminal() -> Result<(), Errno> {
+    loop {
+        let foreground = crate::sched::foreground();
+        if foreground == 0 {
+            return Ok(());
+        }
+        let task = crate::sched::current();
+        if task.pid == 1 || task.pgid == 0 || task.pgid == foreground {
+            return Ok(());
+        }
+        // A process that has said it does not want SIGTTIN cannot be stopped
+        // by it, so the read fails outright rather than looping.
+        let bit = 1u64 << (crate::abi::SIGTTIN as u64 & 63);
+        let action = task.signal_actions[crate::abi::SIGTTIN as usize];
+        if task.signal_mask & bit != 0 || action.handler == crate::signal::SIG_IGN {
+            return Err(Errno::EIO);
+        }
+        let pgid = task.pgid;
+        crate::sched::signal_group(pgid, crate::abi::SIGTTIN);
+        crate::sched::stop_for_signal(crate::abi::SIGTTIN);
+        // Continued. Anything else waiting unwinds the read so it can be
+        // taken on the way out.
+        if crate::sched::has_pending_signal() {
+            return Err(Errno::EINTR);
+        }
+    }
+}
+
 pub fn read(buf: &mut [u8]) -> Result<usize, Errno> {
     if buf.is_empty() {
         return Ok(0);
     }
+    claim_terminal()?;
     let (canonical, echo_on) = {
         let termios = TERMIOS.lock();
         (termios.c_lflag & ICANON != 0, termios.c_lflag & ECHO != 0)

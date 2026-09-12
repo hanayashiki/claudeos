@@ -47,6 +47,8 @@ run_interactive() {
       "yes > /dev/null\n" "wait:1.5" "\x1a" "wait:1" \
       "jobs\n" "wait:0.8" "bg\n" "wait:1" "jobs\n" "wait:0.8" \
       "kill %1\n" "wait:1.5" \
+      "cat &\n" "wait:1.5" "jobs\n" "wait:0.8" \
+      "fg\n" "wait:0.8" "into-cat\n" "wait:1" "\x04" "wait:1.2" \
       "uptime\n" "wait:1.5" \
       "exit\n" "wait:3" 2>&1 | tr -d '\r')"
   echo "$output"
@@ -59,6 +61,7 @@ run_interactive() {
   # background, and `kill %1` has to reach it by job number.
   for expected in "live-input-works" "^abcZ$" "^line-kill-works$" \
                   "survived-interrupt" "Stopped  yes" "Running  yes" \
+                  "Stopped  cat" "^into-cat$" \
                   "session ended"; do
     if ! echo "$output" | grep -q "$expected"; then
       echo "   missing expected output: $expected"
