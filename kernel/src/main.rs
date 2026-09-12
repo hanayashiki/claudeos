@@ -49,6 +49,10 @@ struct BootOptions {
     /// what comes back. Off unless the word `nettest` is on the command line,
     /// so the ordinary suites never see it.
     nettest: bool,
+    /// The addresses the protocol stack uses, and whether to run its own
+    /// checks instead of booting.
+    net: net::Config,
+    net_test: bool,
     args: Vec<String>,
 }
 
@@ -57,6 +61,8 @@ fn parse_cmdline(cmdline: Option<&str>) -> BootOptions {
         init: "/bin/init".to_string(),
         trace: syscall::TRACE_OFF,
         nettest: false,
+        net: net::Config::QEMU_USER,
+        net_test: false,
         args: Vec::new(),
     };
     let Some(cmdline) = cmdline else { return options };
@@ -72,6 +78,26 @@ fn parse_cmdline(cmdline: Option<&str>) -> BootOptions {
             };
         } else if word == "nettest" {
             options.nettest = true;
+        } else if let Some(value) = word.strip_prefix("net=") {
+            // The protocols against a card that only records what it is
+            // asked to send, in place of booting anything.
+            options.net_test = value == "test";
+        } else if let Some(value) = word.strip_prefix("ip=") {
+            if let Some(address) = net::ip::parse_address(value) {
+                options.net.address = address;
+            }
+        } else if let Some(value) = word.strip_prefix("netmask=") {
+            if let Some(address) = net::ip::parse_address(value) {
+                options.net.netmask = address;
+            }
+        } else if let Some(value) = word.strip_prefix("gateway=") {
+            if let Some(address) = net::ip::parse_address(value) {
+                options.net.gateway = address;
+            }
+        } else if let Some(value) = word.strip_prefix("nameserver=") {
+            if let Some(address) = net::ip::parse_address(value) {
+                options.net.nameserver = address;
+            }
         } else {
             // Anything else is handed to the init process as an argument.
             options.args.push(word.to_string());
@@ -141,6 +167,24 @@ pub extern "C" fn kmain(mb_info_phys: u64, magic: u64) -> ! {
     // created, so a mapping made later would be missing from it. Finding no
     // card is the ordinary outcome on a machine booted without one.
     let nic = net::e1000::probe();
+
+    // The protocol stack takes its addresses from here rather than naming any
+    // of its own; a driver that attaches later does not change them.
+    net::configure(options.net);
+    println!(
+        "net: {} netmask {} gateway {}",
+        options.net.address, options.net.netmask, options.net.gateway
+    );
+    if options.net_test {
+        println!();
+        let passed = net::selftest::run();
+        println!();
+        println!(
+            "claudeos: network self test {}",
+            if passed { "passed" } else { "FAILED" }
+        );
+        power_off();
+    }
 
     let mut argv = alloc::vec![options.init.clone()];
     argv.extend(options.args.iter().cloned());

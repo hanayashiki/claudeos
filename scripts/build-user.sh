@@ -19,6 +19,12 @@ cd "$ROOT/user/cbox"
 cargo build --release --target "$TARGET"
 CBOX="$ROOT/user/cbox/target/$TARGET/release/cbox"
 
+# Sockets, through the standard library rather than through this project's own
+# code: `inet` on its own is the socket test, `inet serve` an HTTP server.
+cd "$ROOT/user/inet"
+cargo build --release --target "$TARGET"
+INET="$ROOT/user/inet/target/$TARGET/release/inet"
+
 # ---- assemble the root filesystem ----------------------------------------
 RFS="$ROOT/build/rootfs"
 rm -rf "$RFS"
@@ -26,6 +32,9 @@ mkdir -p "$RFS"/{bin,etc,root,tmp,dev,proc}
 
 cp "$CBOX" "$RFS/bin/cbox"
 chmod +x "$RFS/bin/cbox"
+
+cp "$INET" "$RFS/bin/inet"
+chmod +x "$RFS/bin/inet"
 
 # One symlink per applet, busybox style.
 APPLETS=$("$ROOT/scripts/list-applets.sh" "$ROOT/user/cbox/src/main.rs")

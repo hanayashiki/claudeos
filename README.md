@@ -157,6 +157,33 @@ it neither spins nor waits out a tick to notice a byte that has arrived. The
 condition is re-tested from inside the sleep, on descriptors held across it, so
 a change that lands between the check and the sleep cannot be missed.
 
+**Networking.** A PCI scan finds an emulated Intel gigabit card and brings it
+up: two descriptor rings, buffers the card reaches by physical address, and
+registers mapped uncached into the kernel half. Its interrupt handler only
+moves frames off the ring and wakes a kernel task, because protocol work with
+interrupts masked would hold off the timer for as long as it ran. Above that
+sit Ethernet, address resolution with a cache, IPv4, ICMP, UDP and TCP, and the
+`AF_INET` socket calls, which report readiness through the same machinery
+`poll`, `select` and `epoll` already used. TCP does a passive and an active
+open, in-order data with acknowledgements, retransmission on a timer, and an
+orderly close. It is correct on a quiet link. There is no reassembly queue, no
+fast retransmit and no round-trip estimator, so it is not correct on a lossy
+one.
+
+```
+$ ./scripts/run.sh --hostfwd tcp::8080-:8080 --initrd build/initramfs.cpio \
+      --append 'init=/bin/inet serve 8080'
+inet: listening on 0.0.0.0:8080
+inet: connection from 10.0.2.2:55451
+
+$ curl -i http://127.0.0.1:8080/
+HTTP/1.1 200 OK
+Content-Type: text/plain
+Content-Length: 20
+
+hello from claudeos
+```
+
 **Console.** A 16550 UART and a PS/2 keyboard feed one input ring. A line
 discipline implements canonical mode with echo, backspace, `Ctrl-C`, `Ctrl-D`
 and `Ctrl-U`, and honours the `termios` settings a program sets through
@@ -274,6 +301,5 @@ tests/alpine.sh       in-OS suite run inside an Alpine root filesystem
 Single CPU; no SMP. There is no block device driver or on-disk filesystem: the
 root filesystem lives in RAM and changes do not survive a reboot. There is no
 networking, so the socket calls return `EAFNOSUPPORT`. `futex` still waits by re-checking rather than by queueing,
-though it yields or sleeps rather than spins. Sockets are `socketpair` only:
-there is no `bind` or `connect`, so nothing can be reached by name or over a
-network.
+though it yields or sleeps rather than spins. There is no name resolution in the kernel and no DHCP, so addresses
+come from the command line.

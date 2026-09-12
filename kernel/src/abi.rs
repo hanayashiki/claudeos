@@ -39,6 +39,10 @@ pub mod nr {
     pub const GETPID: u64 = 39;
     pub const SENDFILE: u64 = 40;
     pub const SOCKET: u64 = 41;
+    pub const CONNECT: u64 = 42;
+    pub const ACCEPT: u64 = 43;
+    pub const BIND: u64 = 49;
+    pub const LISTEN: u64 = 50;
     pub const CLONE: u64 = 56;
     pub const FORK: u64 = 57;
     pub const VFORK: u64 = 58;
@@ -209,13 +213,28 @@ pub enum Errno {
     ENOTEMPTY = 39,
     ELOOP = 40,
     ENOTSOCK = 88,
+    EDESTADDRREQ = 89,
+    EMSGSIZE = 90,
+    EPROTOTYPE = 91,
+    ENOPROTOOPT = 92,
     EPROTONOSUPPORT = 93,
     EOPNOTSUPP = 95,
     EAFNOSUPPORT = 97,
-    EISCONN = 106,
+    EADDRINUSE = 98,
+    EADDRNOTAVAIL = 99,
+    ENETDOWN = 100,
+    ENETUNREACH = 101,
+    ECONNABORTED = 103,
     ECONNRESET = 104,
+    ENOBUFS = 105,
+    EISCONN = 106,
+    ENOTCONN = 107,
+    ESHUTDOWN = 108,
     ETIMEDOUT = 110,
     ECONNREFUSED = 111,
+    EHOSTUNREACH = 113,
+    EALREADY = 114,
+    EINPROGRESS = 115,
 }
 
 pub type SysResult = Result<u64, Errno>;

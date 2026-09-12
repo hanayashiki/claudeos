@@ -2,6 +2,7 @@
 
 pub mod file;
 pub mod mem;
+pub mod net;
 pub mod proc;
 
 use crate::abi::*;
@@ -244,19 +245,47 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::SOCKETPAIR => {
             file::socketpair(args[0] as u32, args[1] as u32, args[2] as u32, args[3])
         }
-        nr::SENDTO => file::sendto(args[0] as i32, args[1], args[2] as usize, args[4]),
-        nr::RECVFROM => {
-            file::recvfrom(args[0] as i32, args[1], args[2] as usize, args[4], args[5])
-        }
+        nr::SENDTO => net::sendto(
+            args[0] as i32,
+            args[1],
+            args[2] as usize,
+            args[3] as u32,
+            args[4],
+            args[5],
+        ),
+        nr::RECVFROM => net::recvfrom(
+            args[0] as i32,
+            args[1],
+            args[2] as usize,
+            args[3] as u32,
+            args[4],
+            args[5],
+        ),
         nr::SENDMSG => file::sendmsg(args[0] as i32, args[1]),
         nr::RECVMSG => file::recvmsg(args[0] as i32, args[1]),
-        nr::SHUTDOWN => file::shutdown(args[0] as i32, args[1] as u32),
-        nr::SETSOCKOPT => Ok(0),
-        nr::GETSOCKOPT => file::getsockopt(args[0] as i32, args[3], args[4]),
-        nr::GETSOCKNAME | nr::GETPEERNAME => {
-            file::getsockname(args[0] as i32, args[1], args[2])
-        }
-        nr::SOCKET => Err(Errno::EAFNOSUPPORT),
+        nr::SHUTDOWN => net::shutdown(args[0] as i32, args[1] as u32),
+        nr::SETSOCKOPT => net::setsockopt(
+            args[0] as i32,
+            args[1] as u32,
+            args[2] as u32,
+            args[3],
+            args[4],
+        ),
+        nr::GETSOCKOPT => net::getsockopt(
+            args[0] as i32,
+            args[1] as u32,
+            args[2] as u32,
+            args[3],
+            args[4],
+        ),
+        nr::GETSOCKNAME => net::getsockname(args[0] as i32, args[1], args[2]),
+        nr::GETPEERNAME => net::getpeername(args[0] as i32, args[1], args[2]),
+        nr::SOCKET => net::socket(args[0] as u32, args[1] as u32, args[2] as u32),
+        nr::BIND => net::bind(args[0] as i32, args[1], args[2]),
+        nr::LISTEN => net::listen(args[0] as i32, args[1] as i32),
+        nr::ACCEPT => net::accept4(args[0] as i32, args[1], args[2], 0),
+        nr::ACCEPT4 => net::accept4(args[0] as i32, args[1], args[2], args[3] as u32),
+        nr::CONNECT => net::connect(args[0] as i32, args[1], args[2]),
         nr::CLOSE_RANGE => file::close_range(args[0] as u32, args[1] as u32),
 
         _ => {
@@ -341,6 +370,19 @@ pub fn name_of(number: u64) -> &'static str {
         nr::STATX => "statx",
         nr::RSEQ => "rseq",
         nr::CLONE3 => "clone3",
+        nr::SOCKET => "socket",
+        nr::BIND => "bind",
+        nr::LISTEN => "listen",
+        nr::ACCEPT => "accept",
+        nr::ACCEPT4 => "accept4",
+        nr::CONNECT => "connect",
+        nr::SENDTO => "sendto",
+        nr::RECVFROM => "recvfrom",
+        nr::SHUTDOWN => "shutdown",
+        nr::SETSOCKOPT => "setsockopt",
+        nr::GETSOCKOPT => "getsockopt",
+        nr::GETSOCKNAME => "getsockname",
+        nr::GETPEERNAME => "getpeername",
         _ => "?",
     }
 }

@@ -617,6 +617,7 @@ pub fn ioctl(fd: i32, request: u64, arg: u64) -> SysResult {
                     }
                 },
                 FileBacking::Socket(socket) => socket.rx.available() as u64,
+                FileBacking::Inet(handle) => handle.socket.available() as u64,
                 FileBacking::EventFd(_) | FileBacking::Epoll(_) => 0,
             };
             uaccess::write_u32(arg, available as u32)?;
@@ -675,14 +676,16 @@ pub fn ready_to_write(file: &Arc<OpenFile>) -> bool {
     match &file.backing {
         FileBacking::Pipe(pipe, is_write) => !*is_write || pipe.writable_now(),
         FileBacking::Socket(socket) => socket.tx.writable_now(),
+        FileBacking::Inet(handle) => handle.socket.writable(),
         _ => true,
     }
 }
 
-fn ready_to_read(file: &Arc<OpenFile>) -> bool {
+pub fn ready_to_read(file: &Arc<OpenFile>) -> bool {
     match &file.backing {
         FileBacking::EventFd(event) => event.readable(),
         FileBacking::Socket(socket) => socket.readable(),
+        FileBacking::Inet(handle) => handle.socket.readable(),
         FileBacking::Epoll(_) => false,
         FileBacking::Pipe(pipe, is_write) => {
             if *is_write {
@@ -750,6 +753,9 @@ pub fn poll(fds_addr: u64, count: usize, timeout_ms: i64) -> SysResult {
     };
 
     loop {
+        // A socket whose other end is on this machine has its traffic handed
+        // over by whichever task is not holding a lock, and this is one.
+        crate::net::poll();
         let mut ready = 0u64;
         for (i, request) in requests.iter().enumerate() {
             let revents = current(request);
@@ -824,6 +830,7 @@ pub fn select(
     }
 
     loop {
+        crate::net::poll();
         let mut ready = 0u64;
         let mut read_result = vec![0u64; words.max(1)];
         let mut write_result = vec![0u64; words.max(1)];
@@ -1049,10 +1056,16 @@ pub fn epoll_wait(epfd: i32, events_addr: u64, max: i32, timeout_ms: i64) -> Sys
                 ready |= EPOLLHUP;
             }
         }
+        if let FileBacking::Inet(handle) = &file.backing {
+            if handle.socket.hung_up() {
+                ready |= EPOLLHUP;
+            }
+        }
         ready
     }
 
     loop {
+        crate::net::poll();
         // Hold the descriptors being watched, so readiness can be tested from
         // inside the sleep without going near user memory or the fd table.
         let watches = set.watches.lock().clone();

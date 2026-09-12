@@ -90,6 +90,12 @@ run_interactive() {
 
 run_suite "userland and shell" "/root/suite.sh" 240
 run_suite "rust standard library" "init=/bin/rtest" 300
+# The protocols against a card that only records what it is asked to send:
+# frames in by hand, frames out compared byte for byte.
+run_suite "network protocols" "net=test" 60
+# The socket system calls, through the standard library, over the loopback
+# address, so no card has to be there.
+run_suite "internet sockets" "init=/bin/inet" 120
 if [ -x "$ROOT/build/rootfs/bin/busybox" ]; then
   run_suite "upstream busybox" "/root/busybox.sh" 300
 else

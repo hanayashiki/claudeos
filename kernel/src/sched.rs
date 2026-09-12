@@ -326,10 +326,18 @@ pub fn exit_current(status: i32) -> ! {
         // joining on it can see that it finished. This goes through the
         // checked path: the page may be shared read-only after a fork, and a
         // bare store would fault inside the kernel.
+        //
+        // Clearing the word is only half of it. A joiner waits on that address
+        // with no timeout, which sleeps with no wake-up time set, so the timer
+        // will never return it to the run queue; only a wake on the futex
+        // will. Without one the joiner is released only if it happens to read
+        // the zero before it goes to sleep, and loses that race as soon as
+        // anything else on the machine gets the scheduler in first.
         if task.clear_child_tid != 0 {
             let address = task.clear_child_tid;
             task.clear_child_tid = 0;
             let _ = crate::uaccess::write_u32(address, 0);
+            crate::futex::wake(crate::futex::futex_key(address), u32::MAX);
         }
         task.fds.entries.clear();
         task.fds.cloexec.clear();
