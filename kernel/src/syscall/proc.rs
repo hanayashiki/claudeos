@@ -86,6 +86,9 @@ pub fn fork(
         msr::read(msr::IA32_FS_BASE)
     };
     child.gs_base = msr::read(msr::IA32_KERNEL_GS_BASE);
+    // The child carries on from the same instruction, so it needs the same
+    // floating point and vector registers the parent has right now.
+    child.fpu.save();
     if flags & CLONE_CHILD_CLEARTID != 0 {
         child.clear_child_tid = child_tid;
     }
@@ -125,15 +128,21 @@ pub fn fork(
         // handed back its address space by exec'ing or exiting. The child is
         // already registered and could reach that point first, so the sleep
         // is set up with interrupts off, where nothing else can run.
-        crate::sync::disable_interrupts();
         // The child clears the link when it execs or exits, so a link that is
-        // still there means the wake-up has not happened yet.
-        let waiting = sched::find(child_pid).map_or(false, |c| c.vfork_parent.is_some());
-        if waiting {
-            sched::current().state = State::Sleeping;
-        }
-        crate::sync::enable_interrupts();
-        if waiting {
+        // still there means the address space has not been handed back yet.
+        // Anything else that wakes the parent, a signal from an unrelated
+        // child among them, must not end the wait, so this sleeps until the
+        // link is gone rather than once.
+        loop {
+            crate::sync::disable_interrupts();
+            let waiting = sched::find(child_pid).map_or(false, |c| c.vfork_parent.is_some());
+            if waiting {
+                sched::current().state = State::Sleeping;
+            }
+            crate::sync::enable_interrupts();
+            if !waiting {
+                break;
+            }
             sched::schedule();
         }
     }
@@ -278,6 +287,10 @@ pub fn exec_into_current(
     }
 
     task.fds.close_on_exec();
+    // A new program starts with a clean x87 and SSE state, not the one the
+    // program that called exec left behind.
+    task.fpu = crate::task::FpuState::initial();
+    task.fpu.restore();
     task.fs_base = 0;
     msr::write(msr::IA32_FS_BASE, 0);
     task.name = exec_path
@@ -338,17 +351,31 @@ pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
         if options & WNOHANG != 0 {
             return Ok(0);
         }
-        // A child can exit between the checks above and this sleep. It would
-        // find the parent runnable, leave the wake-up undelivered, and the
-        // sleep would never end. Interrupts off means nothing else runs in
-        // between, so the state the checks saw is still the state here.
+        // A child can finish between the checks above and this sleep: the
+        // checks run with the task on the CPU, and the timer can take it away
+        // at any point in between. The wake-up that the child sends then
+        // finds a runnable parent and does nothing, and the sleep below would
+        // never end. Turning interrupts off here only stops something else
+        // starting now, not something that already happened, so the question
+        // has to be asked again inside the same window, and the sleep skipped
+        // if the answer has changed.
         crate::sync::disable_interrupts();
-        let mut task = sched::current();
-        task.waiting_for = Some(pid as i32);
-        task.state = State::Sleeping;
+        let sleep = !sched::child_event_pending(
+            me,
+            pid as i32,
+            options & WUNTRACED != 0,
+            options & WCONTINUED != 0,
+        );
+        if sleep {
+            let mut task = sched::current();
+            task.waiting_for = Some(pid as i32);
+            task.state = State::Sleeping;
+        }
         crate::sync::enable_interrupts();
-        sched::schedule();
-        sched::current().waiting_for = None;
+        if sleep {
+            sched::schedule();
+            sched::current().waiting_for = None;
+        }
         // A signal arriving while blocked interrupts the wait.
         let pending = sched::current().pending_signals & !sched::current().signal_mask;
         if pending & !(1u64 << (SIGCHLD as u64 & 63)) != 0 {

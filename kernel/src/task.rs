@@ -17,6 +17,71 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+/// The x87, MMX and SSE register file, as `fxsave` lays it out.
+///
+/// The kernel is built without SSE and never touches these registers, so
+/// everything in them between a trap and the next context switch still belongs
+/// to the task that was interrupted. Nothing else preserves them, so a task
+/// preempted in the middle of an SSE memcpy would come back holding whatever
+/// the task that ran in between had left in `xmm0`, and store that to memory.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub struct FpuState([u8; 512]);
+
+impl FpuState {
+    /// The state a program starts with: x87 precision control set the way the
+    /// ABI asks for, and every SSE exception masked.
+    pub fn initial() -> FpuState {
+        let mut state = FpuState([0; 512]);
+        state.0[0..2].copy_from_slice(&0x037Fu16.to_le_bytes()); // FCW
+        state.0[24..28].copy_from_slice(&0x0000_1F80u32.to_le_bytes()); // MXCSR
+        state.0[28..32].copy_from_slice(&0x0000_FFFFu32.to_le_bytes()); // MXCSR_MASK
+        state
+    }
+
+    /// Take the registers as they stand into this buffer.
+    #[inline]
+    pub fn save(&mut self) {
+        unsafe {
+            core::arch::asm!(
+                "fxsave64 [{}]",
+                in(reg) self.0.as_mut_ptr(),
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8; 512] {
+        &self.0
+    }
+
+    /// Take a saved image back, rejecting the control-word bits the hardware
+    /// would fault on: the image came off the user stack.
+    pub fn from_bytes(&mut self, src: &[u8]) -> bool {
+        if src.len() < 512 {
+            return false;
+        }
+        self.0.copy_from_slice(&src[..512]);
+        let mut mxcsr = [0u8; 4];
+        mxcsr.copy_from_slice(&self.0[24..28]);
+        let value = u32::from_le_bytes(mxcsr) & 0x0000_FFBF;
+        self.0[24..28].copy_from_slice(&value.to_le_bytes());
+        true
+    }
+
+    /// Put this buffer back into the registers.
+    #[inline]
+    pub fn restore(&self) {
+        unsafe {
+            core::arch::asm!(
+                "fxrstor64 [{}]",
+                in(reg) self.0.as_ptr(),
+                options(nostack, readonly, preserves_flags),
+            );
+        }
+    }
+}
+
 pub const KERNEL_STACK_SIZE: usize = 32 * 1024;
 pub const TRAP_FRAME_SIZE: usize = core::mem::size_of::<TrapFrame>();
 
@@ -125,6 +190,8 @@ pub struct Task {
     pub exit_code: i32,
     pub fs_base: u64,
     pub gs_base: u64,
+    /// Floating point and vector registers, carried across context switches.
+    pub fpu: FpuState,
     pub clear_child_tid: u64,
     pub set_child_tid: u64,
     pub robust_list: u64,
@@ -201,6 +268,7 @@ impl Task {
             exit_code: 0,
             fs_base: 0,
             gs_base: 0,
+            fpu: FpuState::initial(),
             clear_child_tid: 0,
             set_child_tid: 0,
             robust_list: 0,

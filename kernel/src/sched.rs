@@ -185,6 +185,11 @@ unsafe fn switch_to(next: *mut Task) {
     msr::write(msr::IA32_FS_BASE, next_task.fs_base);
     msr::write(msr::IA32_KERNEL_GS_BASE, next_task.gs_base);
 
+    // So do the floating point and vector registers. The kernel never uses
+    // them, so what is in them here is still the outgoing task's.
+    prev_task.fpu.save();
+    next_task.fpu.restore();
+
     // Entry from user mode must land on the incoming task's kernel stack.
     gdt::set_kernel_stack(next_task.kstack_top);
     per_cpu().kernel_rsp = next_task.kstack_top;
@@ -336,19 +341,8 @@ pub fn exit_current(status: i32) -> ! {
             task.space.free_user_memory();
             task.clear_vmas();
         }
-        task.state = State::Zombie;
-
         let ppid = task.ppid;
         let pid = task.pid;
-
-        if let Some(parent_pid) = task.vfork_parent.take() {
-            if let Some(parent) = find(parent_pid) {
-                if parent.state == State::Sleeping {
-                    parent.state = State::Runnable;
-                    parent.wake_at = 0;
-                }
-            }
-        }
 
         if pid == 1 {
             crate::println!();
@@ -359,29 +353,49 @@ pub fn exit_current(status: i32) -> ! {
             crate::power_off();
         }
 
-        // Orphans are adopted by init. One that has already exited still
-        // needs reaping, and init is normally asleep in wait4, so it has to be
-        // woken here; nothing else will report the adopted zombie to it.
-        let mut adopted_zombie = false;
-        for_each(|other| {
-            if other.ppid == pid {
-                other.ppid = 1;
-                if other.state == State::Zombie {
-                    adopted_zombie = true;
-                }
-            }
-        });
-        if adopted_zombie && ppid != 1 {
-            if let Some(init) = find(1) {
-                init.pending_signals |= 1u64 << (SIGCHLD as u64 & 63);
-                if init.state == State::Sleeping && init.waiting_for.is_some() {
-                    init.state = State::Runnable;
-                    init.wake_at = 0;
-                }
-            }
-        }
+        // Becoming a zombie takes this task off the run queue for good, so
+        // everything that has to be done on its behalf has to be done in the
+        // same breath. A timer landing between the two would hand the CPU to
+        // something else and never hand it back, leaving the parent's
+        // wake-up undelivered by a task that can no longer deliver it.
+        crate::sync::without_interrupts(|| {
+            let mut task = current();
+            task.state = State::Zombie;
 
-        notify_parent(ppid);
+            if let Some(parent_pid) = task.vfork_parent.take() {
+                if let Some(parent) = find(parent_pid) {
+                    if parent.state == State::Sleeping {
+                        parent.state = State::Runnable;
+                        parent.wake_at = 0;
+                    }
+                }
+            }
+
+            // Orphans are adopted by init. One that has already exited still
+            // needs reaping, and init is normally asleep in wait4, so it has
+            // to be woken here; nothing else will report the adopted zombie
+            // to it.
+            let mut adopted_zombie = false;
+            for_each(|other| {
+                if other.ppid == pid {
+                    other.ppid = 1;
+                    if other.state == State::Zombie {
+                        adopted_zombie = true;
+                    }
+                }
+            });
+            if adopted_zombie && ppid != 1 {
+                if let Some(init) = find(1) {
+                    init.pending_signals |= 1u64 << (SIGCHLD as u64 & 63);
+                    if init.state == State::Sleeping && init.waiting_for.is_some() {
+                        init.state = State::Runnable;
+                        init.wake_at = 0;
+                    }
+                }
+            }
+
+            notify_parent(ppid);
+        });
     }
     loop {
         schedule();
@@ -716,6 +730,31 @@ pub fn child_status_change(
         }
     }
     None
+}
+
+/// True when `parent_pid` has a child matching `want` with something for
+/// `wait4` to collect: one that has finished, or one whose stop or continue
+/// has not been reported yet. Takes nothing, so the answer can be asked for
+/// again without consuming the event.
+pub fn child_event_pending(
+    parent_pid: u32,
+    want: i32,
+    untraced: bool,
+    continued: bool,
+) -> bool {
+    let tasks = TASKS.lock();
+    tasks.iter().any(|t| {
+        let task = t.get();
+        if task.ppid != parent_pid {
+            return false;
+        }
+        if want > 0 && task.pid != want as u32 {
+            return false;
+        }
+        task.state == State::Zombie
+            || (untraced && task.report_stop)
+            || (continued && task.report_continue)
+    })
 }
 
 /// True when the parent has at least one live child matching `want`.

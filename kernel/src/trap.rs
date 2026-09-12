@@ -64,6 +64,7 @@ fn page_fault(frame: &mut TrapFrame) {
         for (name, at) in [("r15", frame.r15), ("rbx", frame.rbx), ("rsp", frame.rsp)] {
             dump_user(name, at);
         }
+        dump_regions(addr);
         crate::sched::kill_current(11); // SIGSEGV
     }
 
@@ -118,6 +119,32 @@ pub fn unhandled(frame: &mut TrapFrame) {
     println!("[trap] unhandled vector {} rip={:#x}", vector, frame.rip);
     if frame.from_user() {
         crate::sched::kill_current(11);
+    }
+}
+
+/// What the task believes it has mapped, so a fault says whether the address
+/// was inside a region at all.
+fn dump_regions(addr: u64) {
+    let task = crate::sched::current();
+    let mm = task.mm.lock();
+    println!(
+        "  regions: brk {:#x}..{:#x}  mmap_top {:#x}  {} vmas",
+        mm.brk_start,
+        mm.brk,
+        mm.mmap_top,
+        mm.vmas.len()
+    );
+    for vma in mm.vmas.iter() {
+        let hit = if addr >= vma.start && addr < vma.end { " <== fault" } else { "" };
+        println!(
+            "    {:#014x}..{:#014x} prot {:#x} flags {:#x} {}{}",
+            vma.start,
+            vma.end,
+            vma.prot,
+            vma.flags,
+            if vma.file.is_some() { "file" } else { "anon" },
+            hit
+        );
     }
 }
 

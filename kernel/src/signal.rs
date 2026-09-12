@@ -39,7 +39,12 @@ const UC_STACK: usize = UC_OFFSET + 16;
 const MCONTEXT: usize = UC_OFFSET + 40;
 const UC_SIGMASK: usize = MCONTEXT + 256;
 const INFO_OFFSET: usize = UC_SIGMASK + 8;
-const FRAME_SIZE: usize = INFO_OFFSET + 128;
+/// The x87 and SSE registers, saved where `struct sigcontext`'s `fpstate`
+/// points. The frame is placed at an address 8 past a 16-byte boundary, and
+/// this offset is 8 past a multiple of 16, so the image lands aligned the way
+/// `fxsave` needs it.
+const FPSTATE_OFFSET: usize = INFO_OFFSET + 128;
+const FRAME_SIZE: usize = FPSTATE_OFFSET + 512;
 
 /// Offsets of each saved register inside `struct sigcontext`.
 const SC_R8: usize = 0;
@@ -61,6 +66,8 @@ const SC_RSP: usize = 120;
 const SC_RIP: usize = 128;
 const SC_EFLAGS: usize = 136;
 const SC_CS: usize = 144;
+/// Where `struct sigcontext` keeps the pointer to the saved x87/SSE image.
+const SC_FPSTATE: usize = 184;
 
 fn put64(buf: &mut [u8], offset: usize, value: u64) {
     buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
@@ -117,6 +124,12 @@ pub fn deliver(task: &mut Task, signal: i32, action: &SigAction, frame: &mut Tra
 
     put64(&mut buf, UC_SIGMASK, task.signal_mask);
 
+    // The handler runs on the same registers the interrupted code was using,
+    // and nothing else would put the floating point and vector ones back.
+    task.fpu.save();
+    buf[FPSTATE_OFFSET..FPSTATE_OFFSET + 512].copy_from_slice(task.fpu.bytes());
+    put64(&mut buf, m + SC_FPSTATE, sp + FPSTATE_OFFSET as u64);
+
     // siginfo: si_signo, si_errno, si_code.
     buf[INFO_OFFSET..INFO_OFFSET + 4].copy_from_slice(&signal.to_le_bytes());
     buf[INFO_OFFSET + 4..INFO_OFFSET + 8].copy_from_slice(&0i32.to_le_bytes());
@@ -172,6 +185,13 @@ pub fn sigreturn(task: &mut Task, frame: &mut TrapFrame) -> SysResult {
     frame.rflags = (flags & 0x0000_08D5) | 0x202;
 
     task.signal_mask = get64(&buf, UC_SIGMASK);
+
+    // Put the interrupted code's floating point and vector registers back.
+    if get64(&buf, m + SC_FPSTATE) != 0
+        && task.fpu.from_bytes(&buf[FPSTATE_OFFSET..FPSTATE_OFFSET + 512])
+    {
+        task.fpu.restore();
+    }
 
     // rt_sigreturn does not set a return value; rax comes back from the frame.
     let rax = get64(&buf, m + SC_RAX);

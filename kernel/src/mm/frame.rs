@@ -227,8 +227,10 @@ pub fn init(boot: &BootInfo) {
     let refcounts = phys_to_virt(bitmap_phys + bitmap_bytes as u64) as *mut u16;
     let words = bitmap_bytes / 8;
     unsafe {
-        core::ptr::write_bytes(bitmap, 0xFF, bitmap_bytes);
-        core::ptr::write_bytes(refcounts, 0, refcount_bytes);
+        // Byte counts, so the fills stop at the end of each array rather
+        // than running on for the width of its element type.
+        core::ptr::write_bytes(bitmap as *mut u8, 0xFF, bitmap_bytes);
+        core::ptr::write_bytes(refcounts as *mut u8, 0, refcount_bytes);
     }
 
     let mut alloc = BitmapAllocator {
