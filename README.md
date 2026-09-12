@@ -64,10 +64,20 @@ the page fault handler supplies pages on first touch.
 
 **System calls.** Entry is through `syscall`/`MSR_LSTAR`. The frame the entry
 stub builds has the same layout as the one an interrupt builds, so one code
-path serves both and both return through `iretq`. Around 130 Linux system call
-numbers are implemented, including the file, memory, process, thread, signal,
-and time groups that a libc start-up sequence and a threaded program actually
-exercise.
+path serves both and both return through `iretq`. Interrupts are re-enabled
+once the kernel stack is in place, so the kernel is preemptible and a blocking
+read does not shut out the device it is waiting for. Around 130 Linux system
+call numbers are implemented, including the file, memory, process, thread,
+signal, and time groups that a libc start-up sequence and a threaded program
+actually exercise.
+
+**Signals.** A handler installed with `rt_sigaction` is really entered: the
+kernel writes the same `rt_sigframe` Linux does onto the user stack, points the
+return address at the libc restorer, and `rt_sigreturn` puts the interrupted
+state back. Terminal signals are raised from the interrupt that receives the
+character, so `Ctrl-C` reaches a running job while the shell is blocked waiting
+for it. The shell puts each job in its own process group and hands it the
+terminal, so interrupting a job leaves the shell running.
 
 **Filesystem.** An in-memory tree is populated at boot from a cpio archive
 passed as a multiboot module. Character devices (`/dev/null`, `/dev/zero`,
@@ -105,12 +115,15 @@ failures.
 - `tests/suite.sh` runs **68 checks** inside the OS, driving the shell through
   pipelines, redirection, globbing, control flow, functions, file operations,
   devices, subprocesses and `/proc`.
-- The `rtest` applet runs **22 checks** against the Rust standard library:
+- The `rtest` applet runs **25 checks** against the Rust standard library:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
   thread sleep against the monotonic clock, file read/write/seek/append,
-  directory iteration, and `std::process::Command` capturing a child's output
-  through pipes.
+  directory iteration, `std::process::Command` capturing a child's output
+  through pipes, and signal handlers running and returning.
+- An **interactive session** is driven over the serial console: typing after
+  boot, `Ctrl-C` on a running job, a background job, and the clock advancing
+  while the shell is blocked in a read.
 
 Both suites are ordinary Linux programs. Nothing in them is aware that they are
 not running on Linux.
@@ -130,17 +143,20 @@ kernel/src
   sched.rs            round-robin scheduler, exit and reaping
   uaccess.rs          validated copying between kernel and user memory
   console.rs          input ring and terminal line discipline
+  signal.rs           signal frames, delivery and rt_sigreturn
 
 user/cbox             the multicall userland binary
 user/c/hello.c        a C program linked against musl
 tools/mkcpio.py       initramfs builder
+tools/drive.py        drives the console over a socket for interactive tests
 tests/suite.sh        in-OS shell and userland test suite
 ```
 
 ## Limitations
 
-Single CPU; no SMP. Signals only take their default action, so a program that
-installs a handler will see it recorded but never invoked. There is no block
-device driver or on-disk filesystem: the root filesystem lives in RAM and
-changes do not survive a reboot. There is no networking. Dynamically linked
-executables are rejected; only static and static-PIE ELF binaries load.
+Single CPU; no SMP. There is no block device driver or on-disk filesystem: the
+root filesystem lives in RAM and changes do not survive a reboot. There is no
+networking, so the socket calls return `EAFNOSUPPORT`. Dynamically linked
+executables are rejected; only static and static-PIE ELF binaries load. Job
+control stops at process groups and the foreground terminal: `SIGTSTP` and `fg`
+are not implemented. `futex` waits by polling rather than by queueing waiters.

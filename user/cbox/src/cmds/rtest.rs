@@ -7,6 +7,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+const SIGUSR1: i32 = 10;
+const SIGUSR2: i32 = 12;
+const SIG_IGN: usize = 1;
+
+static SIGNAL_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+    fn raise(signum: i32) -> i32;
+}
+
+extern "C" fn handle_signal(signum: i32) {
+    SIGNAL_TOTAL.fetch_add(signum as usize, Ordering::SeqCst);
+}
+
 struct Report {
     passed: usize,
     failed: usize,
@@ -206,6 +221,53 @@ pub fn main(_args: &[String]) -> i32 {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     report.check("child runs a pipeline", count == "5", format!("{:?}", count));
+
+    println!();
+    println!("-- signals --");
+    unsafe {
+        signal(SIGUSR1, handle_signal as usize);
+        signal(SIGUSR2, handle_signal as usize);
+    }
+    let before = SIGNAL_TOTAL.load(Ordering::SeqCst);
+    unsafe {
+        raise(SIGUSR1);
+        raise(SIGUSR2);
+    }
+    // The handler runs on the way out of a system call.
+    for _ in 0..4 {
+        std::thread::yield_now();
+    }
+    let delivered = SIGNAL_TOTAL.load(Ordering::SeqCst) - before;
+    report.check(
+        "handlers run for two signals",
+        delivered == (SIGUSR1 + SIGUSR2) as usize,
+        format!("sum {}", delivered),
+    );
+
+    // Execution has to continue normally after the handler returns, which
+    // means rt_sigreturn restored the interrupted state.
+    let mut accumulator = 0u64;
+    for i in 0..1000u64 {
+        accumulator = accumulator.wrapping_add(i * i);
+    }
+    report.check(
+        "execution resumes after a handler",
+        accumulator == 332_833_500,
+        format!("{}", accumulator),
+    );
+
+    unsafe {
+        signal(SIGUSR1, SIG_IGN);
+        raise(SIGUSR1);
+    }
+    for _ in 0..2 {
+        std::thread::yield_now();
+    }
+    report.check(
+        "ignored signal is dropped",
+        SIGNAL_TOTAL.load(Ordering::SeqCst) - before == (SIGUSR1 + SIGUSR2) as usize,
+        "handler ran while ignored".into(),
+    );
 
     println!();
     println!("-- time and environment --");

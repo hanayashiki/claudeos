@@ -42,9 +42,15 @@ syscall_entry:
     movq $0x1b, 168(%rsp)         /* user ss */
 
     cld
+    /* SYSCALL masks IF on entry. The kernel stack and the full frame are in
+     * place now, so interrupts can be taken again; without this a syscall that
+     * waits for input would block the timer and the device interrupts it is
+     * waiting on. */
+    sti
     movq %rsp, %rdi
     call syscall_dispatch
 
+    cli
     popq %rax
     popq %rbx
     popq %rcx

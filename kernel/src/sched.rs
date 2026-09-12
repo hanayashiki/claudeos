@@ -297,6 +297,7 @@ pub fn exit_current(status: i32) -> ! {
         });
 
         if let Some(parent) = find(ppid) {
+            parent.pending_signals |= 1u64 << (SIGCHLD as u64 & 63);
             if parent.state == State::Sleeping {
                 let target = parent.waiting_for;
                 let matches = match target {
@@ -343,7 +344,19 @@ pub fn signal_foreground(signal: i32) {
     });
 }
 
-/// Act on any pending signal before returning to user mode.
+/// True when a signal is waiting that the task has not blocked.
+pub fn has_pending_signal() -> bool {
+    if !has_current() {
+        return false;
+    }
+    let task = current();
+    let deliverable = task.pending_signals & !task.signal_mask;
+    // SIGKILL cannot be blocked.
+    deliverable != 0 || task.pending_signals & (1u64 << (SIGKILL as u64 & 63)) != 0
+}
+
+/// Act on pending signals before returning to user mode. Called once the
+/// syscall result has been stored, so a handler may run on the way out.
 pub fn check_signals() {
     if !has_current() {
         return;
@@ -352,18 +365,47 @@ pub fn check_signals() {
     if task.pending_signals == 0 {
         return;
     }
-    for signal in [SIGKILL, SIGINT, SIGTERM, SIGQUIT, SIGHUP, SIGSEGV, SIGPIPE, SIGABRT] {
+
+    for signal in 1..64i32 {
         let bit = 1u64 << (signal as u64 & 63);
-        if task.pending_signals & bit != 0 {
-            task.pending_signals &= !bit;
-            // Only the default action is implemented, and SIGKILL cannot be
-            // caught in any case.
-            let handler = task.signal_handlers[signal as usize];
-            if signal != SIGKILL && (handler == 1 /* SIG_IGN */) {
-                continue;
-            }
+        if task.pending_signals & bit == 0 {
+            continue;
+        }
+        let blocked = task.signal_mask & bit != 0;
+        if blocked && signal != SIGKILL && signal != SIGSTOP {
+            continue;
+        }
+        task.pending_signals &= !bit;
+
+        if signal == SIGKILL || signal == SIGSTOP {
             exit_current(signal & 0x7F);
         }
+
+        let action = task.signal_actions[signal as usize];
+        match action.handler {
+            crate::signal::SIG_IGN => continue,
+            crate::signal::SIG_DFL => {
+                if crate::signal::default_is_ignore(signal) {
+                    continue;
+                }
+                exit_current(signal & 0x7F);
+            }
+            _ => {}
+        }
+
+        // A handler can only run on the way back to user mode.
+        let frame = unsafe { &mut *task.trap_frame() };
+        if !frame.from_user() {
+            task.pending_signals |= bit;
+            return;
+        }
+        if action.flags & crate::signal::SA_RESETHAND != 0 {
+            task.signal_actions[signal as usize] = crate::signal::SigAction::default();
+        }
+        if !crate::signal::deliver(task, signal, &action, frame) {
+            exit_current(SIGSEGV & 0x7F);
+        }
+        return;
     }
 }
 

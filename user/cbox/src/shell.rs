@@ -639,6 +639,9 @@ pub struct Shell {
     pid: i32,
     jobs: Vec<(i32, String)>,
     exit_code: Option<i32>,
+    /// Set once the shell owns the terminal and puts jobs in their own groups.
+    job_control: bool,
+    shell_pgid: i32,
 }
 
 impl Shell {
@@ -657,6 +660,8 @@ impl Shell {
             pid: sys::getpid() as i32,
             jobs: Vec::new(),
             exit_code: None,
+            job_control: false,
+            shell_pgid: 0,
         }
     }
 
@@ -669,6 +674,8 @@ impl Shell {
             pid: sys::getpid() as i32,
             jobs: Vec::new(),
             exit_code: None,
+            job_control: false,
+            shell_pgid: self.shell_pgid,
         }
     }
 
@@ -695,6 +702,12 @@ impl Shell {
     }
 
     fn interactive(&mut self) -> i32 {
+        // Keyboard signals belong to the foreground job, not to the shell.
+        for signum in [sys::SIGINT, sys::SIGQUIT, sys::SIGTTIN, sys::SIGTTOU, sys::SIGTSTP] {
+            sys::set_signal(signum, sys::SIG_IGN);
+        }
+        self.job_control = true;
+        self.shell_pgid = sys::own_process_group();
         println!();
         println!("claudeos shell -- `help` lists the available commands");
         let mut pending = String::new();
@@ -879,6 +892,7 @@ impl Shell {
 
         let mut pids = Vec::new();
         let mut previous_read: Option<i32> = None;
+        let mut leader = 0i32;
 
         for (index, command) in commands.iter().enumerate() {
             let last = index + 1 == commands.len();
@@ -897,6 +911,15 @@ impl Shell {
 
             let pid = sys::fork();
             if pid == 0 {
+                if self.job_control {
+                    // Join the job's group and take the terminal signals back.
+                    sys::setpgid(0, leader);
+                    for signum in
+                        [sys::SIGINT, sys::SIGQUIT, sys::SIGTTIN, sys::SIGTTOU, sys::SIGTSTP]
+                    {
+                        sys::set_signal(signum, sys::SIG_DFL);
+                    }
+                }
                 if let Some(fd) = previous_read {
                     sys::dup2(fd, sys::STDIN);
                     sys::close(fd);
@@ -927,6 +950,18 @@ impl Shell {
                 return Flow::Normal;
             }
 
+            if self.job_control {
+                if leader == 0 {
+                    leader = pid as i32;
+                    if !pipeline.background {
+                        sys::give_terminal_to(leader);
+                    }
+                }
+                // Also set it here, so the group exists no matter which of the
+                // two processes runs first.
+                sys::setpgid(pid as i32, leader);
+            }
+
             if let Some(fd) = previous_read {
                 sys::close(fd);
             }
@@ -951,11 +986,21 @@ impl Shell {
         }
 
         let mut status = 0;
+        let mut interrupted = false;
         for pid in pids {
             let (rc, raw) = sys::wait4(pid, 0);
             if rc >= 0 {
                 status = sys::exit_code_of(raw);
+                if sys::signal_of(raw) == Some(sys::SIGINT) {
+                    interrupted = true;
+                }
             }
+        }
+        if self.job_control {
+            sys::give_terminal_to(self.shell_pgid);
+        }
+        if interrupted {
+            println!();
         }
         self.last_status = status;
         Flow::Normal

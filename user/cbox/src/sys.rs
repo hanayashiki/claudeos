@@ -207,3 +207,37 @@ pub fn set_foreground_group(pgid: i32) {
         syscall3(SYS_IOCTL, STDIN as u64, TIOCSPGRP, &value as *const i32 as u64);
     }
 }
+
+// musl provides these; the shell uses them for job control.
+extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+    fn tcsetpgrp(fd: i32, pgid: i32) -> i32;
+    fn getpgrp() -> i32;
+}
+
+pub const SIG_DFL: usize = 0;
+pub const SIG_IGN: usize = 1;
+
+pub const SIGINT: i32 = 2;
+pub const SIGQUIT: i32 = 3;
+pub const SIGTERM: i32 = 15;
+pub const SIGTSTP: i32 = 20;
+pub const SIGTTIN: i32 = 21;
+pub const SIGTTOU: i32 = 22;
+
+pub fn set_signal(signum: i32, handler: usize) {
+    unsafe {
+        signal(signum, handler);
+    }
+}
+
+pub fn own_process_group() -> i32 {
+    unsafe { getpgrp() }
+}
+
+/// Hand the terminal to `pgid` so it receives keyboard-generated signals.
+pub fn give_terminal_to(pgid: i32) {
+    unsafe {
+        tcsetpgrp(STDIN, pgid);
+    }
+}

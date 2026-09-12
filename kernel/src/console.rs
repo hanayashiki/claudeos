@@ -68,7 +68,37 @@ pub static TERMIOS: Spinlock<Termios> = Spinlock::new(Termios {
     c_ospeed: 38400,
 });
 
+/// Feed one received byte to the terminal.
+///
+/// Signal-generating characters are acted on here, in the interrupt that
+/// delivered them, because the process that will eventually read the terminal
+/// is usually blocked waiting for the job that needs the signal.
 pub fn push_byte(byte: u8) {
+    let (isig, intr, quit) = {
+        let termios = TERMIOS.lock();
+        (termios.c_lflag & crate::abi::ISIG != 0, termios.c_cc[0], termios.c_cc[1])
+    };
+
+    if isig && byte != 0 {
+        let signal = if byte == intr {
+            Some(crate::abi::SIGINT)
+        } else if byte == quit {
+            Some(crate::abi::SIGQUIT)
+        } else {
+            None
+        };
+        if let Some(signal) = signal {
+            {
+                let mut line = LINE.lock();
+                line.len = 0;
+                line.pos = 0;
+            }
+            echo(b"^C\n");
+            crate::sched::signal_foreground(signal);
+            return;
+        }
+    }
+
     INPUT.lock().push(byte);
 }
 
@@ -124,6 +154,9 @@ pub fn read(buf: &mut [u8]) -> Result<usize, Errno> {
                 }
                 return Ok(n);
             }
+            if crate::sched::has_pending_signal() {
+                return Err(Errno::EINTR);
+            }
             crate::sched::yield_now();
         }
     }
@@ -150,6 +183,9 @@ pub fn read(buf: &mut [u8]) -> Result<usize, Errno> {
         }
 
         if !gather_line(echo_on) {
+            if crate::sched::has_pending_signal() {
+                return Err(Errno::EINTR);
+            }
             crate::sched::yield_now();
         }
     }
@@ -207,13 +243,6 @@ fn gather_line(echo_on: bool) -> bool {
                         echo(b"\x08 \x08");
                     }
                 }
-            }
-            0x03 => {
-                line.len = 0;
-                drop(line);
-                echo(b"^C\n");
-                crate::sched::signal_foreground(crate::abi::SIGINT);
-                return false;
             }
             byte => {
                 let at = line.len;

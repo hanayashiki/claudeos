@@ -468,12 +468,15 @@ impl OpenFile {
         }
         match &self.backing {
             FileBacking::Node(node) => {
-                let mut offset = self.offset.lock();
-                let n = node.read_at(*offset, buf)?;
-                // Character devices have no position.
-                if !matches!(node.kind, NodeKind::Device(_)) {
-                    *offset += n as u64;
+                // A device read can block for an arbitrary time. Holding the
+                // offset lock across it would also hold interrupts off, which
+                // would stop the very device the read is waiting on.
+                if matches!(node.kind, NodeKind::Device(_)) {
+                    return node.read_at(0, buf);
                 }
+                let offset = *self.offset.lock();
+                let n = node.read_at(offset, buf)?;
+                *self.offset.lock() = offset + n as u64;
                 Ok(n)
             }
             FileBacking::Pipe(pipe, _) => pipe.read(buf, self.flags() & O_NONBLOCK != 0),
@@ -486,14 +489,16 @@ impl OpenFile {
         }
         match &self.backing {
             FileBacking::Node(node) => {
-                let mut offset = self.offset.lock();
-                if self.flags() & O_APPEND != 0 {
-                    *offset = node.size();
+                if matches!(node.kind, NodeKind::Device(_)) {
+                    return node.write_at(0, buf);
                 }
-                let n = node.write_at(*offset, buf)?;
-                if !matches!(node.kind, NodeKind::Device(_)) {
-                    *offset += n as u64;
-                }
+                let offset = if self.flags() & O_APPEND != 0 {
+                    node.size()
+                } else {
+                    *self.offset.lock()
+                };
+                let n = node.write_at(offset, buf)?;
+                *self.offset.lock() = offset + n as u64;
                 Ok(n)
             }
             FileBacking::Pipe(pipe, _) => pipe.write(buf, self.flags() & O_NONBLOCK != 0),

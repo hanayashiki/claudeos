@@ -106,7 +106,7 @@ pub struct Task {
     pub robust_list: u64,
 
     pub pending_signals: u64,
-    pub signal_handlers: [u64; 64],
+    pub signal_actions: [crate::signal::SigAction; 64],
     pub signal_mask: u64,
 
     /// Tick count to wake at when sleeping, or zero.
@@ -173,7 +173,7 @@ impl Task {
             set_child_tid: 0,
             robust_list: 0,
             pending_signals: 0,
-            signal_handlers: [0; 64],
+            signal_actions: [crate::signal::SigAction::default(); 64],
             signal_mask: 0,
             wake_at: 0,
             waiting_for: None,

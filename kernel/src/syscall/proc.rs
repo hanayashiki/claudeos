@@ -79,7 +79,7 @@ pub fn fork(
     child.name = parent.name.clone();
     child.fds = parent.fds.clone_table();
     child.umask = parent.umask;
-    child.signal_handlers = parent.signal_handlers;
+    child.signal_actions = parent.signal_actions;
     child.fs_base = if flags & CLONE_SETTLS != 0 {
         tls
     } else {
@@ -208,7 +208,12 @@ pub fn exec_into_current(
         .unwrap_or(&exec_path)
         .to_string();
     task.exe_path = exec_path;
-    task.signal_handlers = [0; 64];
+    // Handlers do not survive exec, but ignored signals stay ignored.
+    for action in task.signal_actions.iter_mut() {
+        if action.handler != crate::signal::SIG_IGN {
+            *action = crate::signal::SigAction::default();
+        }
+    }
 
     task::set_user_entry(task, image.entry, sp);
     Ok(())
@@ -249,7 +254,12 @@ pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
         task.state = State::Sleeping;
         sched::schedule();
         sched::current().waiting_for = None;
-        sched::check_signals();
+        // A signal arriving while blocked interrupts the wait.
+        let pending = sched::current().pending_signals & !sched::current().signal_mask;
+        if pending & !(1u64 << (SIGCHLD as u64 & 63)) != 0 {
+            return Err(Errno::EINTR);
+        }
+        sched::current().pending_signals &= !(1u64 << (SIGCHLD as u64 & 63));
     }
 }
 
@@ -435,19 +445,40 @@ pub fn getrandom(buf: u64, len: usize) -> SysResult {
 }
 
 pub fn rt_sigaction(signal: usize, act: u64, old: u64) -> SysResult {
-    if signal >= 64 || signal == SIGKILL as usize || signal == SIGSTOP as usize {
+    if signal == 0 || signal >= 64 || signal == SIGKILL as usize || signal == SIGSTOP as usize {
         return Err(Errno::EINVAL);
     }
     let task = sched::current();
     if old != 0 {
+        // struct sigaction: handler, flags, restorer, mask.
+        let existing = task.signal_actions[signal];
         let mut buf = [0u8; 32];
-        buf[..8].copy_from_slice(&task.signal_handlers[signal].to_le_bytes());
+        buf[0..8].copy_from_slice(&existing.handler.to_le_bytes());
+        buf[8..16].copy_from_slice(&existing.flags.to_le_bytes());
+        buf[16..24].copy_from_slice(&existing.restorer.to_le_bytes());
+        buf[24..32].copy_from_slice(&existing.mask.to_le_bytes());
         uaccess::write_bytes(old, &buf)?;
     }
     if act != 0 {
-        task.signal_handlers[signal] = uaccess::read_u64(act)?;
+        let mut buf = [0u8; 32];
+        uaccess::read_bytes(act, &mut buf)?;
+        let read = |offset: usize| {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&buf[offset..offset + 8]);
+            u64::from_le_bytes(bytes)
+        };
+        task.signal_actions[signal] = crate::signal::SigAction {
+            handler: read(0),
+            flags: read(8),
+            restorer: read(16),
+            mask: read(24),
+        };
     }
     Ok(0)
+}
+
+pub fn rt_sigreturn(frame: &mut TrapFrame) -> SysResult {
+    crate::signal::sigreturn(sched::current(), frame)
 }
 
 pub fn rt_sigprocmask(how: u32, set: u64, old: u64) -> SysResult {
@@ -485,8 +516,10 @@ pub fn futex(uaddr: u64, op: u32, val: u32, timeout: u64) -> SysResult {
                 if crate::trap::ticks() >= deadline {
                     return Err(Errno::ETIMEDOUT);
                 }
+                if sched::has_pending_signal() {
+                    return Err(Errno::EINTR);
+                }
                 sched::yield_now();
-                sched::check_signals();
             }
             Ok(0)
         }

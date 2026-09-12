@@ -197,7 +197,7 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::RT_SIGPROCMASK => proc::rt_sigprocmask(args[0] as u32, args[1], args[2]),
         nr::RT_SIGSUSPEND => Err(Errno::EINTR),
         nr::SIGALTSTACK => Ok(0),
-        nr::RT_SIGRETURN => Err(Errno::ENOSYS),
+        nr::RT_SIGRETURN => proc::rt_sigreturn(frame),
 
         // ---- misc -----------------------------------------------------
         nr::GETRANDOM => proc::getrandom(args[0], args[1] as usize),

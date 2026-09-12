@@ -18,6 +18,7 @@ mod io;
 mod mm;
 mod multiboot;
 mod sched;
+mod signal;
 mod sync;
 mod syscall;
 mod task;
