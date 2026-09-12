@@ -273,13 +273,13 @@ pub fn exit_current(status: i32) -> ! {
         task.exit_code = status;
 
         // A thread that asked for it gets its tid slot cleared so whoever is
-        // joining on it can see that it finished.
+        // joining on it can see that it finished. This goes through the
+        // checked path: the page may be shared read-only after a fork, and a
+        // bare store would fault inside the kernel.
         if task.clear_child_tid != 0 {
             let address = task.clear_child_tid;
             task.clear_child_tid = 0;
-            if task.space.translate(address).is_some() {
-                unsafe { core::ptr::write_volatile(address as *mut u32, 0) };
-            }
+            let _ = crate::uaccess::write_u32(address, 0);
         }
         task.fds.entries.clear();
         task.fds.cloexec.clear();
