@@ -184,6 +184,63 @@ fn thread_of_a_child_is_not_a_child(report: &mut Report) {
     );
 }
 
+/// A process blocked on something other than a child still has to learn that a
+/// child finished: the child signal is a signal, and every other one returns a
+/// sleeping task to the run queue. A shell waiting for a key is the case that
+/// matters.
+fn a_child_exit_reaches_a_blocked_parent(report: &mut Report) {
+    use crate::sys;
+    use std::sync::atomic::AtomicBool;
+
+    const SIGCHLD: i32 = 17;
+    const SIG_DFL: usize = 0;
+    static DONE: AtomicBool = AtomicBool::new(false);
+
+    let Ok((reader, writer)) = sys::pipe() else {
+        report.check("a pipe for the blocked read", false, String::new());
+        return;
+    };
+    unsafe { signal(SIGCHLD, handle_signal as extern "C" fn(i32) as usize) };
+    let before = SIGNAL_TOTAL.load(Ordering::SeqCst);
+
+    let child = sys::fork();
+    if child == 0 {
+        std::thread::sleep(Duration::from_millis(250));
+        sys::exit_group(0);
+    }
+    // Nothing will ever be written to this pipe, so only the child signal ends
+    // the read. The watchdog writes a byte if it does not, so a regression is a
+    // failed check rather than a suite that never finishes.
+    let watchdog = std::thread::spawn(move || {
+        for _ in 0..30 {
+            if DONE.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        sys::write(writer, b"x");
+    });
+
+    let started = Instant::now();
+    let mut buf = [0u8; 1];
+    let n = sys::read(reader, &mut buf);
+    let waited = started.elapsed();
+    DONE.store(true, Ordering::Relaxed);
+    let _ = watchdog.join();
+
+    let ran = SIGNAL_TOTAL.load(Ordering::SeqCst) - before == SIGCHLD as usize;
+    unsafe { signal(SIGCHLD, SIG_DFL) };
+    let _ = sys::wait4(child as i32, 0);
+    sys::close(reader);
+    sys::close(writer);
+
+    report.check(
+        "a child's exit ends a read the parent was blocked in",
+        n == -4 && ran && waited < Duration::from_millis(1500),
+        format!("read returned {} after {:?}, handler ran: {}", n, waited, ran),
+    );
+}
+
 /// A child that has not written to its stack since the fork still shares those
 /// pages with the parent, so the signal frame the kernel writes there goes
 /// through the path that breaks the sharing first.
@@ -696,6 +753,7 @@ pub fn main(_args: &[String]) -> i32 {
     println!();
     println!("-- threads, processes and waiting --");
     thread_of_a_child_is_not_a_child(&mut report);
+    a_child_exit_reaches_a_blocked_parent(&mut report);
     a_signal_frame_on_a_shared_page(&mut report);
     stopping_a_job_reaches_the_parent(&mut report);
     a_signal_ends_a_sleep(&mut report);

@@ -415,7 +415,7 @@ pub fn exit_current(status: i32) -> ! {
             if adopted_zombie && ppid != 1 {
                 if let Some(init) = find(1) {
                     init.pending_signals |= 1u64 << (SIGCHLD as u64 & 63);
-                    if init.state == State::Sleeping && init.waiting_for.is_some() {
+                    if init.state == State::Sleeping {
                         init.state = State::Runnable;
                         init.wake_at = 0;
                     }
@@ -455,7 +455,12 @@ pub fn raise_on_current(signal: i32) {
 pub fn notify_parent(ppid: u32) {
     if let Some(parent) = find(ppid) {
         parent.pending_signals |= 1u64 << (SIGCHLD as u64 & 63);
-        if parent.state == State::Sleeping && parent.waiting_for.is_some() {
+        // Any sleep, not only a wait for a child. This is a signal, and every
+        // other signal returns a sleeping task to the run queue; a shell
+        // blocked reading its terminal has a handler for this one and would
+        // otherwise not learn that a background job had finished until the next
+        // key was pressed.
+        if parent.state == State::Sleeping {
             parent.state = State::Runnable;
             parent.wake_at = 0;
         }
