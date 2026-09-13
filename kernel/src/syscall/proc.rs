@@ -18,7 +18,7 @@ pub fn fork(
     child_tid: u64,
     tls: u64,
 ) -> SysResult {
-    let mut parent = sched::current();
+    let parent = sched::current();
     let share_vm = flags & CLONE_VM != 0;
 
     // A fresh address space belongs to nothing until the child is registered
@@ -109,7 +109,6 @@ pub fn fork(
         child.vfork_parent = Some(parent.pid);
     }
 
-    parent.children.push(child_pid);
     sched::register(child);
 
     if vfork {

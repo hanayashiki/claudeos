@@ -153,7 +153,6 @@ pub struct Task {
     /// Pid this task is waiting for, if it is in wait4.
     pub waiting_for: Option<i32>,
 
-    pub children: Vec<u32>,
     pub umask: u32,
     /// Set once the task has been switched away from at least once, so a
     /// freshly created task is not resumed from a stale frame.
@@ -219,7 +218,6 @@ impl Task {
             signal_mask: 0,
             wake_at: 0,
             waiting_for: None,
-            children: Vec::new(),
             umask: 0o022,
             started: false,
             pending_exec: None,
