@@ -352,6 +352,21 @@ fn address_resolution(report: &mut Report, nic: &FakeNic) {
     elsewhere[24..28].copy_from_slice(&Ipv4Addr::new(10, 0, 2, 99).to_be_bytes());
     deliver(ether::ETHERTYPE_ARP, &elsewhere);
     report.check("request for another address ignored", nic.take().is_empty());
+
+    // A reply nobody asked for, claiming this machine's own address. Taking
+    // it would point our own address at somebody else's card.
+    let impostor: [u8; 6] = [0x52, 0x55, 0x0A, 0x00, 0x02, 0x63];
+    let mut claim = Vec::new();
+    claim.extend_from_slice(&[0x00, 0x01]);
+    claim.extend_from_slice(&[0x08, 0x00]);
+    claim.extend_from_slice(&[6, 4, 0x00, 0x02]); // reply
+    claim.extend_from_slice(&impostor);
+    claim.extend_from_slice(&OUR_IP.to_be_bytes());
+    claim.extend_from_slice(&PEER_MAC);
+    claim.extend_from_slice(&PEER_IP.to_be_bytes());
+    deliver(ether::ETHERTYPE_ARP, &claim);
+    report.check("a claim on our own address is not believed", super::arp::lookup(OUR_IP).is_none());
+    nic.take();
 }
 
 /// A ping is answered with an echo reply whose checksum is right.
