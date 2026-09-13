@@ -77,9 +77,9 @@ if command -v clang >/dev/null 2>&1; then
   chmod +x "$RFS/bin/hello_c"
 fi
 
-# The upstream busybox and Alpine images fetch/ downloads are x86-64 builds, so
-# there is no third-party binary here yet. An aarch64 busybox dropped into
-# build/thirdparty/busybox-aarch64 is picked up.
+# An upstream busybox, if ARCH=aarch64 scripts/fetch-busybox.sh has been run.
+# It is a binary this project did not build, so it is the strictest ABI test
+# here.
 if [ -x "$ROOT/build/thirdparty/busybox-aarch64" ]; then
   cp "$ROOT/build/thirdparty/busybox-aarch64" "$RFS/bin/busybox"
   chmod +x "$RFS/bin/busybox"
@@ -106,6 +106,7 @@ claudeos
 HOSTNAME
 
 cp "$ROOT/tests/suite.sh" "$RFS/root/suite.sh"
+cp "$ROOT/tests/busybox.sh" "$RFS/root/busybox.sh"
 
 cat > "$RFS/root/hello.txt" <<'HELLO'
 This file came from the initramfs, unpacked by the kernel at boot.
