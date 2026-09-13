@@ -68,19 +68,7 @@ static LINE: Spinlock<LineBuffer> = Spinlock::new(LineBuffer {
     eof: false,
 });
 
-pub static TERMIOS: Spinlock<Termios> = Spinlock::new(Termios {
-    c_iflag: crate::abi::ICRNL | crate::abi::IXON,
-    c_oflag: crate::abi::OPOST | crate::abi::ONLCR,
-    c_cflag: 0o2277,
-    c_lflag: crate::abi::ISIG | ICANON | ECHO | crate::abi::ECHOE,
-    c_line: 0,
-    // VINTR, VQUIT, VERASE, VKILL, VEOF, VTIME, VMIN, VSWTC, VSTART, VSTOP,
-    // VSUSP, then the rest unset.
-    c_cc: [3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-           0, 0, 0, 0, 0, 0],
-    c_ispeed: 38400,
-    c_ospeed: 38400,
-});
+pub static TERMIOS: Spinlock<Termios> = Spinlock::new(Termios::CONSOLE);
 
 /// Feed one received byte to the terminal.
 ///
