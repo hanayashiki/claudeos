@@ -270,9 +270,9 @@ pub fn run() -> bool {
     refused(&mut report, nic);
     crate::println!("net: a served connection");
     connection(&mut report, nic);
-    crate::println!("net: segments that are nobody's business");
+    crate::println!("net: segments outside the window");
     unacceptable_segments(&mut report, nic);
-    crate::println!("net: a connection nobody holds");
+    crate::println!("net: a connection the program has closed");
     abandoned_connection(&mut report, nic);
     crate::println!("net: addresses this machine does not have");
     foreign_addresses(&mut report, nic);
