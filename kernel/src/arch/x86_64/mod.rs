@@ -134,6 +134,30 @@ pub fn halt() {
 pub fn sync_instruction_cache(_start: u64, _len: usize) {}
 
 // ---------------------------------------------------------------------------
+// Handing memory to a device that reads and writes it itself
+// ---------------------------------------------------------------------------
+//
+// All three are nothing here. A PCI device's transfers are coherent with the
+// caches on this machine: the chipset snoops them, so a device reading memory
+// sees a line the CPU has only written into its cache, and a line the device
+// overwrites is dropped from the CPU's cache rather than left stale. The calls
+// are in the interface because none of that is promised on the other machine.
+
+/// Push the kernel's writes over `start..start+len` out to where a device
+/// reading memory will see them. Call before handing the range to a device.
+#[inline]
+pub fn clean_data_cache(_start: u64, _len: usize) {}
+
+/// Throw away anything cached over `start..start+len`, so a read afterwards
+/// fetches what a device wrote there. Call after the device has finished.
+#[inline]
+pub fn invalidate_data_cache(_start: u64, _len: usize) {}
+
+/// Both at once: the kernel's writes go out, and nothing stale is left behind.
+#[inline]
+pub fn flush_data_cache(_start: u64, _len: usize) {}
+
+// ---------------------------------------------------------------------------
 // Interrupt enable state
 // ---------------------------------------------------------------------------
 
