@@ -184,6 +184,32 @@ fn thread_of_a_child_is_not_a_child(report: &mut Report) {
     );
 }
 
+/// A child that has not written to its stack since the fork still shares those
+/// pages with the parent, so the signal frame the kernel writes there goes
+/// through the path that breaks the sharing first.
+fn a_signal_frame_on_a_shared_page(report: &mut Report) {
+    use crate::sys;
+
+    let before = SIGNAL_TOTAL.load(Ordering::SeqCst);
+    let child = sys::fork();
+    if child == 0 {
+        // Straight to the kernel rather than through libc's `raise`: this task
+        // was made by a bare fork, so the thread id libc remembers is still the
+        // parent's and the signal would go there.
+        sys::kill(sys::getpid() as i32, SIGUSR2);
+        // The handler runs on the way out, and execution has to carry on from
+        // where it left off afterwards.
+        let ran = SIGNAL_TOTAL.load(Ordering::SeqCst) - before == SIGUSR2 as usize;
+        sys::exit_group(if ran { 0 } else { 1 });
+    }
+    let (pid, status) = sys::wait4(child as i32, 0);
+    report.check(
+        "a signal frame lands on a page shared after a fork",
+        pid == child && sys::exit_code_of(status) == 0,
+        format!("reaped {} status {:#x}", pid, status),
+    );
+}
+
 /// Stopping a job and telling its parent are one step. A tick between them
 /// takes the CPU away from a task that is no longer runnable, so the parent is
 /// never told and sleeps in wait4 for good: the shell that pressed the suspend
@@ -670,6 +696,7 @@ pub fn main(_args: &[String]) -> i32 {
     println!();
     println!("-- threads, processes and waiting --");
     thread_of_a_child_is_not_a_child(&mut report);
+    a_signal_frame_on_a_shared_page(&mut report);
     stopping_a_job_reaches_the_parent(&mut report);
     a_signal_ends_a_sleep(&mut report);
     failed_exec_and_siblings(&mut report);

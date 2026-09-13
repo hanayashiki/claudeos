@@ -349,7 +349,7 @@ pub fn exit_current(status: i32) -> ! {
         if task.clear_child_tid != 0 {
             let address = task.clear_child_tid;
             task.clear_child_tid = 0;
-            let _ = crate::uaccess::write_u32(address, 0);
+            let _ = crate::uaccess::write_u32_in(&task, address, 0);
             crate::futex::wake(crate::futex::futex_key(address), u32::MAX);
         }
         // Under CLONE_FILES the table belongs to the whole process, so only

@@ -97,10 +97,10 @@ pub fn fork(
     // shared with the parent we are running in.
     if share_vm {
         if flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
-            let _ = uaccess::write_u32(parent_tid, child_pid);
+            let _ = uaccess::write_u32_in(&parent, parent_tid, child_pid);
         }
         if flags & CLONE_CHILD_SETTID != 0 && child_tid != 0 {
-            let _ = uaccess::write_u32(child_tid, child_pid);
+            let _ = uaccess::write_u32_in(&parent, child_tid, child_pid);
         }
     }
 
@@ -287,7 +287,7 @@ pub fn exec_into_current(
         }
     }
 
-    let sp = match task::build_user_stack(&mut task, &image, &argv, &envp, &exec_path, interp_base) {
+    let sp = match task::build_user_stack(&task, &image, &argv, &envp, &exec_path, interp_base) {
         Ok(sp) => sp,
         Err(err) => {
             abandon_exec(&mut task, old_space, old_mm, new_space);
@@ -705,11 +705,11 @@ pub fn rt_sigaction(signal: usize, act: u64, old: u64) -> SysResult {
         buf[8..16].copy_from_slice(&existing.flags.to_le_bytes());
         buf[16..24].copy_from_slice(&existing.restorer.to_le_bytes());
         buf[24..32].copy_from_slice(&existing.mask.to_le_bytes());
-        uaccess::write_bytes(old, &buf)?;
+        uaccess::write_bytes_in(&task, old, &buf)?;
     }
     if act != 0 {
         let mut buf = [0u8; 32];
-        uaccess::read_bytes(act, &mut buf)?;
+        uaccess::read_bytes_in(&task, act, &mut buf)?;
         let read = |offset: usize| {
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&buf[offset..offset + 8]);
@@ -732,10 +732,10 @@ pub fn rt_sigreturn(frame: &mut TrapFrame) -> SysResult {
 pub fn rt_sigprocmask(how: u32, set: u64, old: u64) -> SysResult {
     let mut task = sched::current();
     if old != 0 {
-        uaccess::write_u64(old, task.signal_mask)?;
+        uaccess::write_u64_in(&task, old, task.signal_mask)?;
     }
     if set != 0 {
-        let value = uaccess::read_u64(set)?;
+        let value = uaccess::read_u64_in(&task, set)?;
         task.signal_mask = match how {
             0 => task.signal_mask | value,  // SIG_BLOCK
             1 => task.signal_mask & !value, // SIG_UNBLOCK
