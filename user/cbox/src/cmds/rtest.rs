@@ -157,6 +157,32 @@ fn event_and_poll(report: &mut Report) {
     let _ = sys::close(event);
 }
 
+/// A thread of a child process is not a child of this one. It is given its
+/// process's parent as its own so that an orphan is adopted the same way, and
+/// a wait that matches on that alone hands back a task id this process never
+/// forked while the child it is waiting for is still running.
+fn thread_of_a_child_is_not_a_child(report: &mut Report) {
+    use crate::sys;
+
+    let child = sys::fork();
+    if child == 0 {
+        let worker = std::thread::spawn(|| 1u8);
+        let _ = worker.join();
+        // Outlive the thread by long enough that a wait which took the thread
+        // would have come back well before this task did.
+        std::thread::sleep(Duration::from_millis(400));
+        sys::exit_group(7);
+    }
+    let started = Instant::now();
+    let (reaped, status) = sys::wait4(-1, 0);
+    let waited = started.elapsed();
+    report.check(
+        "wait skips the threads of a child",
+        reaped == child && sys::exit_code_of(status) == 7,
+        format!("forked {} reaped {} status {:#x} after {:?}", child, reaped, status, waited),
+    );
+}
+
 /// A failed exec has to put the task back on the address space it came from
 /// and on the page tables that go with it together. A thread running in the
 /// same address space is what notices if it does not: it is resumed on the
@@ -486,7 +512,8 @@ pub fn main(_args: &[String]) -> i32 {
     event_and_poll(&mut report);
 
     println!();
-    println!("-- kernel races --");
+    println!("-- threads, processes and waiting --");
+    thread_of_a_child_is_not_a_child(&mut report);
     failed_exec_and_siblings(&mut report);
 
     println!();

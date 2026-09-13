@@ -69,6 +69,7 @@ pub fn init() {
 }
 
 pub fn register(task: Box<Task>) -> u32 {
+    reap_dead_threads();
     let pid = task.pid;
     let ptr = Box::into_raw(task);
     TASKS.lock().push(TaskPtr(ptr));
@@ -313,6 +314,11 @@ pub fn exit_group(status: i32) -> ! {
 
 pub fn exit_current(status: i32) -> ! {
     {
+        // Threads that finished earlier are still holding a kernel stack and a
+        // reference to this process's region list, and the second of those is
+        // what decides below whether the user memory may go.
+        reap_dead_threads();
+
         let mut task = current();
         task.exit_code = status;
 
@@ -348,6 +354,10 @@ pub fn exit_current(status: i32) -> ! {
         }
         let ppid = task.ppid;
         let pid = task.pid;
+        // A thread is not a child of the process's parent, so its exit is not
+        // a child exit to report there. Whoever joins it is woken through the
+        // cleared tid word above.
+        let is_process = task.pid == task.tgid;
 
         if pid == 1 {
             crate::println!();
@@ -399,7 +409,9 @@ pub fn exit_current(status: i32) -> ! {
                 }
             }
 
-            notify_parent(ppid);
+            if is_process {
+                notify_parent(ppid);
+            }
         });
     }
     loop {
@@ -668,6 +680,20 @@ pub fn check_signals() {
     }
 }
 
+/// True when `task` is a child `wait4` may be told about, rather than one of
+/// the threads inside one.
+///
+/// A thread is given its process's parent as its own parent, so that an orphan
+/// is adopted the same way a process is. Matching on that field alone offers
+/// the thread to that parent as if it were a child of its own: the parent is
+/// woken out of its wait and handed a task id it never forked, with the
+/// thread's status, while the process it is actually waiting for is still
+/// running. A thread is reported to a joiner inside the process and to nothing
+/// else.
+fn is_child_process(task: &Task, parent_pid: u32) -> bool {
+    task.ppid == parent_pid && task.pid == task.tgid
+}
+
 /// Collect a finished child. Returns (pid, exit code).
 pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
     let mut found: Option<(u32, i32, *mut Task)> = None;
@@ -675,7 +701,7 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
         let tasks = TASKS.lock();
         for entry in tasks.iter() {
             let task = entry.get();
-            if task.ppid != parent_pid || task.state != State::Zombie {
+            if !is_child_process(task, parent_pid) || task.state != State::Zombie {
                 continue;
             }
             if want > 0 && task.pid != want as u32 {
@@ -705,6 +731,47 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
     Some((pid, code))
 }
 
+/// Release the tasks of threads that have finished.
+///
+/// Nothing waits for a thread, so no `wait4` ever takes its entry out of the
+/// table: the kernel stack, the task itself and the share it holds of the
+/// process's region list would stay taken for as long as the machine ran.
+/// Called where threads are made and where one exits, so a program that starts
+/// and joins them in a loop leaves at most the one that has not finished
+/// switching away yet.
+pub fn reap_dead_threads() {
+    let mut dead = Vec::new();
+    {
+        let cur = unsafe { CURRENT };
+        let mut tasks = TASKS.lock();
+        tasks.retain(|entry| {
+            let task = entry.get();
+            // The running task is in the middle of its own exit and is still on
+            // the stack this would hand back.
+            let finished =
+                task.state == State::Zombie && task.pid != task.tgid && entry.0 != cur;
+            if finished {
+                dead.push(entry.0);
+            }
+            !finished
+        });
+    }
+    for ptr in dead {
+        unsafe {
+            let mut task = Box::from_raw(ptr);
+            crate::fs::procfs::remove_process(task.pid);
+            // Out of the table already, so this asks whether anything else --
+            // the process, or another of its threads -- still names the space.
+            if !space_in_use(task.space) {
+                task.space.destroy();
+            }
+            task.free_kernel_stack();
+            task.state = State::Dead;
+            drop(task);
+        }
+    }
+}
+
 /// Report a child that stopped or was continued since the last report. The
 /// child stays where it is; this is a status change, not an exit.
 pub fn child_status_change(
@@ -716,7 +783,7 @@ pub fn child_status_change(
     let tasks = TASKS.lock();
     for entry in tasks.iter() {
         let task = entry.get();
-        if task.ppid != parent_pid {
+        if !is_child_process(task, parent_pid) {
             continue;
         }
         if want > 0 && task.pid != want as u32 {
@@ -747,7 +814,7 @@ pub fn child_event_pending(
     let tasks = TASKS.lock();
     tasks.iter().any(|t| {
         let task = t.get();
-        if task.ppid != parent_pid {
+        if !is_child_process(task, parent_pid) {
             return false;
         }
         if want > 0 && task.pid != want as u32 {
@@ -764,7 +831,7 @@ pub fn has_children(parent_pid: u32, want: i32) -> bool {
     let tasks = TASKS.lock();
     tasks.iter().any(|t| {
         let task = t.get();
-        task.ppid == parent_pid && (want <= 0 || task.pid == want as u32)
+        is_child_process(task, parent_pid) && (want <= 0 || task.pid == want as u32)
     })
 }
 
