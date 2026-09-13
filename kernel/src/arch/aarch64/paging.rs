@@ -431,7 +431,9 @@ impl AddressSpace {
         Some(unsafe { Frame::from_recorded(old) })
     }
 
-    /// Take the mapping away, handing back the reference it held.
+    /// Take the mapping at `virt` away, handing back the reference the
+    /// descriptor held. Dropping the result releases the frame.
+    #[must_use = "dropping the frame is what releases it"]
     pub fn unmap(&self, virt: u64) -> Option<Frame> {
         let frame = unsafe {
             let entry = self.entry_for(virt, false).ok()?;
