@@ -152,9 +152,16 @@ fn abandon_exec(
     old_mm: alloc::sync::Arc<crate::sync::Spinlock<crate::task::MemState>>,
     new_space: AddressSpace,
 ) {
-    task.space = old_space;
-    task.mm = old_mm;
-    unsafe { old_space.switch_to() };
+    // A context switch reloads the page table root only when the two tasks'
+    // recorded spaces differ, so between the record going back to the old space
+    // and the CPU following it the two disagree. A sibling thread recorded on
+    // the old space is then resumed with no reload and runs on the half-built
+    // exec image. The pair has to move together.
+    crate::sync::without_interrupts(|| {
+        task.space = old_space;
+        task.mm = old_mm;
+        unsafe { old_space.switch_to() };
+    });
     new_space.destroy();
 }
 
@@ -189,19 +196,24 @@ pub fn exec_into_current(
     // Everything below runs against the new address space; the kernel half is
     // shared so the stack and heap stay valid across the switch.
     //
-    // The task's recorded address space is the authority a context switch
-    // restores the page table root from, so it has to be updated before the
-    // CPU's is, or a preemption in between would put the old page tables back
-    // underneath us.
-    let mut task = sched::current();
-    task.space = new_space;
+    // The task's recorded address space is what a context switch compares to
+    // decide whether to reload the page table root, so the record and the CPU
+    // have to change together: while they disagree, a sibling thread recorded
+    // on the space the record names is resumed with no reload and runs on the
+    // other one.
+    //
     // exec starts a fresh address space; a shared record must not follow it.
-    // The old record is kept until the image is known to load, because the
-    // page tables it describes are still there and the task goes back to
-    // running on them if it does not.
+    // The old record is kept until the image is known to load, because the page
+    // tables it describes are still there and the task goes back to running on
+    // them if it does not.
+    let mut task = sched::current();
     let old_mm = alloc::sync::Arc::clone(&task.mm);
-    task.mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
-    unsafe { new_space.switch_to() };
+    let new_mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
+    crate::sync::without_interrupts(|| {
+        task.space = new_space;
+        task.mm = new_mm;
+        unsafe { new_space.switch_to() };
+    });
 
     // The file stays locked while its headers are read and its first pages
     // are assembled; the rest arrives through the fault handler later.

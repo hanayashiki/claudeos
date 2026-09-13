@@ -157,6 +157,81 @@ fn event_and_poll(report: &mut Report) {
     let _ = sys::close(event);
 }
 
+/// A failed exec has to put the task back on the address space it came from
+/// and on the page tables that go with it together. A thread running in the
+/// same address space is what notices if it does not: it is resumed on the
+/// record's word that nothing reloaded, which is the half-built image the exec
+/// was assembling.
+///
+/// Running the path many times is a smoke test, not proof: the window is a few
+/// instructions wide and lands only if a tick falls inside it.
+fn failed_exec_and_siblings(report: &mut Report) {
+    use crate::sys;
+    use std::sync::atomic::AtomicBool;
+
+    static RUNNING: AtomicBool = AtomicBool::new(true);
+    let devnull = sys::open("/dev/null", sys::O_WRONLY, 0);
+    let rounds = Arc::new(AtomicUsize::new(0));
+    let refused = Arc::new(AtomicUsize::new(0));
+
+    // Both halves run on threads rather than on the main one. The scheduler
+    // takes the next task in the table, and the one after the main thread is
+    // the kernel's network task, which runs on the kernel's own page tables
+    // and so reloads them on the way past; a task whose neighbour is its own
+    // sibling is what gets handed straight over.
+    let execer_refused = Arc::clone(&refused);
+    let execer = std::thread::spawn(move || {
+        // An argument list past what the stack may hold fails after the new
+        // image is loaded and the CPU is running on it, which is the path that
+        // has to put the old one back.
+        let argv: Vec<String> = (0..600).map(|_| "x".repeat(4000)).collect();
+        for _ in 0..40 {
+            if sys::execve("/bin/echo", &argv, &[]) < 0 {
+                execer_refused.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        RUNNING.store(false, Ordering::Relaxed);
+    });
+
+    let worker_rounds = Arc::clone(&rounds);
+    let worker = std::thread::spawn(move || {
+        let mut heap = vec![0u8; 512 * 1024];
+        while RUNNING.load(Ordering::Relaxed) {
+            let mut i = 0;
+            while i < heap.len() {
+                heap[i] = heap[i].wrapping_add(1);
+                i += 4096;
+            }
+            // And once through the kernel: a buffer the kernel itself reads is
+            // where page tables that do not match the record are fatal rather
+            // than a fault the handler can retry.
+            if devnull >= 0 {
+                sys::write(devnull as i32, &heap[..4096]);
+            }
+            worker_rounds.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let _ = execer.join();
+    let _ = worker.join();
+    if devnull >= 0 {
+        sys::close(devnull as i32);
+    }
+
+    let rounds = rounds.load(Ordering::Relaxed);
+    let refused = refused.load(Ordering::Relaxed);
+    report.check(
+        "an oversized argument list is refused",
+        refused == 40,
+        format!("{} of 40 refused", refused),
+    );
+    report.check(
+        "a thread runs through its sibling's failed execs",
+        rounds > 0,
+        format!("{} rounds", rounds),
+    );
+}
+
 pub fn main(_args: &[String]) -> i32 {
     let mut report = Report { passed: 0, failed: 0 };
     println!("=== Rust standard library on claudeos ===");
@@ -409,6 +484,10 @@ pub fn main(_args: &[String]) -> i32 {
     println!();
     println!("-- waiting on several things at once --");
     event_and_poll(&mut report);
+
+    println!();
+    println!("-- kernel races --");
+    failed_exec_and_siblings(&mut report);
 
     println!();
     println!("=== {} passed, {} failed ===", report.passed, report.failed);
