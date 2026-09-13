@@ -185,7 +185,7 @@ pub fn exec_into_current(
         exec_path = interp;
     }
 
-    elf::validate(&node.inner.lock().data)?;
+    elf::check(&node)?;
 
     let old_space = sched::current().space();
     let new_space = AddressSpace::new_user().ok_or(Errno::ENOMEM)?;

@@ -86,8 +86,33 @@ pub struct ProgramHeader {
     pub p_align: u64,
 }
 
+/// The ELF header, and how long the file was when it was read.
+///
+/// The node's lock masks interrupts, so it is taken for these sixty-four bytes
+/// and let go again. Everything done with the numbers in them happens without
+/// it, which means the file can change in between: what is read here is a copy
+/// and stays what it was.
+fn head_of(node: &crate::fs::NodeRef) -> Result<([u8; 64], usize), Errno> {
+    let mut head = [0u8; 64];
+    let inner = node.inner.lock();
+    if inner.data.len() < 64 {
+        return Err(Errno::ENOEXEC);
+    }
+    head.copy_from_slice(&inner.data[..64]);
+    Ok((head, inner.data.len()))
+}
+
+/// Refuse a file that is not an ELF64 executable for this machine.
+///
+/// exec asks this before it takes the caller's address space apart, so a file
+/// that is not a program for this machine leaves the task on the one it has.
+pub fn check(node: &crate::fs::NodeRef) -> Result<(), Errno> {
+    validate(&head_of(node)?.0)?;
+    Ok(())
+}
+
 /// Check that `data` is a 64-bit little-endian ELF for this machine.
-pub fn validate(data: &[u8]) -> Result<u16, Errno> {
+fn validate(data: &[u8]) -> Result<u16, Errno> {
     if data.len() < 64 || &data[0..4] != b"\x7FELF" {
         return Err(Errno::ENOEXEC);
     }
