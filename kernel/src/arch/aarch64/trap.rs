@@ -236,11 +236,49 @@ pub extern "C" fn exception_entry(frame: &mut TrapFrame) {
     // so the kind is the slot within its group of four.
     match frame.slot & 3 {
         0 => synchronous(frame),
-        1 | 2 => interrupt(frame),
+        1 => interrupt(frame),
+        2 => fast_interrupt(frame),
         _ => {
             crate::println!("[trap] system error at {:#x} esr {:#x}", frame.elr, frame.esr);
         }
     }
+}
+
+/// A fast interrupt, which this kernel does not take.
+///
+/// Nothing signals a line as one. The controller is brought up with its
+/// interface enabled for the group it acknowledges and the bit that would
+/// route the other group to this vector left clear, and EL1 is entered with
+/// all four masks set and nothing here clears this one: `disable_interrupts`
+/// and `enable_interrupts` are `daifset` and `daifclr` of the ordinary kind
+/// only. A program runs with every mask clear, so the level below is the one
+/// place a fast interrupt could arrive at all, and only from a controller
+/// programmed differently from this one.
+///
+/// So this is a refusal rather than a handler. Sending it down the ordinary
+/// path would acknowledge on an interface that may not claim it and then call
+/// whichever handler the line named, the scheduler among them, and because the
+/// kernel masks the ordinary kind only, a fast interrupt that did arrive in
+/// kernel code would arrive inside a critical section. A section re-entered at
+/// random is indistinguishable from memory corruption and is found nowhere
+/// near where it went wrong.
+///
+/// Masking both kinds wherever the kernel masks one is the other way to close
+/// that, and it was not taken: unmasking would then have to clear both, and
+/// clearing this mask is the one thing that would make a fast interrupt
+/// deliverable in kernel mode, where today it cannot be. The hardening would
+/// have opened the door it is meant to shut. A refusal rests on no mask at
+/// all, and costs one arm of a match that is already being made.
+fn fast_interrupt(frame: &mut TrapFrame) -> ! {
+    crate::println!();
+    crate::println!("FAST INTERRUPT from slot {} at {:#x}", frame.slot, frame.elr);
+    crate::println!(
+        "  the controller is routing a line this kernel does not take, and \
+         this kernel masks the ordinary kind only, so one of these can land \
+         inside a critical section"
+    );
+    dump_registers(frame);
+    panic!("fast interrupt");
 }
 
 /// A synchronous exception, run with interrupts in the state the code that
