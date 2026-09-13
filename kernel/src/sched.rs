@@ -252,11 +252,24 @@ pub fn on_tick() {
     schedule();
 }
 
-/// Put the current task to sleep for `ticks` timer ticks.
+/// Put the current task to sleep for `ticks` timer ticks, or until a signal
+/// arrives.
 pub fn sleep_ticks(ticks: u64) {
-    let mut task = current();
-    task.wake_at = crate::trap::ticks() + ticks.max(1);
-    task.state = State::Sleeping;
+    // A signal landing between a caller's own check and this sleep finds a task
+    // that is still runnable, so it wakes nothing, and the task then parks
+    // itself for the whole of the time it asked for with the signal pending and
+    // nothing left that will deliver it. `pause` asks for about 2^62 ticks,
+    // which is for good. Turning interrupts off only stops something else
+    // starting now, so the question has to be asked again inside the same
+    // window and the sleep skipped if the answer has changed.
+    crate::sync::without_interrupts(|| {
+        if has_pending_signal() {
+            return;
+        }
+        let mut task = current();
+        task.wake_at = crate::trap::ticks() + ticks.max(1);
+        task.state = State::Sleeping;
+    });
     schedule();
 }
 

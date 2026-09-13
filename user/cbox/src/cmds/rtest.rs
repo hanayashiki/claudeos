@@ -16,6 +16,7 @@ static SIGNAL_TOTAL: AtomicUsize = AtomicUsize::new(0);
 extern "C" {
     fn signal(signum: i32, handler: usize) -> usize;
     fn raise(signum: i32) -> i32;
+    fn pause() -> i32;
 }
 
 extern "C" fn handle_signal(signum: i32) {
@@ -268,6 +269,73 @@ fn stopping_a_job_reaches_the_parent(report: &mut Report) {
         "a continue is not lost to the stop it races",
         state != "T" && !state.is_empty(),
         format!("child state {:?} after 60 stop-continue pairs", state),
+    );
+}
+
+/// A signal that arrives while a task is still runnable finds nothing to wake.
+/// If the task then parks itself without asking again, the signal waits out the
+/// whole sleep: a minute for a bounded one, and for good for the unbounded
+/// sleep `pause` asks for.
+///
+/// Forty rounds with the signal walked across the child's way into the sleep is
+/// a smoke test, not proof: the window is a handful of instructions.
+fn a_signal_ends_a_sleep(report: &mut Report) {
+    use crate::sys;
+
+    // A signal whose default action kills: the handler for SIGUSR1 is set to
+    // ignore by the time this runs, and an ignored signal is no reason to end a
+    // sleep.
+    const SIGTERM: i32 = 15;
+
+    let mut rounds = 0;
+    let mut worst = Duration::ZERO;
+    let mut detail = String::new();
+    for k in 0..40 {
+        let child = sys::fork();
+        if child == 0 {
+            // Long enough that a sleep which ignored the signal is unmistakable.
+            std::thread::sleep(Duration::from_secs(4));
+            sys::exit_group(0);
+        }
+        // Walk the signal's arrival across the child's way into the sleep.
+        std::thread::sleep(Duration::from_millis(5 + (k % 7)));
+        let started = Instant::now();
+        sys::kill(child as i32, SIGTERM);
+        let (pid, _) = sys::wait4(child as i32, 0);
+        let waited = started.elapsed();
+        worst = worst.max(waited);
+        if pid != child {
+            detail = format!("round {}: reaped {} not {}", k, pid, child);
+            break;
+        }
+        if waited > Duration::from_millis(1500) {
+            detail = format!("round {}: the sleep ran on for {:?}", k, waited);
+            break;
+        }
+        rounds += 1;
+    }
+    report.check(
+        "a signal ends a bounded sleep",
+        rounds == 40,
+        format!("{} rounds, worst {:?}; {}", rounds, worst, detail),
+    );
+
+    // And the unbounded one. A pause with nothing pending never ends on its
+    // own, so the signal goes in after the child is certainly inside it.
+    let child = sys::fork();
+    if child == 0 {
+        unsafe { pause() };
+        sys::exit_group(0);
+    }
+    std::thread::sleep(Duration::from_millis(250));
+    let started = Instant::now();
+    sys::kill(child as i32, SIGTERM);
+    let (pid, _) = sys::wait4(child as i32, 0);
+    let waited = started.elapsed();
+    report.check(
+        "a signal ends a pause",
+        pid == child && waited < Duration::from_millis(1500),
+        format!("reaped {} after {:?}", pid, waited),
     );
 }
 
@@ -603,6 +671,7 @@ pub fn main(_args: &[String]) -> i32 {
     println!("-- threads, processes and waiting --");
     thread_of_a_child_is_not_a_child(&mut report);
     stopping_a_job_reaches_the_parent(&mut report);
+    a_signal_ends_a_sleep(&mut report);
     failed_exec_and_siblings(&mut report);
 
     println!();
