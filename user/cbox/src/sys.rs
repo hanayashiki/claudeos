@@ -44,6 +44,7 @@ mod numbers {
     pub const SYS_GETPPID: u64 = 110;
     pub const SYS_CHDIR: u64 = 80;
     pub const SYS_KILL: u64 = 62;
+    pub const SYS_RT_SIGACTION: u64 = 13;
     pub const SYS_IOCTL: u64 = 16;
     pub const SYS_SYNC: u64 = 162;
     pub const SYS_MKNOD: u64 = 133;
@@ -81,6 +82,7 @@ mod numbers {
     pub const SYS_GETPPID: u64 = 173;
     pub const SYS_CHDIR: u64 = 49;
     pub const SYS_KILL: u64 = 129;
+    pub const SYS_RT_SIGACTION: u64 = 134;
     pub const SYS_IOCTL: u64 = 29;
     pub const SYS_SYNC: u64 = 81;
     pub const SYS_MKNODAT: u64 = 33;
@@ -300,6 +302,18 @@ pub fn pwrite(fd: i32, data: &[u8], offset: u64) -> i64 {
 
 pub fn kill(pid: i32, signal: i32) -> i64 {
     unsafe { syscall2(SYS_KILL, pid as u64, signal as u64) }
+}
+
+/// Install a handler with the restorer field left empty.
+///
+/// `struct sigaction` is handler, flags, restorer and mask, and libc fills the
+/// restorer in on both machines, so nothing that goes through `signal` or
+/// `sigaction` ever asks for a disposition without one. A program built for
+/// Linux on aarch64 does: the kernel there maps the return sequence itself and
+/// never reads the field. This is the only way to ask from here.
+pub fn set_handler_without_restorer(signum: i32, handler: usize) -> i64 {
+    let action = [handler as u64, 0, 0, 0];
+    unsafe { syscall4(SYS_RT_SIGACTION, signum as u64, action.as_ptr() as u64, 0, 8) }
 }
 
 pub fn chdir(path: &str) -> i64 {

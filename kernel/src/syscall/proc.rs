@@ -211,6 +211,16 @@ pub fn exec_into_current(
     let new_mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
     crate::sync::without_interrupts(|irq| task.run_on_space(new_space, new_mm, irq));
 
+    // The code a machine supplies to every program, on the one that supplies
+    // any: the page an aarch64 signal handler returns through when the
+    // program registered no restorer of its own, which is what a program
+    // built for Linux there does. It goes in first, so that everything placed
+    // afterwards is placed knowing it is there.
+    if let Err(err) = arch::map_signal_trampoline(&task, &new_space) {
+        abandon_exec(&task, old_space, old_mm, new_space);
+        return Err(err);
+    }
+
     // The loader reads the file in pieces under its lock rather than holding
     // it open: only the first pages are assembled here, and the rest arrives
     // through the fault handler later.

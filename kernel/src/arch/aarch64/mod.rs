@@ -41,7 +41,9 @@ global_asm!(include_str!("switch.s"), FRAME_SIZE = const task::SWITCH_FRAME_SIZE
 // portable half today; they are listed here because this file is the contract.
 #[allow(unused_imports)]
 pub use clock::{counter_frequency, cycle_counter, read_wall_clock, WallClock};
-pub use signal_frame::{enter_signal_handler, leave_signal_handler, MIN_ALT_STACK};
+pub use signal_frame::{
+    enter_signal_handler, leave_signal_handler, map_signal_trampoline, MIN_ALT_STACK,
+};
 pub use syscall::{
     arch_prctl, clone_args, fork_child_frame, init_syscall_entry, set_syscall_result, syscall_args,
     syscall_number, syscall_result,

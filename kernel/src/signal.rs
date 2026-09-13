@@ -107,7 +107,7 @@ pub fn deliver(
     action: &SigAction,
     frame: &mut crate::arch::TrapFrame,
 ) -> bool {
-    crate::arch::enter_signal_handler(task, signal.number(), action, frame)
+    crate::arch::enter_signal_handler(task, signal, action, frame)
 }
 
 /// Restore the register state a handler was entered with.
