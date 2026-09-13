@@ -287,6 +287,38 @@ fn what_a_wait_does_with_signals(report: &mut Report) {
     );
 }
 
+/// A wait for a negative value below minus one names a process group, which is
+/// how a shell waits for a job rather than for one process of it.
+fn waiting_on_a_process_group(report: &mut Report) {
+    use crate::sys;
+
+    // One child in a group of its own, taking its time, and one in this
+    // process's group that finishes at once.
+    let member = sys::fork();
+    if member == 0 {
+        sys::setpgid(0, 0);
+        std::thread::sleep(Duration::from_millis(300));
+        sys::exit_group(4);
+    }
+    // Set it from here as well, so the group is right whichever task runs next.
+    sys::setpgid(member as i32, member as i32);
+
+    let outsider = sys::fork();
+    if outsider == 0 {
+        sys::exit_group(5);
+    }
+    std::thread::sleep(Duration::from_millis(50));
+
+    let (pid, status) = sys::wait4(-(member as i32), 0);
+    let ok = pid == member && sys::exit_code_of(status) == 4;
+    let _ = sys::wait4(outsider as i32, 0);
+    report.check(
+        "a wait for a process group skips a child outside it",
+        ok,
+        format!("group {} outsider {} reaped {} status {:#x}", member, outsider, pid, status),
+    );
+}
+
 /// A task's entry in /proc has to be there before the task can run. The first
 /// thing a forked child does here is open its own status file, which is what a
 /// shell applying a redirection through its own descriptor directory amounts
@@ -945,6 +977,7 @@ pub fn main(_args: &[String]) -> i32 {
     thread_of_a_child_is_not_a_child(&mut report);
     a_child_exit_reaches_a_blocked_parent(&mut report);
     what_a_wait_does_with_signals(&mut report);
+    waiting_on_a_process_group(&mut report);
     a_child_finds_its_own_proc_entry(&mut report);
     a_fork_while_a_sibling_writes(&mut report);
     reading_proc_while_a_child_is_reaped(&mut report);

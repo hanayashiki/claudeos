@@ -760,6 +760,20 @@ fn is_child_process(task: &Task, parent_pid: u32) -> bool {
     task.ppid == parent_pid && task.pid == task.tgid
 }
 
+/// Does `task` match the pid argument `wait4` was given?
+///
+/// Above zero it names one task; minus one is any child; below minus one is
+/// the process group its negation names, which is how a shell waits for a job
+/// rather than for a particular process. Zero is any child here, where Linux
+/// reads it as the caller's own process group.
+fn matches_want(task: &Task, want: i32) -> bool {
+    match want {
+        w if w > 0 => task.pid == w as u32,
+        w if w < -1 => task.pgid == (-w) as u32,
+        _ => true,
+    }
+}
+
 /// Collect a finished child. Returns (pid, exit code).
 pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
     let mut found: Option<(u32, i32, *mut Task)> = None;
@@ -770,7 +784,7 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
             if !is_child_process(task, parent_pid) || task.state != State::Zombie {
                 continue;
             }
-            if want > 0 && task.pid != want as u32 {
+            if !matches_want(task, want) {
                 continue;
             }
             found = Some((task.pid, task.exit_code, entry.0));
@@ -852,7 +866,7 @@ pub fn child_status_change(
         if !is_child_process(task, parent_pid) {
             continue;
         }
-        if want > 0 && task.pid != want as u32 {
+        if !matches_want(task, want) {
             continue;
         }
         if untraced && task.report_stop {
@@ -883,7 +897,7 @@ pub fn child_event_pending(
         if !is_child_process(task, parent_pid) {
             return false;
         }
-        if want > 0 && task.pid != want as u32 {
+        if !matches_want(task, want) {
             return false;
         }
         task.state == State::Zombie
@@ -897,7 +911,7 @@ pub fn has_children(parent_pid: u32, want: i32) -> bool {
     let tasks = TASKS.lock();
     tasks.iter().any(|t| {
         let task = t.get();
-        is_child_process(task, parent_pid) && (want <= 0 || task.pid == want as u32)
+        is_child_process(task, parent_pid) && matches_want(task, want)
     })
 }
 
