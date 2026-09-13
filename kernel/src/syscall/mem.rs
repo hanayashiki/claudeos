@@ -4,6 +4,7 @@ use crate::abi::*;
 use crate::arch::paging::{is_user_addr, FreshPage, NO_EXECUTE, PRESENT, USER, WRITABLE};
 use crate::mm::{page_align_down, page_align_up, PAGE_SIZE_U64, USER_MMAP_BASE};
 use crate::sched;
+use crate::sync::without_interrupts;
 use crate::uaccess;
 
 /// Upper bound on a single mapping, so a bogus length fails fast.
@@ -52,7 +53,7 @@ pub fn brk(request: u64) -> SysResult {
         // back the reference the entry held, and dropping it is the release.
         let mut page = new_brk;
         while page < current_brk {
-            drop(task.space().unmap(page));
+            without_interrupts(|irq| drop(task.space().unmap(page, irq)));
             page += PAGE_SIZE_U64;
         }
     }
@@ -120,7 +121,7 @@ pub fn mmap(
             // place.
             let mut page = base;
             while page < base + len {
-                drop(task.space().unmap(page));
+                without_interrupts(|irq| drop(task.space().unmap(page, irq)));
                 page += PAGE_SIZE_U64;
             }
             return Err(err);
@@ -200,7 +201,12 @@ fn unmap_range(addr: u64, len: u64) {
     task.remove_vma_range(start, end);
     let mut page = start;
     while page < end {
-        drop(task.space().unmap(page));
+        // One page at a time rather than one section around the loop: a range
+        // is as long as a program asks for, and the timer may not be held off
+        // for as long as it takes to walk one. What has to be inside one
+        // section is the emptying of a table and the decision to free it,
+        // which is the whole of what `unmap` does.
+        without_interrupts(|irq| drop(task.space().unmap(page, irq)));
         page += PAGE_SIZE_U64;
     }
 }

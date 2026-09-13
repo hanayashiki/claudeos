@@ -40,6 +40,7 @@ pub fn run(report: &mut Report) {
     replacing_hands_the_old_frame_back(report);
     replacing_nothing_maps_nothing(report);
     replacing_leaks_nothing(report);
+    a_clone_reaches_a_shared_page_through_tables_of_its_own(report);
     #[cfg(target_arch = "aarch64")]
     device_window::run(report);
     #[cfg(target_arch = "aarch64")]
@@ -292,6 +293,62 @@ fn replacing_leaks_nothing(report: &mut Report) {
         "a thousand replacements cost no memory",
         reached == ROUNDS && after == before,
     );
+}
+
+/// Taking the last page out of a table gives the table back, and a table is
+/// safe to give back because a fork does not share one.
+///
+/// The two are one decision: freeing a table another address space still
+/// named would take that space's mappings away with it. The counts say which
+/// it is. A clone of a space with one page in it takes four frames -- its top
+/// table and the three under it -- and shares the page rather than the tables,
+/// so taking that one page away hands back exactly the three and leaves the
+/// page where the space it was cloned from has it.
+fn a_clone_reaches_a_shared_page_through_tables_of_its_own(report: &mut Report) {
+    let Some(parent) = AddressSpace::new_user() else {
+        report.check("an address space to map into", false);
+        return;
+    };
+    let Ok(page) = parent.map_new(VIRT, flags()) else {
+        report.check("a page to share", false);
+        parent.destroy();
+        return;
+    };
+
+    // Nothing may print between the counts below: printing goes through the
+    // kernel heap, which takes frames.
+    let (mapped, _) = frame::stats();
+    let Some(child) = AddressSpace::new_user() else {
+        report.check("a second address space", false);
+        parent.destroy();
+        return;
+    };
+    let cloned = child.clone_user_from(&parent).is_ok();
+    let (after_clone, _) = frame::stats();
+    let shares = frame::frame_references(page);
+    drop(crate::sync::without_interrupts(|irq| child.unmap(VIRT, irq)));
+    let (after_unmap, _) = frame::stats();
+    let parent_reaches = parent.translate(VIRT);
+    let held = frame::frame_references(page);
+
+    report.check("a clone of an address space is built", cloned);
+    report.check(
+        "it reaches the page through tables of its own",
+        after_clone == mapped + 4,
+    );
+    report.check("and holds a share of the page itself", shares == 2);
+    report.check(
+        "taking its only page away gives those tables back",
+        after_unmap == mapped + 1,
+    );
+    report.check(
+        "and leaves the page where the space it was cloned from has it",
+        parent_reaches == Some(page) && held == 1,
+    );
+
+    child.destroy();
+    parent.destroy();
+    report.check("both spaces release what is left", frame::frame_references(page) == 0);
 }
 
 /// What the frame allocator makes of the memory map a 4 GiB Raspberry Pi 4

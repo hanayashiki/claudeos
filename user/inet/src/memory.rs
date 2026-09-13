@@ -20,6 +20,74 @@ pub fn run(report: &mut Report) {
     argument_blocks_larger_than_the_stack_is_mapped_with(report);
     addresses_outside_user_space_are_refused(report);
     a_hint_over_a_live_mapping_is_not_taken(report);
+    a_table_whose_last_page_goes_is_given_back(report);
+}
+
+/// The tables a mapping needs are memory too, and a program that walks across
+/// a wide range a page at a time makes one of them per two megabytes it
+/// visits.
+///
+/// Each round maps one page at a fresh two-megabyte-aligned address, touches
+/// it so the table under it is really built, and takes it away again. The page
+/// itself comes back every round whatever the kernel does with the table, so
+/// nothing here is visible to the program except what the machine says is
+/// free: a table left behind per round is four kilobytes a round that no
+/// program owns and nothing will ask for again.
+fn a_table_whose_last_page_goes_is_given_back(report: &mut Report) {
+    /// What one last-level table covers, so consecutive rounds land in
+    /// different ones.
+    const SPAN: u64 = 2 * 1024 * 1024;
+    /// Clear of where the program is loaded, of its heap, and of the window
+    /// mmap hands out addresses from.
+    const BASE: u64 = 0x1_0000_0000;
+    const ROUNDS: u64 = 1000;
+    const PAGE: u64 = 4096;
+    /// The kernel heap takes frames as it grows and does not give them back,
+    /// so a few tens of kilobytes of drift is ordinary. A table a round is a
+    /// hundred times this.
+    const SLACK: i64 = 64;
+    /// Enough rounds to have grown the heap by whatever these need before the
+    /// measurement starts.
+    const WARM_UP: u64 = 200;
+
+    let round = |i: u64| -> bool {
+        let at = BASE + i * SPAN;
+        if sys::mmap_fixed(at, PAGE) != at as i64 {
+            return false;
+        }
+        // Anonymous memory arrives on the first touch, so without this the
+        // mapping is a recorded region and no table at all.
+        unsafe { std::ptr::write_volatile(at as *mut u8, 1) };
+        sys::munmap(at, PAGE) == 0
+    };
+
+    for i in 0..WARM_UP {
+        if !round(i) {
+            report.check("a page mapped and taken away again", false, format!("round {}", i));
+            return;
+        }
+    }
+    let Some(before) = free_kib() else {
+        report.check("free memory is reported", false, String::new());
+        return;
+    };
+    for i in 0..ROUNDS {
+        if !round(WARM_UP + i) {
+            report.check("a page mapped and taken away again", false, format!("round {}", i));
+            return;
+        }
+    }
+    let Some(after) = free_kib() else {
+        report.check("free memory is reported", false, String::new());
+        return;
+    };
+
+    let lost = before as i64 - after as i64;
+    report.check(
+        "the table a page was mapped through is given back with it",
+        lost <= SLACK,
+        format!("free memory fell by {} kB over {} rounds", lost, ROUNDS),
+    );
 }
 
 /// Pages a fork left shared, written from two threads of the same process at
