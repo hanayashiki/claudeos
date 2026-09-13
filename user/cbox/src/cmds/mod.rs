@@ -138,20 +138,26 @@ pub fn without_newline(line: &[u8]) -> &[u8] {
 }
 
 /// Read every named file, or standard input when there are none.
-pub fn read_inputs(program: &str, paths: &[String]) -> (Vec<(String, String)>, i32) {
+///
+/// What comes back is bytes. Reading into a String instead asks the tool to
+/// decide whether its input was text, and answers no for a file of arbitrary
+/// bytes: the read fails, and the applet prints nothing at all for a file it
+/// was asked to count or to copy.
+pub fn read_inputs(program: &str, paths: &[String]) -> (Vec<(String, Vec<u8>)>, i32) {
     use std::io::Read;
     let mut out = Vec::new();
     let mut status = 0;
     if paths.is_empty() {
-        let mut text = String::new();
-        if std::io::stdin().read_to_string(&mut text).is_ok() {
-            out.push(("-".to_string(), text));
+        let mut data = Vec::new();
+        match std::io::stdin().read_to_end(&mut data) {
+            Ok(_) => out.push(("-".to_string(), data)),
+            Err(err) => status = fail(program, "-", err),
         }
         return (out, status);
     }
     for path in paths {
-        match std::fs::read_to_string(path) {
-            Ok(text) => out.push((path.clone(), text)),
+        match std::fs::read(path) {
+            Ok(data) => out.push((path.clone(), data)),
             Err(err) => status = fail(program, path, err),
         }
     }

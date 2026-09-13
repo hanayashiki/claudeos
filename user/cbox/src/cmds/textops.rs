@@ -1,7 +1,17 @@
 //! Text-processing applets.
+//!
+//! What these move is bytes. A tool that counts lines or takes the first few
+//! of them has no say in whether its input was text, so an encoding that does
+//! not decode is carried through rather than refused or replaced.
 
-use super::{fail, read_inputs, split_flags};
+use super::{fail, lines, read_inputs, split_flags, without_newline};
 use std::io::{Read, Write};
+
+/// The bytes C calls whitespace, which is what separates one word from the
+/// next and what `tr [:space:]` names.
+fn is_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
 
 pub fn echo(args: &[String]) -> i32 {
     let mut items = &args[1..];
@@ -47,19 +57,26 @@ pub fn wc(args: &[String]) -> i32 {
     let (inputs, mut status) = read_inputs("wc", &operands);
 
     let mut totals = (0usize, 0usize, 0usize, 0usize);
-    for (name, text) in &inputs {
-        let lines = text.lines().count();
-        let words = text.split_whitespace().count();
-        let bytes = text.len();
-        let longest = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+    for (name, data) in &inputs {
+        // A line is a newline, not a decoded one: a file whose last line has
+        // no newline after it has as many lines as it has newlines, which is
+        // what every other wc reports.
+        let line_count = data.iter().filter(|byte| **byte == b'\n').count();
+        let words = data.split(|byte| is_space(*byte)).filter(|word| !word.is_empty()).count();
+        let bytes = data.len();
+        // The longest line, in bytes. How wide it would be on a terminal is a
+        // different question, and one a file of arbitrary bytes has no answer
+        // to.
+        let longest =
+            lines(data).iter().map(|line| without_newline(line).len()).max().unwrap_or(0);
         totals = (
-            totals.0 + lines,
+            totals.0 + line_count,
             totals.1 + words,
             totals.2 + bytes,
             totals.3.max(longest),
         );
         print_counts(
-            lines,
+            line_count,
             words,
             bytes,
             longest,
@@ -152,40 +169,53 @@ pub fn head(args: &[String]) -> i32 {
     }
     let (count, operands) = count_argument(args, 10);
 
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
     // Read only as far as needed. Reading to the end first would never return
     // on an endless producer such as `yes`.
     if operands.is_empty() {
-        use std::io::BufRead;
         let stdin = std::io::stdin();
+        let mut reader = stdin.lock();
+        let mut buffer = [0u8; 65536];
         let mut taken = 0;
-        for line in stdin.lock().lines() {
-            match line {
-                Ok(line) => {
-                    println!("{}", line);
+        while taken < count {
+            let filled = match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let mut upto = filled;
+            for (index, byte) in buffer[..filled].iter().enumerate() {
+                if *byte == b'\n' {
                     taken += 1;
                     if taken >= count {
+                        upto = index + 1;
                         break;
                     }
                 }
-                Err(_) => break,
+            }
+            if out.write_all(&buffer[..upto]).is_err() {
+                return 1;
             }
         }
+        let _ = out.flush();
         return 0;
     }
 
     let (inputs, status) = read_inputs("head", &operands);
     let many = inputs.len() > 1;
-    for (index, (name, text)) in inputs.iter().enumerate() {
+    for (index, (name, data)) in inputs.iter().enumerate() {
         if many {
             if index > 0 {
-                println!();
+                let _ = writeln!(out);
             }
-            println!("==> {} <==", name);
+            let _ = writeln!(out, "==> {} <==", name);
         }
-        for line in text.lines().take(count) {
-            println!("{}", line);
+        for line in lines(data).iter().take(count) {
+            let _ = out.write_all(line);
         }
     }
+    let _ = out.flush();
     status
 }
 
@@ -239,19 +269,22 @@ pub fn tail(args: &[String]) -> i32 {
     let (count, operands) = count_argument(&kept, 10);
     let (inputs, status) = read_inputs("tail", &operands);
     let many = inputs.len() > 1;
-    for (index, (name, text)) in inputs.iter().enumerate() {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for (index, (name, data)) in inputs.iter().enumerate() {
         if many {
             if index > 0 {
-                println!();
+                let _ = writeln!(out);
             }
-            println!("==> {} <==", name);
+            let _ = writeln!(out, "==> {} <==", name);
         }
-        let lines: Vec<&str> = text.lines().collect();
-        let start = lines.len().saturating_sub(count);
-        for line in &lines[start..] {
-            println!("{}", line);
+        let all = lines(data);
+        let start = all.len().saturating_sub(count);
+        for line in &all[start..] {
+            let _ = out.write_all(line);
         }
     }
+    let _ = out.flush();
     if follow {
         return follow_files(&operands);
     }
@@ -332,7 +365,10 @@ pub fn grep(args: &[String]) -> i32 {
     }
     let paths = &paths[..];
 
-    let source = if ignore_case { pattern.to_lowercase() } else { pattern.clone() };
+    // -i folds only the ASCII letters, on both sides. A byte outside them has
+    // no case to fold, and folding it as though it were a character would move
+    // it to some other byte.
+    let source = if ignore_case { pattern.to_ascii_lowercase() } else { pattern.clone() };
     let matcher = if flags.contains('F') {
         crate::regex::Regex::literal(&source)
     } else {
@@ -342,11 +378,20 @@ pub fn grep(args: &[String]) -> i32 {
     let show_names = inputs.len() > 1 || recursive;
     let mut matched_any = false;
 
-    for (name, text) in &inputs {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for (name, data) in &inputs {
         let mut count = 0;
-        for (index, line) in text.lines().enumerate() {
-            let haystack = if ignore_case { line.to_lowercase() } else { line.to_string() };
-            let hit = matcher.is_match(haystack.as_bytes());
+        for (index, raw) in lines(data).iter().enumerate() {
+            let line = without_newline(raw);
+            let folded;
+            let haystack: &[u8] = if ignore_case {
+                folded = line.to_ascii_lowercase();
+                &folded
+            } else {
+                line
+            };
+            let hit = matcher.is_match(haystack);
             if hit == invert {
                 continue;
             }
@@ -358,35 +403,30 @@ pub fn grep(args: &[String]) -> i32 {
             if names_only {
                 break;
             }
-            let prefix = if show_names { format!("{}:", name) } else { String::new() };
+            let mut label = if show_names { format!("{}:", name) } else { String::new() };
+            if number {
+                label.push_str(&format!("{}:", index + 1));
+            }
             // -o prints what matched rather than the line it was found on,
             // once per match.
             if only_matching {
-                let hay = haystack.as_bytes();
-                let original = line.as_bytes();
                 let mut at = 0usize;
-                while let Some((start, end)) = matcher.find(hay, at) {
+                while let Some((start, end)) = matcher.find(haystack, at) {
                     if end > start {
-                        let piece = &original[start..end.min(original.len())];
-                        let piece = String::from_utf8_lossy(piece);
-                        if number {
-                            println!("{}{}:{}", prefix, index + 1, piece);
-                        } else {
-                            println!("{}{}", prefix, piece);
-                        }
+                        let _ = out.write_all(label.as_bytes());
+                        let _ = out.write_all(&line[start..end]);
+                        let _ = out.write_all(b"\n");
                     }
                     at = if end > start { end } else { start + 1 };
-                    if at > hay.len() {
+                    if at > haystack.len() {
                         break;
                     }
                 }
                 continue;
             }
-            if number {
-                println!("{}{}:{}", prefix, index + 1, line);
-            } else {
-                println!("{}{}", prefix, line);
-            }
+            let _ = out.write_all(label.as_bytes());
+            let _ = out.write_all(line);
+            let _ = out.write_all(b"\n");
         }
         if names_only {
             if count > 0 {
@@ -400,6 +440,7 @@ pub fn grep(args: &[String]) -> i32 {
             }
         }
     }
+    let _ = out.flush();
     if !matched_any && status == 0 {
         status = 1;
     }
@@ -429,50 +470,62 @@ fn collect_files(path: &str, out: &mut Vec<String>) {
 pub fn sort(args: &[String]) -> i32 {
     let (flags, operands) = split_flags(args);
     let (inputs, status) = read_inputs("sort", &operands);
-    let mut lines: Vec<String> = Vec::new();
-    for (_, text) in &inputs {
-        lines.extend(text.lines().map(|l| l.to_string()));
+    let mut collected: Vec<Vec<u8>> = Vec::new();
+    for (_, data) in &inputs {
+        collected.extend(lines(data).iter().map(|line| without_newline(line).to_vec()));
     }
     if flags.contains('n') {
         // Compare the number a line starts with, ignoring whatever follows.
-        lines.sort_by(|a, b| {
+        collected.sort_by(|a, b| {
             leading_number(a)
                 .partial_cmp(&leading_number(b))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     } else {
-        lines.sort();
+        // Byte order, which is the order sort uses where no locale says
+        // otherwise, and the only one a line of arbitrary bytes has.
+        collected.sort();
     }
     if flags.contains('r') {
-        lines.reverse();
+        collected.reverse();
     }
     if flags.contains('u') {
-        lines.dedup();
+        collected.dedup();
     }
-    for line in lines {
-        println!("{}", line);
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for line in &collected {
+        let _ = out.write_all(line);
+        let _ = out.write_all(b"\n");
     }
+    let _ = out.flush();
     status
 }
 
 /// The number a line begins with, for `sort -n`. Lines without one sort first.
-fn leading_number(line: &str) -> f64 {
-    let text = line.trim_start();
+fn leading_number(line: &[u8]) -> f64 {
+    let text = match line.iter().position(|byte| !is_space(*byte)) {
+        Some(at) => &line[at..],
+        None => return f64::NEG_INFINITY,
+    };
     let mut end = 0;
-    let bytes = text.as_bytes();
-    if end < bytes.len() && (bytes[end] == b'-' || bytes[end] == b'+') {
+    if end < text.len() && (text[end] == b'-' || text[end] == b'+') {
         end += 1;
     }
-    while end < bytes.len() && bytes[end].is_ascii_digit() {
+    while end < text.len() && text[end].is_ascii_digit() {
         end += 1;
     }
-    if end < bytes.len() && bytes[end] == b'.' {
+    if end < text.len() && text[end] == b'.' {
         end += 1;
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
+        while end < text.len() && text[end].is_ascii_digit() {
             end += 1;
         }
     }
-    text[..end].parse().unwrap_or(f64::NEG_INFINITY)
+    // Digits and a sign, so what was taken is always readable as text.
+    std::str::from_utf8(&text[..end])
+        .ok()
+        .and_then(|number| number.parse().ok())
+        .unwrap_or(f64::NEG_INFINITY)
 }
 
 pub fn uniq(args: &[String]) -> i32 {
@@ -482,42 +535,46 @@ pub fn uniq(args: &[String]) -> i32 {
     let only_repeated = flags.contains('d');
     let only_unique = flags.contains('u');
 
-    let mut previous: Option<String> = None;
+    let mut previous: Option<Vec<u8>> = None;
     let mut repeats = 0usize;
-    let emit = |line: &str, repeats: usize| {
+    let emit = |out: &mut dyn Write, line: &[u8], repeats: usize| {
         if (only_repeated && repeats < 2) || (only_unique && repeats > 1) {
             return;
         }
         if count {
-            println!("{:>7} {}", repeats, line);
-        } else {
-            println!("{}", line);
+            let _ = write!(out, "{:>7} ", repeats);
         }
+        let _ = out.write_all(line);
+        let _ = out.write_all(b"\n");
     };
-    for (_, text) in &inputs {
-        for line in text.lines() {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for (_, data) in &inputs {
+        for raw in lines(data) {
+            let line = without_newline(raw);
             match &previous {
                 Some(prev) if prev == line => repeats += 1,
                 Some(prev) => {
-                    emit(prev, repeats);
-                    previous = Some(line.to_string());
+                    emit(&mut out, prev, repeats);
+                    previous = Some(line.to_vec());
                     repeats = 1;
                 }
                 None => {
-                    previous = Some(line.to_string());
+                    previous = Some(line.to_vec());
                     repeats = 1;
                 }
             }
         }
     }
     if let Some(prev) = previous {
-        emit(&prev, repeats);
+        emit(&mut out, &prev, repeats);
     }
+    let _ = out.flush();
     status
 }
 
 pub fn cut(args: &[String]) -> i32 {
-    let mut delimiter = '\t';
+    let mut delimiter = b'\t';
     let mut fields: Vec<usize> = Vec::new();
     let mut characters: Vec<usize> = Vec::new();
     let mut operands = Vec::new();
@@ -525,10 +582,10 @@ pub fn cut(args: &[String]) -> i32 {
     while i < args.len() {
         let arg = &args[i];
         if arg == "-d" && i + 1 < args.len() {
-            delimiter = args[i + 1].chars().next().unwrap_or('\t');
+            delimiter = args[i + 1].as_bytes().first().copied().unwrap_or(b'\t');
             i += 2;
         } else if let Some(rest) = arg.strip_prefix("-d") {
-            delimiter = rest.chars().next().unwrap_or('\t');
+            delimiter = rest.as_bytes().first().copied().unwrap_or(b'\t');
             i += 1;
         } else if arg == "-f" && i + 1 < args.len() {
             fields = parse_fields(&args[i + 1]);
@@ -552,25 +609,32 @@ pub fn cut(args: &[String]) -> i32 {
         return 2;
     }
     let (inputs, status) = read_inputs("cut", &operands);
-    for (_, text) in &inputs {
-        for line in text.lines() {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for (_, data) in &inputs {
+        for raw in lines(data) {
+            let line = without_newline(raw);
+            let mut picked: Vec<u8> = Vec::new();
             if !characters.is_empty() {
-                let chars: Vec<char> = line.chars().collect();
-                let picked: String = characters
-                    .iter()
-                    .filter_map(|c| chars.get(c.saturating_sub(1)).copied())
-                    .collect();
-                println!("{}", picked);
-                continue;
+                // -c selects by position in the line, which for a line that
+                // is not text is a byte.
+                picked.extend(
+                    characters.iter().filter_map(|c| line.get(c.saturating_sub(1)).copied()),
+                );
+            } else {
+                let parts: Vec<&[u8]> = line.split(|byte| *byte == delimiter).collect();
+                for field in fields.iter().filter_map(|f| parts.get(f.saturating_sub(1))) {
+                    if !picked.is_empty() {
+                        picked.push(delimiter);
+                    }
+                    picked.extend_from_slice(field);
+                }
             }
-            let parts: Vec<&str> = line.split(delimiter).collect();
-            let selected: Vec<&str> = fields
-                .iter()
-                .filter_map(|f| parts.get(f.saturating_sub(1)).copied())
-                .collect();
-            println!("{}", selected.join(&delimiter.to_string()));
+            let _ = out.write_all(&picked);
+            let _ = out.write_all(b"\n");
         }
     }
+    let _ = out.flush();
     status
 }
 
@@ -776,10 +840,21 @@ pub fn seq(args: &[String]) -> i32 {
 pub fn rev(args: &[String]) -> i32 {
     let (_, operands) = split_flags(args);
     let (inputs, status) = read_inputs("rev", &operands);
-    for (_, text) in &inputs {
-        for line in text.lines() {
-            println!("{}", line.chars().rev().collect::<String>());
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for (_, data) in &inputs {
+        for raw in lines(data) {
+            // Reversed byte by byte. Which bytes make up one character is a
+            // question about an encoding the line need not be written in.
+            let line = without_newline(raw);
+            let mut reversed = line.to_vec();
+            reversed.reverse();
+            let _ = out.write_all(&reversed);
+            if raw.len() != line.len() {
+                let _ = out.write_all(b"\n");
+            }
         }
     }
+    let _ = out.flush();
     status
 }
