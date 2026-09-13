@@ -466,12 +466,69 @@ pub fn unlink(path: &str, want_dir: bool) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Whether `node` is `ancestor` or sits somewhere beneath it.
+///
+/// Directories carry no parent back-pointers, so the question is answered by
+/// walking down from `ancestor` rather than up from `node`. The lock on a
+/// directory is dropped before its children are looked at, so nothing here
+/// holds two at once.
+fn is_within(ancestor: &NodeRef, node: &NodeRef) -> bool {
+    let mut pending = alloc::vec![ancestor.clone()];
+    while let Some(current) = pending.pop() {
+        if Arc::ptr_eq(&current, node) {
+            return true;
+        }
+        if !current.is_dir() {
+            continue;
+        }
+        let children: Vec<NodeRef> = current.inner.lock().children.values().cloned().collect();
+        pending.extend(children);
+    }
+    false
+}
+
 pub fn rename(from: &str, to: &str) -> Result<(), Errno> {
+    if from == "/" || to == "/" {
+        return Err(Errno::EBUSY);
+    }
     let node = lookup_nofollow(from)?;
     let (from_parent, from_name) = split_parent(from)?;
     let (to_parent, to_name) = split_parent(to)?;
+    let existing = to_parent.inner.lock().children.get(&to_name).cloned();
+
+    // The same file under both names, which includes a path renamed onto
+    // itself. Inserting the entry and then removing it is what loses the file.
+    if let Some(existing) = &existing {
+        if Arc::ptr_eq(existing, &node) {
+            return Ok(());
+        }
+    }
+
+    // A directory moved into its own subtree ends up holding a reference to
+    // itself and unreachable from the root, so nothing ever frees it.
+    if node.is_dir() && is_within(&node, &to_parent) {
+        return Err(Errno::EINVAL);
+    }
+
+    if let Some(existing) = &existing {
+        if existing.is_dir() != node.is_dir() {
+            return Err(if existing.is_dir() { Errno::EISDIR } else { Errno::ENOTDIR });
+        }
+        if existing.is_dir() && !existing.inner.lock().children.is_empty() {
+            return Err(Errno::ENOTEMPTY);
+        }
+    }
+
+    // Both parents may be the same directory, so the two edits take its lock
+    // one after the other rather than one inside the other.
     to_parent.inner.lock().children.insert(to_name, node);
     from_parent.inner.lock().children.remove(&from_name);
+    // The moved file keeps the one name it had. What the move landed on has
+    // lost one, and may still have others.
+    if let Some(existing) = existing {
+        let mut inner = existing.inner.lock();
+        inner.nlink = inner.nlink.saturating_sub(1);
+    }
     Ok(())
 }
 
