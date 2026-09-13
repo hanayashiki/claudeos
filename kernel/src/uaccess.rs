@@ -154,6 +154,54 @@ pub fn write_bytes_in(task: &Task, addr: u64, buf: &[u8]) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Copy `len` bytes from one user address to another, a page at a time,
+/// checking both and copying with nothing else able to run in between.
+///
+/// Moving a mapping is the one place the kernel reads through one user address
+/// and writes through another. Checking the two and then copying left the same
+/// window the two calls above close: a sibling thread that forks takes write
+/// permission away from every page of the address space, the destination among
+/// them, and the copy that follows is a kernel store into a page that is
+/// read-only by then. A sibling that unmaps either range leaves the copy
+/// reading or writing a page that is not present. Both are fatal to the
+/// machine rather than to the program.
+///
+/// A chunk stops at the end of a page on either side, so the block is never
+/// longer than one page of copying whatever the caller is moving. A range that
+/// goes bad partway is a bad address with the bytes before it already copied,
+/// which is what the two calls above do as well.
+///
+/// The two ranges must not overlap. The one caller moves a mapping into a
+/// region that was free, so they never do.
+///
+/// Only the form that takes the task, because that caller is holding a
+/// reference to it already.
+pub fn copy_within_user_in(task: &Task, dst: u64, src: u64, len: u64) -> Result<(), Errno> {
+    if len == 0 {
+        return Ok(());
+    }
+    src.checked_add(len).ok_or(Errno::EFAULT)?;
+    dst.checked_add(len).ok_or(Errno::EFAULT)?;
+    let mut done = 0u64;
+    while done < len {
+        let from = src + done;
+        let to = dst + done;
+        let chunk = (page_align_down(from) + PAGE_SIZE_U64 - from)
+            .min(page_align_down(to) + PAGE_SIZE_U64 - to)
+            .min(len - done);
+        crate::sync::without_interrupts(|_irq| -> Result<(), Errno> {
+            validate_in(task, from, chunk, false)?;
+            validate_in(task, to, chunk, true)?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, chunk as usize)
+            };
+            Ok(())
+        })?;
+        done += chunk;
+    }
+    Ok(())
+}
+
 pub fn read_u64(addr: u64) -> Result<u64, Errno> {
     let mut bytes = [0u8; 8];
     read_bytes(addr, &mut bytes)?;

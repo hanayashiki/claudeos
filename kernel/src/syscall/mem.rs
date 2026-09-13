@@ -274,12 +274,12 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, _flags: u64) -> SysRe
     // Otherwise relocate.
     let base = task.find_free_region(new_size);
     task.add_vma(base, base + new_size, vma.prot, vma.flags);
-    let copy_len = old_size.min(new_size) as usize;
-    uaccess::validate(old_addr, copy_len as u64, false)?;
-    uaccess::validate(base, copy_len as u64, true)?;
-    unsafe {
-        core::ptr::copy_nonoverlapping(old_addr as *const u8, base as *mut u8, copy_len);
-    }
+    // Through the checked path, which takes a page at a time with interrupts
+    // off: a sibling thread that forks between the check and the copy takes
+    // write permission away from every page of the address space, the
+    // destination among them, and a bare copy is then a kernel store into a
+    // read-only page.
+    uaccess::copy_within_user_in(&task, base, old_addr, old_size.min(new_size))?;
     unmap_range(old_addr, old_size);
     Ok(base)
 }

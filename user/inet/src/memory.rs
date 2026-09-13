@@ -13,6 +13,7 @@ pub fn run(report: &mut Report) {
     pages_shared_by_a_fork_written_from_two_threads(report);
     pages_a_fork_shared_are_out_of_the_parents_reach(report);
     a_user_buffer_unmapped_while_the_kernel_reads_it(report);
+    a_mapping_moved_while_a_sibling_forks(report);
     a_page_two_threads_reach_at_once(report);
     a_file_mapping_read_while_it_is_made(report);
     exec_that_fails_keeps_the_memory_state(report);
@@ -506,6 +507,94 @@ fn a_file_mapping_read_while_it_is_made(report: &mut Report) {
     sys::munmap(base, LEN);
     sys::close(fd);
     let _ = std::fs::remove_file(PATH);
+}
+
+/// A mapping that has to move is copied from its old address to its new one by
+/// the kernel, reading through one and writing through the other. Both are
+/// checked first, and a sibling thread that forks in between takes write
+/// permission away from every page of the address space, the destination among
+/// them. The copy that follows is then a kernel store into a read-only page,
+/// which is fatal to the machine rather than to the program.
+///
+/// The move is what is wanted, so the page directly above the mapping is taken
+/// by another one: growing where it is is then refused and the kernel has to
+/// find somewhere else and copy.
+///
+/// A smoke test. The window is as long as the copy, so catching it needs a
+/// fork to land inside one.
+fn a_mapping_moved_while_a_sibling_forks(report: &mut Report) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const PAGE: u64 = 4096;
+    const PAGES: u64 = 64;
+    const LEN: u64 = PAGES * PAGE;
+    const ROUNDS: usize = 150;
+    /// What every byte of the mapping holds before it moves, and what every
+    /// byte of it has to hold after.
+    const MARKER: u8 = 0x5A;
+
+    let stop = AtomicBool::new(false);
+    let moved = AtomicUsize::new(0);
+    let damaged = AtomicUsize::new(0);
+    let mut rounds = 0usize;
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            // A fork takes write permission away from every page of the
+            // address space, the destination the sibling has just had checked
+            // among them.
+            while !stop.load(Ordering::Relaxed) {
+                let child = sys::fork();
+                if child == 0 {
+                    sys::exit_group(0);
+                }
+                if child > 0 {
+                    sys::wait4(child as i32, 0);
+                }
+            }
+        });
+
+        for _ in 0..ROUNDS {
+            let base = sys::mmap_anon(0, LEN);
+            if base <= 0 {
+                break;
+            }
+            let base = base as u64;
+            let blocker = sys::mmap_fixed(base + LEN, PAGE);
+            unsafe { std::ptr::write_bytes(base as *mut u8, MARKER, LEN as usize) };
+            let to = sys::mremap(base, LEN, LEN * 2);
+            if to > 0 {
+                let at = to as u64;
+                if at != base {
+                    moved.fetch_add(1, Ordering::Relaxed);
+                }
+                let seen = unsafe { std::slice::from_raw_parts(at as *const u8, LEN as usize) };
+                damaged.fetch_add(
+                    seen.iter().filter(|byte| **byte != MARKER).count(),
+                    Ordering::Relaxed,
+                );
+                sys::munmap(at, LEN * 2);
+            } else {
+                sys::munmap(base, LEN);
+            }
+            if blocker > 0 {
+                sys::munmap(blocker as u64, PAGE);
+            }
+            rounds += 1;
+        }
+        stop.store(true, Ordering::Relaxed);
+    });
+
+    let moved = moved.load(Ordering::Relaxed);
+    let damaged = damaged.load(Ordering::Relaxed);
+    report.check(
+        "a mapping moved while a sibling forks arrives with what it held",
+        rounds == ROUNDS && moved == ROUNDS && damaged == 0,
+        format!(
+            "{} of {} rounds ran, {} moved, {} bytes came back changed",
+            rounds, ROUNDS, moved, damaged
+        ),
+    );
 }
 
 /// A hint names where a mapping should start, and the mapping is as long as it

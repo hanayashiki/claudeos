@@ -24,6 +24,7 @@ mod numbers {
     pub const SYS_OPENAT: u64 = 257;
     pub const SYS_MMAP: u64 = 9;
     pub const SYS_MUNMAP: u64 = 11;
+    pub const SYS_MREMAP: u64 = 25;
     pub const SYS_BRK: u64 = 12;
     pub const SYS_FORK: u64 = 57;
     pub const SYS_EXECVE: u64 = 59;
@@ -42,6 +43,7 @@ mod numbers {
     pub const SYS_OPENAT: u64 = 56;
     pub const SYS_MMAP: u64 = 222;
     pub const SYS_MUNMAP: u64 = 215;
+    pub const SYS_MREMAP: u64 = 216;
     pub const SYS_BRK: u64 = 214;
     pub const SYS_CLONE: u64 = 220;
     pub const SYS_EXECVE: u64 = 221;
@@ -269,4 +271,12 @@ pub fn exit_group(code: i32) -> ! {
         syscall(SYS_EXIT_GROUP, code as u64, 0, 0, 0, 0, 0);
     }
     unreachable!()
+}
+
+/// Move or grow the mapping at `addr`, letting the kernel put it somewhere
+/// else if it has to. What the checks want is the move: a relocation is the
+/// one path where the kernel copies from one user address to another.
+pub fn mremap(addr: u64, old_len: u64, new_len: u64) -> i64 {
+    const MREMAP_MAYMOVE: u64 = 1;
+    unsafe { syscall(SYS_MREMAP, addr, old_len, new_len, MREMAP_MAYMOVE, 0, 0) }
 }
