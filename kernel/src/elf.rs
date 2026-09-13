@@ -39,8 +39,9 @@ pub struct LoadedImage {
     pub tls_memsz: u64,
     pub tls_align: u64,
     /// The mapped segments, so the task can record them alongside its other
-    /// regions. A segment with a file mapping has not been read in yet: its
-    /// pages arrive as the program reaches them.
+    /// regions. A segment has not been read in yet beyond the pages the loader
+    /// had to assemble: the rest arrive from the file as the program reaches
+    /// them.
     pub segments: alloc::vec::Vec<Segment>,
 }
 
@@ -49,7 +50,7 @@ pub struct Segment {
     pub start: u64,
     pub end: u64,
     pub prot: u64,
-    pub file: Option<crate::task::FileMap>,
+    pub file: crate::task::FileMap,
 }
 
 /// A field of the file, or ENOEXEC if the file does not reach that far.
@@ -130,33 +131,79 @@ fn validate(data: &[u8]) -> Result<u16, Errno> {
     Ok(e_type)
 }
 
-pub fn program_headers(data: &[u8]) -> Result<alloc::vec::Vec<ProgramHeader>, Errno> {
-    let phoff = rd64(data, 32)?;
-    let phentsize = rd16(data, 54)? as u64;
-    let phnum = rd16(data, 56)? as u64;
-    if phentsize < 56 {
-        return Err(Errno::ENOEXEC);
+/// What the loader reads out of the file before it maps anything: the ELF
+/// header, the program header table, and how long the file was.
+///
+/// Every offset the loader checks and then uses comes from here. The file's
+/// lock masks interrupts and so cannot be held across the mapping and filling
+/// of an image, which leaves the file free to change while a load runs; taking
+/// the table once is what keeps the numbers the loader tested and the numbers
+/// it uses the same ones.
+struct Headers {
+    /// The file's length when the table was read. A segment's bytes are
+    /// checked against this and read against whatever the file holds later.
+    size: usize,
+    e_type: u16,
+    e_entry: u64,
+    phoff: u64,
+    phent: u64,
+    phnum: u64,
+    phdrs: alloc::vec::Vec<ProgramHeader>,
+}
+
+impl Headers {
+    fn read(node: &crate::fs::NodeRef) -> Result<Headers, Errno> {
+        let (head, size) = head_of(node)?;
+        let e_type = validate(&head)?;
+        let e_entry = rd64(&head, 24)?;
+        let phoff = rd64(&head, 32)?;
+        let phent = rd16(&head, 54)? as u64;
+        let phnum = rd16(&head, 56)? as u64;
+        if phent < 56 {
+            return Err(Errno::ENOEXEC);
+        }
+        // e_phoff is a 64-bit number from the file, so the end of the table is
+        // a sum that wraps: one near the top of the range plus a table of any
+        // size is a small number, and a small number is inside the file.
+        if sum(&[phoff, phnum * phent])? > size as u64 {
+            return Err(Errno::ENOEXEC);
+        }
+        // Room for the table is asked for before the file is locked: the
+        // allocator is the slow half of this, and it has a lock of its own.
+        let mut phdrs = alloc::vec::Vec::with_capacity(phnum as usize);
+        let inner = node.inner.lock();
+        for i in 0..phnum {
+            // A file shortened since its length was read fails here, because
+            // every field is taken from the buffer the file has now.
+            let base = (phoff + i * phent) as usize;
+            phdrs.push(ProgramHeader {
+                p_type: rd32(&inner.data, base)?,
+                p_flags: rd32(&inner.data, base + 4)?,
+                p_offset: rd64(&inner.data, base + 8)?,
+                p_vaddr: rd64(&inner.data, base + 16)?,
+                p_filesz: rd64(&inner.data, base + 32)?,
+                p_memsz: rd64(&inner.data, base + 40)?,
+                p_align: rd64(&inner.data, base + 48)?,
+            });
+        }
+        drop(inner);
+        Ok(Headers { size, e_type, e_entry, phoff, phent, phnum, phdrs })
     }
-    // e_phoff is a 64-bit number from the file, so the end of the table is a
-    // sum that wraps: one near the top of the range plus a table of any size
-    // is a small number, and a small number is inside the file.
-    if sum(&[phoff, phnum * phentsize])? > data.len() as u64 {
-        return Err(Errno::ENOEXEC);
-    }
-    let mut out = alloc::vec::Vec::with_capacity(phnum as usize);
-    for i in 0..phnum {
-        let base = (phoff + i * phentsize) as usize;
-        out.push(ProgramHeader {
-            p_type: rd32(data, base)?,
-            p_flags: rd32(data, base + 4)?,
-            p_offset: rd64(data, base + 8)?,
-            p_vaddr: rd64(data, base + 16)?,
-            p_filesz: rd64(data, base + 32)?,
-            p_memsz: rd64(data, base + 40)?,
-            p_align: rd64(data, base + 48)?,
-        });
-    }
-    Ok(out)
+}
+
+/// Read the file's bytes at `off` into `dst`, and say how many arrived.
+///
+/// The node's lock is taken for this one piece and let go after it, so a page
+/// is the most the timer is held off by. A file shortened since its headers
+/// were read gives back less than was asked for, and the rest of the page
+/// stays as the fresh frame was, which is zero. That is what the fault handler
+/// does with a page of the same image that arrives later.
+fn read_into(node: &crate::fs::NodeRef, off: u64, dst: &mut [u8]) -> usize {
+    let inner = node.inner.lock();
+    let start = off as usize;
+    let n = inner.data.len().saturating_sub(start).min(dst.len());
+    dst[..n].copy_from_slice(&inner.data[start..start + n]);
+    n
 }
 
 /// The sum of numbers that came out of the file.
@@ -248,31 +295,28 @@ impl Extent {
     }
 }
 
-/// Map `data`'s PT_LOAD segments into `space`, which must be the active
-/// address space so the segment contents can be written directly.
-pub fn load(space: &AddressSpace, data: &[u8]) -> Result<LoadedImage, Errno> {
-    load_at(space, data, None, None)
-}
-
-/// As `load`, but with an explicit load address for a relocatable image, and
-/// with the file the image came from so its pages can be read in on demand
-/// rather than copied here.
+/// Map the PT_LOAD segments of the program in `node` into `space`, which must
+/// be the active address space so the segment contents can be written
+/// directly. `base_override` says where to put a relocatable image.
+///
+/// The file is read a piece at a time rather than held under its lock for the
+/// length of the load. That lock masks interrupts, and what happens here is
+/// proportional to the size of the program: a page table walk and a frame per
+/// page of every segment, and a copy of the pages an image cannot leave to a
+/// fault. The header and the program header table are read once and kept; the
+/// bytes of a segment are copied a page at a time, with the lock taken for
+/// each page and let go after it.
 pub fn load_at(
     space: &AddressSpace,
-    data: &[u8],
+    node: &crate::fs::NodeRef,
     base_override: Option<u64>,
-    node: Option<crate::fs::NodeRef>,
 ) -> Result<LoadedImage, Errno> {
-    let e_type = validate(data)?;
-    let phdrs = program_headers(data)?;
-    let e_entry = rd64(data, 24)?;
-    let phoff = rd64(data, 32)?;
-    let phentsize = rd16(data, 54)? as u64;
-    let phnum = rd16(data, 56)? as u64;
+    let headers = Headers::read(node)?;
+    let phdrs = &headers.phdrs;
 
     let base = match base_override {
-        Some(base) if e_type == ET_DYN => base,
-        _ if e_type == ET_DYN => DYN_BASE,
+        Some(base) if headers.e_type == ET_DYN => base,
+        _ if headers.e_type == ET_DYN => DYN_BASE,
         _ => 0,
     };
 
@@ -285,7 +329,7 @@ pub fn load_at(
         if ph.p_type != PT_LOAD {
             continue;
         }
-        let extent = Extent::of(ph, base, data.len())?;
+        let extent = Extent::of(ph, base, headers.size)?;
         if ph.p_memsz == 0 {
             continue;
         }
@@ -340,10 +384,6 @@ pub fn load_at(
             page += PAGE_SIZE_U64;
         }
     }
-    // Without a file to read from later, everything has to be read now.
-    if node.is_none() {
-        eager.extend(page_flags.keys().copied());
-    }
 
     for page in page_flags.keys() {
         if !eager.contains(page) {
@@ -363,13 +403,14 @@ pub fn load_at(
             let page = page_align_down(address);
             let chunk = (page + PAGE_SIZE_U64 - address).min(extent.file_len - offset);
             if eager.contains(&page) {
-                unsafe {
-                    let src = data.as_ptr().add((extent.file_offset + offset) as usize);
-                    core::ptr::copy_nonoverlapping(src, address as *mut u8, chunk as usize);
-                }
+                // The page is mapped, present and writable, and this task is
+                // the only one on the address space it is in.
+                let dst =
+                    unsafe { core::slice::from_raw_parts_mut(address as *mut u8, chunk as usize) };
+                let n = read_into(node, extent.file_offset + offset, dst);
                 // These bytes are about to be executed, and on some machines
                 // writing them is not enough to make them fetchable.
-                crate::arch::sync_instruction_cache(address, chunk as usize);
+                crate::arch::sync_instruction_cache(address, n);
             }
             offset += chunk;
         }
@@ -391,17 +432,17 @@ pub fn load_at(
 
     // AT_PHDR must point at the program headers as they sit in memory.
     let mut phdr_addr = 0u64;
-    for ph in &phdrs {
+    for ph in phdrs {
         if ph.p_type == PT_PHDR {
             phdr_addr = sum(&[base, ph.p_vaddr])?;
         }
     }
     if phdr_addr == 0 {
-        let table_end = sum(&[phoff, phnum * phentsize])?;
+        let table_end = sum(&[headers.phoff, headers.phnum * headers.phent])?;
         for (index, extent) in &loads {
             let ph = &phdrs[*index];
-            if phoff >= ph.p_offset && table_end <= extent.file_offset + extent.file_len {
-                phdr_addr = extent.vaddr + (phoff - ph.p_offset);
+            if headers.phoff >= ph.p_offset && table_end <= extent.file_offset + extent.file_len {
+                phdr_addr = extent.vaddr + (headers.phoff - ph.p_offset);
                 break;
             }
         }
@@ -409,13 +450,16 @@ pub fn load_at(
 
     let mut interp = None;
     let mut tls = (0u64, 0u64, 0u64, 0u64);
-    for ph in &phdrs {
+    for ph in phdrs {
         if ph.p_type == PT_INTERP {
-            let end = sum(&[ph.p_offset, ph.p_filesz])?;
-            let name = data
-                .get(ph.p_offset as usize..end as usize)
-                .ok_or(Errno::ENOEXEC)?;
-            if let Ok(text) = core::str::from_utf8(name) {
+            if sum(&[ph.p_offset, ph.p_filesz])? > headers.size as u64 {
+                return Err(Errno::ENOEXEC);
+            }
+            // p_filesz is a number from the file like any other, and what it
+            // measures here is a path, so no more than a path's worth is read.
+            let mut name = alloc::vec![0u8; (ph.p_filesz as usize).min(4096)];
+            let read = read_into(node, ph.p_offset, &mut name);
+            if let Ok(text) = core::str::from_utf8(&name[..read]) {
                 interp = Some(alloc::string::String::from(text.trim_end_matches('\0')));
             }
         }
@@ -446,24 +490,23 @@ pub fn load_at(
         // which is where the fault handler measures from. The offset the
         // segment's bytes begin at within their page is the same in the file,
         // which is what makes the subtraction below sound.
-        let file = node.as_ref().map(|node| crate::task::FileMap {
-            node: node.clone(),
-            offset: extent.file_offset - extent.into_page(),
-            length: extent.file_len + extent.into_page(),
-        });
         segments.push(Segment {
             start: extent.start,
             end: extent.end,
             prot,
-            file,
+            file: crate::task::FileMap {
+                node: node.clone(),
+                offset: extent.file_offset - extent.into_page(),
+                length: extent.file_len + extent.into_page(),
+            },
         });
     }
 
     Ok(LoadedImage {
-        entry: sum(&[base, e_entry])?,
+        entry: sum(&[base, headers.e_entry])?,
         phdr_addr,
-        phent: phentsize,
-        phnum,
+        phent: headers.phent,
+        phnum: headers.phnum,
         base,
         brk_start,
         interp,
