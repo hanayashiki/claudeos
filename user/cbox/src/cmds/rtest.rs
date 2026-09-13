@@ -790,9 +790,9 @@ fn failed_exec_and_siblings(report: &mut Report) {
 ///
 /// The two clocks are independent: the tick is counted by the timer interrupt
 /// and the monotonic clock is a cycle counter, which keeps running whatever
-/// the interrupt mask says. This is the rate between them while nothing is
-/// holding the timer off, and it is not 10 ms -- see `timer_under_load` for
-/// why not.
+/// the interrupt mask says and whose rate comes from the machine rather than
+/// from the tick. This is the rate between them while nothing is holding the
+/// timer off.
 fn tick_period() -> Duration {
     use crate::sys;
     const SPAN: u64 = 20;
@@ -804,6 +804,54 @@ fn tick_period() -> Duration {
     let started = Instant::now();
     while sys::tick_count() < first + SPAN {}
     started.elapsed() / SPAN as u32
+}
+
+/// A tick has to last as long as the kernel says a tick lasts.
+///
+/// Every deadline in the kernel is a whole number of timer ticks and the
+/// tick's length is asserted rather than measured: `clock_getres` says a
+/// hundredth of a second and a sleep of one second waits a hundred ticks.
+/// Nothing inside the kernel contradicts a tick that is really 15 ms, and with
+/// one every sleep, every poll and select timeout and every scheduling quantum
+/// is half as long again in real time as it was asked for. A timer rearmed
+/// with a fresh interval from inside its own handler, rather than moved on
+/// from the deadline that just passed, is one way to get one: the delivery
+/// latency is then added to every period instead of being absorbed by it.
+///
+/// The reference is the monotonic clock, whose rate does not come from the
+/// tick. It is the cycle counter's rate, read out of `cntfrq_el0` on one
+/// machine and measured against the interval timer's own countdown on the
+/// other, so the two clocks can disagree and this is the disagreement.
+///
+/// What it cannot catch: a counter whose stated rate is itself wrong, because
+/// then the reference is wrong by the same factor and the two agree; a clock
+/// that is right on average and arrives in bursts, since this measures twenty
+/// ticks and divides; and anything at all about the wall clock, which is this
+/// same counter with a date added.
+fn a_tick_is_the_length_it_claims(report: &mut Report) {
+    use crate::sys;
+    // Wide enough to pass on an emulated machine, where the measurement is
+    // worth a per cent or two, and far tighter than the 50 per cent a tick
+    // that loses its delivery latency every period costs.
+    const TOLERANCE: u32 = 10;
+    let measured = tick_period();
+    let claimed = sys::tick_nanoseconds();
+    let off = if claimed == 0 {
+        100
+    } else {
+        let claimed = claimed as i128;
+        ((measured.as_nanos() as i128 - claimed).abs() * 100 / claimed) as u32
+    };
+    println!(
+        "      the kernel calls a tick {} us; against the monotonic clock it is {} us",
+        claimed / 1000,
+        measured.as_micros(),
+    );
+    report.check(
+        "a tick lasts as long as the kernel says it does",
+        claimed != 0 && off <= TOLERANCE,
+        format!("{} us claimed, {} us measured", claimed / 1000, measured.as_micros()),
+    );
 }
 
 /// The timer has to keep arriving while another task is inside a long system
@@ -819,21 +867,13 @@ fn tick_period() -> Duration {
 /// the difference.
 ///
 /// Bounding the wall-clock lateness of the sleeps instead measures something
-/// else, which is why it was replaced. CLOCK_MONOTONIC is the cycle counter
-/// divided by a count of it taken over five ticks at boot, so its second is
-/// however long a tick was during those 50 ms, while a sleep of 100 ms waits
-/// ten whole ticks however long they turn out to be. The lateness of one is
-/// therefore ten times the difference between the tick period now and the tick
-/// period during that window, which settles per boot and is a few milliseconds
-/// either way on an emulated board, where a tick takes 14.8 ms of the host's
-/// time rather than 10 and how much of that is the emulator's own latency
-/// varies. Ten boots of this suite on aarch64 measured the tick at 9484 to
-/// 11018 us and the sleeps at 4782 us early to 9778 us late, the two tracking
-/// each other to within a millisecond, with almost no spread inside a run. A
-/// bound on the lateness reads which side of its own calibration the boot
-/// landed on. On x86-64 it reads zero whatever the timer does, because the
-/// same calibration lands 4 per cent short there and every sleep comes back
-/// early.
+/// else, which is why it was replaced. A sleep of 100 ms waits ten whole ticks
+/// however long a tick turns out to be, so its lateness is ten times the
+/// difference between the tick's real length and the tenth of a second it is
+/// supposed to be, plus whatever the timer was held off for. The first term
+/// settles per boot and swamps the second: on an emulated board a tick ran
+/// 14.8 ms and every sleep came back 48 per cent late whatever the mask was
+/// doing. `a_tick_is_the_length_it_claims` is where that term is checked now.
 fn timer_under_load(report: &mut Report) {
     use crate::sys;
     const ROUNDS: usize = 12;
@@ -1051,7 +1091,8 @@ pub fn main(_args: &[String]) -> i32 {
     );
 
     println!();
-    println!("-- the clock under load --");
+    println!("-- the clock --");
+    a_tick_is_the_length_it_claims(&mut report);
     timer_under_load(&mut report);
 
     println!();

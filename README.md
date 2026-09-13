@@ -193,8 +193,12 @@ Scheduling is round-robin, preemptive, driven by the 100 Hz timer tick.
 Anonymous memory is demand-paged: `mmap` and `brk` record a region and the
 page fault handler supplies pages on first touch.
 
-**Time.** The timestamp counter is calibrated against the timer tick at boot,
-so `CLOCK_MONOTONIC` has real resolution rather than the 10 ms of the tick. The
+**Time.** `CLOCK_MONOTONIC` is the CPU's free-running cycle counter, so it has
+real resolution rather than the 10 ms of the tick. What makes that counter a
+clock is the rate it runs at, and the machine is asked for that rather than the
+tick: aarch64 states it in `cntfrq_el0`, and x86-64, which states it nowhere, is
+measured against a channel of the interval timer counting down. Neither answer
+comes through the tick, so the tick's own length can be checked against it. The
 tick still drives scheduling and timeouts.
 
 **Blocking.** A task waiting for the terminal or a pipe sleeps on a wait queue
@@ -368,19 +372,20 @@ failures.
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
   subprocesses and `/proc`.
-- The `rtest` applet runs **55 checks** against the Rust standard library:
+- The `rtest` applet runs **57 checks** against the Rust standard library:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
-  thread sleep against the monotonic clock, a sleep that still wakes on time
-  while another thread sits inside a 32 MiB write, file read/write/seek/append,
-  directory iteration, `std::process::Command` capturing a child's output
-  through pipes, signal handlers running and returning, a `UnixStream` pair
-  carrying bytes both ways, an epoll set woken by a counter and a socket,
-  timing out when it should and waking promptly when a write arrives, and a
-  walk of the system call numbers past the end of the table, every one of which
-  has to answer ENOSYS. Two of them run a thread alongside a sibling failing an
-  exec over and over, which is a smoke test for a race rather than proof of its
-  absence.
+  thread sleep against the monotonic clock, the tick measured against that same
+  clock to see that it lasts the hundredth of a second the kernel says it does,
+  a sleep that still wakes on time while another thread sits inside a 32 MiB
+  write, file read/write/seek/append, directory iteration,
+  `std::process::Command` capturing a child's output through pipes, signal
+  handlers running and returning, a `UnixStream` pair carrying bytes both ways,
+  an epoll set woken by a counter and a socket, timing out when it should and
+  waking promptly when a write arrives, and a walk of the system call numbers
+  past the end of the table, every one of which has to answer ENOSYS. Two of
+  them run a thread alongside a sibling failing an exec over and over, which is
+  a smoke test for a race rather than proof of its absence.
 - `tests/busybox.sh` runs **39 checks** against an upstream busybox binary that
   this project did not build: `awk`, `sed`, `tar` create and extract, `find`,
   `md5sum` and `sha256sum` (whose digests are compared against the ones the

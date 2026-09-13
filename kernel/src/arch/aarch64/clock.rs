@@ -8,7 +8,7 @@
 use core::arch::asm;
 
 /// A reading of the architected counter. Its unit is not a second;
-/// `crate::time` measures it against the timer tick to find out what it is.
+/// `counter_frequency` below says how many of them make one.
 #[inline]
 pub fn cycle_counter() -> u64 {
     let value: u64;

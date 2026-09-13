@@ -31,7 +31,7 @@ global_asm!(include_str!("syscall_entry.s"), options(att_syntax));
 // Some of these name a part of the interface without being called from the
 // portable half today; they are listed here because this file is the contract.
 #[allow(unused_imports)]
-pub use clock::{cycle_counter, read_wall_clock, WallClock};
+pub use clock::{counter_frequency, cycle_counter, read_wall_clock, WallClock};
 pub use signal_frame::{enter_signal_handler, leave_signal_handler};
 pub use syscall::{
     arch_prctl, clone_args, fork_child_frame, init_syscall_entry, set_syscall_result, syscall_args,
