@@ -6,7 +6,9 @@
 //! to hold across a context switch.
 
 use crate::abi::*;
-use crate::arch::paging::{AddressSpace, FreshPage, NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::arch::paging::{
+    AddressSpace, FreshPage, MapError, NO_EXECUTE, PRESENT, USER, WRITABLE,
+};
 use crate::arch::{self, TaskContext, TrapFrame};
 use crate::fs::{FdTable, OpenFile};
 use crate::mm::{page_align_down, page_align_up, PAGE_SIZE_U64, USER_MMAP_BASE, USER_STACK_TOP};
@@ -182,6 +184,17 @@ pub fn allocate_pid() -> u32 {
 /// Restart pid numbering, so the first user process is pid 1.
 pub fn reset_pid_counter(next: u32) {
     NEXT_PID.store(next, Ordering::Relaxed);
+}
+
+/// What a demand-paging map means for the fault that asked for it.
+///
+/// An address a sibling thread on the same address space got to first is not a
+/// failure: the page is there, which is what the fault wanted, and what is
+/// there is finished, because a page is published with its contents already in
+/// it. Reading the refusal as a failure killed the task with a segmentation
+/// fault at an address that is mapped.
+fn served(mapped: Result<u64, MapError>) -> bool {
+    matches!(mapped, Ok(_) | Err(MapError::AlreadyMapped))
 }
 
 fn kstack_layout() -> Layout {
@@ -456,11 +469,23 @@ impl Task {
     }
 
     /// Back `addr`'s page with memory if the heap or a region covers it.
+    ///
+    /// True means the address has memory at it now, not that this call is what
+    /// put it there. Threads share an address space, so two of them reaching
+    /// one page of a program's text at the same moment is ordinary, and the
+    /// one that arrives second has nothing to do and nothing to report. What
+    /// it finds is finished, because a page is published with its contents
+    /// already in it.
     pub fn fault_in(&self, addr: u64) -> bool {
         let page = page_align_down(addr);
         if self.space.translate(page).is_some() {
-            // Already present: the fault was a protection violation.
-            return false;
+            // The hardware found nothing at this address and the tables have
+            // something at it: two readings of one entry either side of a
+            // sibling's store. The faulting instruction can run again. A fault
+            // the tables really do refuse does not arrive here, because a
+            // present page's fault is a protection violation and that is
+            // decided before this is called.
+            return true;
         }
         let (in_heap, vma) = {
             let mm = self.mm.lock();
@@ -470,16 +495,13 @@ impl Task {
             )
         };
         if in_heap {
-            return self
-                .space
-                .map_new(page, PRESENT | WRITABLE | USER | NO_EXECUTE)
-                .is_ok();
+            return served(self.space.map_new(page, PRESENT | WRITABLE | USER | NO_EXECUTE));
         }
         let Some(vma) = vma else {
             return false;
         };
         let Some(file) = &vma.file else {
-            return self.space.map_new(page, vma.page_flags()).is_ok();
+            return served(self.space.map_new(page, vma.page_flags()));
         };
 
         // A page of an executable is filled before it is published, and goes
@@ -506,7 +528,7 @@ impl Task {
                 crate::arch::sync_instruction_cache(fresh.bytes().as_ptr() as u64, filled);
             }
         }
-        self.space.publish(page, fresh, flags).is_ok()
+        served(self.space.publish(page, fresh, flags))
     }
 
     pub fn free_kernel_stack(&mut self) {
