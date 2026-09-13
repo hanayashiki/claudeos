@@ -6,6 +6,13 @@
 //! the same code that produced the frame, so a header laid out wrongly fails
 //! rather than agreeing with itself.
 //!
+//! Above that sits a peer with a link in each direction, for the behaviour
+//! that only shows when packets go missing. The link is told what to do with
+//! each segment before the test runs -- lose this one, hold that one back,
+//! deliver the next twice, damage the one after -- so a failure names one
+//! packet and happens again on the next run, which is what a real network
+//! cannot be asked for.
+//!
 //! Run with `net=test` on the kernel command line.
 
 use super::ether;
@@ -272,6 +279,8 @@ pub fn run() -> bool {
     connection(&mut report, nic);
     crate::println!("net: segments outside the window");
     unacceptable_segments(&mut report, nic);
+    crate::println!("net: a link that loses and reorders");
+    lossy_link(&mut report, nic);
     crate::println!("net: a connection the program has closed");
     abandoned_connection(&mut report, nic);
     crate::println!("net: addresses this machine does not have");
@@ -846,6 +855,322 @@ fn establish(nic: &FakeNic, server_port: u16, client_port: u16, client_iss: u32)
         client_next: client_iss.wrapping_add(1),
         server_next: server_iss.wrapping_add(1),
     })
+}
+
+// ---- a link that loses, reorders, duplicates and corrupts -----------------
+
+/// What a link does with one segment. A test lists these in the order the
+/// segments reach it, so the same segment meets the same fate on every run
+/// and a failure names one packet rather than a probability.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fate {
+    Pass,
+    /// Lost, with nothing anywhere to say so.
+    Lose,
+    /// Held back until the segment behind it has gone, so the two arrive the
+    /// wrong way round.
+    Late,
+    /// Delivered, and then delivered again.
+    Twice,
+    /// A bit of the checksum flipped, which is what corruption of any part of
+    /// the segment looks like to the end that receives it.
+    Corrupt,
+}
+
+/// One direction of a link.
+struct Link {
+    /// Where the TCP header starts in what this carries: a frame has the
+    /// Ethernet and IPv4 headers in front of it, a datagram only the IPv4 one.
+    tcp_at: usize,
+    fates: Vec<Fate>,
+    carried: usize,
+    late: Option<Vec<u8>>,
+    lost: usize,
+}
+
+impl Link {
+    fn new(tcp_at: usize) -> Link {
+        Link { tcp_at, fates: Vec::new(), carried: 0, late: None, lost: 0 }
+    }
+
+    /// What is to happen to the next segments through here. Anything past the
+    /// end of the list passes.
+    fn script(&mut self, fates: &[Fate]) {
+        self.fates = fates.to_vec();
+        self.carried = 0;
+        self.lost = 0;
+    }
+
+    /// Hand one segment to the link. What comes back is what arrives at the
+    /// far end, in the order it arrives there.
+    fn carry(&mut self, packet: Vec<u8>) -> Vec<Vec<u8>> {
+        let fate = self.fates.get(self.carried).copied().unwrap_or(Fate::Pass);
+        self.carried += 1;
+        let mut out = Vec::new();
+        match fate {
+            Fate::Pass => out.push(packet),
+            Fate::Lose => self.lost += 1,
+            Fate::Late => {
+                // One held at a time: a test that wants two reordered says
+                // Late twice with something between.
+                if let Some(earlier) = self.late.replace(packet) {
+                    out.push(earlier);
+                }
+                return out;
+            }
+            Fate::Twice => {
+                out.push(packet.clone());
+                out.push(packet);
+            }
+            Fate::Corrupt => {
+                let mut damaged = packet;
+                damaged[self.tcp_at + 16] ^= 0x40;
+                out.push(damaged);
+            }
+        }
+        if let Some(earlier) = self.late.take() {
+            out.push(earlier);
+        }
+        out
+    }
+}
+
+/// The other end of a connection, reached over a link in each direction.
+///
+/// It is a small TCP of its own: it acknowledges what arrives, holds what
+/// arrives before the bytes in front of it so that resending one segment
+/// finishes the stream, and counts the acknowledgements it has repeated. What
+/// the links do to each segment is scripted, so a test names the segment that
+/// is lost rather than waiting for a link to lose one.
+struct Peer {
+    nic: &'static FakeNic,
+    listener: Arc<InetSocket>,
+    socket: Arc<InetSocket>,
+    port: u16,
+    server_port: u16,
+    /// The peer's own numbers: what it sends next, and what it wants next.
+    send_next: u32,
+    receive_next: u32,
+    window: u16,
+    /// The stream as the peer has taken it, and what arrived past a gap.
+    stream: Vec<u8>,
+    early: Vec<(u32, Vec<u8>)>,
+    fin_seen: bool,
+    /// The last number the peer acknowledged, and how many times it has since
+    /// acknowledged the same one again.
+    last_ack: u32,
+    repeated_acks: usize,
+    to_peer: Link,
+    to_stack: Link,
+}
+
+impl Peer {
+    /// Take a connection through its handshake and keep both ends' numbers.
+    fn open(
+        nic: &'static FakeNic,
+        server_port: u16,
+        client_port: u16,
+        client_iss: u32,
+    ) -> Option<Peer> {
+        let connection = establish(nic, server_port, client_port, client_iss)?;
+        Some(Peer {
+            nic,
+            listener: connection.listener,
+            socket: connection.socket,
+            port: client_port,
+            server_port,
+            send_next: connection.client_next,
+            receive_next: connection.server_next,
+            window: 64240,
+            stream: Vec::new(),
+            early: Vec::new(),
+            fin_seen: false,
+            last_ack: connection.server_next,
+            repeated_acks: 0,
+            to_peer: Link::new(34),
+            to_stack: Link::new(20),
+        })
+    }
+
+    /// Send one segment at a sequence number of the caller's choosing, which
+    /// is what puts a stream out of order or repeats a segment already sent.
+    fn send(&mut self, sequence: u32, flags: u8, payload: &[u8]) {
+        let body = segment(
+            self.port,
+            self.server_port,
+            sequence,
+            self.receive_next,
+            flags,
+            self.window,
+            &[],
+            payload,
+            PEER_IP,
+            OUR_IP,
+        );
+        let packet = datagram(0x4242, ip::PROTO_TCP, PEER_IP, OUR_IP, &body);
+        for arriving in self.to_stack.carry(packet) {
+            deliver(ether::ETHERTYPE_IPV4, &arriving);
+        }
+    }
+
+    /// Send the next bytes of the peer's own stream.
+    fn write(&mut self, payload: &[u8]) {
+        let sequence = self.send_next;
+        self.send_next = self.send_next.wrapping_add(payload.len() as u32);
+        self.send(sequence, tcp::PSH | tcp::ACK, payload);
+    }
+
+    fn ack(&mut self) {
+        if self.receive_next == self.last_ack {
+            self.repeated_acks += 1;
+        }
+        self.last_ack = self.receive_next;
+        let sequence = self.send_next;
+        self.send(sequence, tcp::ACK, &[]);
+    }
+
+    /// Take one segment the stack sent. True when an acknowledgement is owed
+    /// for it.
+    fn absorb(&mut self, frame: &[u8]) -> bool {
+        let Some((_, datagram)) = ip::parse(&frame[14..]) else { return false };
+        let pseudo = ip::pseudo_sum(OUR_IP, PEER_IP, ip::PROTO_TCP, datagram.len());
+        if ip::fold(ip::sum(datagram, pseudo)) != 0 {
+            // Damaged on the way: nothing here can be believed, so the peer
+            // behaves as if it never arrived.
+            return false;
+        }
+        let Some(parsed) = tcp::Segment::parse(datagram) else { return false };
+        let mut owed = false;
+        if !parsed.payload.is_empty() {
+            owed = true;
+            self.take(parsed.sequence, parsed.payload);
+        }
+        if parsed.flags & tcp::FIN != 0 {
+            owed = true;
+            let finish = parsed.sequence.wrapping_add(parsed.payload.len() as u32);
+            if finish == self.receive_next && !self.fin_seen {
+                self.fin_seen = true;
+                self.receive_next = self.receive_next.wrapping_add(1);
+            }
+        }
+        owed
+    }
+
+    /// Put one segment's bytes where they belong in the peer's own stream.
+    fn take(&mut self, sequence: u32, payload: &[u8]) {
+        let mut sequence = sequence;
+        let mut payload = payload;
+        if tcp::seq_lt(sequence, self.receive_next) {
+            let skip = self.receive_next.wrapping_sub(sequence) as usize;
+            if skip >= payload.len() {
+                return;
+            }
+            payload = &payload[skip..];
+            sequence = self.receive_next;
+        }
+        if sequence != self.receive_next {
+            self.early.push((sequence, payload.to_vec()));
+            return;
+        }
+        self.stream.extend_from_slice(payload);
+        self.receive_next = self.receive_next.wrapping_add(payload.len() as u32);
+        // Whatever arrived early and now follows on.
+        loop {
+            let Some(index) = self.early.iter().position(|(start, data)| {
+                tcp::seq_le(*start, self.receive_next)
+                    && tcp::seq_gt(start.wrapping_add(data.len() as u32), self.receive_next)
+            }) else {
+                break;
+            };
+            let (start, data) = self.early.remove(index);
+            let skip = self.receive_next.wrapping_sub(start) as usize;
+            self.stream.extend_from_slice(&data[skip..]);
+            self.receive_next = self.receive_next.wrapping_add((data.len() - skip) as u32);
+        }
+    }
+
+    /// Let the stack say everything it has to say, answering each segment as
+    /// it arrives. Returns how many segments reached the peer.
+    fn pump(&mut self) -> usize {
+        let mut seen = 0;
+        for _ in 0..512 {
+            let sent = self.nic.take();
+            if sent.is_empty() {
+                break;
+            }
+            for frame in sent {
+                for arriving in self.to_peer.carry(frame) {
+                    seen += 1;
+                    if self.absorb(&arriving) {
+                        self.ack();
+                    }
+                }
+            }
+        }
+        seen
+    }
+
+    fn finish(self) {
+        socket::close(&self.socket);
+        socket::close(&self.listener);
+        self.nic.take();
+    }
+}
+
+/// The number a segment this stack sent acknowledges.
+fn ack_number(frame: &[u8]) -> Option<u32> {
+    let (_, datagram) = ip::parse(&frame[14..])?;
+    Some(tcp::Segment::parse(datagram)?.acknowledgement)
+}
+
+/// What the link can do that a real one cannot be asked for: deliver a
+/// segment twice, damage one, and lose a chosen one out of a long stream.
+fn lossy_link(report: &mut Report, nic: &'static FakeNic) {
+    const SERVER_PORT: u16 = 8085;
+
+    // ---- a segment delivered twice ----
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40500, 11_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    peer.to_stack.script(&[Fate::Twice]);
+    peer.write(b"twelve bytes");
+    report.check(
+        "a segment delivered twice is taken once",
+        received_len_of(&peer.socket) == 12,
+    );
+    let sent = nic.take();
+    let acks: Vec<u32> = sent.iter().filter_map(|frame| ack_number(frame)).collect();
+    report.check(
+        "and each copy is acknowledged in the same place",
+        acks.len() == 2 && acks[0] == acks[1],
+    );
+    peer.finish();
+
+    // ---- a segment damaged on the way ----
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40501, 12_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    peer.to_stack.script(&[Fate::Corrupt]);
+    let sequence = peer.send_next;
+    peer.send(sequence, tcp::PSH | tcp::ACK, b"damaged");
+    report.check(
+        "a damaged segment is neither taken nor answered",
+        received_len_of(&peer.socket) == 0 && nic.take().is_empty(),
+    );
+    peer.to_stack.script(&[]);
+    peer.send(sequence, tcp::PSH | tcp::ACK, b"damaged");
+    report.check(
+        "and the same segment again is taken",
+        received_len_of(&peer.socket) == 7,
+    );
+    peer.finish();
+
+    socket::reset();
+    nic.take();
 }
 
 fn fin_received_of(socket: &Arc<InetSocket>) -> bool {
