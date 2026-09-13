@@ -105,6 +105,7 @@ cat > "$RFS/etc/hostname" <<'HOSTNAME'
 claudeos
 HOSTNAME
 
+cp "$ROOT/tests/demo.sh" "$RFS/root/demo.sh"
 cp "$ROOT/tests/suite.sh" "$RFS/root/suite.sh"
 cp "$ROOT/tests/busybox.sh" "$RFS/root/busybox.sh"
 
