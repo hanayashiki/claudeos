@@ -307,60 +307,68 @@ impl AddressSpace {
     /// Writable pages are made read-only on both sides and marked
     /// copy-on-write, so a fork costs a page table walk rather than a copy of
     /// the whole address space; the copy happens per page, only if written to.
+    ///
+    /// A walk that stops partway has still taken write permission away from
+    /// every page it reached, so the flush belongs to both outcomes and is
+    /// done here where neither can get past it. What this address space has
+    /// collected by then is the caller's to release.
     pub fn clone_user_from(&self, src: &AddressSpace) -> Result<(), MapError> {
-        unsafe {
-            let src_pml4 = table_at(src.pml4);
-            for i in 0..256usize {
-                let e4 = *src_pml4.add(i);
-                if e4 & PRESENT == 0 {
+        let result = unsafe { self.share_user_tables(src) };
+        // The parent's write permissions just changed underneath it.
+        flush_tlb_all();
+        result
+    }
+
+    unsafe fn share_user_tables(&self, src: &AddressSpace) -> Result<(), MapError> {
+        let src_pml4 = table_at(src.pml4);
+        for i in 0..256usize {
+            let e4 = *src_pml4.add(i);
+            if e4 & PRESENT == 0 {
+                continue;
+            }
+            let pdpt = table_at(e4 & ADDR_MASK);
+            for j in 0..512usize {
+                let e3 = *pdpt.add(j);
+                if e3 & PRESENT == 0 || e3 & HUGE != 0 {
                     continue;
                 }
-                let pdpt = table_at(e4 & ADDR_MASK);
-                for j in 0..512usize {
-                    let e3 = *pdpt.add(j);
-                    if e3 & PRESENT == 0 || e3 & HUGE != 0 {
+                let pd = table_at(e3 & ADDR_MASK);
+                for k in 0..512usize {
+                    let e2 = *pd.add(k);
+                    if e2 & PRESENT == 0 || e2 & HUGE != 0 {
                         continue;
                     }
-                    let pd = table_at(e3 & ADDR_MASK);
-                    for k in 0..512usize {
-                        let e2 = *pd.add(k);
-                        if e2 & PRESENT == 0 || e2 & HUGE != 0 {
+                    let pt = table_at(e2 & ADDR_MASK);
+                    for l in 0..512usize {
+                        let entry = *pt.add(l);
+                        if entry & PRESENT == 0 {
                             continue;
                         }
-                        let pt = table_at(e2 & ADDR_MASK);
-                        for l in 0..512usize {
-                            let entry = *pt.add(l);
-                            if entry & PRESENT == 0 {
-                                continue;
-                            }
-                            let virt = sign_extend(
-                                ((i as u64) << 39)
-                                    | ((j as u64) << 30)
-                                    | ((k as u64) << 21)
-                                    | ((l as u64) << 12),
-                            );
-                            let phys = entry & ADDR_MASK;
-                            let flags = entry & !ADDR_MASK;
+                        let virt = sign_extend(
+                            ((i as u64) << 39)
+                                | ((j as u64) << 30)
+                                | ((k as u64) << 21)
+                                | ((l as u64) << 12),
+                        );
+                        let phys = entry & ADDR_MASK;
+                        let flags = entry & !ADDR_MASK;
 
-                            let shared = if flags & WRITABLE != 0 {
-                                let shared = (flags & !WRITABLE) | COW;
-                                // The parent loses write access too, or it
-                                // would change pages the child can see.
-                                *pt.add(l) = phys | shared;
-                                shared
-                            } else {
-                                flags
-                            };
-                            // A second reference for the entry about to be
-                            // written in the child.
-                            self.map(virt, frame::share_recorded(phys), shared)?;
-                        }
+                        let shared = if flags & WRITABLE != 0 {
+                            let shared = (flags & !WRITABLE) | COW;
+                            // The parent loses write access too, or it
+                            // would change pages the child can see.
+                            *pt.add(l) = phys | shared;
+                            shared
+                        } else {
+                            flags
+                        };
+                        // A second reference for the entry about to be
+                        // written in the child.
+                        self.map(virt, frame::share_recorded(phys), shared)?;
                     }
                 }
             }
         }
-        // The parent's write permissions just changed underneath it.
-        flush_tlb_all();
         Ok(())
     }
 

@@ -21,15 +21,27 @@ pub fn fork(
     let mut parent = sched::current();
     let share_vm = flags & CLONE_VM != 0;
 
+    // A fresh address space belongs to nothing until the child is registered
+    // on it, so anything that goes wrong before then has to hand it back here
+    // or it is held by nobody: the tables under it, and the references its
+    // entries took on the parent's frames, would stay taken for good.
     let space = if share_vm {
         parent.space
     } else {
         let space = AddressSpace::new_user().ok_or(Errno::ENOMEM)?;
-        space.clone_user_from(&parent.space).map_err(|_| Errno::ENOMEM)?;
+        if space.clone_user_from(&parent.space).is_err() {
+            space.destroy();
+            return Err(Errno::ENOMEM);
+        }
         space
     };
 
-    let mut child = Task::new(&parent.name, space).ok_or(Errno::ENOMEM)?;
+    let Some(mut child) = Task::new(&parent.name, space) else {
+        if !share_vm {
+            space.destroy();
+        }
+        return Err(Errno::ENOMEM);
+    };
     if share_vm {
         // Threads must see each other's mappings, so they share one record.
         child.mm = parent.mm.clone();
