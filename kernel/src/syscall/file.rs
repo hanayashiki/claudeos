@@ -178,10 +178,39 @@ pub fn pwrite(fd: i32, buf_addr: u64, len: u64, offset: u64) -> SysResult {
     Ok(n as u64)
 }
 
+/// The descriptor `path` names, when it is one of the calling process's own
+/// entries under /proc/<pid>/fd.
+///
+/// The table is what such an entry stands for, so it is asked directly rather
+/// than through the directory that lists it: that directory is rebuilt on
+/// demand and is not there at all for the first moments of a task's life, so
+/// a child that redirects to one of its own descriptors before the fork that
+/// made it has finished would otherwise be told the name does not exist.
+fn own_descriptor(path: &str) -> Option<i32> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (owner, rest) = rest.split_once('/')?;
+    if owner.parse::<u32>().ok()? != sched::current().pid {
+        return None;
+    }
+    rest.strip_prefix("fd/")?.parse::<i32>().ok()
+}
+
+/// Another handle on the open file a descriptor already holds.
+fn open_descriptor(fd: i32, flags: u32) -> SysResult {
+    // A descriptor that is not open has no entry, so the answer is the one a
+    // missing name gets rather than the one a bad descriptor gets.
+    let file = sched::current().fds.get(fd).map_err(|_| Errno::ENOENT)?;
+    let new = sched::current().fds.alloc(file, flags & O_CLOEXEC != 0)?;
+    Ok(new as u64)
+}
+
 pub fn openat(dirfd: i64, path_addr: u64, flags: u32, mode: u32) -> SysResult {
     let mut path = resolve_at(dirfd, path_addr)?;
     if let Some(target) = procfs_override(&path) {
         path = target;
+    }
+    if let Some(fd) = own_descriptor(&path) {
+        return open_descriptor(fd, flags);
     }
 
     let node = match fs::lookup(&path) {
@@ -203,10 +232,7 @@ pub fn openat(dirfd: i64, path_addr: u64, flags: u32, mode: u32) -> SysResult {
     // to /dev/stdout reach the terminal or the pipe stdout is attached to.
     if let fs::NodeKind::Fd(owner, fd) = node.kind {
         if owner == sched::current().pid {
-            let file = sched::current().fds.get(fd)?;
-            let cloexec = flags & O_CLOEXEC != 0;
-            let new = sched::current().fds.alloc(file, cloexec)?;
-            return Ok(new as u64);
+            return open_descriptor(fd, flags);
         }
         return Err(Errno::EACCES);
     }
