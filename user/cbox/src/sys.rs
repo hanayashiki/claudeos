@@ -51,6 +51,8 @@ mod numbers {
     pub const SYS_EPOLL_CTL: u64 = 233;
     pub const SYS_EPOLL_WAIT: u64 = 232;
     pub const SYS_STATFS: u64 = 137;
+    pub const SYS_TIMES: u64 = 100;
+    pub const SYS_CLOCK_GETRES: u64 = 229;
 
     /// `struct epoll_event` is declared packed on x86-64, so the 8-byte data
     /// word follows the 4-byte mask with no gap.
@@ -84,6 +86,8 @@ mod numbers {
     pub const SYS_EPOLL_CTL: u64 = 21;
     pub const SYS_EPOLL_PWAIT: u64 = 22;
     pub const SYS_STATFS: u64 = 43;
+    pub const SYS_TIMES: u64 = 153;
+    pub const SYS_CLOCK_GETRES: u64 = 114;
 
     /// `struct epoll_event` is not packed here, so the data word is aligned to
     /// 8 and the structure is 16 bytes.
@@ -547,4 +551,23 @@ pub fn statfs(path: &str) -> Option<StatFs> {
         u64::from_le_bytes(bytes)
     };
     Some(StatFs { block_size: field(8), blocks: field(16), free: field(24) })
+}
+
+/// The timer tick count, which is what `times` returns as its value. The
+/// buffer of process times it can also fill is not wanted here, and a null
+/// pointer asks for none of it.
+pub fn tick_count() -> u64 {
+    unsafe { syscall1(SYS_TIMES, 0) as u64 }
+}
+
+/// How long one timer tick is, in nanoseconds, or zero if the kernel will not
+/// say: the resolution of CLOCK_MONOTONIC is the tick a deadline is counted
+/// in.
+pub fn tick_nanoseconds() -> u64 {
+    const CLOCK_MONOTONIC: u64 = 1;
+    let mut spec = [0i64; 2];
+    if unsafe { syscall2(SYS_CLOCK_GETRES, CLOCK_MONOTONIC, spec.as_mut_ptr() as u64) } < 0 {
+        return 0;
+    }
+    spec[0] as u64 * 1_000_000_000 + spec[1] as u64
 }
