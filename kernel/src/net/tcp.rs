@@ -68,8 +68,16 @@ pub const MSS: usize = 1460;
 /// The smallest maximum segment size a peer is allowed to insist on.
 const MIN_MSS: usize = 536;
 /// Bytes a connection will hold in each direction.
-pub const RECEIVE_WINDOW: usize = 32 * 1024;
-pub const SEND_BUFFER: usize = 32 * 1024;
+///
+/// The window field is sixteen bits and there is no window scaling here, so
+/// this is as much as can ever be offered, and offering it is what keeps
+/// enough segments in flight for a lost one to be found by the
+/// acknowledgements repeating rather than by the clock. Half of it, which is
+/// what this was, collapsed to three or four segments whenever the program
+/// reading was behind, and three or four segments in flight cannot produce
+/// the three repeats that find a loss.
+pub const RECEIVE_WINDOW: usize = 65535;
+pub const SEND_BUFFER: usize = 64 * 1024;
 
 /// Timer values, in timer ticks. The tick is ten milliseconds.
 ///
