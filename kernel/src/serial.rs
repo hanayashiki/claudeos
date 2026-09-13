@@ -171,6 +171,21 @@ pub fn init() {
     SERIAL.lock().init();
 }
 
+/// Take the console and the log back from whoever was holding them.
+///
+/// A panic can be reached from inside a print, or from anything a print calls,
+/// with either lock held. Printing the panic would then spin for ever on a
+/// lock nothing is going to release, with interrupts already masked, and the
+/// cable would show nothing at all -- which on a board is every diagnosis
+/// there is. Whatever held them cannot run again, because the panic path masks
+/// interrupts and does not return, so there is nothing left to take them from.
+///
+/// Only for the panic path.
+pub unsafe fn force_release() {
+    SERIAL.force_unlock();
+    LOG.force_unlock();
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     let _ = Logged.write_fmt(args);

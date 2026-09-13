@@ -242,11 +242,17 @@ fn mount_initramfs(boot: &boot::BootInfo) {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     sync::disable_interrupts();
+    // Before the first print, because a panic reached while the console lock
+    // or the log lock was held would otherwise spin for ever on it with
+    // interrupts off and print nothing at all.
+    unsafe { serial::force_release() };
     println!();
     println!("KERNEL PANIC: {}", info);
     if sched::has_current() {
-        let task = sched::current();
-        println!("  in pid {} ({})", task.pid, task.name());
+        // The pid is a plain field. The task's name is behind a lock of its
+        // own and is copied onto the heap to be read, which are two more
+        // places this could hang before it has said anything.
+        println!("  in pid {}", sched::current().pid);
     }
     loop {
         arch::halt();
