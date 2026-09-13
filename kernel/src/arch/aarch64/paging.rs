@@ -55,7 +55,7 @@ const FLAG_MASK: u64 = !ADDR_MASK;
 /// Turn the flags the portable half speaks into a last-level descriptor for
 /// `phys`. The software bits are kept as they were asked for; the hardware
 /// permission bits are derived from them.
-fn encode(phys: u64, flags: u64) -> u64 {
+fn encode(phys: u64, flags: u64) -> Entry {
     let mut entry = (phys & ADDR_MASK) | (flags & FLAG_MASK) | PAGE_DESCRIPTOR | ACCESSED | SHARED;
     if flags & WRITABLE == 0 || flags & COW != 0 {
         entry |= READ_ONLY;
@@ -68,7 +68,7 @@ fn encode(phys: u64, flags: u64) -> u64 {
     if flags & (NO_EXECUTE | USER) != 0 {
         entry |= NO_EXECUTE_EL1;
     }
-    entry
+    Entry::new(entry)
 }
 
 #[inline]
@@ -139,9 +139,80 @@ fn index_of(virt: u64, level: u32) -> usize {
     ((virt >> (12 + 9 * level)) & 0x1FF) as usize
 }
 
+/// One descriptor in a translation table.
+///
+/// The hardware that translates addresses walks these tables itself, so a
+/// descriptor is memory a second observer reads, and this one is allowed to
+/// read it speculatively, without any instruction naming the address it
+/// covers. A store to one therefore has to be ordered against whatever the
+/// descriptor makes reachable. `store` is the only way to write one and emits
+/// that ordering, so it cannot be left out: a table is an array of these and
+/// nothing hands out the word inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct Entry(u64);
+
+impl Entry {
+    pub const EMPTY: Entry = Entry(0);
+
+    #[inline]
+    pub const fn new(bits: u64) -> Entry {
+        Entry(bits)
+    }
+
+    #[inline]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn is_present(self) -> bool {
+        self.0 & PRESENT != 0
+    }
+
+    /// The output address the descriptor names.
+    #[inline]
+    pub const fn addr(self) -> u64 {
+        self.0 & ADDR_MASK
+    }
+
+    /// The flags as they were asked for, software bits included.
+    #[inline]
+    pub const fn flags(self) -> u64 {
+        self.0 & FLAG_MASK
+    }
+
+    /// Write this descriptor where the walker will read it.
+    ///
+    /// The barrier is what puts everything the descriptor makes reachable --
+    /// a table that was just zeroed, a frame that was just filled in -- in
+    /// memory before the descriptor naming it is there. Without it the walker
+    /// can reach the descriptor and read what was at that address before.
+    /// QEMU does not model this; a board does.
+    #[inline]
+    pub unsafe fn store(self, at: *mut Entry) {
+        asm!("dsb ishst", options(nostack, preserves_flags));
+        core::ptr::write(at, self);
+    }
+}
+
+/// Put a fresh table under `at` and link it there.
+///
+/// The three steps belong together and are here and nowhere else: the frame is
+/// zeroed, the zeroing is made visible to the walker, and only then does a
+/// descriptor name it. In any other order, or with anything in between, the
+/// walker can reach the descriptor and read whatever the frame held before it
+/// was cleared. The descriptor above holds the table's reference from here on;
+/// `free_table` takes it back.
+unsafe fn publish_table(at: *mut Entry) -> Result<u64, MapError> {
+    let table = frame::alloc_zeroed().ok_or(MapError::OutOfMemory)?.into_recorded();
+    Entry::new(table | PRESENT | PAGE_DESCRIPTOR).store(at);
+    Ok(table)
+}
+
 #[inline]
-unsafe fn table_at(phys: u64) -> *mut u64 {
-    phys_to_virt(phys) as *mut u64
+unsafe fn table_at(phys: u64) -> *mut Entry {
+    phys_to_virt(phys) as *mut Entry
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,7 +249,7 @@ impl AddressSpace {
             let dst = table_at(root);
             // Entries 256..512 cover the kernel: direct map, heap, image.
             for i in 256..512 {
-                *dst.add(i) = *src.add(i);
+                (*src.add(i)).store(dst.add(i));
             }
         }
         Some(AddressSpace { root })
@@ -195,30 +266,19 @@ impl AddressSpace {
     /// can forbid what the pages under it allow, and using that would mean
     /// revisiting every ancestor whenever one page's permissions changed, so
     /// the tables are left permissive and the last level decides.
-    unsafe fn entry_for(&self, virt: u64, create: bool) -> Result<*mut u64, MapError> {
+    unsafe fn entry_for(&self, virt: u64, create: bool) -> Result<*mut Entry, MapError> {
         let mut table = self.root;
         for level in (1..4).rev() {
             let idx = index_of(virt, level);
             let entry_ptr = table_at(table).add(idx);
             let entry = *entry_ptr;
-            if entry & PRESENT == 0 {
+            if !entry.is_present() {
                 if !create {
                     return Err(MapError::OutOfMemory);
                 }
-                // The entry above it holds the table's reference from here
-                // on; `free_table` takes it back.
-                let new = frame::alloc_zeroed().ok_or(MapError::OutOfMemory)?.into_recorded();
-                // The walker reads these tables itself and may do so
-                // speculatively, so the zeroed table has to be visible before
-                // the descriptor naming it is. Without this the walker can
-                // reach the descriptor and read whatever the frame held
-                // before it was cleared. QEMU does not model this; a board
-                // does.
-                asm!("dsb ishst", options(nostack, preserves_flags));
-                *entry_ptr = new | PRESENT | PAGE_DESCRIPTOR;
-                table = new;
+                table = publish_table(entry_ptr)?;
             } else {
-                table = entry & ADDR_MASK;
+                table = entry.addr();
             }
         }
         Ok(table_at(table).add(index_of(virt, 0)))
@@ -234,10 +294,10 @@ impl AddressSpace {
     pub fn map(&self, virt: u64, frame: Frame, flags: u64) -> Result<(), MapError> {
         unsafe {
             let entry = self.entry_for(virt, true)?;
-            if *entry & PRESENT != 0 {
+            if (*entry).is_present() {
                 return Err(MapError::AlreadyMapped);
             }
-            *entry = encode(frame.into_recorded(), flags);
+            encode(frame.into_recorded(), flags).store(entry);
         }
         flush_tlb(virt);
         Ok(())
@@ -248,10 +308,10 @@ impl AddressSpace {
     pub fn map_fixed(&self, virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
         unsafe {
             let entry = self.entry_for(virt, true)?;
-            if *entry & PRESENT != 0 {
+            if (*entry).is_present() {
                 return Err(MapError::AlreadyMapped);
             }
-            *entry = encode(phys, flags);
+            encode(phys, flags).store(entry);
         }
         flush_tlb(virt);
         Ok(())
@@ -269,11 +329,11 @@ impl AddressSpace {
     pub fn unmap(&self, virt: u64) -> Option<Frame> {
         let frame = unsafe {
             let entry = self.entry_for(virt, false).ok()?;
-            if *entry & PRESENT == 0 {
+            if !(*entry).is_present() {
                 return None;
             }
-            let phys = *entry & ADDR_MASK;
-            *entry = 0;
+            let phys = (*entry).addr();
+            Entry::EMPTY.store(entry);
             Frame::from_recorded(phys)
         };
         flush_tlb(virt);
@@ -286,21 +346,21 @@ impl AddressSpace {
             let mut table = self.root;
             for level in (1..4).rev() {
                 let entry = *table_at(table).add(index_of(virt, level));
-                if entry & PRESENT == 0 {
+                if !entry.is_present() {
                     return None;
                 }
                 // A block descriptor at this level ends the walk.
-                if entry & PAGE_DESCRIPTOR == 0 {
+                if entry.bits() & PAGE_DESCRIPTOR == 0 {
                     let size = 1u64 << (12 + 9 * level);
-                    return Some((entry & ADDR_MASK) + (virt & (size - 1)));
+                    return Some(entry.addr() + (virt & (size - 1)));
                 }
-                table = entry & ADDR_MASK;
+                table = entry.addr();
             }
             let entry = *table_at(table).add(index_of(virt, 0));
-            if entry & PRESENT == 0 {
+            if !entry.is_present() {
                 return None;
             }
-            Some((entry & ADDR_MASK) + (virt & 0xFFF))
+            Some(entry.addr() + (virt & 0xFFF))
         }
     }
 
@@ -308,10 +368,10 @@ impl AddressSpace {
     pub fn flags_of(&self, virt: u64) -> Option<u64> {
         unsafe {
             let entry = self.entry_for(virt, false).ok()?;
-            if *entry & PRESENT == 0 {
+            if !(*entry).is_present() {
                 return None;
             }
-            Some(*entry & FLAG_MASK)
+            Some((*entry).flags())
         }
     }
 
@@ -319,10 +379,10 @@ impl AddressSpace {
     pub fn set_flags(&self, virt: u64, flags: u64) -> Option<()> {
         unsafe {
             let entry = self.entry_for(virt, false).ok()?;
-            if *entry & PRESENT == 0 {
+            if !(*entry).is_present() {
                 return None;
             }
-            *entry = encode(*entry & ADDR_MASK, flags);
+            encode((*entry).addr(), flags).store(entry);
         }
         flush_tlb(virt);
         Some(())
@@ -346,18 +406,18 @@ impl AddressSpace {
     /// address.
     pub fn free_user_memory(&self) {
         // Entries 0..256 are the low half: everything a program owns.
-        let mut detached = [0u64; 256];
+        let mut detached = [Entry::EMPTY; 256];
         unsafe {
             let root = table_at(self.root);
             for (i, entry) in detached.iter_mut().enumerate() {
                 *entry = *root.add(i);
-                *root.add(i) = 0;
+                Entry::EMPTY.store(root.add(i));
             }
         }
         flush_tlb_all();
         for entry in detached {
-            if entry & PRESENT != 0 {
-                unsafe { free_table(entry & ADDR_MASK, 3) };
+            if entry.is_present() {
+                unsafe { free_table(entry.addr(), 3) };
             }
         }
     }
@@ -380,11 +440,11 @@ impl AddressSpace {
         let from = table_at(src.root);
         for i in 0..256usize {
             let entry = *from.add(i);
-            if entry & PRESENT == 0 {
+            if !entry.is_present() {
                 continue;
             }
             let virt = (i as u64) << 39;
-            clone_table(self, src, entry & ADDR_MASK, virt, 3)?;
+            clone_table(self, src, entry.addr(), virt, 3)?;
         }
         Ok(())
     }
@@ -402,15 +462,15 @@ unsafe fn free_table(phys: u64, level: u32) {
     let table = table_at(phys);
     for i in 0..512 {
         let entry = *table.add(i);
-        if entry & PRESENT == 0 {
+        if !entry.is_present() {
             continue;
         }
         if level == 1 {
-            drop(Frame::from_recorded(entry & ADDR_MASK));
+            drop(Frame::from_recorded(entry.addr()));
         } else {
-            free_table(entry & ADDR_MASK, level - 1);
+            free_table(entry.addr(), level - 1);
         }
-        *table.add(i) = 0;
+        Entry::EMPTY.store(table.add(i));
     }
     drop(Frame::from_recorded(phys));
 }
@@ -428,22 +488,22 @@ unsafe fn clone_table(
     for i in 0..512usize {
         let entry_ptr = table.add(i);
         let entry = *entry_ptr;
-        if entry & PRESENT == 0 {
+        if !entry.is_present() {
             continue;
         }
         let virt = base | (i as u64) << (12 + 9 * (level - 1));
         if level == 1 {
-            let mut flags = entry & FLAG_MASK;
+            let mut flags = entry.flags();
             if flags & WRITABLE != 0 {
                 flags |= COW;
                 // The page the parent is still running on has to lose write
                 // permission too, or its writes would be seen by the child.
-                *entry_ptr = encode(entry & ADDR_MASK, flags);
+                encode(entry.addr(), flags).store(entry_ptr);
             }
-            let shared = frame::share_recorded(entry & ADDR_MASK);
+            let shared = frame::share_recorded(entry.addr());
             dst.map(virt, shared, flags)?;
         } else {
-            clone_table(dst, src, entry & ADDR_MASK, virt, level - 1)?;
+            clone_table(dst, src, entry.addr(), virt, level - 1)?;
         }
     }
     Ok(())
@@ -453,7 +513,7 @@ unsafe fn clone_table(
 /// entirely out of the higher half. This frees the low half for programs.
 pub unsafe fn drop_identity_map() {
     let root = table_at(read_ttbr0());
-    *root.add(0) = 0;
+    Entry::EMPTY.store(root.add(0));
     flush_tlb_all();
 }
 
