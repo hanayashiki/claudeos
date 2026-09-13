@@ -1034,6 +1034,15 @@ pub fn receive(source: Ipv4Addr, destination: Ipv4Addr, bytes: &[u8]) {
     if ip::fold(ip::sum(bytes, pseudo)) != 0 {
         return;
     }
+    // RFC 1122: a segment addressed to a broadcast or a multicast address is
+    // discarded. Answering one would name an address this machine does not
+    // have as the source, and open a connection with every host that answered.
+    if destination.is_broadcast()
+        || destination.is_multicast()
+        || destination == super::config().broadcast()
+    {
+        return;
+    }
     let local = Endpoint::new(destination, segment.destination_port);
     let remote = Endpoint::new(source, segment.source_port);
 

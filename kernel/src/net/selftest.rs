@@ -229,6 +229,12 @@ fn deliver_ip(protocol: u8, payload: &[u8]) {
     deliver(ether::ETHERTYPE_IPV4, &bytes);
 }
 
+/// The same, for a datagram addressed somewhere other than at this machine.
+fn deliver_ip_between(protocol: u8, payload: &[u8], source: Ipv4Addr, destination: Ipv4Addr) {
+    let bytes = datagram(0x4242, protocol, source, destination, payload);
+    deliver(ether::ETHERTYPE_IPV4, &bytes);
+}
+
 // ---- the tests ------------------------------------------------------------
 
 pub fn run() -> bool {
@@ -268,6 +274,8 @@ pub fn run() -> bool {
     unacceptable_segments(&mut report, nic);
     crate::println!("net: a connection nobody holds");
     abandoned_connection(&mut report, nic);
+    crate::println!("net: addresses this machine does not have");
+    foreign_addresses(&mut report, nic);
     crate::println!("net: datagrams");
     datagrams(&mut report, nic);
     // The driver for this board's own Ethernet, as far as it can be exercised
@@ -1139,6 +1147,135 @@ fn abandoned_connection(report: &mut Report, nic: &FakeNic) {
         "which holds nothing and takes nothing more",
         received_len_of(&connection.socket) == 0 && read_shutdown_of(&connection.socket),
     );
+    socket::reset();
+    nic.take();
+}
+
+/// An echo request, ready to be addressed anywhere.
+fn echo_request() -> Vec<u8> {
+    let mut request = Vec::new();
+    request.push(8);
+    request.push(0);
+    request.extend_from_slice(&[0, 0]);
+    request.extend_from_slice(&[0x13, 0x37]);
+    request.extend_from_slice(&[0x00, 0x09]);
+    request.extend_from_slice(b"abcdefghijklmnopqrstuvwabcdefghi");
+    let checksum = ip::checksum(&request);
+    request[2..4].copy_from_slice(&checksum.to_be_bytes());
+    request
+}
+
+/// A frame off the card addressed to somewhere this machine is not, or from
+/// somewhere it is. Each of these is one frame from whoever can reach the
+/// card, and each of them used to be answered.
+fn foreign_addresses(report: &mut Report, nic: &FakeNic) {
+    const SERVER_PORT: u16 = 8083;
+    const CLIENT_PORT: u16 = 40300;
+    let loopback = Ipv4Addr::new(127, 0, 0, 1);
+    let subnet_broadcast = Ipv4Addr::new(10, 0, 2, 255);
+
+    // ---- a socket bound to the loopback address is not on the network ----
+    socket::reset();
+    let listener = InetSocket::new(true);
+    if listener.bind(Endpoint::new(loopback, SERVER_PORT)).is_err() || listener.listen(4).is_err() {
+        report.check("a socket bound to the loopback address", false);
+        return;
+    }
+    nic.take();
+    deliver_ip_between(
+        ip::PROTO_TCP,
+        &segment(
+            CLIENT_PORT, SERVER_PORT, 7_000_000, 0, tcp::SYN, 64240, &[], &[], PEER_IP, loopback,
+        ),
+        PEER_IP,
+        loopback,
+    );
+    report.check(
+        "a connection request to the loopback address is not answered",
+        nic.take().is_empty(),
+    );
+    report.check("and reaches no socket", socket::count() == 1);
+    socket::reset();
+
+    // ---- the broadcast addresses ----
+    let listener = InetSocket::new(true);
+    if listener.bind(Endpoint::new(Ipv4Addr::UNSPECIFIED, SERVER_PORT)).is_err()
+        || listener.listen(4).is_err()
+    {
+        report.check("a listening socket", false);
+        return;
+    }
+    nic.take();
+    for (name, destination) in [
+        ("the all-ones broadcast", Ipv4Addr::BROADCAST),
+        ("the subnet broadcast", subnet_broadcast),
+    ] {
+        deliver_ip_between(
+            ip::PROTO_TCP,
+            &segment(
+                CLIENT_PORT, SERVER_PORT, 7_100_000, 0, tcp::SYN, 64240, &[], &[], PEER_IP,
+                destination,
+            ),
+            PEER_IP,
+            destination,
+        );
+        // RFC 1122: a segment addressed to a broadcast is discarded.
+        report.check(name, nic.take().is_empty() && socket::count() == 1);
+
+        // And a closed port there draws nothing either, which is what would
+        // otherwise send a reset from an address this machine does not have.
+        deliver_ip_between(
+            ip::PROTO_TCP,
+            &segment(
+                CLIENT_PORT, 9999, 7_200_000, 0, tcp::SYN, 64240, &[], &[], PEER_IP, destination,
+            ),
+            PEER_IP,
+            destination,
+        );
+        report.check("a closed port on it is not refused either", nic.take().is_empty());
+
+        // Nor is an echo request: answering one makes this machine a way of
+        // pointing traffic at somebody else. Linux ignores these by default.
+        deliver_ip_between(ip::PROTO_ICMP, &echo_request(), PEER_IP, destination);
+        report.check("and an echo request to it draws no reply", nic.take().is_empty());
+    }
+
+    // ---- a frame claiming to come from us ----
+    deliver_ip_between(
+        ip::PROTO_TCP,
+        &segment(
+            CLIENT_PORT, SERVER_PORT, 7_300_000, 0, tcp::SYN, 64240, &[], &[], OUR_IP, OUR_IP,
+        ),
+        OUR_IP,
+        OUR_IP,
+    );
+    report.check(
+        "a frame off the card claiming our own address is dropped",
+        nic.take().is_empty() && socket::count() == 1,
+    );
+    socket::close(&listener);
+    socket::reset();
+    nic.take();
+
+    // ---- what a broadcast is still for ----
+    let socket = InetSocket::new(false);
+    if socket.bind(Endpoint::new(Ipv4Addr::UNSPECIFIED, 7779)).is_err() {
+        report.check("a datagram socket", false);
+        return;
+    }
+    nic.take();
+    deliver_ip_between(
+        ip::PROTO_UDP,
+        &udp_datagram(5555, 7779, b"to everyone", PEER_IP, subnet_broadcast),
+        PEER_IP,
+        subnet_broadcast,
+    );
+    let mut buf = [0u8; 64];
+    match socket.receive_into(&mut buf, false) {
+        Ok((n, _)) => report.bytes("a broadcast datagram still arrives", &buf[..n], b"to everyone"),
+        Err(_) => report.check("a broadcast datagram still arrives", false),
+    }
+    socket::close(&socket);
     socket::reset();
     nic.take();
 }
