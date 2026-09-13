@@ -59,6 +59,9 @@ After `make alpine`, boot into Alpine itself:
 ```
 
 `make run` gives a shell on the serial console. `exit` powers the machine off.
+QEMU's monitor is multiplexed onto that same console, which is what leaves
+`Ctrl-C` to the guest: it interrupts the job running there rather than killing
+the emulator. `Ctrl-A` then `X` is the way out of the emulator.
 
 ### The other machine
 
@@ -74,11 +77,11 @@ ARCH=aarch64 ./scripts/run.sh --initrd build/initramfs-aarch64.cpio \
     --append 'init=/bin/init'
 ARCH=aarch64 make busybox                # an aarch64 busybox to test against
 ARCH=aarch64 make alpine                 # an aarch64 Alpine root filesystem
-ARCH=aarch64 ./scripts/test.sh           # all seven suites
+ARCH=aarch64 ./scripts/test.sh           # all eight suites
 ```
 
 Both third-party images are fetched for the machine `ARCH` names, so the same
-seven suites run on either one. busybox.net has no aarch64 build among its
+eight suites run on either one. busybox.net has no aarch64 build among its
 prebuilt binaries, so that one comes from Alpine's `busybox-static` package
 instead; `scripts/fetch-busybox.sh` refuses anything that is not a static ELF
 for the machine asked for, since a dynamically linked one has no interpreter to
@@ -343,13 +346,15 @@ kill sleep clear hexdump basename dirname yes true false`.
 `?`. `sed` takes line, `$`, regex and range addresses, `!`, and the `s`, `y`, `p`,
 `d`, `q` and `=` commands, with `-n`, `-e`, `-E` and `-i`. A group's text can be
 put back with `\1`, and `grep -o` prints what matched rather than the line.
+`grep -r` with no path searches the working directory, since a recursive
+search of standard input is not something that can be asked for.
 
 ## Tests
 
 `make test` boots the OS once per suite and requires each to report zero
 failures.
 
-- `tests/suite.sh` runs **249 checks** inside the OS, driving the shell through
+- `tests/suite.sh` runs **250 checks** inside the OS, driving the shell through
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
   subprocesses and `/proc`.
@@ -382,6 +387,12 @@ failures.
   followed by `jobs`, `bg` and `kill %1`, a background `cat` stopped for
   reading the terminal and resumed with `fg`, and the clock advancing while the
   shell is blocked in a read.
+- The **interrupt key at a terminal** is a second session, driven through
+  `scripts/run.sh` on a pseudo-terminal rather than over a socket. A socket
+  hands the guest whatever byte is written to it, so it cannot say whether the
+  terminal in front of QEMU would have kept `Ctrl-C` for the host; this one
+  interrupts a foreground `cat` and requires the prompt back and the next
+  command run.
 
 Every suite is an ordinary Linux program. Nothing in them is aware that they
 are not running on Linux.

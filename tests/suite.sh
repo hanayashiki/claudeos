@@ -151,6 +151,12 @@ check "invert"         "99" "$(seq 1 100 | grep -vc '^42$')"
 check "ignore case"    "2"  "$(printf 'Cat\ncat\ndog\n' | grep -ci '^cat$')"
 check "quiet status"   "1"  "$(seq 1 10 | grep -q '^99$'; echo $?)"
 check "recursive"      "2"  "$(grep -rl claudeos /etc | wc -l)"
+# A recursive search with no path searches the working directory. Standard
+# input is taken away here so that reading it instead comes back empty rather
+# than waiting for a line nothing is going to type.
+mkdir -p /tmp/gr/d; echo claudeos > /tmp/gr/d/f.txt
+check "recursive no path" "./d/f.txt" "$(cd /tmp/gr && grep -rl claudeos < /dev/null)"
+rm -rf /tmp/gr
 
 echo
 echo "-- sed --"

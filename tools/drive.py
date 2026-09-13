@@ -3,20 +3,27 @@
 
 QEMU's stdio character device does not pick up input written to a pipe after
 start-up, so the console is exposed as a unix socket instead and this script
-connects to it.
+connects to it. Pass --tty to go through scripts/run.sh on a terminal instead:
+a socket hands every byte to the guest untouched, so it says nothing about the
+keys a terminal's line discipline acts on before the guest can see them.
 
 Usage:
     drive.py [--timeout SECS] [--initramfs FILE] [--append CMDLINE] [--raw]
-             -- <step> [<step> ...]
+             [--tty] -- <step> [<step> ...]
 
-Each step is either text to send (backslash escapes are interpreted) or
-"wait:SECONDS" to pause.
+Each step is either text to send (backslash escapes are interpreted),
+"wait:SECONDS" to pause, or "until:TEXT" to pause until TEXT has been printed.
+A boot takes a different length of time on each machine, so waiting for the
+prompt is steadier than guessing at how long to sleep.
 
 Output is rendered the way a terminal would render it, so the redraws a line
 editor performs collapse into the line you would actually see. Pass --raw to
 get the bytes untouched.
 """
 import os
+import pty
+import select
+import signal
 import socket
 import subprocess
 import sys
@@ -113,12 +120,136 @@ class Screen:
             self._flush()
 
 
+class SocketConsole:
+    """The console as a unix socket, with QEMU started here.
+
+    Every byte written goes to the guest as it stands, which is what makes a
+    scripted session repeatable. Nothing enforces the timeout on this side;
+    the driver's own deadline is what ends the run.
+    """
+
+    def __init__(self, initramfs, append, timeout):
+        sock_path = os.path.join(tempfile.mkdtemp(), "console.sock")
+        console = [
+            "-chardev", f"socket,id=console,path={sock_path},server=on,wait=off",
+            "-serial", "chardev:console",
+            "-display", "none",
+            "-no-reboot",
+        ]
+        if os.environ.get("ARCH") == "aarch64":
+            # The flat image, because only that form gets a ram disk and a
+            # command line, and the first serial port, because that is the
+            # PL011.
+            command = [
+                "qemu-system-aarch64",
+                "-M", "raspi4b",
+                "-kernel", os.path.join(ROOT, "build", "kernel8.img"),
+                "-initrd", initramfs,
+            ] + console
+        else:
+            command = [
+                "qemu-system-x86_64",
+                "-kernel", os.path.join(ROOT, "build", "kernel.elf"),
+                "-initrd", initramfs,
+            ] + console + [
+                "-m", "512M",
+                "-cpu", "qemu64,+pdpe1gb,+rdrand,+fsgsbase,+xsave",
+            ]
+        if append:
+            command += ["-append", append]
+        self.process = subprocess.Popen(
+            command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        # Wait for QEMU to create the socket.
+        self.connection = None
+        for _ in range(200):
+            if os.path.exists(sock_path):
+                try:
+                    self.connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    self.connection.connect(sock_path)
+                    break
+                except OSError:
+                    self.connection = None
+            time.sleep(0.05)
+        if self.connection is None:
+            self.process.kill()
+            raise OSError("could not connect to the console socket")
+        self.connection.settimeout(0.3)
+
+    def recv(self):
+        try:
+            chunk = self.connection.recv(4096)
+        except socket.timeout:
+            return b""
+        except OSError:
+            return None
+        return chunk or None
+
+    def send(self, payload):
+        self.connection.sendall(payload)
+
+    def close(self):
+        if self.process.poll() is None:
+            self.process.kill()
+        try:
+            self.connection.close()
+        except OSError:
+            pass
+
+
+class TerminalConsole:
+    """The console as a terminal, through scripts/run.sh.
+
+    A socket carries a keystroke to the guest whatever it is, so it cannot
+    tell whether the terminal would have kept that key for the host. This form
+    goes through the same path a person does, which is where the interrupt
+    character is either passed on to the guest or taken by QEMU.
+    """
+
+    def __init__(self, initramfs, append, timeout):
+        self.master, slave = pty.openpty()
+        command = [os.path.join(ROOT, "scripts", "run.sh"),
+                   "--timeout", str(timeout), "--initrd", initramfs]
+        if append:
+            command += ["--append", append]
+        # Its own session, so a signal the terminal raises reaches this guest
+        # and not the script driving it, and the whole group can be cleared
+        # away at the end.
+        self.process = subprocess.Popen(
+            command, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+        os.close(slave)
+
+    def recv(self):
+        if not select.select([self.master], [], [], 0.3)[0]:
+            return b""
+        try:
+            chunk = os.read(self.master, 4096)
+        except OSError:
+            return None
+        return chunk or None
+
+    def send(self, payload):
+        os.write(self.master, payload)
+
+    def close(self):
+        if self.process.poll() is None:
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            os.close(self.master)
+        except OSError:
+            pass
+
+
 def main():
     args = sys.argv[1:]
     timeout = 60
     initramfs = os.path.join(ROOT, "build", "initramfs.cpio")
     append = None
     raw = False
+    tty = False
 
     while args and args[0].startswith("--"):
         if args[0] == "--timeout":
@@ -129,6 +260,8 @@ def main():
             append, args = args[1], args[2:]
         elif args[0] == "--raw":
             raw, args = True, args[1:]
+        elif args[0] == "--tty":
+            tty, args = True, args[1:]
         elif args[0] == "--":
             args.pop(0)
             break
@@ -140,65 +273,25 @@ def main():
     if os.path.exists(reaper):
         subprocess.run([reaper, "15"], check=False)
 
-    sock_path = os.path.join(tempfile.mkdtemp(), "console.sock")
-    console = [
-        "-chardev", f"socket,id=console,path={sock_path},server=on,wait=off",
-        "-serial", "chardev:console",
-        "-display", "none",
-        "-no-reboot",
-    ]
-    if os.environ.get("ARCH") == "aarch64":
-        # The flat image, because only that form gets a ram disk and a command
-        # line, and the first serial port, because that is the PL011.
-        command = [
-            "qemu-system-aarch64",
-            "-M", "raspi4b",
-            "-kernel", os.path.join(ROOT, "build", "kernel8.img"),
-            "-initrd", initramfs,
-        ] + console
-    else:
-        command = [
-            "qemu-system-x86_64",
-            "-kernel", os.path.join(ROOT, "build", "kernel.elf"),
-            "-initrd", initramfs,
-        ] + console + [
-            "-m", "512M",
-            "-cpu", "qemu64,+pdpe1gb,+rdrand,+fsgsbase,+xsave",
-        ]
-    if append:
-        command += ["-append", append]
-    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-    # Wait for QEMU to create the socket.
-    connection = None
-    for _ in range(200):
-        if os.path.exists(sock_path):
-            try:
-                connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                connection.connect(sock_path)
-                break
-            except OSError:
-                connection = None
-        time.sleep(0.05)
-    if connection is None:
-        process.kill()
-        print("could not connect to the console socket", file=sys.stderr)
+    try:
+        console = TerminalConsole(initramfs, append, timeout) if tty \
+            else SocketConsole(initramfs, append, timeout)
+    except OSError as err:
+        print(err, file=sys.stderr)
         return 1
 
     stop = threading.Event()
     screen = None if raw else Screen(sys.stdout)
+    transcript = bytearray()
 
     def reader():
-        connection.settimeout(0.3)
         while not stop.is_set():
-            try:
-                chunk = connection.recv(4096)
-            except socket.timeout:
-                continue
-            except OSError:
+            chunk = console.recv()
+            if chunk is None:
                 break
             if not chunk:
-                break
+                continue
+            transcript.extend(chunk)
             if screen is None:
                 sys.stdout.buffer.write(chunk)
                 sys.stdout.buffer.flush()
@@ -214,25 +307,28 @@ def main():
             if step.startswith("wait:"):
                 time.sleep(float(step[5:]))
                 continue
+            if step.startswith("until:"):
+                wanted = step[6:].encode()
+                # Give up rather than hang: the session that follows will fail
+                # on what it did not see, which says more than a stall does.
+                limit = min(time.time() + 30, deadline)
+                while wanted not in transcript and time.time() < limit:
+                    time.sleep(0.1)
+                continue
             payload = step.encode().decode("unicode_escape").encode("latin-1")
-            connection.sendall(payload)
+            console.send(payload)
             time.sleep(0.3)
     except OSError:
         pass
 
-    while time.time() < deadline and process.poll() is None:
+    while time.time() < deadline and console.process.poll() is None:
         time.sleep(0.2)
 
     stop.set()
-    if process.poll() is None:
-        process.kill()
+    console.close()
     thread.join(timeout=2)
     if screen is not None:
         screen.close()
-    try:
-        connection.close()
-    except OSError:
-        pass
     return 0
 
 
