@@ -182,7 +182,10 @@ pub struct Task {
     pub stop_signal: Cell<i32>,
     pub report_stop: Cell<bool>,
     pub report_continue: Cell<bool>,
-    signal_actions: [Cell<crate::signal::SigAction>; 64],
+    /// One cell holding the whole table, rather than sixty-four holding an
+    /// entry each, so that a fork copies it in one move the way the plain
+    /// field did. `as_slice_of_cells` gives the entries back one at a time.
+    signal_actions: Cell<[crate::signal::SigAction; 64]>,
     pub signal_mask: Cell<u64>,
 
     /// Pid this task is waiting for, if it is in wait4.
@@ -260,9 +263,7 @@ impl Task {
             stop_signal: Cell::new(0),
             report_stop: Cell::new(false),
             report_continue: Cell::new(false),
-            signal_actions: core::array::from_fn(|_| {
-                Cell::new(crate::signal::SigAction::default())
-            }),
+            signal_actions: Cell::new([crate::signal::SigAction::default(); 64]),
             signal_mask: Cell::new(0),
             wake_at: Cell::new(0),
             waiting_for: Cell::new(None),
@@ -299,25 +300,29 @@ impl Task {
         *self.pending_exec.lock() = Some(program);
     }
 
+    /// The dispositions, one cell each.
+    fn actions(&self) -> &[Cell<crate::signal::SigAction>] {
+        let table: &Cell<[crate::signal::SigAction]> = &self.signal_actions;
+        table.as_slice_of_cells()
+    }
+
     /// The disposition of one signal, and the way to change it.
     pub fn action(&self, signal: usize) -> crate::signal::SigAction {
-        self.signal_actions[signal].get()
+        self.actions()[signal].get()
     }
 
     pub fn set_action(&self, signal: usize, action: crate::signal::SigAction) {
-        self.signal_actions[signal].set(action);
+        self.actions()[signal].set(action);
     }
 
     /// Take another task's dispositions, which is what a fork gives the child.
     pub fn copy_actions_from(&self, other: &Task) {
-        for (mine, theirs) in self.signal_actions.iter().zip(other.signal_actions.iter()) {
-            mine.set(theirs.get());
-        }
+        self.signal_actions.set(other.signal_actions.get());
     }
 
     /// Handlers do not survive exec, but ignored signals stay ignored.
     pub fn reset_actions_for_exec(&self) {
-        for action in self.signal_actions.iter() {
+        for action in self.actions() {
             if action.get().handler != crate::signal::SIG_IGN {
                 action.set(crate::signal::SigAction::default());
             }
