@@ -102,13 +102,18 @@ pub fn init() {
     }
 }
 
-pub fn write_byte(byte: u8) {
+/// Hand one byte to the transmitter if it has room, and say whether it took
+/// it. Never waits and never changes what it was given: how long a stalled
+/// transmitter is waited for, and what a line ending looks like, are decided
+/// once in the console rather than once per machine.
+pub fn try_write_byte(byte: u8) -> bool {
     unsafe {
-        while read(FR) & TX_FULL != 0 {
-            core::hint::spin_loop();
+        if read(FR) & TX_FULL != 0 {
+            return false;
         }
         write(DR, byte as u32);
     }
+    true
 }
 
 pub fn read_byte() -> Option<u8> {

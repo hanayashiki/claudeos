@@ -32,8 +32,30 @@ impl Console {
     /// the only way in.
     fn write_chunk(&mut self, chunk: &Chunk) {
         for &byte in &chunk.bytes[..chunk.len] {
-            crate::arch::console_write_byte(byte);
+            put(byte);
         }
+    }
+}
+
+/// How many times a transmitter with no room is asked again before the byte is
+/// given up on.
+///
+/// A port that is working takes a byte within one byte time, 86.8 microseconds
+/// at 115200 baud. This many reads of its flag register is milliseconds on
+/// either machine, so a busy port is waited out and a port that never drains
+/// at all -- one the firmware left without a clock, one that is not there --
+/// costs a dropped byte rather than the machine. Waiting for ever is what the
+/// board's port did: interrupts are masked here, so that stops the clock and
+/// the input along with the output, and the cable shows a machine that has
+/// died rather than one that is missing a character.
+const TX_ATTEMPTS: u32 = 50_000;
+
+fn put(byte: u8) {
+    for _ in 0..TX_ATTEMPTS {
+        if crate::arch::console_try_write_byte(byte) {
+            return;
+        }
+        core::hint::spin_loop();
     }
 }
 
@@ -137,11 +159,9 @@ struct Logged;
 
 impl Write for Logged {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        let mut out = Chunk::new();
-        for &byte in s.as_bytes() {
-            out.push(byte);
-        }
-        drop(out);
+        // Through the console, because that is where a line ending is decided.
+        // What goes in the log is what was printed, before that.
+        crate::console::write_kernel(s.as_bytes());
         LOG.lock().push(s.as_bytes());
         Ok(())
     }

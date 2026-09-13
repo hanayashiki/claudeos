@@ -33,28 +33,19 @@ fn tx_empty() -> bool {
     unsafe { inb(COM1 + 5) & 0x20 != 0 }
 }
 
-fn raw_byte(byte: u8) {
-    let mut spins = 0u32;
-    while !tx_empty() {
-        spins += 1;
-        if spins > 1_000_000 {
-            break;
-        }
-        core::hint::spin_loop();
-    }
-    unsafe { outb(COM1, byte) };
-}
-
-/// Write one byte, turning a newline into the carriage return and line feed a
-/// terminal expects. Blocks until the transmitter takes it.
-pub fn write_byte(byte: u8) {
+/// Hand one byte to the transmitter if it has room, and say whether it took
+/// it. Never waits and never changes what it was given: how long a stalled
+/// transmitter is waited for, and what a line ending looks like, are decided
+/// once in the console rather than once per machine.
+pub fn try_write_byte(byte: u8) -> bool {
     if !INITIALIZED.load(Ordering::Relaxed) {
         init();
     }
-    if byte == b'\n' {
-        raw_byte(b'\r');
+    if !tx_empty() {
+        return false;
     }
-    raw_byte(byte);
+    unsafe { outb(COM1, byte) };
+    true
 }
 
 fn data_ready() -> bool {
