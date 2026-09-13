@@ -376,8 +376,8 @@ echo "-- devices --"
 check "/dev/null read"    "0"        "$(wc -c < /dev/null)"
 check "/dev/null write"   "0"        "$(echo discard > /dev/null; echo $?)"
 check "/dev/zero"         "16"       "$(head -c 16 < /dev/zero | wc -c)"
-# hexdump rather than wc -c throughout: wc counts the characters of a text
-# file and gives nothing for bytes that are not one.
+# The last line hexdump prints is the offset it stopped at, which is the
+# number of bytes it was given.
 check "/dev/urandom"      "00000010" "$(head -c 16 /dev/urandom | hexdump | tail -n 1)"
 check "/dev/random"       "00000010" "$(head -c 16 /dev/random | hexdump | tail -n 1)"
 # Two reads of a generator that is running cannot agree. Two that did would
@@ -495,6 +495,101 @@ check "basename"          "file"     "$(basename /tmp/t/file)"
 check "dirname"           "/tmp/t"   "$(dirname /tmp/t/file)"
 check "expr add"          "9"        "$(expr 4 + 5)"
 check "printf"            "x=5"      "$(printf 'x=%d' 5)"
+
+echo
+echo "-- bytes that are not text --"
+# A tool that moves bytes has no business deciding whether they are text.
+# Everything here is built in the guest: /tmp/by/all holds every byte value in
+# order, /tmp/by/high the same without the zero byte, /tmp/by/nonl a file whose
+# last line has no newline after it, /tmp/by/long one line of digits with
+# nothing after it, and /tmp/by/bad four sequences that are not valid UTF-8 for
+# a reason other than holding a high byte: an overlong encoding, a surrogate, a
+# code point past the last one, and a sequence that stops in the middle.
+rm -rf /tmp/by
+mkdir -p /tmp/by
+fmt=""
+i=0
+while [ $i -lt 256 ]; do
+  fmt="$fmt\\$((i / 64))$((i / 8 % 8))$((i % 8))"
+  i=$((i + 1))
+done
+printf "$fmt" > /tmp/by/all
+printf 'a\nb' > /tmp/by/nonl
+printf '\300\200\355\240\200\364\220\200\200\341\200\n' > /tmp/by/bad
+printf 'a\0b:c\0d\n' > /tmp/by/zero
+printf 'one two\nthree\n' > /tmp/by/text
+seq 1 20000 | tr -d '\n' > /tmp/by/long
+tr -d '\0' < /tmp/by/all > /tmp/by/high
+
+check "an escape names one byte"      "1"   "$(printf '\377' | wc -c)"
+check "every byte value in order"     "256" "$(wc -c < /tmp/by/all)"
+check "a zero byte is a byte"         "8"   "$(wc -c < /tmp/by/zero)"
+check "counting what a device gave"   "16"  "$(head -c 16 /dev/urandom | wc -c)"
+check "a line is a newline"           "1"   "$(wc -l < /tmp/by/all)"
+check "an unterminated last line"     "1"   "$(wc -l < /tmp/by/nonl)"
+check "one long line has none"        "0"   "$(wc -l < /tmp/by/long)"
+check "an invalid encoding is bytes"  "12"  "$(wc -c < /tmp/by/bad)"
+check "grep matches in a binary file" "0"   "$(grep -q abc /tmp/by/all; echo $?)"
+check "and says which lines"          "2"   "$(grep -c . /tmp/by/all)"
+check "grep over an invalid encoding" "1"   "$(grep -c . /tmp/by/bad)"
+check "a zero byte survives cut"      "4"   "$(cut -d: -f1 /tmp/by/zero | wc -c)"
+check "a zero byte survives tr"       "7"   "$(tr -d ':' < /tmp/by/zero | wc -c)"
+check "sed keeps a missing newline"   "3"   "$(sed 's/a/A/' /tmp/by/nonl | wc -c)"
+check "head keeps one too"            "3"   "$(head -n 9 /tmp/by/nonl | wc -c)"
+check "tail keeps one too"            "3"   "$(tail -n 9 /tmp/by/nonl | wc -c)"
+# busybox's cat -n reads lines and writes them back with an end, so it puts a
+# newline after a last line that had not got one. Ours writes what it was
+# given, which is what GNU cat does, so this one is not compared below.
+check "cat -n adds no line end"       "1"   "$(cat -n /tmp/by/nonl | wc -l)"
+
+if [ -x /bin/busybox ]; then
+  # The same input through the upstream busybox in this image, whose answer is
+  # the one worth matching. The bytes cannot go through command substitution,
+  # so what is compared is a digest of each side's output.
+  pair() {
+    check "$1" "$(sh -c "$3" | busybox md5sum)" "$(sh -c "$2" | busybox md5sum)"
+  }
+  pair "cat every byte"       'cat /tmp/by/all'         'busybox cat /tmp/by/all'
+  pair "cat from a pipe"      'cat < /tmp/by/all'       'busybox cat < /tmp/by/all'
+  pair "cat -n"               'cat -n /tmp/by/bad'      'busybox cat -n /tmp/by/bad'
+  pair "cat -e"               'cat -e /tmp/by/nonl'     'busybox cat -e /tmp/by/nonl'
+  pair "head -c"              'head -c 100 /tmp/by/all' 'busybox head -c 100 /tmp/by/all'
+  pair "head -n"              'head -n 1 /tmp/by/all'   'busybox head -n 1 /tmp/by/all'
+  pair "head past the end"    'head -n 5 /tmp/by/nonl'  'busybox head -n 5 /tmp/by/nonl'
+  pair "head of a long line"  'head -n 1 /tmp/by/long'  'busybox head -n 1 /tmp/by/long'
+  pair "tail"                 'tail -n 1 /tmp/by/all'   'busybox tail -n 1 /tmp/by/all'
+  pair "tail past the start"  'tail -n 5 /tmp/by/nonl'  'busybox tail -n 5 /tmp/by/nonl'
+  pair "tee"                  'tee /dev/null < /tmp/by/all' 'busybox tee /dev/null < /tmp/by/all'
+  pair "printf escapes"       'printf "\300\200\377"'   'busybox printf "\300\200\377"'
+  # The line tools below are given /tmp/by/high rather than /tmp/by/all:
+  # busybox holds a line as a C string, so a zero byte in one truncates what it
+  # writes back, and there is nothing to be gained by matching that.
+  pair "grep prints its line" 'grep . /tmp/by/high'     'busybox grep . /tmp/by/high'
+  pair "grep an invalid one"  'grep . /tmp/by/bad'      'busybox grep . /tmp/by/bad'
+  pair "grep -o"              'grep -o abc /tmp/by/high' 'busybox grep -o abc /tmp/by/high'
+  pair "sed substitutes"      'sed s/abc/ABC/ /tmp/by/high' 'busybox sed s/abc/ABC/ /tmp/by/high'
+  pair "sed keeps the rest"   'sed s/a/A/ /tmp/by/nonl' 'busybox sed s/a/A/ /tmp/by/nonl'
+  pair "tr translates"        'tr a-z A-Z < /tmp/by/high' 'busybox tr a-z A-Z < /tmp/by/high'
+  pair "tr deletes"           'tr -d "\0" < /tmp/by/all' 'busybox tr -d "\0" < /tmp/by/all'
+  pair "sort"                 'sort /tmp/by/high'       'busybox sort /tmp/by/high'
+  pair "uniq"                 'uniq /tmp/by/high'       'busybox uniq /tmp/by/high'
+  pair "cut -c"               'cut -c1-5 /tmp/by/high'  'busybox cut -c1-5 /tmp/by/high'
+  pair "cut -f"               'cut -d: -f1 /tmp/by/high' 'busybox cut -d: -f1 /tmp/by/high'
+  pair "rev"                  'rev /tmp/by/high'        'busybox rev /tmp/by/high'
+  pair "rev a long line"      'rev /tmp/by/long'        'busybox rev /tmp/by/long'
+  check "wc -c"               "$(busybox wc -c < /tmp/by/all)"  "$(wc -c < /tmp/by/all)"
+  check "wc -l"               "$(busybox wc -l < /tmp/by/all)"  "$(wc -l < /tmp/by/all)"
+  check "wc -c on a long line" "$(busybox wc -c < /tmp/by/long)" "$(wc -c < /tmp/by/long)"
+  # The counts, not the column widths, which the two pad differently. -w and -L
+  # are compared over text only: busybox counts a word and a line length in
+  # printable ASCII, so over arbitrary bytes the two are answering different
+  # questions rather than disagreeing.
+  check "wc counts of text" "$(busybox wc /tmp/by/nonl | tr -s ' ')" "$(wc /tmp/by/nonl | tr -s ' ')"
+  check "wc -w of text"     "$(busybox wc -w < /tmp/by/text)" "$(wc -w < /tmp/by/text)"
+else
+  echo "SKIP  the comparison against busybox (needs upstream busybox)"
+fi
+rm -rf /tmp/by
 
 echo
 echo "=== $pass passed, $fail failed ==="
