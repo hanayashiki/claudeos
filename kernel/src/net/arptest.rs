@@ -136,7 +136,7 @@ fn format_ip(ip: &[u8; 4]) -> alloc::string::String {
 /// Arm the test and start the task that runs it.
 pub fn start() {
     ARMED.store(true, Ordering::Relaxed);
-    super::e1000::trace_received(true);
+    super::trace_received(true);
 
     let space = AddressSpace::current();
     let Some(mut task) = Task::new("arptest", space) else {
@@ -220,10 +220,11 @@ extern "C" fn run() -> ! {
 }
 
 fn report_counters() {
+    let (interrupts, overruns, dropped) = super::counters();
     crate::println!(
         "[nettest] {} card interrupts, {} ring overruns, {} frames dropped by the queue",
-        super::e1000::interrupts(),
-        super::e1000::overruns(),
-        super::e1000::dropped()
+        interrupts,
+        overruns,
+        dropped
     );
 }

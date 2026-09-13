@@ -14,6 +14,11 @@ pub mod arp;
 pub mod arptest;
 pub mod e1000;
 pub mod ether;
+/// The Raspberry Pi 4's wired Ethernet, which exists on one machine only.
+#[cfg(target_arch = "aarch64")]
+pub mod genet;
+#[cfg(target_arch = "aarch64")]
+pub mod genettest;
 pub mod icmp;
 pub mod ip;
 pub mod selftest;
@@ -35,6 +40,53 @@ pub trait Interface: Sync {
     /// Queue one complete Ethernet frame, headers included. Called from task
     /// context, and must not sleep.
     fn transmit(&self, frame: &[u8]) -> Result<(), Errno>;
+}
+
+/// Bring up whatever card this machine has, before the first process exists.
+///
+/// Each driver's own probe reports whether it found anything, and finding
+/// nothing is the ordinary outcome rather than an error: a machine booted
+/// without a card boots without a network. The first one that answers is the
+/// one the stack gets, because the stack holds one interface.
+pub fn probe() -> bool {
+    if e1000::probe() {
+        return true;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if genet::probe() {
+        return true;
+    }
+    false
+}
+
+/// Start the kernel task belonging to whichever driver attached. After init,
+/// because process ids are handed out in order.
+pub fn start_task() {
+    if e1000::device().is_some() {
+        e1000::start_task();
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if genet::device().is_some() {
+        genet::start_task();
+    }
+}
+
+/// Log every frame that arrives, for the boot-time test.
+pub fn trace_received(on: bool) {
+    e1000::trace_received(on);
+    #[cfg(target_arch = "aarch64")]
+    genet::trace_received(on);
+}
+
+/// What the card has to say for itself: interrupts it raised, times it ran out
+/// of receive descriptors, and frames the queue behind it had no room for.
+pub fn counters() -> (u64, u64, u64) {
+    #[cfg(target_arch = "aarch64")]
+    if genet::device().is_some() {
+        return (genet::interrupts(), genet::overruns(), genet::dropped());
+    }
+    (e1000::interrupts(), e1000::overruns(), e1000::dropped())
 }
 
 static INTERFACE: Spinlock<Option<&'static dyn Interface>> = Spinlock::new(None);

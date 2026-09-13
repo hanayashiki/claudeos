@@ -144,7 +144,7 @@ pub fn start(boot: &boot::BootInfo) -> ! {
     // address space copies the kernel half as it stands at the moment it is
     // created, so a mapping made later would be missing from it. Finding no
     // card is the ordinary outcome on a machine booted without one.
-    let nic = net::e1000::probe();
+    let nic = net::probe();
 
     // The protocol stack takes its addresses from here rather than naming any
     // of its own; a driver that attaches later does not change them.
@@ -189,7 +189,7 @@ pub fn start(boot: &boot::BootInfo) -> ! {
     // After init, because the scheduler hands out process ids in order and a
     // good deal of the system takes pid 1 to be init.
     if nic {
-        net::e1000::start_task();
+        net::start_task();
         if options.nettest {
             net::arptest::start();
         }
