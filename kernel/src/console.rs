@@ -186,8 +186,8 @@ fn claim_terminal() -> Result<(), Errno> {
         }
         // A process that has said it does not want SIGTTIN cannot be stopped
         // by it, so the read fails outright rather than looping.
-        let bit = 1u64 << (crate::abi::SIGTTIN as u64 & 63);
-        let action = task.action(crate::abi::SIGTTIN as usize);
+        let bit = crate::abi::SIGTTIN.bit();
+        let action = task.action(crate::abi::SIGTTIN);
         if task.signal_mask.get() & bit != 0 || action.handler == crate::signal::SIG_IGN {
             return Err(Errno::EIO);
         }

@@ -228,30 +228,13 @@ pub const AT_EXECFN: u64 = 31;
 pub const AT_SYSINFO_EHDR: u64 = 33;
 pub const AT_MINSIGSTKSZ: u64 = 51;
 
-// Signals
-pub const SIGHUP: i32 = 1;
-pub const SIGINT: i32 = 2;
-pub const SIGQUIT: i32 = 3;
-pub const SIGILL: i32 = 4;
-pub const SIGTRAP: i32 = 5;
-pub const SIGABRT: i32 = 6;
-pub const SIGFPE: i32 = 8;
-pub const SIGKILL: i32 = 9;
-pub const SIGSEGV: i32 = 11;
-pub const SIGPIPE: i32 = 13;
-pub const SIGALRM: i32 = 14;
-pub const SIGTERM: i32 = 15;
-pub const SIGCHLD: i32 = 17;
-pub const SIGCONT: i32 = 18;
-pub const SIGSTOP: i32 = 19;
-pub const SIGTSTP: i32 = 20;
-pub const SIGTTIN: i32 = 21;
-pub const SIGTTOU: i32 = 22;
-
-/// Signals whose default action is to stop the task.
-pub fn is_stop_signal(signal: i32) -> bool {
-    matches!(signal, SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
-}
+// Signals. The numbers are the interface's, but nothing here passes one
+// around as a number: what carries a signal is the type next door, whose
+// values these are.
+pub use crate::signal::{
+    SIGABRT, SIGALRM, SIGCHLD, SIGCONT, SIGFPE, SIGHUP, SIGILL, SIGINT, SIGKILL, SIGPIPE,
+    SIGQUIT, SIGSEGV, SIGSTOP, SIGTERM, SIGTRAP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGWINCH,
+};
 
 /// What the kernel knows about a file. This is not the structure user code
 /// reads: Linux orders and sizes those fields differently on each machine, so

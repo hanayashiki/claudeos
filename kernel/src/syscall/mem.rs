@@ -111,6 +111,7 @@ pub fn mmap(
         let node = file.node().ok_or(Errno::ENODEV)?.clone();
         let task = sched::current();
 
+        let offset = crate::fs::Offset::new(offset);
         if let Err(err) = populate_from_file(&node, base, len, offset, prot_to_flags(prot)) {
             // Pages already published are reachable and pages not yet
             // published are not, so a failure part of the way through leaves a
@@ -158,17 +159,14 @@ fn populate_from_file(
     node: &crate::fs::NodeRef,
     base: u64,
     len: u64,
-    offset: u64,
+    offset: crate::fs::Offset,
     bits: u64,
 ) -> Result<(), Errno> {
     let task = sched::current();
     let mut page = base;
     while page < base + len {
         let mut fresh = FreshPage::new().ok_or(Errno::ENOMEM)?;
-        // The offset is the program's, and the release build wraps rather than
-        // trapping, so a sum that does not fit would name a place near the
-        // start of the file instead of one past its end.
-        let at = offset.checked_add(page - base).ok_or(Errno::EINVAL)?;
+        let at = offset.advanced(page - base)?;
         let n = node.read_at(at, fresh.bytes())?;
         // These bytes were written through the direct map rather than the
         // address they will be fetched from, and an executable mapping is

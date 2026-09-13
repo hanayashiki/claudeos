@@ -30,6 +30,8 @@ mod numbers {
     pub const SYS_WRITE: u64 = 1;
     pub const SYS_OPEN: u64 = 2;
     pub const SYS_CLOSE: u64 = 3;
+    pub const SYS_PREAD64: u64 = 17;
+    pub const SYS_PWRITE64: u64 = 18;
     pub const SYS_PIPE2: u64 = 293;
     pub const SYS_DUP2: u64 = 33;
     pub const SYS_FORK: u64 = 57;
@@ -65,6 +67,8 @@ mod numbers {
     pub const SYS_WRITE: u64 = 64;
     pub const SYS_OPENAT: u64 = 56;
     pub const SYS_CLOSE: u64 = 57;
+    pub const SYS_PREAD64: u64 = 67;
+    pub const SYS_PWRITE64: u64 = 68;
     pub const SYS_PIPE2: u64 = 59;
     pub const SYS_DUP3: u64 = 24;
     pub const SYS_CLONE: u64 = 220;
@@ -281,6 +285,17 @@ pub fn write(fd: i32, data: &[u8]) -> i64 {
 
 pub fn read(fd: i32, buf: &mut [u8]) -> i64 {
     unsafe { syscall3(SYS_READ, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64) }
+}
+
+/// Read and write at a position the caller names, leaving the descriptor's own
+/// where it was. The position goes in as the raw 64-bit number the register
+/// carries, so a caller can hand the kernel one no file has a byte at.
+pub fn pread(fd: i32, buf: &mut [u8], offset: u64) -> i64 {
+    unsafe { syscall4(SYS_PREAD64, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, offset) }
+}
+
+pub fn pwrite(fd: i32, data: &[u8], offset: u64) -> i64 {
+    unsafe { syscall4(SYS_PWRITE64, fd as u64, data.as_ptr() as u64, data.len() as u64, offset) }
 }
 
 pub fn kill(pid: i32, signal: i32) -> i64 {

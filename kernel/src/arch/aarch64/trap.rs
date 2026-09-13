@@ -476,7 +476,7 @@ pub fn exception_name(vector: u64) -> &'static str {
 
 /// The signal a user-mode program is killed by when it takes exception
 /// `vector`.
-pub fn exception_signal(vector: u64) -> i32 {
+pub fn exception_signal(vector: u64) -> crate::signal::Signal {
     match vector {
         0x00 | 0x0E | 0x18 => SIGILL,
         0x22 | 0x26 => SIGILL,

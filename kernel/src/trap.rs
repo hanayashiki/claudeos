@@ -73,7 +73,7 @@ fn page_fault(frame: &mut TrapFrame) {
             dump_user(name, at);
         }
         dump_regions(addr);
-        crate::sched::kill_current(11); // SIGSEGV
+        crate::sched::kill_current(crate::abi::SIGSEGV);
     }
 
     // A kernel fault is not recoverable; dump everything useful and stop.
@@ -141,7 +141,7 @@ pub fn unhandled(frame: &mut TrapFrame) {
     }
     println!("[trap] unhandled vector {} rip={:#x}", vector, arch::instruction_pointer(frame));
     if frame.from_user() {
-        crate::sched::kill_current(11);
+        crate::sched::kill_current(crate::abi::SIGSEGV);
     }
 }
 

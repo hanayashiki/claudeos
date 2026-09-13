@@ -158,6 +158,56 @@ fn event_and_poll(report: &mut Report) {
     let _ = sys::close(event);
 }
 
+/// A position no file has a byte at, handed to a positional read and write.
+///
+/// The position arrives in a register and the write path adds the buffer's
+/// length to it. Added and cast where it was used, a position near the top of
+/// the range wrapped to a small one: the routine that makes room was asked for
+/// a file the caller never named, said yes, and the write then indexed past
+/// the end of the buffer it had. The two positions below are the ones that did
+/// it -- the last byte of the range, and eight short of it with sixteen bytes
+/// to write, which straddles the end.
+fn a_position_no_file_has(report: &mut Report) {
+    use crate::sys;
+
+    const EINVAL: i64 = -22;
+    let path = "/tmp/rtest-offset.dat";
+    let _ = std::fs::write(path, b"start");
+    let fd = sys::open(path, sys::O_RDWR, 0);
+    if fd < 0 {
+        report.check("open the file to write into", false, format!("{}", fd));
+        return;
+    }
+    let fd = fd as i32;
+
+    let last = sys::pwrite(fd, b"abcde", u64::MAX);
+    let straddling = sys::pwrite(fd, &[b'z'; 16], u64::MAX - 7);
+    let mut buf = [0u8; 5];
+    let reading = sys::pread(fd, &mut buf, u64::MAX);
+    report.check(
+        "a write at a position past the end of the range is refused",
+        last == EINVAL && straddling == EINVAL,
+        format!("last {} straddling {}", last, straddling),
+    );
+    report.check(
+        "and so is a read there",
+        reading == EINVAL,
+        format!("{}", reading),
+    );
+
+    // The file is untouched by the refusals, and a position it does have still
+    // works: the check is that the range is refused, not that writing is.
+    let inside = sys::pwrite(fd, b"XY", 2);
+    sys::close(fd);
+    let after = std::fs::read(path).unwrap_or_default();
+    report.check(
+        "a position the file has is written as it was before",
+        inside == 2 && after == b"stXYt",
+        format!("{} bytes, {:?}", inside, String::from_utf8_lossy(&after)),
+    );
+    let _ = std::fs::remove_file(path);
+}
+
 /// Numbers past the end of the table answer ENOSYS, which is how a program
 /// finds out that a call it would rather use is not there.
 ///
@@ -640,6 +690,66 @@ fn stopping_a_job_reaches_the_parent(report: &mut Report) {
         "a continue is not lost to the stop it races",
         state != "T" && !state.is_empty(),
         format!("child state {:?} after 60 stop-continue pairs", state),
+    );
+}
+
+/// A number no signal has, sent to a stopped child.
+///
+/// The number arrives in a register, and it used to be folded into the range
+/// on its way to the pending set: 73 masked to six bits is 9, so a send Linux
+/// refuses set the bit for the kill signal instead. The code that restarts a
+/// stopped task for a kill compared the number it was given, saw 73, and did
+/// nothing, so the child stayed stopped with a kill pending that nothing could
+/// take away -- and took it the moment anything continued it. Negative numbers
+/// fold into the range the same way.
+fn a_number_no_signal_has(report: &mut Report) {
+    use crate::sys;
+
+    const EINVAL: i64 = -22;
+    const SIGKILL: i32 = 9;
+    const SIGCONT: i32 = 18;
+    const SIGSTOP: i32 = 19;
+    const WNOHANG: u64 = 1;
+
+    let child = sys::fork();
+    if child == 0 {
+        loop {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let child = child as i32;
+
+    let stopping = sys::kill(child, SIGSTOP);
+    std::thread::sleep(Duration::from_millis(150));
+    let above = sys::kill(child, 73);
+    let below = sys::kill(child, -55);
+    report.check(
+        "a number no signal has is refused",
+        stopping == 0 && above == EINVAL && below == EINVAL,
+        format!("stop {} 73 {} -55 {}", stopping, above, below),
+    );
+
+    // Continuing the child is what shows whether either send left a kill
+    // behind: a child carrying one dies here rather than running on.
+    sys::kill(child, SIGCONT);
+    std::thread::sleep(Duration::from_millis(200));
+    let (reaped, status) = sys::wait4(child, WNOHANG);
+    let state = std::fs::read_to_string(format!("/proc/{}/stat", child))
+        .ok()
+        .and_then(|line| line.split(' ').nth(2).map(|s| s.to_string()))
+        .unwrap_or_default();
+    report.check(
+        "and the child it was sent to is running afterwards",
+        reaped == 0 && (state == "S" || state == "R"),
+        format!("wait4 {} status {:#x} state {:?}", reaped, status, state),
+    );
+
+    sys::kill(child, SIGKILL);
+    let (pid, status) = sys::wait4(child, 0);
+    report.check(
+        "a kill that is one still lands",
+        pid == child as i64 && sys::signal_of(status) == Some(SIGKILL),
+        format!("{} status {:#x}", pid, status),
     );
 }
 
@@ -1152,6 +1262,8 @@ pub fn main(_args: &[String]) -> i32 {
     report.check("remove", std::fs::metadata(path).is_err(), "still present".into());
     let _ = std::fs::remove_dir_all("/tmp/rtest-dir");
 
+    a_position_no_file_has(&mut report);
+
     println!();
     println!("-- processes --");
     let output = std::process::Command::new("/bin/echo")
@@ -1273,6 +1385,7 @@ pub fn main(_args: &[String]) -> i32 {
     reading_proc_while_a_child_is_reaped(&mut report);
     a_signal_frame_on_a_shared_page(&mut report);
     stopping_a_job_reaches_the_parent(&mut report);
+    a_number_no_signal_has(&mut report);
     a_signal_ends_a_sleep(&mut report);
     failed_exec_and_siblings(&mut report);
 

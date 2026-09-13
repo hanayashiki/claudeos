@@ -5,6 +5,7 @@ use crate::arch::paging::AddressSpace;
 use crate::arch::{self, TrapFrame};
 use crate::elf;
 use crate::sched;
+use crate::signal::Signal;
 use crate::task::{self, State, Task};
 use crate::uaccess;
 use alloc::string::{String, ToString};
@@ -374,7 +375,7 @@ pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
         // that will do something when it is delivered. Asking the raw pending
         // set instead turns a terminal resize, or anything else the process has
         // told the kernel to discard, into a failed wait.
-        let child_bit = 1u64 << (SIGCHLD as u64 & 63);
+        let child_bit = SIGCHLD.bit();
         if sched::has_pending_signal_except(child_bit) {
             return Err(Errno::EINTR);
         }
@@ -383,7 +384,7 @@ pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
         // never sees that handler run for a child it reaped itself. Only the
         // dispositions that would discard it on delivery are cleared here.
         let task = sched::current();
-        let handler = task.action(SIGCHLD as usize).handler;
+        let handler = task.action(SIGCHLD).handler;
         if handler == crate::signal::SIG_DFL || handler == crate::signal::SIG_IGN {
             task.drop_pending(child_bit);
         }
@@ -392,8 +393,13 @@ pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
 
 pub fn kill(pid: i64, signal: i32) -> SysResult {
     // Signal zero sends nothing and reports whether the target is there,
-    // which is how a program watches something it did not fork.
-    let probe = signal == 0;
+    // which is how a program watches something it did not fork. Any other
+    // number has to name a signal: one that does not is refused here rather
+    // than folded into the range further in.
+    let send = match signal {
+        0 => None,
+        number => Some(Signal::from_number(number).ok_or(Errno::EINVAL)?),
+    };
     let mut delivered = false;
     let me = sched::current().pid;
     let my_pgid = sched::current_pgid();
@@ -405,7 +411,7 @@ pub fn kill(pid: i64, signal: i32) -> SysResult {
             p => task.pgid.get() == (-p) as u32,
         };
         if target && task.state() != State::Zombie && task.pid != 0 {
-            if !probe {
+            if let Some(signal) = send {
                 sched::post_signal(task, signal, table);
             }
             delivered = true;
@@ -626,8 +632,9 @@ pub fn nanosleep(req: u64, rem: u64) -> SysResult {
     if spec.tv_sec < 0 || spec.tv_nsec < 0 || spec.tv_nsec >= 1_000_000_000 {
         return Err(Errno::EINVAL);
     }
-    let total_ns = spec.tv_sec as u64 * 1_000_000_000 + spec.tv_nsec as u64;
-    let ticks = crate::time::ns_to_ticks(total_ns);
+    let total_ns =
+        (spec.tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(spec.tv_nsec as u64);
+    let ticks = super::wait_ticks(total_ns);
     if ticks == 0 {
         sched::yield_now();
         if rem != 0 {
@@ -676,8 +683,10 @@ pub fn getrandom(buf: u64, len: usize) -> SysResult {
     Ok(bytes.len() as u64)
 }
 
-pub fn rt_sigaction(signal: usize, act: u64, old: u64) -> SysResult {
-    if signal == 0 || signal >= 64 || signal == SIGKILL as usize || signal == SIGSTOP as usize {
+pub fn rt_sigaction(signal: i32, act: u64, old: u64) -> SysResult {
+    let signal = Signal::from_number(signal).ok_or(Errno::EINVAL)?;
+    // Neither of these has a disposition to set: they act on the task.
+    if signal == SIGKILL || signal == SIGSTOP {
         return Err(Errno::EINVAL);
     }
     let task = sched::current();
@@ -791,8 +800,10 @@ pub fn futex(uaddr: u64, op: u32, val: u32, timeout: u64) -> SysResult {
                 u64::MAX
             } else {
                 let spec: Timespec = uaccess::read_struct(timeout)?;
-                let ns = spec.tv_sec as u64 * 1_000_000_000 + spec.tv_nsec as u64;
-                crate::trap::ticks() + crate::time::ns_to_ticks(ns)
+                let ns = (spec.tv_sec as u64)
+                    .saturating_mul(1_000_000_000)
+                    .saturating_add(spec.tv_nsec as u64);
+                super::deadline_in(ns)
             };
             let key = crate::futex::futex_key(uaddr);
             loop {
