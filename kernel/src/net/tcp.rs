@@ -15,6 +15,14 @@
 //! no more between them than one does at full stretch. A gap that never fills
 //! is given up on after thirty seconds and what was held behind it released.
 //!
+//! The retransmission timeout comes from RFC 6298's estimator: one segment at
+//! a time is timed from the moment it goes out to the acknowledgement that
+//! covers it, and the smoothed average and variation of those samples are
+//! what the timeout is built from. Karn's rule decides what may be sampled --
+//! a segment sent twice is not, because its acknowledgement does not say
+//! which copy it answers -- and a timeout doubles the timeout and leaves it
+//! doubled until a segment that went out once is acknowledged.
+//!
 //! What is not here, all of which only matters on a link that loses or
 //! reorders packets:
 //!
@@ -22,9 +30,6 @@
 //!     acknowledgement count, no fast retransmit, no fast recovery, and no
 //!     selective acknowledgement, so one lost segment costs a whole timeout
 //!     and a go-back-N retransmission.
-//!   * The retransmission timeout is a fixed starting value doubled on each
-//!     loss. Round trip time is never measured, so there is no Karn or
-//!     Jacobson estimator behind it.
 //!   * Congestion control is slow start and the textbook congestion avoidance
 //!     increment, reset to one segment on every timeout. Without duplicate
 //!     acknowledgements there is nothing else it could react to.
@@ -60,7 +65,14 @@ pub const RECEIVE_WINDOW: usize = 32 * 1024;
 pub const SEND_BUFFER: usize = 32 * 1024;
 
 /// Timer values, in timer ticks. The tick is ten milliseconds.
-const INITIAL_RTO: u64 = 50;
+///
+/// RFC 6298 2.1: one second, until a round trip has actually been measured.
+const INITIAL_RTO: u64 = 100;
+/// RFC 6298 2.4 puts the floor at one second. Linux uses a fifth of that and
+/// so does this: what the floor is for is keeping the timeout clear of the
+/// clock's own granularity, not waiting out a second on a link whose round
+/// trip is measured in microseconds.
+const MIN_RTO: u64 = 20;
 const MAX_RTO: u64 = 600;
 const MAX_RETRIES: u32 = 8;
 const SYN_RETRIES: u32 = 5;
@@ -408,6 +420,22 @@ pub struct Tcb {
     /// Tick at which the unacknowledged data is sent again. Zero is off.
     pub retransmit_at: u64,
     rto: u64,
+    /// RFC 6298's estimator, in microseconds: the smoothed round trip time
+    /// and how much it varies. Zero says nothing has been measured yet, and
+    /// the timeout is still the opening guess.
+    srtt: u32,
+    rttvar: u32,
+    /// The segment being timed: the sequence number just past it, and the
+    /// clock when it went out.
+    ///
+    /// Karn's rule is what the `None` is for. An acknowledgement of a segment
+    /// that was sent twice does not say which copy it answers, so the time
+    /// from either one to it is not a round trip: it is either the real one
+    /// or the real one plus a whole timeout, and there is no way to tell.
+    /// Every retransmission clears this, so the next sample comes from a
+    /// segment that went out once.
+    timed: Option<u32>,
+    timed_at: u64,
     retries: u32,
     /// Tick at which a state that waits on a clock rather than on the other
     /// end gives up: TIME-WAIT's two segment lifetimes, and the bound on
@@ -453,6 +481,10 @@ impl Tcb {
             peer_mss: MSS,
             retransmit_at: 0,
             rto: INITIAL_RTO,
+            srtt: 0,
+            rttvar: 0,
+            timed: None,
+            timed_at: 0,
             retries: 0,
             expire_at: 0,
             congestion_window: MSS as u32,
@@ -520,6 +552,50 @@ impl Tcb {
         }
     }
 
+    /// The timeout the estimate gives. RFC 6298 2.2: the smoothed average
+    /// plus four times its variation, never less than the clock the timer
+    /// runs on can measure, and bounded at both ends.
+    fn estimated_rto(&self) -> u64 {
+        let granularity = 1_000_000 / crate::arch::TICK_HZ as u32;
+        let slack = self.rttvar.saturating_mul(4).max(granularity);
+        let microseconds = self.srtt.saturating_add(slack) as u64;
+        crate::time::ns_to_ticks(microseconds * 1000).clamp(MIN_RTO, MAX_RTO)
+    }
+
+    /// One round trip, measured. RFC 6298 2.2 and 2.3: the first sample is
+    /// the average outright and half of it the variation; every one after
+    /// moves each of them a fraction of the way.
+    fn measure(&mut self, microseconds: u32) {
+        let sample = microseconds.max(1);
+        if self.srtt == 0 {
+            self.srtt = sample;
+            self.rttvar = sample / 2;
+        } else {
+            let difference = self.srtt.abs_diff(sample) as u64;
+            self.rttvar = ((self.rttvar as u64 * 3 + difference) / 4) as u32;
+            self.srtt = ((self.srtt as u64 * 7 + sample as u64) / 8) as u32;
+        }
+        self.rto = self.estimated_rto();
+    }
+
+    /// Time the segment that ends at `sequence`, if nothing is being timed.
+    fn time_segment(&mut self, sequence: u32) {
+        if self.timed.is_none() {
+            self.timed = Some(sequence);
+            self.timed_at = crate::time::monotonic_ns();
+        }
+    }
+
+    /// What the timeout stands at, and what the estimate behind it is. The
+    /// suite asks; nothing else does.
+    pub fn retransmit_timeout(&self) -> u64 {
+        self.rto
+    }
+
+    pub fn smoothed_round_trip(&self) -> u32 {
+        self.srtt
+    }
+
     fn arm_retransmit(&mut self) {
         if self.retransmit_at == 0 {
             self.retransmit_at = crate::trap::ticks() + self.rto;
@@ -540,6 +616,7 @@ impl Tcb {
         self.retries = 0;
         self.send_segment(SYN, self.iss, &[], true);
         self.sent_through(self.iss.wrapping_add(1));
+        self.time_segment(self.iss.wrapping_add(1));
         self.arm_retransmit();
     }
 
@@ -557,6 +634,7 @@ impl Tcb {
         self.send_unacknowledged = self.iss;
         self.send_high = self.iss;
         self.sent_through(self.iss.wrapping_add(1));
+        self.time_segment(self.iss.wrapping_add(1));
         self.window_ack = self.iss;
         self.state = State::SynReceived;
         self.congestion_window = MSS as u32;
@@ -688,8 +766,16 @@ impl Tcb {
                 let sequence = self.send_next;
                 let last = offset + n == self.pending.len();
                 let flags = ACK | if last { PSH } else { 0 };
+                let end = sequence.wrapping_add(n as u32);
+                // Only a segment going out for the first time is worth
+                // timing: Karn again, and the retransmission path comes
+                // through here too.
+                let first_time = seq_lt(self.send_high, end);
                 self.send_segment(flags, sequence, &chunk, false);
-                self.sent_through(sequence.wrapping_add(n as u32));
+                self.sent_through(end);
+                if first_time {
+                    self.time_segment(end);
+                }
                 self.arm_retransmit();
             } else if self.fin_queued && self.fin_sequence.is_none() {
                 let sequence = self.send_next;
@@ -748,6 +834,7 @@ impl Tcb {
             // The connection request again, because our answer was lost. It
             // sits one before what is wanted next, so the window test turns
             // it away, and it is still the handshake carrying on.
+            self.timed = None;
             self.send_syn_ack();
             return false;
         }
@@ -830,13 +917,20 @@ impl Tcb {
             let drop_count = acked.min(self.pending.len());
             self.pending.drain(..drop_count);
             self.send_unacknowledged = acknowledgement;
+            if let Some(timed) = self.timed {
+                if seq_le(timed, acknowledgement) {
+                    let elapsed =
+                        crate::time::monotonic_ns().saturating_sub(self.timed_at);
+                    self.timed = None;
+                    self.measure((elapsed / 1000).min(u32::MAX as u64) as u32);
+                }
+            }
             if seq_lt(self.send_next, self.send_unacknowledged) {
                 // The timer moved the pointer back over bytes that turned out
                 // to have arrived. There is nothing there left to send again.
                 self.send_next = self.send_unacknowledged;
             }
             self.retries = 0;
-            self.rto = INITIAL_RTO;
             if self.congestion_window < self.slow_start_threshold {
                 self.congestion_window = self.congestion_window.saturating_add(MSS as u32);
             } else {
@@ -1219,7 +1313,10 @@ impl Tcb {
             self.error = Some(reason);
             return true;
         }
+        // RFC 6298 5.5: the timeout doubles, and it stays doubled until a
+        // segment that went out once is acknowledged.
         self.rto = (self.rto * 2).min(MAX_RTO);
+        self.timed = None;
         self.retransmit_at = now + self.rto;
         let flight = self.send_next.wrapping_sub(self.send_unacknowledged);
         self.slow_start_threshold = (flight / 2).max(2 * MSS as u32);

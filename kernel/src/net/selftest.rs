@@ -283,6 +283,8 @@ pub fn run() -> bool {
     lossy_link(&mut report, nic);
     crate::println!("net: segments that arrive out of order");
     reassembly(&mut report, nic);
+    crate::println!("net: the round trip, measured");
+    round_trip_estimate(&mut report, nic);
     crate::println!("net: a connection the program has closed");
     abandoned_connection(&mut report, nic);
     crate::println!("net: addresses this machine does not have");
@@ -1787,6 +1789,70 @@ fn reassembly(report: &mut Report, nic: &'static FakeNic) {
     drop(sockets);
     report.check("and letting them go gives all of it back", tcp::held_bytes() == 0);
     socket::close(&listener);
+    socket::reset();
+    nic.take();
+}
+
+fn rto_of(socket: &Arc<InetSocket>) -> u64 {
+    match &*socket.inner.lock() {
+        Protocol::Tcp(tcb) => tcb.retransmit_timeout(),
+        Protocol::Udp(_) => 0,
+    }
+}
+
+fn srtt_of(socket: &Arc<InetSocket>) -> u32 {
+    match &*socket.inner.lock() {
+        Protocol::Tcp(tcb) => tcb.smoothed_round_trip(),
+        Protocol::Udp(_) => 0,
+    }
+}
+
+/// The retransmission timeout comes from a measured round trip, and a segment
+/// that was sent twice is not measured.
+fn round_trip_estimate(report: &mut Report, nic: &'static FakeNic) {
+    const SERVER_PORT: u16 = 8087;
+
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40700, 19_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    // The handshake is itself a round trip: the answer to the connection
+    // request was timed and the acknowledgement that completed it measured.
+    report.check("the handshake measures a round trip", srtt_of(&peer.socket) != 0);
+    let measured = rto_of(&peer.socket);
+    report.check(
+        "and the timeout comes from that rather than from the opening guess",
+        (20..100).contains(&measured),
+    );
+
+    // ---- a segment lost, and the one sent in its place ----
+    peer.to_peer.script(&[Fate::Lose]);
+    let _ = peer.socket.send(b"lost on the way", None);
+    peer.pump();
+    report.check("a segment the link ate reaches nobody", peer.stream.is_empty());
+
+    let deadline = deadline_of(&peer.socket);
+    fire_timer(&peer.socket, deadline);
+    let backed_off = rto_of(&peer.socket);
+    report.check("the timeout doubles when one runs out", backed_off == measured * 2);
+    peer.pump();
+    report.check("what was sent again does arrive", peer.stream == b"lost on the way");
+    // Karn: the acknowledgement does not say which copy it answers, so the
+    // time to it is either the round trip or the round trip plus a timeout.
+    report.check(
+        "but says nothing about the round trip, so the timeout stays doubled",
+        rto_of(&peer.socket) == backed_off,
+    );
+
+    // ---- and one that went out once ----
+    let _ = peer.socket.send(b"sent once", None);
+    peer.pump();
+    report.check(
+        "a segment sent once brings the timeout back down",
+        rto_of(&peer.socket) < backed_off,
+    );
+    peer.finish();
     socket::reset();
     nic.take();
 }
