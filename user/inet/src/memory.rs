@@ -11,6 +11,7 @@ use crate::Report;
 
 pub fn run(report: &mut Report) {
     pages_shared_by_a_fork_written_from_two_threads(report);
+    pages_a_fork_shared_are_out_of_the_parents_reach(report);
     exec_that_fails_keeps_the_memory_state(report);
     a_thread_left_unreaped_keeps_the_space(report);
     argument_blocks_larger_than_the_stack_is_mapped_with(report);
@@ -137,6 +138,105 @@ fn pages_shared_by_a_fork_written_from_two_threads(report: &mut Report) {
 
     drop(source);
     let _ = std::fs::remove_file(SOURCE);
+    sys::munmap(base, LEN);
+}
+
+/// A fork is a snapshot: once it has shared a page with the child, nothing the
+/// parent does may reach that page again.
+///
+/// Sharing one took the parent's write permission away and then took the
+/// child's reference on the frame, with a window between them. A sibling
+/// thread that faulted on the page in that window read a reference count of
+/// one, took the last-owner path, and cleared the mark, so the parent kept
+/// write access to a frame the child was about to share. Both processes then
+/// had a writable mapping of one page.
+///
+/// What the child watches for is its own memory moving under it: it reads
+/// every page, sleeps while the sibling keeps writing, and reads them again.
+/// A page that changed is one the parent still reaches.
+///
+/// This is a smoke test. The window was between two calls, so catching it
+/// needs the timer to land inside one; the proof was a widened window.
+fn pages_a_fork_shared_are_out_of_the_parents_reach(report: &mut Report) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const PAGES: usize = 64;
+    const ROUNDS: usize = 40;
+    const PAGE: usize = 4096;
+    const LEN: u64 = (PAGES * PAGE) as u64;
+    /// How long the child leaves the sibling writing before it looks again.
+    const WATCH_MS: u64 = 30;
+
+    let base = sys::mmap_anon(0, LEN);
+    if base <= 0 {
+        report.check("pages to fork over", false, format!("mmap returned {:#x}", base));
+        return;
+    }
+    let base = base as u64;
+    // Every page present and writable in this thread before the first fork, so
+    // the walk has write permission to take away from each of them.
+    unsafe { std::ptr::write_bytes(base as *mut u8, 0, LEN as usize) };
+
+    let stop = AtomicBool::new(false);
+    let mut rounds = 0usize;
+    let mut moved = 0usize;
+
+    std::thread::scope(|scope| {
+        // A rising number, so a write that lands in a page the child holds
+        // shows up as a different value rather than the same one again.
+        scope.spawn(|| {
+            let mut count: u32 = 1;
+            while !stop.load(Ordering::Relaxed) {
+                for page in 0..PAGES {
+                    let at = base + (page * PAGE) as u64;
+                    unsafe { std::ptr::write_volatile(at as *mut u32, count) };
+                }
+                count = count.wrapping_add(1);
+            }
+        });
+
+        for _ in 0..ROUNDS {
+            let child = sys::fork();
+            if child == 0 {
+                // Nothing here allocates or takes a lock: this is a fork out
+                // of a program with a thread running in it, and the only
+                // things the child may rely on are its own stack and the
+                // system calls it makes itself.
+                let mut first = [0u32; PAGES];
+                for (page, slot) in first.iter_mut().enumerate() {
+                    let at = base + (page * PAGE) as u64;
+                    *slot = unsafe { std::ptr::read_volatile(at as *const u32) };
+                }
+                sys::sleep_ms(WATCH_MS);
+                let mut changed = 0;
+                for (page, slot) in first.iter().enumerate() {
+                    let at = base + (page * PAGE) as u64;
+                    if unsafe { std::ptr::read_volatile(at as *const u32) } != *slot {
+                        changed += 1;
+                    }
+                }
+                sys::exit_group(i32::from(changed != 0));
+            }
+            if child < 0 {
+                break;
+            }
+            let (pid, code) = sys::wait4(child as i32, 0);
+            if pid < 0 {
+                break;
+            }
+            if code != 0 {
+                moved += 1;
+            }
+            rounds += 1;
+        }
+        stop.store(true, Ordering::Relaxed);
+    });
+
+    report.check(
+        "a page a fork shared is beyond the parent's reach afterwards",
+        rounds == ROUNDS && moved == 0,
+        format!("{} of {} rounds ran, the child's memory moved under it in {}", rounds, ROUNDS, moved),
+    );
     sys::munmap(base, LEN);
 }
 

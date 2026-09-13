@@ -539,6 +539,58 @@ impl AddressSpace {
         unsafe { self.share_user_tables(src) }
     }
 
+    /// Share the page `at` names with this address space at `virt`, leaving
+    /// both sides copy-on-write when it was writable.
+    ///
+    /// One call, because the two halves are one account of the page. Taking
+    /// the parent's write permission away and then taking the child's
+    /// reference on the frame were two calls with a window between them, and
+    /// the second takes the allocator's lock, which unmasks interrupts on the
+    /// way out. A sibling thread that faulted on the page there read a
+    /// reference count of one, took the last-owner path and cleared the mark,
+    /// so the parent kept write access to a frame the child was about to
+    /// share. Two processes then had a writable mapping of one page and
+    /// neither knew. A fault from user mode is handled on this machine with
+    /// interrupts in the state the faulting code was in, so the sibling needs
+    /// nothing unusual to get in.
+    ///
+    /// The token is what says nothing runs between the two halves. It could
+    /// not say that while they were separate calls: each is legitimate alone,
+    /// and a token proves a section exists rather than that two calls are
+    /// inside one. The walk opens the section around one page rather than
+    /// around itself, because it is tens of thousands of pages long.
+    ///
+    /// The reference for the child is taken first, so the count is never
+    /// lower than the number of mappings that are going to hold it.
+    unsafe fn share_page(
+        &self,
+        virt: u64,
+        at: *mut Entry,
+        _irq: NoInterrupts,
+    ) -> Result<(), MapError> {
+        let entry = *at;
+        if !entry.is_present() {
+            // Gone between the walk reading the entry and this section
+            // opening, so there is nothing here to share.
+            return Ok(());
+        }
+        let phys = entry.addr();
+        let shared = frame::share_recorded(phys);
+        let mut flags = entry.flags();
+        if flags & WRITABLE != 0 {
+            flags |= COW;
+            // The page the parent is still running on has to lose write
+            // permission too, or its writes would be seen by the child. The
+            // walk runs on the parent's tables, so the translation this
+            // contradicts is in the processor's cache of them right now, and a
+            // sibling's store would go through it into the page the child is
+            // about to share until it is thrown away.
+            encode(phys, flags).store(at);
+            flush_tlb(virt);
+        }
+        self.map(virt, shared, flags)
+    }
+
     unsafe fn share_user_tables(&self, src: &AddressSpace) -> Result<(), MapError> {
         let from = table_at(src.root);
         for i in 0..256usize {
@@ -596,21 +648,7 @@ unsafe fn clone_table(
         }
         let virt = base | (i as u64) << (12 + 9 * (level - 1));
         if level == 1 {
-            let mut flags = entry.flags();
-            if flags & WRITABLE != 0 {
-                flags |= COW;
-                // The page the parent is still running on has to lose write
-                // permission too, or its writes would be seen by the child.
-                // The walk runs on the parent's tables, so the translation
-                // this contradicts is in the processor's cache of them right
-                // now: a sibling's store goes through it, into a page the
-                // child is about to share, until it is thrown away. That is
-                // why the invalidation is here and not at the end of the walk.
-                encode(entry.addr(), flags).store(entry_ptr);
-                flush_tlb(virt);
-            }
-            let shared = frame::share_recorded(entry.addr());
-            dst.map(virt, shared, flags)?;
+            crate::sync::without_interrupts(|irq| dst.share_page(virt, entry_ptr, irq))?;
         } else {
             clone_table(dst, src, entry.addr(), virt, level - 1)?;
         }
