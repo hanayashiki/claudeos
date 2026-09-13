@@ -156,25 +156,56 @@ pub fn init_interrupt_controller() {
 
 /// Counter ticks between timer interrupts, worked out once at start-up.
 static mut TIMER_INTERVAL: u64 = 0;
+/// The counter reading the last tick was due at. The next one is due an
+/// interval after it, not an interval after the handler got around to looking.
+static mut TIMER_DEADLINE: u64 = 0;
 
 /// Start the periodic timer at `hz` interrupts a second.
 pub fn init_timer(hz: u32) {
-    let interval = super::clock::counter_frequency() / hz as u64;
+    // Zero would divide the next deadline by nothing. Firmware that did not
+    // set the counter's rate leaves a timer that never fires, which is a worse
+    // machine but a running one.
+    let interval = (super::clock::counter_frequency() / hz as u64).max(1);
+    let deadline = super::clock::cycle_counter() + interval;
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!(TIMER_INTERVAL), interval);
-        asm!("msr cntv_tval_el0, {}", in(reg) interval);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(TIMER_DEADLINE), deadline);
+        asm!("msr cntv_cval_el0, {}", in(reg) deadline);
         asm!("msr cntv_ctl_el0, {}", in(reg) 1u64); // enabled, not masked
     }
 }
 
-/// Set the timer going again for another interval. The architected timer fires
-/// when its countdown passes zero and then keeps counting down, so a handler
-/// that does not reload it is called once and never again.
+/// Set the timer going again for the next tick.
+///
+/// The comparator moves on from the deadline that just passed rather than
+/// being reloaded with an interval from here, because the time between the
+/// deadline and this handler running is delivery latency: counted from here it
+/// is added to the period, and since it is paid on every tick it accumulates.
+/// On the emulated board that is 4 ms a tick, which makes the 10 ms tick 14 ms
+/// and everything counted in ticks half as long again in real time.
+///
+/// A machine held off for longer than a whole interval leaves the next
+/// deadline already behind: the tick that was due then cannot be delivered on
+/// time whatever is done, so the deadline moves forward by whole intervals to
+/// the first one still ahead and those ticks are not counted. The count
+/// therefore runs short over a stall, and a sleep spanning one comes back late
+/// by what was skipped. Delivering the missed ticks back to back instead keeps
+/// the count true, but on a machine already slower than real time the backlog
+/// is worked through more slowly than it grows and the kernel does nothing
+/// else until it is; and the other machine's timer, which free-runs and whose
+/// interrupts coalesce while masked, loses them in exactly this way already.
 #[inline]
 fn rearm_timer() {
     unsafe {
         let interval = core::ptr::read_volatile(core::ptr::addr_of!(TIMER_INTERVAL));
-        asm!("msr cntv_tval_el0, {}", in(reg) interval);
+        let mut deadline =
+            core::ptr::read_volatile(core::ptr::addr_of!(TIMER_DEADLINE)) + interval;
+        let now = super::clock::cycle_counter();
+        if deadline <= now {
+            deadline += ((now - deadline) / interval + 1) * interval;
+        }
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(TIMER_DEADLINE), deadline);
+        asm!("msr cntv_cval_el0, {}", in(reg) deadline);
     }
 }
 
