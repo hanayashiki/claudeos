@@ -719,12 +719,22 @@ pub fn spawn(
     envp: Vec<String>,
     parent_pid: u32,
 ) -> Result<u32, Errno> {
+    // Nothing owns the address space or the kernel stack until the task is
+    // registered, so anything that goes wrong before then hands them back here
+    // or they are held by nobody: dropping the task frees neither.
     let space = crate::arch::paging::AddressSpace::new_user().ok_or(Errno::ENOMEM)?;
     let name = path.rsplit('/').next().unwrap_or(path);
-    let mut task = Task::new(name, space).ok_or(Errno::ENOMEM)?;
+    let Some(mut task) = Task::new(name, space) else {
+        space.destroy();
+        return Err(Errno::ENOMEM);
+    };
     task.ppid = parent_pid;
     task.pgid = task.pid;
-    attach_console(&mut task)?;
+    if let Err(err) = attach_console(&mut task) {
+        task.free_kernel_stack();
+        space.destroy();
+        return Err(err);
+    }
     task.pending_exec = Some((path.to_string(), argv, envp));
     task.prepare_kernel_frame(user_bootstrap as extern "C" fn() -> ! as usize as u64);
     Ok(crate::sched::register(task))
