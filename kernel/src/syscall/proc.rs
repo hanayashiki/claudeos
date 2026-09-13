@@ -185,7 +185,7 @@ pub fn exec_into_current(
         exec_path = interp;
     }
 
-    elf::validate(&node.inner.lock().data)?;
+    elf::check(&node)?;
 
     let old_space = sched::current().space();
     let new_space = AddressSpace::new_user().ok_or(Errno::ENOMEM)?;
@@ -208,9 +208,10 @@ pub fn exec_into_current(
     let new_mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
     crate::sync::without_interrupts(|irq| task.run_on_space(new_space, new_mm, irq));
 
-    // The file stays locked while its headers are read and its first pages
-    // are assembled; the rest arrives through the fault handler later.
-    let image = match elf::load_at(&new_space, &node.inner.lock().data, None, Some(node.clone())) {
+    // The loader reads the file in pieces under its lock rather than holding
+    // it open: only the first pages are assembled here, and the rest arrives
+    // through the fault handler later.
+    let image = match elf::load_at(&new_space, &node, None) {
         Ok(image) => image,
         Err(err) => {
             abandon_exec(&mut task, old_space, old_mm, new_space);
@@ -220,19 +221,16 @@ pub fn exec_into_current(
 
     task.set_heap_base(image.brk_start);
     // Record the image so /proc reports it and mmap never lands on top of it.
-    // A segment that names a file has not been read in: its pages come from
-    // there as the program reaches them.
+    // A segment names the file it came from and has not been read in: its
+    // pages come from there as the program reaches them.
     for segment in &image.segments {
-        match &segment.file {
-            Some(file) => task.add_file_vma(
-                segment.start,
-                segment.end,
-                segment.prot,
-                MAP_PRIVATE,
-                file.clone(),
-            ),
-            None => task.add_vma(segment.start, segment.end, segment.prot, MAP_PRIVATE),
-        }
+        task.add_file_vma(
+            segment.start,
+            segment.end,
+            segment.prot,
+            MAP_PRIVATE,
+            segment.file.clone(),
+        );
     }
 
     // A dynamically linked program names an interpreter that has to be loaded
@@ -243,25 +241,17 @@ pub fn exec_into_current(
     if let Some(interp_path) = image.interp.clone() {
         let loaded = crate::fs::lookup(&interp_path)
             .map_err(|_| Errno::ENOENT)
-            .and_then(|node| {
-                let data = node.inner.lock().data.clone();
-                elf::load_at(&new_space, &data, Some(elf::INTERP_BASE), Some(node.clone()))
-            });
+            .and_then(|node| elf::load_at(&new_space, &node, Some(elf::INTERP_BASE)));
         match loaded {
             Ok(interp_image) => {
                 for segment in &interp_image.segments {
-                    match &segment.file {
-                        Some(file) => task.add_file_vma(
-                            segment.start,
-                            segment.end,
-                            segment.prot,
-                            MAP_PRIVATE,
-                            file.clone(),
-                        ),
-                        None => {
-                            task.add_vma(segment.start, segment.end, segment.prot, MAP_PRIVATE)
-                        }
-                    }
+                    task.add_file_vma(
+                        segment.start,
+                        segment.end,
+                        segment.prot,
+                        MAP_PRIVATE,
+                        segment.file.clone(),
+                    );
                 }
                 task.set_heap_base(image.brk_start.max(interp_image.brk_start));
                 interp_base = interp_image.base;
