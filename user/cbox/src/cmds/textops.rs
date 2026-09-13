@@ -27,13 +27,13 @@ pub fn echo(args: &[String]) -> i32 {
         items = &items[1..];
     }
     let joined = items.join(" ");
-    let text = if escapes { unescape(&joined) } else { joined };
+    let text = if escapes { unescape(&joined) } else { joined.into_bytes() };
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     // A write that fails has to be reported, or `cmd > file || handler` can
     // never fire.
-    if out.write_all(text.as_bytes()).is_err() {
+    if out.write_all(&text).is_err() {
         eprintln!("echo: write error");
         return 1;
     }
@@ -666,82 +666,88 @@ pub fn tr(args: &[String]) -> i32 {
     let set1 = expand_set(&operands[0]);
     let set2 = operands.get(1).map(|s| expand_set(s)).unwrap_or_default();
 
-    let mut text = String::new();
-    if std::io::stdin().read_to_string(&mut text).is_err() {
+    let mut data = Vec::new();
+    if std::io::stdin().read_to_end(&mut data).is_err() {
         return 1;
     }
 
-    let in_set1 = |c: char| set1.contains(&c) != complement;
+    let in_set1 = |byte: u8| set1.contains(&byte) != complement;
 
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
+    let mut out = Vec::with_capacity(data.len());
+    for byte in data {
         if delete {
-            if !in_set1(c) {
-                out.push(c);
+            if !in_set1(byte) {
+                out.push(byte);
             }
             continue;
         }
-        match set1.iter().position(|&s| s == c) {
+        match set1.iter().position(|member| *member == byte) {
             Some(index) if !complement => {
-                out.push(*set2.get(index).or(set2.last()).unwrap_or(&c))
+                out.push(*set2.get(index).or(set2.last()).unwrap_or(&byte))
             }
-            _ => out.push(c),
+            _ => out.push(byte),
         }
     }
 
     if squeeze {
-        // Runs of a character from the squeeze set collapse to one. The set is
+        // Runs of a byte from the squeeze set collapse to one. The set is
         // SET2 when translating, SET1 otherwise.
         let squeeze_set = if set2.is_empty() { &set1 } else { &set2 };
-        let mut collapsed = String::with_capacity(out.len());
-        let mut previous: Option<char> = None;
-        for c in out.chars() {
-            let repeat = previous == Some(c) && squeeze_set.contains(&c);
-            if !repeat {
-                collapsed.push(c);
+        let mut collapsed = Vec::with_capacity(out.len());
+        let mut previous: Option<u8> = None;
+        for byte in out {
+            if previous != Some(byte) || !squeeze_set.contains(&byte) {
+                collapsed.push(byte);
             }
-            previous = Some(c);
+            previous = Some(byte);
         }
         out = collapsed;
     }
 
-    print!("{}", out);
-    let _ = std::io::stdout().flush();
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    let _ = handle.write_all(&out);
+    let _ = handle.flush();
     0
 }
 
-/// Turn backslash escapes into the characters they stand for.
-fn unescape(spec: &str) -> String {
-    let chars: Vec<char> = spec.chars().collect();
-    let mut out = String::new();
+/// Turn backslash escapes into the bytes they stand for.
+///
+/// `\377` names one byte, so one byte is what comes out. Going through a
+/// `char` instead makes it the two bytes that encode U+00FF, which is not
+/// what any other printf writes and is no use for building a file of
+/// arbitrary bytes to test against.
+fn unescape(spec: &str) -> Vec<u8> {
+    let spec = spec.as_bytes();
+    let mut out = Vec::new();
     let mut i = 0;
-    while i < chars.len() {
-        if chars[i] != '\\' || i + 1 >= chars.len() {
-            out.push(chars[i]);
+    while i < spec.len() {
+        if spec[i] != b'\\' || i + 1 >= spec.len() {
+            out.push(spec[i]);
             i += 1;
             continue;
         }
-        let next = chars[i + 1];
+        let next = spec[i + 1];
         i += 2;
         match next {
-            'n' => out.push('\n'),
-            't' => out.push('\t'),
-            'r' => out.push('\r'),
-            'f' => out.push('\u{0c}'),
-            'v' => out.push('\u{0b}'),
-            'a' => out.push('\u{07}'),
-            'b' => out.push('\u{08}'),
-            '\\' => out.push('\\'),
-            '0'..='7' => {
+            b'n' => out.push(b'\n'),
+            b't' => out.push(b'\t'),
+            b'r' => out.push(b'\r'),
+            b'f' => out.push(0x0c),
+            b'v' => out.push(0x0b),
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'\\' => out.push(b'\\'),
+            b'0'..=b'7' => {
                 // An octal escape of up to three digits.
-                let mut value = next.to_digit(8).unwrap();
+                let mut value = (next - b'0') as u32;
                 let mut taken = 1;
-                while taken < 3 && i < chars.len() && chars[i].is_digit(8) {
-                    value = value * 8 + chars[i].to_digit(8).unwrap();
+                while taken < 3 && i < spec.len() && spec[i].is_ascii_digit() && spec[i] < b'8' {
+                    value = value * 8 + (spec[i] - b'0') as u32;
                     i += 1;
                     taken += 1;
                 }
-                out.push(char::from_u32(value).unwrap_or('\0'));
+                out.push(value as u8);
             }
             other => out.push(other),
         }
@@ -749,37 +755,32 @@ fn unescape(spec: &str) -> String {
     out
 }
 
-/// Expand `a-z` style ranges and the common character classes.
-fn expand_set(spec: &str) -> Vec<char> {
-    let spec = &unescape(spec);
+/// Expand `a-z` style ranges and the common character classes, as bytes.
+fn expand_set(spec: &str) -> Vec<u8> {
+    let spec = unescape(spec);
     let mut out = Vec::new();
-    let chars: Vec<char> = spec.chars().collect();
     let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '[' && spec[i..].starts_with("[:") {
-            if let Some(end) = spec[i..].find(":]") {
-                let class = &spec[i + 2..i + end];
-                match class {
-                    "alpha" => out.extend(('a'..='z').chain('A'..='Z')),
-                    "lower" => out.extend('a'..='z'),
-                    "upper" => out.extend('A'..='Z'),
-                    "digit" => out.extend('0'..='9'),
-                    "space" => out.extend([' ', '\t', '\n', '\r']),
+    while i < spec.len() {
+        if spec[i] == b'[' && spec[i..].starts_with(b"[:") {
+            if let Some(end) = spec[i..].windows(2).position(|pair| pair == b":]") {
+                match &spec[i + 2..i + end] {
+                    b"alpha" => out.extend((b'a'..=b'z').chain(b'A'..=b'Z')),
+                    b"lower" => out.extend(b'a'..=b'z'),
+                    b"upper" => out.extend(b'A'..=b'Z'),
+                    b"digit" => out.extend(b'0'..=b'9'),
+                    b"space" => out.extend((0..=255u8).filter(|byte| is_space(*byte))),
                     _ => {}
                 }
                 i += end + 2;
                 continue;
             }
         }
-        if i + 2 < chars.len() && chars[i + 1] == '-' && chars[i + 2] >= chars[i] {
-            let (start, end) = (chars[i], chars[i + 2]);
-            for c in start..=end {
-                out.push(c);
-            }
+        if i + 2 < spec.len() && spec[i + 1] == b'-' && spec[i + 2] >= spec[i] {
+            out.extend(spec[i]..=spec[i + 2]);
             i += 3;
             continue;
         }
-        out.push(chars[i]);
+        out.push(spec[i]);
         i += 1;
     }
     out
@@ -788,28 +789,46 @@ fn expand_set(spec: &str) -> Vec<char> {
 pub fn tee(args: &[String]) -> i32 {
     let (flags, operands) = split_flags(args);
     let append = flags.contains('a');
-    let mut text = String::new();
-    if std::io::stdin().read_to_string(&mut text).is_err() {
-        return 1;
-    }
-    print!("{}", text);
-    let _ = std::io::stdout().flush();
-
     let mut status = 0;
+
+    // Every file is opened before anything is read, so a name that cannot be
+    // written is reported then rather than after the whole input has been
+    // taken in, and the input is copied through a chunk at a time rather than
+    // held in memory to the end.
+    let mut files = Vec::new();
     for path in &operands {
-        let result = if append {
-            std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(path)
-                .and_then(|mut f| f.write_all(text.as_bytes()))
-        } else {
-            std::fs::write(path, text.as_bytes())
-        };
-        if let Err(err) = result {
-            status = fail("tee", path, err);
+        let opened = std::fs::OpenOptions::new()
+            .write(true)
+            .append(append)
+            .truncate(!append)
+            .create(true)
+            .open(path);
+        match opened {
+            Ok(file) => files.push(file),
+            Err(err) => status = fail("tee", path, err),
         }
     }
+
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let filled = match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        if out.write_all(&buffer[..filled]).is_err() {
+            status = 1;
+        }
+        for file in files.iter_mut() {
+            if file.write_all(&buffer[..filled]).is_err() {
+                status = 1;
+            }
+        }
+    }
+    let _ = out.flush();
     status
 }
 
