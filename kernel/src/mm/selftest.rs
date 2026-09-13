@@ -38,6 +38,45 @@ pub fn run(report: &mut Report) {
     refusing_leaks_nothing(report);
     #[cfg(target_arch = "aarch64")]
     device_window::run(report);
+    #[cfg(target_arch = "aarch64")]
+    invalidation_operands(report);
+}
+
+/// The operand a translation invalidation by address takes.
+///
+/// This is the encoding and not the effect. Bits 47 to 44 of the operand are a
+/// hint saying which level of the walk the entry came from, and the core on
+/// this board does not implement them, so nothing the machine can be asked
+/// afterwards tells an operand that fills them in wrongly from one that leaves
+/// them clear. What can be pinned is the number the kernel puts in the
+/// register.
+#[cfg(target_arch = "aarch64")]
+fn invalidation_operands(report: &mut Report) {
+    use crate::arch::paging::invalidation_operand;
+    /// Bits 47 to 44, which are the level hint rather than any of the address.
+    const HINT: u64 = 0xF << 44;
+    /// The field holds bits 55 to 12 of the address, so an address masked to
+    /// 56 bits and shifted is the whole of what belongs in it.
+    const ADDRESS_BITS: u64 = 0x00FF_FFFF_FFFF_FFFF;
+
+    let user = 0x1000_0000u64;
+    report.check(
+        "a user address is its page number",
+        invalidation_operand(user) == user >> 12,
+    );
+    for (name, kernel) in [
+        ("the direct map", crate::mm::HHDM_BASE + 0x1000),
+        ("the kernel's own base", crate::mm::KERNEL_VMA + 0x1000),
+    ] {
+        report.check(
+            &alloc::format!("an address in {} names no level", name),
+            invalidation_operand(kernel) & HINT == 0,
+        );
+        report.check(
+            &alloc::format!("and carries every address bit the field holds, in {}", name),
+            invalidation_operand(kernel) == (kernel & ADDRESS_BITS) >> 12,
+        );
+    }
 }
 
 fn flags() -> u64 {
