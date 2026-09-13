@@ -35,6 +35,7 @@ const RAN: i32 = 7;
 pub fn run(report: &mut Report) {
     a_well_formed_image_still_runs(report);
     a_segment_whose_file_extent_wraps(report);
+    a_program_header_table_whose_extent_wraps(report);
     a_segment_whose_end_address_wraps(report);
     a_segment_the_size_of_user_space(report);
 }
@@ -153,7 +154,7 @@ fn exec_in_child(path: &str, image: &Image) -> Option<i32> {
     }
 }
 
-/// The guard on the three below: a loader that refused every image would pass
+/// The guard on the four below: a loader that refused every image would pass
 /// all of them having stopped running programs altogether.
 fn a_well_formed_image_still_runs(report: &mut Report) {
     let code = exec_in_child("/tmp/elf-sound", &Image::new(exit_with(RAN as u8)));
@@ -178,6 +179,22 @@ fn a_segment_whose_file_extent_wraps(report: &mut Report) {
     let code = exec_in_child("/tmp/elf-file-extent", &image);
     report.check(
         "a segment whose bytes wrap past the end of the file is refused",
+        code == Some(REFUSED),
+        format!("the child reported {:?} rather than {}", code, REFUSED),
+    );
+}
+
+/// The program header table's extent is e_phoff plus the size of the table,
+/// and a wrap there passes the same check. The loop then reads the table from
+/// far outside the file, which is a bounds-checked index in every build: a
+/// panic, and a panic in the kernel is a machine that has to be restarted.
+fn a_program_header_table_whose_extent_wraps(report: &mut Report) {
+    let mut image = Image::new(Vec::new());
+    image.phoff = u64::MAX - 55; // one 56-byte entry past it is zero
+    image.entry = NOWHERE;
+    let code = exec_in_child("/tmp/elf-phdr-extent", &image);
+    report.check(
+        "a program header table whose extent wraps is refused",
         code == Some(REFUSED),
         format!("the child reported {:?} rather than {}", code, REFUSED),
     );

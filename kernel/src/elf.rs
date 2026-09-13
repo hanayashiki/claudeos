@@ -52,16 +52,28 @@ pub struct Segment {
     pub file: Option<crate::task::FileMap>,
 }
 
-fn rd16(data: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([data[off], data[off + 1]])
+/// A field of the file, or ENOEXEC if the file does not reach that far.
+/// Indexing would do instead, but an index past the end of a slice is a panic
+/// in every build, and a panic here is a machine that stops rather than a
+/// program that is refused.
+fn field(data: &[u8], off: usize, len: usize) -> Result<&[u8], Errno> {
+    off.checked_add(len)
+        .and_then(|end| data.get(off..end))
+        .ok_or(Errno::ENOEXEC)
 }
-fn rd32(data: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+
+fn rd16(data: &[u8], off: usize) -> Result<u16, Errno> {
+    let b = field(data, off, 2)?;
+    Ok(u16::from_le_bytes([b[0], b[1]]))
 }
-fn rd64(data: &[u8], off: usize) -> u64 {
+fn rd32(data: &[u8], off: usize) -> Result<u32, Errno> {
+    let b = field(data, off, 4)?;
+    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+fn rd64(data: &[u8], off: usize) -> Result<u64, Errno> {
     let mut b = [0u8; 8];
-    b.copy_from_slice(&data[off..off + 8]);
-    u64::from_le_bytes(b)
+    b.copy_from_slice(field(data, off, 8)?);
+    Ok(u64::from_le_bytes(b))
 }
 
 pub struct ProgramHeader {
@@ -82,8 +94,8 @@ pub fn validate(data: &[u8]) -> Result<u16, Errno> {
     if data[4] != 2 || data[5] != 1 {
         return Err(Errno::ENOEXEC); // not 64-bit little-endian
     }
-    let e_type = rd16(data, 16);
-    let e_machine = rd16(data, 18);
+    let e_type = rd16(data, 16)?;
+    let e_machine = rd16(data, 18)?;
     if e_machine != crate::arch::ELF_MACHINE {
         return Err(Errno::ENOEXEC);
     }
@@ -94,23 +106,29 @@ pub fn validate(data: &[u8]) -> Result<u16, Errno> {
 }
 
 pub fn program_headers(data: &[u8]) -> Result<alloc::vec::Vec<ProgramHeader>, Errno> {
-    let phoff = rd64(data, 32) as usize;
-    let phentsize = rd16(data, 54) as usize;
-    let phnum = rd16(data, 56) as usize;
-    if phentsize < 56 || phoff + phnum * phentsize > data.len() {
+    let phoff = rd64(data, 32)?;
+    let phentsize = rd16(data, 54)? as u64;
+    let phnum = rd16(data, 56)? as u64;
+    if phentsize < 56 {
         return Err(Errno::ENOEXEC);
     }
-    let mut out = alloc::vec::Vec::with_capacity(phnum);
+    // e_phoff is a 64-bit number from the file, so the end of the table is a
+    // sum that wraps: one near the top of the range plus a table of any size
+    // is a small number, and a small number is inside the file.
+    if sum(&[phoff, phnum * phentsize])? > data.len() as u64 {
+        return Err(Errno::ENOEXEC);
+    }
+    let mut out = alloc::vec::Vec::with_capacity(phnum as usize);
     for i in 0..phnum {
-        let base = phoff + i * phentsize;
+        let base = (phoff + i * phentsize) as usize;
         out.push(ProgramHeader {
-            p_type: rd32(data, base),
-            p_flags: rd32(data, base + 4),
-            p_offset: rd64(data, base + 8),
-            p_vaddr: rd64(data, base + 16),
-            p_filesz: rd64(data, base + 32),
-            p_memsz: rd64(data, base + 40),
-            p_align: rd64(data, base + 48),
+            p_type: rd32(data, base)?,
+            p_flags: rd32(data, base + 4)?,
+            p_offset: rd64(data, base + 8)?,
+            p_vaddr: rd64(data, base + 16)?,
+            p_filesz: rd64(data, base + 32)?,
+            p_memsz: rd64(data, base + 40)?,
+            p_align: rd64(data, base + 48)?,
         });
     }
     Ok(out)
@@ -222,10 +240,10 @@ pub fn load_at(
 ) -> Result<LoadedImage, Errno> {
     let e_type = validate(data)?;
     let phdrs = program_headers(data)?;
-    let e_entry = rd64(data, 24);
-    let phoff = rd64(data, 32);
-    let phentsize = rd16(data, 54) as u64;
-    let phnum = rd16(data, 56) as u64;
+    let e_entry = rd64(data, 24)?;
+    let phoff = rd64(data, 32)?;
+    let phentsize = rd16(data, 54)? as u64;
+    let phnum = rd16(data, 56)? as u64;
 
     let base = match base_override {
         Some(base) if e_type == ET_DYN => base,
