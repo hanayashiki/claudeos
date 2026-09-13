@@ -95,8 +95,13 @@ pub fn extract(archive: &[u8]) -> Result<Stats, &'static str> {
                 if let Some(parent) = parent_of(&path) {
                     let _ = mkdir_p(&parent);
                 }
+                // The entry's bytes are copied before the node is locked.
+                // The lock masks interrupts and an entry here reaches four
+                // megabytes; that the unpacking runs before there is anything
+                // to hold off is the boot order's doing, not this code's.
+                let contents = data.to_vec();
                 let node = Node::new_file(mode & 0o7777);
-                node.inner.lock().data.extend_from_slice(data);
+                node.inner.lock().data = contents;
                 link_node(&path, node).map_err(|_| "link failed")?;
                 stats.files += 1;
                 stats.bytes += filesize;
