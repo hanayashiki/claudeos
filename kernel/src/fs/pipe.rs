@@ -7,6 +7,29 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const PIPE_CAPACITY: usize = 64 * 1024;
 
+/// Which ends of a pipe one descriptor holds.
+///
+/// A FIFO opened O_RDWR holds both at once: it may be written and read, and
+/// closing it has to give back a reader and a writer. A single "is this the
+/// write end" flag cannot say that, and a descriptor it called a read end
+/// refused writes and never reached end of file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PipeEnd {
+    Read,
+    Write,
+    Both,
+}
+
+impl PipeEnd {
+    pub fn reads(self) -> bool {
+        matches!(self, PipeEnd::Read | PipeEnd::Both)
+    }
+
+    pub fn writes(self) -> bool {
+        matches!(self, PipeEnd::Write | PipeEnd::Both)
+    }
+}
+
 struct Buffer {
     data: alloc::vec::Vec<u8>,
     head: usize,
@@ -29,10 +52,17 @@ pub struct Pipe {
     /// Tasks blocked because the pipe is empty, and because it is full.
     pub(super) not_empty: crate::sched::WaitQueue,
     pub(super) not_full: crate::sched::WaitQueue,
+    /// The inode whose registry entry holds this buffer, for a named pipe. An
+    /// anonymous pipe has none: it is reached through its descriptors alone.
+    fifo: Option<u64>,
 }
 
 impl Pipe {
     pub fn new() -> Arc<Pipe> {
+        Pipe::make(None)
+    }
+
+    fn make(fifo: Option<u64>) -> Arc<Pipe> {
         Arc::new(Pipe {
             buffer: Spinlock::new(Buffer { data: alloc::vec::Vec::new(), head: 0 }),
             readers: AtomicUsize::new(0),
@@ -41,6 +71,7 @@ impl Pipe {
             writer_opens: AtomicUsize::new(0),
             not_empty: crate::sched::WaitQueue::new(),
             not_full: crate::sched::WaitQueue::new(),
+            fifo,
         })
     }
 
@@ -142,20 +173,91 @@ impl Pipe {
     }
 }
 
-/// Every named pipe that has been opened, by inode number. A FIFO's two ends
+/// Every named pipe something has open, by inode number. A FIFO's two ends
 /// are separate `open` calls that have to meet at the same buffer, so the
 /// buffer belongs to the file rather than to the descriptor.
+///
+/// The first open makes the entry and the last close takes it away. Nothing
+/// carries over between the two: with no descriptor left there is nobody to
+/// read what is in the buffer, and a FIFO reopened later is a fresh
+/// rendezvous. Keeping the entry would also never end, because inode numbers
+/// are handed out in order and never reused, so every FIFO ever opened would
+/// leave one behind.
 static FIFOS: Spinlock<alloc::collections::BTreeMap<u64, Arc<Pipe>>> =
     Spinlock::new(alloc::collections::BTreeMap::new());
 
-fn fifo_for(ino: u64) -> Arc<Pipe> {
+/// Take a reference to the named pipe for `ino`, counting `end` onto it, and
+/// report the other side's open count as it stood before that.
+///
+/// The counts go up under the registry lock, which is the lock a close takes
+/// to remove an entry, so an entry cannot go away between being found here
+/// and being joined.
+fn fifo_join(ino: u64, end: PipeEnd, nonblock: bool) -> Result<(Arc<Pipe>, usize), Errno> {
     let mut fifos = FIFOS.lock();
-    if let Some(pipe) = fifos.get(&ino) {
-        return pipe.clone();
+    let existing = fifos.get(&ino).cloned();
+
+    // Opening for writing with nothing reading is ENXIO when the open is not
+    // allowed to wait. Answering that before an entry is made keeps a refused
+    // open from leaving one behind.
+    if end == PipeEnd::Write && nonblock {
+        let readers = existing.as_ref().map_or(0, |pipe| pipe.readers.load(Ordering::Acquire));
+        if readers == 0 {
+            return Err(Errno::ENXIO);
+        }
     }
-    let pipe = Pipe::new();
-    fifos.insert(ino, pipe.clone());
-    pipe
+
+    let pipe = match existing {
+        Some(pipe) => pipe,
+        None => {
+            let pipe = Pipe::make(Some(ino));
+            fifos.insert(ino, pipe.clone());
+            pipe
+        }
+    };
+
+    // Read the other side's open count before joining, so an open that
+    // happens from here on is seen as a change even if it has finished by the
+    // time this one looks.
+    let seen = if end == PipeEnd::Write {
+        pipe.reader_opens.load(Ordering::Acquire)
+    } else {
+        pipe.writer_opens.load(Ordering::Acquire)
+    };
+    if end.reads() {
+        pipe.readers.fetch_add(1, Ordering::AcqRel);
+        pipe.reader_opens.fetch_add(1, Ordering::AcqRel);
+    }
+    if end.writes() {
+        pipe.writers.fetch_add(1, Ordering::AcqRel);
+        pipe.writer_opens.fetch_add(1, Ordering::AcqRel);
+    }
+    Ok((pipe, seen))
+}
+
+/// Give back the ends one descriptor held.
+fn leave(pipe: &Arc<Pipe>, end: PipeEnd) {
+    // For a named pipe the counts and the registry entry have to agree, so
+    // both change under the one lock: an open that finds the entry has
+    // already counted itself onto it, and one that does not find it makes a
+    // new one.
+    let ino = match pipe.fifo {
+        Some(ino) => ino,
+        None => return give_back(pipe, end),
+    };
+    let mut fifos = FIFOS.lock();
+    give_back(pipe, end);
+    if pipe.readers.load(Ordering::Acquire) == 0 && pipe.writers.load(Ordering::Acquire) == 0 {
+        fifos.remove(&ino);
+    }
+}
+
+fn give_back(pipe: &Pipe, end: PipeEnd) {
+    if end.reads() {
+        pipe.readers.fetch_sub(1, Ordering::AcqRel);
+    }
+    if end.writes() {
+        pipe.writers.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Open one end of a named pipe.
@@ -165,45 +267,25 @@ fn fifo_for(ino: u64) -> Arc<Pipe> {
 /// once and never waits.
 pub fn open_fifo(ino: u64, flags: u32, path: &str) -> Result<Arc<super::OpenFile>, Errno> {
     use crate::abi::{O_ACCMODE, O_NONBLOCK, O_RDWR, O_WRONLY};
-    let pipe = fifo_for(ino);
-    let access = flags & O_ACCMODE;
-    let writing = access == O_WRONLY;
-    let both = access == O_RDWR;
-
-    // Read the other side's open count before joining, so an open that
-    // happens from here on is seen as a change even if it has finished by the
-    // time this one looks.
-    let seen = if writing {
-        pipe.reader_opens.load(Ordering::Acquire)
-    } else {
-        pipe.writer_opens.load(Ordering::Acquire)
+    let end = match flags & O_ACCMODE {
+        O_WRONLY => PipeEnd::Write,
+        O_RDWR => PipeEnd::Both,
+        _ => PipeEnd::Read,
     };
-
-    if writing {
-        if flags & O_NONBLOCK != 0 && pipe.readers.load(Ordering::Acquire) == 0 {
-            return Err(Errno::ENXIO);
-        }
-        pipe.writers.fetch_add(1, Ordering::AcqRel);
-        pipe.writer_opens.fetch_add(1, Ordering::AcqRel);
-    } else {
-        pipe.readers.fetch_add(1, Ordering::AcqRel);
-        pipe.reader_opens.fetch_add(1, Ordering::AcqRel);
-        if both {
-            pipe.writers.fetch_add(1, Ordering::AcqRel);
-            pipe.writer_opens.fetch_add(1, Ordering::AcqRel);
-        }
-    }
+    let nonblock = flags & O_NONBLOCK != 0;
+    let (pipe, seen) = fifo_join(ino, end, nonblock)?;
     // The end that just arrived may be the one the other side was waiting for.
     pipe.wake();
 
     let file = Arc::new(super::OpenFile {
-        backing: super::FileBacking::Pipe(pipe.clone(), writing),
+        backing: super::FileBacking::Pipe(pipe.clone(), end),
         offset: Spinlock::new(0),
         flags: Spinlock::new(flags),
         path: alloc::string::String::from(path),
     });
 
-    if !both && flags & O_NONBLOCK == 0 {
+    if end != PipeEnd::Both && !nonblock {
+        let writing = end == PipeEnd::Write;
         let want = if writing { &pipe.readers } else { &pipe.writers };
         let opens = if writing { &pipe.reader_opens } else { &pipe.writer_opens };
         let queue = if writing { &pipe.not_full } else { &pipe.not_empty };
@@ -231,13 +313,13 @@ pub fn create_pair(flags: u32) -> (Arc<super::OpenFile>, Arc<super::OpenFile>) {
     pipe.writers.store(1, Ordering::Release);
 
     let read_end = Arc::new(OpenFile {
-        backing: FileBacking::Pipe(pipe.clone(), false),
+        backing: FileBacking::Pipe(pipe.clone(), PipeEnd::Read),
         offset: Spinlock::new(0),
         flags: Spinlock::new(flags),
         path: alloc::string::String::from("pipe:"),
     });
     let write_end = Arc::new(OpenFile {
-        backing: FileBacking::Pipe(pipe, true),
+        backing: FileBacking::Pipe(pipe, PipeEnd::Write),
         offset: Spinlock::new(0),
         flags: Spinlock::new(flags),
         path: alloc::string::String::from("pipe:"),
@@ -248,9 +330,8 @@ pub fn create_pair(flags: u32) -> (Arc<super::OpenFile>, Arc<super::OpenFile>) {
 impl Drop for super::OpenFile {
     fn drop(&mut self) {
         match &self.backing {
-            super::FileBacking::Pipe(pipe, is_write) => {
-                let counter = if *is_write { &pipe.writers } else { &pipe.readers };
-                counter.fetch_sub(1, Ordering::AcqRel);
+            super::FileBacking::Pipe(pipe, end) => {
+                leave(pipe, *end);
                 // The other end has to notice that this one is gone.
                 pipe.wake();
             }

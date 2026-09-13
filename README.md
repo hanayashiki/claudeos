@@ -245,7 +245,8 @@ tree. Pipes, symbolic links, and `getdents64` all work. A file can have more
 than one name: nodes are reference counted and a directory entry is the
 reference, so `link` is a second entry for the same node and `st_nlink` counts
 them. `mkfifo` makes a named pipe whose two ends meet at one buffer, with the
-open of each side waiting for the other. `/proc/<pid>/fd` is rebuilt whenever
+open of each side waiting for the other, or holding both ends at once when it
+is opened read-write. `/proc/<pid>/fd` is rebuilt whenever
 something looks inside it, so it lists the descriptors the process has open
 right now.
 
@@ -363,7 +364,7 @@ search of standard input is not something that can be asked for.
 `make test` boots the OS once per suite and requires each to report zero
 failures.
 
-- `tests/suite.sh` runs **250 checks** inside the OS, driving the shell through
+- `tests/suite.sh` runs **251 checks** inside the OS, driving the shell through
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
   subprocesses and `/proc`.
@@ -375,7 +376,7 @@ failures.
   through pipes, signal handlers running and returning, a `UnixStream` pair
   carrying bytes both ways, and an epoll set woken by a counter and a socket,
   timing out when it should and waking promptly when a write arrives.
-- `tests/busybox.sh` runs **36 checks** against an upstream busybox binary that
+- `tests/busybox.sh` runs **39 checks** against an upstream busybox binary that
   this project did not build: `awk`, `sed`, `tar` create and extract, `find`,
   `md5sum` and `sha256sum` (whose digests are compared against the ones the
   host computes for the same input), `ps`, `df`, `xargs`, `timeout`, and

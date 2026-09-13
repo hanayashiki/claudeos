@@ -522,7 +522,7 @@ impl Drop for InetHandle {
 /// An entry in a task's file descriptor table.
 pub enum FileBacking {
     Node(NodeRef),
-    Pipe(Arc<pipe::Pipe>, bool),
+    Pipe(Arc<pipe::Pipe>, pipe::PipeEnd),
     EventFd(Arc<chan::EventFd>),
     /// One end of a connected pair, which is what `socketpair` returns.
     Socket(Arc<chan::Socket>),
@@ -567,7 +567,7 @@ impl OpenFile {
 
     pub fn readable(&self) -> bool {
         match &self.backing {
-            FileBacking::Pipe(_, is_write) => !is_write,
+            FileBacking::Pipe(_, end) => end.reads(),
             FileBacking::EventFd(_) | FileBacking::Socket(_) | FileBacking::Inet(_) => true,
             FileBacking::Epoll(_) => false,
             _ => {
@@ -579,7 +579,7 @@ impl OpenFile {
 
     pub fn writable(&self) -> bool {
         match &self.backing {
-            FileBacking::Pipe(_, is_write) => *is_write,
+            FileBacking::Pipe(_, end) => end.writes(),
             FileBacking::EventFd(_) | FileBacking::Socket(_) | FileBacking::Inet(_) => true,
             FileBacking::Epoll(_) => false,
             _ => {

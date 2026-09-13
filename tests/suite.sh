@@ -304,6 +304,15 @@ done
 echo $n
 RACE
 check "a fifo meets a fast writer" "20"  "$(sh /tmp/lk/race.sh)"
+# A fifo's buffer is there for two opens to meet at. Once nothing holds it
+# open there is nobody left to read what is in it, so the last close takes the
+# buffer away: what a reader gets from the next open is what that open's
+# writer put there and nothing else. An entry kept past its last close is also
+# one that is never removed at all, since inode numbers are never reused.
+mkfifo /tmp/lk/s
+printf 'stale\n' > /tmp/lk/s &
+sleep 1 < /tmp/lk/s
+check "a closed fifo keeps nothing" "fresh" "$(printf 'fresh\n' > /tmp/lk/s & cat /tmp/lk/s)"
 check "descriptors are listed" "1"      "$(ls /proc/self/fd | grep -c '^0$')"
 check "a descriptor names its file" "/tmp/lk/a" "$(sh -c 'readlink /proc/self/fd/0' < /tmp/lk/a)"
 check "a descriptor is a link" "l"      "$(sh -c 'ls -l /proc/self/fd/1' | cut -c1)"

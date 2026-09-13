@@ -82,6 +82,26 @@ check "timeout"         "0"           "$(bb timeout 5 /bin/busybox true; echo $?
 check "nested busybox"  "deep"        "$(bb sh -c '/bin/busybox echo deep')"
 
 echo
+echo "-- a fifo opened read-write --"
+# O_RDWR on a FIFO is how a program holds one open without waiting for the
+# other side. busybox's shell is what asks for it here: `<>` is not a
+# redirection the shell this project ships understands.
+bb mkfifo /tmp/bb/rw1 /tmp/bb/rw2 /tmp/bb/rw3
+check "rdwr fifo takes a write" "0" \
+    "$(bb sh -c 'exec 3<>/tmp/bb/rw1; echo hello >&3' 2>/dev/null; echo $?)"
+# The write is what the read depends on, so a failed write skips the read
+# rather than blocking on a fifo nothing will ever fill.
+check "rdwr fifo reads it back" "hello" \
+    "$(bb sh -c 'exec 3<>/tmp/bb/rw2; echo hello >&3 2>/dev/null && read -r l <&3 && echo "$l"')"
+# Closing a read-write end gives back the writer it took as well as the
+# reader. A writer left behind is one nothing can close, and a later reader
+# waits for an end of file that never comes; `timeout` is what turns that
+# wait into a failure rather than a hung suite.
+bb sh -c 'exec 3<>/tmp/bb/rw3'
+check "closing it gives both back" "0" \
+    "$(bb printf 'x\n' > /tmp/bb/rw3 & bb timeout 5 /bin/busybox cat /tmp/bb/rw3 > /dev/null; echo $?)"
+
+echo
 echo "-- terminal --"
 check "tty"             "/dev/console" "$(bb tty)"
 check "stty size"       "24 80"       "$(bb stty size)"
