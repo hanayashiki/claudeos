@@ -5,8 +5,7 @@
 //! being lost into a sleep nobody will end.
 
 use crate::sched;
-use crate::task::State;
-use crate::sync::{disable_interrupts, enable_interrupts, Spinlock};
+use crate::sync::Spinlock;
 use alloc::vec::Vec;
 
 /// What identifies a futex: the address space it lives in and the address
@@ -63,35 +62,40 @@ pub fn wake(key: Key, count: u32) -> u32 {
     // The task list has its own lock, so it is taken after the waiter list is
     // released rather than inside it.
     let woken = pids.len() as u32;
-    for pid in pids {
-        if let Some(task) = sched::find(pid) {
-            if task.state == State::Sleeping {
-                task.state = State::Runnable;
-                task.wake_at = 0;
+    sched::with_tasks(|table| {
+        for pid in pids {
+            if let Some(task) = table.find(pid) {
+                task.wake(table.irq());
             }
         }
-    }
+    });
     woken
 }
 
 /// Sleep until woken on `key` or until `deadline` passes. Returns false when
 /// the deadline had already passed, which is the caller's timeout.
 pub fn sleep_until(key: Key, deadline: u64) -> bool {
-    disable_interrupts();
-    if woken(key) {
-        enable_interrupts();
-        return true;
+    // Registering, re-reading and parking have to be one step: a wake that
+    // lands between the last check and the sleep finds a runnable task, wakes
+    // nothing, and the sleep then has no deadline to end it.
+    let parked = crate::sync::without_interrupts(|irq| {
+        if woken(key) {
+            return None;
+        }
+        if crate::trap::ticks() >= deadline {
+            return Some(false);
+        }
+        sched::current().sleep(if deadline == u64::MAX { 0 } else { deadline }, irq);
+        Some(true)
+    });
+    match parked {
+        None => return true,
+        Some(false) => return false,
+        Some(true) => {}
     }
-    if crate::trap::ticks() >= deadline {
-        enable_interrupts();
-        return false;
-    }
-    let mut task = sched::current();
-    task.state = State::Sleeping;
-    task.wake_at = if deadline == u64::MAX { 0 } else { deadline };
-    enable_interrupts();
 
+    // Nothing returns a sleeping task to the run queue without clearing its
+    // deadline, so there is none left to clear here.
     sched::schedule();
-    sched::current().wake_at = 0;
     true
 }
