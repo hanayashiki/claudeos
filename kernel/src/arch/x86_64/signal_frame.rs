@@ -4,13 +4,28 @@
 //! `rt_sigframe` Linux does on the user stack, points the return address at
 //! the libc restorer, and re-enters user mode at the handler. `rt_sigreturn`
 //! reads that frame back.
+//!
+//! That address is the program's to supply. There is no page of kernel code
+//! mapped into a program on this machine to return through -- aarch64 is the
+//! one with such a page -- so a disposition naming no restorer is refused
+//! where the signal would be delivered, which is what Linux does here too.
 
 use super::cpu::idt::TrapFrame;
+use super::paging::AddressSpace;
 use super::task::FPU_STATE_SIZE;
-use crate::abi::SysResult;
-use crate::signal::{SigAction, SA_NODEFER, SA_ONSTACK};
+use crate::abi::{Errno, SysResult};
+use crate::signal::{SigAction, Signal, SA_NODEFER, SA_ONSTACK};
 use crate::task::Task;
 use crate::uaccess;
+
+/// Nothing to map here. A handler on this machine returns through the address
+/// the program registered and there is no other place it could go: Linux
+/// refuses to deliver a signal whose disposition names no restorer, rather
+/// than supplying one. The name exists because the exec path calls it on
+/// whichever machine it is built for; aarch64 is the one with a page to map.
+pub fn map_signal_trampoline(_task: &Task, _space: &AddressSpace) -> Result<(), Errno> {
+    Ok(())
+}
 
 // Frame layout, matching the x86_64 kernel ABI.
 const UC_OFFSET: usize = 8;
@@ -86,14 +101,30 @@ fn restore_alt_stack(task: &Task, buf: &[u8], sp: u64) {
 }
 
 /// Build a signal frame on the user stack and redirect `frame` into
-/// `action.handler`. Returns false if the user stack could not be written, in
-/// which case the caller should kill the task.
+/// `action.handler`. Returns false if the user stack could not be written or
+/// no restorer was registered, in which case the caller should kill the task.
 pub fn enter_signal_handler(
     task: &Task,
-    signal: i32,
+    signal: Signal,
     action: &SigAction,
     frame: &mut TrapFrame,
 ) -> bool {
+    // The return address on the frame is the only way back from a handler on
+    // this machine, and a program that registered no restorer has given
+    // nothing to put there. Linux refuses the delivery in that case rather
+    // than sending the handler somewhere, and so does this. Say which program
+    // and which signal, because from outside it looks like a program that took
+    // a fault it never executed an instruction for.
+    if action.restorer == 0 {
+        crate::println!(
+            "[signal] pid={} registered no restorer for signal {}, \
+             and this machine has no return sequence of its own to supply",
+            crate::sched::current().pid,
+            signal.number()
+        );
+        return false;
+    }
+
     // A disposition that asked for its own stack gets it, unless a handler is
     // already running on it -- nesting continues down the same stack rather
     // than starting again at its top, which would write over the frame the
@@ -155,7 +186,7 @@ pub fn enter_signal_handler(
     put64(&mut buf, m + SC_FPSTATE, sp + FPSTATE_OFFSET as u64);
 
     // siginfo: si_signo, si_errno, si_code.
-    buf[INFO_OFFSET..INFO_OFFSET + 4].copy_from_slice(&signal.to_le_bytes());
+    buf[INFO_OFFSET..INFO_OFFSET + 4].copy_from_slice(&signal.number().to_le_bytes());
     buf[INFO_OFFSET + 4..INFO_OFFSET + 8].copy_from_slice(&0i32.to_le_bytes());
     buf[INFO_OFFSET + 8..INFO_OFFSET + 12].copy_from_slice(&0i32.to_le_bytes());
 
@@ -166,12 +197,12 @@ pub fn enter_signal_handler(
     // Block this signal for the duration of the handler unless asked not to.
     task.signal_mask.set(task.signal_mask.get() | action.mask);
     if action.flags & SA_NODEFER == 0 {
-        task.signal_mask.set(task.signal_mask.get() | 1u64 << (signal as u64 & 63));
+        task.signal_mask.set(task.signal_mask.get() | signal.bit());
     }
 
     frame.rip = action.handler;
     frame.rsp = sp;
-    frame.rdi = signal as u64;
+    frame.rdi = signal.number() as u64;
     frame.rsi = sp + INFO_OFFSET as u64;
     frame.rdx = sp + UC_OFFSET as u64;
     frame.rax = 0;

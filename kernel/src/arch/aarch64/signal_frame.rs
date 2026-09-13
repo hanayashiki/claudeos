@@ -2,8 +2,8 @@
 //!
 //! When a task has installed a handler, the kernel builds the same
 //! `rt_sigframe` Linux does on the user stack, points the link register at the
-//! restorer libc registered, and re-enters user mode at the handler.
-//! `rt_sigreturn` reads that frame back.
+//! address the handler returns through, and re-enters user mode at the
+//! handler. `rt_sigreturn` reads that frame back.
 //!
 //! The shape is not the x86-64 one. The saved registers sit in a `sigcontext`
 //! reached through the `ucontext`, and the vector registers are not written at
@@ -12,19 +12,83 @@
 //! and a record of length zero ends the chain. Only one record is written
 //! here, so the chain is that record and its terminator.
 //!
-//! Nothing here is executable. The kernel writes the frame and nothing else,
-//! and the address a handler returns through is one inside the program's own
-//! image, which the loader wrote and made fetchable when it loaded it. There
-//! is no trampoline generated at run time and no page of kernel-supplied code
-//! mapped into a program, so no cache maintenance is owed on this path. A
-//! program that registered no restorer is refused rather than sent somewhere.
+//! The address a handler returns through is the restorer the program
+//! registered, when it registered one. Linux on this machine does not read
+//! that field at all: it maps a page of its own holding the return sequence
+//! into every program and sends a handler back through that. So a program
+//! built for this machine has no reason to fill the field in, and Go does not.
+//! `map_signal_trampoline` builds the same page here, and it is where a
+//! handler goes back through when the field is empty.
 
+use super::paging::{AddressSpace, FreshPage, PRESENT, USER};
 use super::task::VECTOR_BYTES;
 use super::trap::TrapFrame;
-use crate::abi::SysResult;
-use crate::signal::{SigAction, SA_NODEFER, SA_ONSTACK};
+use crate::abi::{Errno, SysResult, MAP_PRIVATE, PROT_EXEC, PROT_READ};
+use crate::mm::{PAGE_SIZE_U64, USER_TRAMPOLINE};
+use crate::signal::{SigAction, Signal, SA_NODEFER, SA_ONSTACK};
 use crate::task::Task;
 use crate::uaccess;
+
+/// `movz x8, #0`, with room in the immediate for the call number.
+const MOVZ_X8: u32 = 0xD280_0008;
+/// `svc #0`.
+const SVC_0: u32 = 0xD400_0001;
+
+/// The sequence a handler returns through: the number of the call that reads
+/// the signal frame back in the register that carries a call number, then the
+/// instruction that makes the call. It is the same pair Linux maps, and the
+/// immediate comes from the number the dispatcher matches on rather than
+/// being written out again, so the two cannot come to name different calls.
+const RETURN_SEQUENCE: [u32; 2] = [MOVZ_X8 | ((super::nr::RT_SIGRETURN as u32) << 5), SVC_0];
+
+const _: () = assert!(super::nr::RT_SIGRETURN < 1 << 16, "movz carries 16 bits");
+
+/// Give `space` the page a handler returns through, and record the region it
+/// occupies so that an mmap with no address of its own is placed past it.
+///
+/// One page per address space rather than one frame shared by all of them.
+/// The frame would be cheaper, but a program may call `mprotect` on any
+/// address it owns, and this kernel grants write access to a page that asks
+/// for it unless the page carries the copy-on-write mark. That mark is not
+/// available here: it means a page the program may write once it has a copy
+/// of its own, and a write to a page of code is a fault rather than a silent
+/// copy. A shared frame would therefore be one a program could get write
+/// access to and then change underneath every other program on the machine.
+/// A page apiece costs a frame per exec -- a fork shares its parent's
+/// read-only through the same path as the rest of the image -- and leaves
+/// what a program does to its own trampoline its own business.
+///
+/// Every address space gets one: whether a program will install a handler is
+/// not known when its address space is being built. It goes in at exec, where
+/// the rest of the address space is laid out, and a fork inherits it with
+/// everything else.
+pub fn map_signal_trampoline(task: &Task, space: &AddressSpace) -> Result<(), Errno> {
+    let mut page = FreshPage::new().ok_or(Errno::ENOMEM)?;
+    let mut at = 0;
+    for instruction in RETURN_SEQUENCE {
+        page.bytes()[at..at + 4].copy_from_slice(&instruction.to_le_bytes());
+        at += 4;
+    }
+    // The kernel stored these bytes through the direct map and the program
+    // fetches them as instructions through its own address. The two caches are
+    // not coherent here, so what was stored has to be pushed down to where the
+    // fetch will look before anything jumps there. Left out, a program runs
+    // whatever the instruction cache was holding for that frame, which
+    // emulation never shows.
+    super::sync_instruction_cache(page.bytes().as_ptr() as u64, at);
+
+    // Read-only and executable, which is what it stays. It is never reachable
+    // any wider: the contents are finished before the page is published, and
+    // publishing is what makes it reachable at all.
+    space.publish(USER_TRAMPOLINE, page, PRESENT | USER).map_err(|_| Errno::ENOMEM)?;
+    task.add_vma(
+        USER_TRAMPOLINE,
+        USER_TRAMPOLINE + PAGE_SIZE_U64,
+        PROT_READ | PROT_EXEC,
+        MAP_PRIVATE,
+    );
+    Ok(())
+}
 
 /// `struct siginfo` comes first and is a fixed 128 bytes.
 const INFO: usize = 0;
@@ -119,32 +183,14 @@ fn restore_alt_stack(task: &Task, buf: &[u8], sp: u64) {
 }
 
 /// Build a signal frame on the user stack and redirect `frame` into
-/// `action.handler`. Returns false if the user stack could not be written or
-/// no restorer was registered, in which case the caller should kill the task.
+/// `action.handler`. Returns false if the user stack could not be written, in
+/// which case the caller should kill the task.
 pub fn enter_signal_handler(
     task: &Task,
-    signal: i32,
+    signal: Signal,
     action: &SigAction,
     frame: &mut TrapFrame,
 ) -> bool {
-    // There is no code in this kernel's address space a handler could return
-    // through, so a program that registered no restorer has nowhere to go.
-    // Linux on this machine maps a page of its own holding the two
-    // instructions and does not look at the field at all, which is why a
-    // program built for it need not fill the field in; this kernel maps no
-    // such page. Say so rather than kill the task without a word, because
-    // what it looks like from outside is a program that took a fault it never
-    // executed an instruction for.
-    if action.restorer == 0 {
-        crate::println!(
-            "[signal] pid={} registered no restorer for signal {}, \
-             and this machine has no trampoline of its own to return through",
-            crate::sched::current().pid,
-            signal
-        );
-        return false;
-    }
-
     // A disposition that asked for its own stack gets it, unless a handler is
     // already running on it -- nesting continues down the same stack rather
     // than starting again at its top, which would write over the frame the
@@ -157,7 +203,7 @@ pub fn enter_signal_handler(
     let mut buf = [0u8; WRITTEN_SIZE];
 
     // siginfo: si_signo, si_errno, si_code.
-    put32(&mut buf, INFO, signal as u32);
+    put32(&mut buf, INFO, signal.number() as u32);
     put32(&mut buf, INFO + 4, 0);
     put32(&mut buf, INFO + 8, 0);
 
@@ -208,16 +254,20 @@ pub fn enter_signal_handler(
     // Block this signal for the duration of the handler unless asked not to.
     task.signal_mask.set(task.signal_mask.get() | action.mask);
     if action.flags & SA_NODEFER == 0 {
-        task.signal_mask.set(task.signal_mask.get() | 1u64 << (signal as u64 & 63));
+        task.signal_mask.set(task.signal_mask.get() | signal.bit());
     }
 
     frame.elr = action.handler;
     frame.sp = sp;
-    frame.x[0] = signal as u64;
+    frame.x[0] = signal.number() as u64;
     frame.x[1] = sp + INFO as u64;
     frame.x[2] = sp + UC as u64;
     frame.x[29] = sp + FRAME_SIZE as u64;
-    frame.x[30] = action.restorer;
+    // Where the handler returns to. A program that registered a restorer is
+    // sent back through it, which is what everything built against musl does;
+    // one that registered none goes through the page above, which is what a
+    // program built for Linux on this machine expects and never asked for.
+    frame.x[30] = if action.restorer != 0 { action.restorer } else { USER_TRAMPOLINE };
     true
 }
 

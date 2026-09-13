@@ -327,8 +327,24 @@ loader bring up Alpine's userland.
 
 **Signals.** A handler installed with `rt_sigaction` is really entered: the
 kernel writes the same `rt_sigframe` Linux does onto the user stack, points the
-return address at the libc restorer, and `rt_sigreturn` puts the interrupted
-state back. A disposition that asked for `SA_ONSTACK` is entered on the stack
+return address at the address the handler returns through, and `rt_sigreturn`
+puts the interrupted state back. On x86-64 that address is the restorer the
+program registered and there is nothing else it could be, so a disposition
+that names none is refused where the signal would be delivered, which is what
+Linux does there too. On aarch64 Linux does not read that field at all: it
+maps a page of its own holding `mov x8, #139; svc #0` into every program and
+sends a handler back through that, so a program built for that machine has no
+reason to fill the field in. This kernel maps the same page, at the last page
+of the half a program owns, and uses it when the field is empty. musl fills
+the field in on both machines and is still sent back through what it
+registered; Go fills it in on neither, and on aarch64 that page is the whole
+reason a Go program survives its first signal. The page goes in read-only and
+executable, and the instruction cache is told about the bytes the kernel wrote
+before any program can fetch them -- the two caches are not coherent on that
+machine, and leaving that out is a program executing whatever the cache was
+holding, which emulation never shows.
+
+A disposition that asked for `SA_ONSTACK` is entered on the stack
 `sigaltstack` named rather than on the interrupted one, and `sigaltstack` is
 answered rather than accepted and forgotten: a program that asks where its
 handler would run is told, and one that has named no stack is told that. A
@@ -459,10 +475,14 @@ QUIC and QUIC does not work here. A QUIC sender holds one unconnected socket
 and names a destination on each datagram; `sendmsg` drops that name and sends
 on the descriptor, which an unconnected socket refuses, and the batching read
 it pairs with, `recvmmsg`, is not implemented. Everything else cloudflared asks
-for it gets. On aarch64 it does not get that far: Go registers its handlers
-without a restorer, which is right for that machine because Linux returns
-through a page of its own there, and this kernel has no such page, so the first
-signal its scheduler sends kills it.
+for it gets.
+
+It runs on aarch64 too. Go registers its handlers there with no restorer,
+which is right for that machine, and the page described under **Signals** is
+what they return through: `cloudflared --version` on the emulated Pi comes
+back out of a dozen or more handlers before it prints its line. That machine
+has no network device under emulation, so a tunnel cannot be established
+there; what the page buys is that the program lives past its first signal.
 
 **Console.** A 16550 UART and a PS/2 keyboard feed one input ring. A line
 discipline implements canonical mode with echo, backspace, `Ctrl-C`, `Ctrl-D`

@@ -37,6 +37,25 @@ pub const USER_MMAP_BASE: u64 = 0x0000_7F00_0000_0000;
 /// Top of the initial user stack (grows down from here).
 pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
 pub const USER_STACK_SIZE: u64 = 1024 * 1024;
+/// Where a machine that supplies its own code to a program puts it: the page
+/// a signal handler returns through on aarch64.
+///
+/// It is the last page of the half a program owns, and every other thing
+/// placed in that half is below it. An image and the break are refused above
+/// `USER_MMAP_BASE`. An mmap with no address of its own is placed from
+/// `USER_MMAP_BASE` up, past the regions already recorded, of which this is
+/// one. The stack occupies `USER_STACK_TOP - STACK_RESERVE` to
+/// `USER_STACK_TOP` and grows downwards, so this page starts where the stack
+/// ends and nothing about it moves.
+pub const USER_TRAMPOLINE: u64 = USER_STACK_TOP;
+
+const _: () = {
+    // The page has to fit in the half a program owns, whose top is where the
+    // kernel's half begins.
+    assert!(USER_TRAMPOLINE % PAGE_SIZE_U64 == 0);
+    assert!(USER_TRAMPOLINE + PAGE_SIZE_U64 <= 0x0000_8000_0000_0000);
+    assert!(USER_TRAMPOLINE >= USER_STACK_TOP);
+};
 
 extern "C" {
     static __kernel_end_virt: u8;

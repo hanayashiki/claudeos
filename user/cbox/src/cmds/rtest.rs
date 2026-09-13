@@ -605,6 +605,63 @@ fn a_signal_frame_on_a_shared_page(report: &mut Report) {
     );
 }
 
+/// A handler installed with no restorer.
+///
+/// Linux on aarch64 does not read that field. It maps a page of its own
+/// holding the return sequence into every program and sends a handler back
+/// through that, so a program built for that machine has no reason to fill the
+/// field in, and a Go program does not. x86-64 has no such page: the return
+/// address on the frame is the only way back, and Linux refuses to deliver a
+/// signal to a disposition that names none. So the two machines are checked
+/// against different answers, and each against the one its ABI gives.
+///
+/// musl fills the field in on both, which is why every program shipped here
+/// would pass this either way. The call below goes straight to the kernel with
+/// the field zero, which is the only way to ask the question from a program
+/// linked against a libc.
+fn a_handler_with_no_restorer(report: &mut Report) {
+    use crate::sys;
+
+    const SIGSEGV: i32 = 11;
+
+    let child = sys::fork();
+    if child == 0 {
+        let handler = handle_signal as extern "C" fn(i32) as usize;
+        let installed = sys::set_handler_without_restorer(SIGUSR1, handler);
+        let before = SIGNAL_TOTAL.load(Ordering::SeqCst);
+        // Straight to the kernel rather than through libc's `raise`, which
+        // sends to the thread id libc remembers -- still the parent's after a
+        // bare fork.
+        let sent = sys::kill(sys::getpid() as i32, SIGUSR1);
+        let ran = SIGNAL_TOTAL.load(Ordering::SeqCst) - before == SIGUSR1 as usize;
+        // On aarch64 this is reached only if the handler returned, so reaching
+        // it at all is the check; on x86-64 the delivery is refused and the
+        // child never gets here. The sum says the code after the handler runs
+        // on the registers the handler was entered with.
+        let mut accumulator = 0u64;
+        for i in 0..1000u64 {
+            accumulator = accumulator.wrapping_add(i * i);
+        }
+        let ok = installed == 0 && sent == 0 && ran && accumulator == 332_833_500;
+        sys::exit_group(if ok { 0 } else { 1 });
+    }
+    let (pid, status) = sys::wait4(child as i32, 0);
+    let detail = format!("reaped {} status {:#x}", pid, status);
+    if cfg!(target_arch = "aarch64") {
+        report.check(
+            "a handler with no restorer is delivered and returns",
+            pid == child && sys::exit_code_of(status) == 0,
+            detail,
+        );
+    } else {
+        report.check(
+            "a handler with no restorer is refused, and the program told so",
+            pid == child && sys::signal_of(status) == Some(SIGSEGV),
+            detail,
+        );
+    }
+}
+
 /// Stopping a job and telling its parent are one step. A tick between them
 /// takes the CPU away from a task that is no longer runnable, so the parent is
 /// never told and sleeps in wait4 for good: the shell that pressed the suspend
@@ -1384,6 +1441,7 @@ pub fn main(_args: &[String]) -> i32 {
     a_fork_while_a_sibling_writes(&mut report);
     reading_proc_while_a_child_is_reaped(&mut report);
     a_signal_frame_on_a_shared_page(&mut report);
+    a_handler_with_no_restorer(&mut report);
     stopping_a_job_reaches_the_parent(&mut report);
     a_number_no_signal_has(&mut report);
     a_signal_ends_a_sleep(&mut report);
