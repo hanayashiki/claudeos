@@ -81,6 +81,25 @@ fn page_fault(frame: &mut TrapFrame) {
         if fault.user { "user " } else { "kernel " },
         if fault.instruction_fetch { "instruction-fetch" } else { "" },
     );
+    // Every entry the walker reads for this address, out of the tables the
+    // machine is pointed at. A fault the last entry says should not have
+    // happened is one this is the only way to take further: what is left is a
+    // level above it, a translation cached from an older entry, or tables that
+    // are not the ones the access went through.
+    let live = arch::paging::AddressSpace::current();
+    live.dump_walk(addr);
+    if crate::sched::has_current() {
+        let task = crate::sched::current();
+        println!("  faulted in pid {} ({})", task.pid, task.name);
+        // The same tables in every path that reaches user memory through a
+        // task. Printed when they are not, because a check made against one
+        // and an access made through the other explains a fault that neither
+        // on its own does.
+        if task.space() != live {
+            println!("  but the task is recorded on other tables:");
+            task.space().dump_walk(addr);
+        }
+    }
     dump(frame);
     panic!("unrecoverable kernel page fault");
 }

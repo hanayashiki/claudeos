@@ -377,7 +377,14 @@ pub fn handle_user_page_fault(fault: &arch::PageFault) -> bool {
         // The page is present, so the only fault that can be repaired is a
         // write to a page still shared with another address space.
         if fault.write {
-            return current().handle_cow(fault.address);
+            // The copy is one step, and this machine's two halves disagree
+            // about how it is reached: an interrupt gate arrives here masked,
+            // a synchronous exception from user mode arrives with interrupts
+            // in the state the faulting code was in. Masking here is what
+            // stops the second from depending on the first.
+            return crate::sync::without_interrupts(|irq| {
+                current().handle_cow(fault.address, irq)
+            });
         }
         return false;
     }

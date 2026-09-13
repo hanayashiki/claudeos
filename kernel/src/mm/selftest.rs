@@ -36,6 +36,9 @@ impl Report {
 pub fn run(report: &mut Report) {
     refuses_a_second_mapping(report);
     refusing_leaks_nothing(report);
+    replacing_hands_the_old_frame_back(report);
+    replacing_nothing_maps_nothing(report);
+    replacing_leaks_nothing(report);
     #[cfg(target_arch = "aarch64")]
     device_window::run(report);
     #[cfg(target_arch = "aarch64")]
@@ -90,29 +93,26 @@ fn refuses_a_second_mapping(report: &mut Report) {
         report.check("an address space to map into", false);
         return;
     };
-    let (Some(first), Some(second)) = (frame::alloc_zeroed(), frame::alloc_zeroed()) else {
-        report.check("two frames to map", false);
-        space.destroy();
-        return;
-    };
-    let kept = first.addr();
-    let turned_away = second.addr();
+    let mapped = space.map_new(VIRT, flags());
 
     // Nothing may print between the calls below and the counts read after
-    // them: printing goes through the kernel heap, which takes frames.
-    let mapped = space.map(VIRT, first, flags());
-    let refused = space.map(VIRT, second, flags());
+    // them: printing goes through the kernel heap, which takes frames. The
+    // tables down to this address are built by the first call, so the only
+    // frame the refused one can take is the page it fails to map.
+    let (before, _) = frame::stats();
+    let refused = space.map_new(VIRT, flags());
+    let (after, _) = frame::stats();
     let still_there = space.translate(VIRT);
-    let released = frame::frame_references(turned_away);
 
     report.check("the first mapping goes in", mapped.is_ok());
     report.check(
         "a second mapping at the same address is refused",
         refused == Err(MapError::AlreadyMapped),
     );
-    report.check("the mapping that was there is untouched", still_there == Some(kept));
-    report.check("the frame that was turned away is released", released == 0);
+    report.check("the mapping that was there is untouched", still_there == mapped.ok());
+    report.check("the frame that was turned away is released", after == before);
 
+    let kept = mapped.unwrap_or(0);
     space.destroy();
     report.check(
         "tearing the space down releases what it held",
@@ -129,21 +129,114 @@ fn refusing_leaks_nothing(report: &mut Report) {
     let mut reached = 0usize;
     for _ in 0..ROUNDS {
         let Some(space) = AddressSpace::new_user() else { break };
-        let (Some(first), Some(second)) = (frame::alloc_zeroed(), frame::alloc_zeroed()) else {
-            space.destroy();
-            break;
-        };
-        if space.map(VIRT, first, flags()).is_err() {
+        if space.map_new(VIRT, flags()).is_err() {
             space.destroy();
             break;
         }
-        let _ = space.map(VIRT, second, flags());
+        let _ = space.map_new(VIRT, flags());
         space.destroy();
         reached += 1;
     }
     let (after, _) = frame::stats();
     report.check(
         "a thousand refused mappings cost no memory",
+        reached == ROUNDS && after == before,
+    );
+}
+
+/// What replaces a mapping is one store, so the address it covers is never
+/// without one. A machine with one processor cannot be caught in the middle
+/// of a store from here; what can be pinned is the accounting either side of
+/// it. The old entry's reference comes back in hand rather than being dropped
+/// where the caller cannot see it, which is what a copy-on-write fault needs:
+/// the frame it was sharing is still held by the address spaces that share it.
+fn replacing_hands_the_old_frame_back(report: &mut Report) {
+    let Some(space) = AddressSpace::new_user() else {
+        report.check("an address space to map into", false);
+        return;
+    };
+    let (Ok(old), Some(fresh)) = (space.map_new(VIRT, flags()), frame::alloc_zeroed()) else {
+        report.check("a mapping to replace and a frame to replace it with", false);
+        space.destroy();
+        return;
+    };
+    let new = fresh.addr();
+
+    // Every reading is taken before anything is printed, for the reason above.
+    let handed_back =
+        crate::sync::without_interrupts(|irq| space.replace(VIRT, fresh, flags(), irq));
+    let reaches = space.translate(VIRT);
+    let named = handed_back.as_ref().map(|frame| frame.addr());
+    let held_while_in_hand = frame::frame_references(old);
+    drop(handed_back);
+    let held_after = frame::frame_references(old);
+
+    report.check("the address reaches the replacement", reaches == Some(new));
+    report.check("the frame that was there is handed back", named == Some(old));
+    report.check("it is still held while the handle is", held_while_in_hand == 1);
+    report.check("and dropping the handle releases it", held_after == 0);
+
+    space.destroy();
+    report.check(
+        "the replacement goes when the space does",
+        frame::frame_references(new) == 0,
+    );
+}
+
+/// An address with nothing at it has no mapping to replace. Writing one there
+/// would be creating a mapping, which is what `map_new` is for, and it would
+/// hand back a frame reference that no entry was holding.
+fn replacing_nothing_maps_nothing(report: &mut Report) {
+    let Some(space) = AddressSpace::new_user() else {
+        report.check("an address space to map into", false);
+        return;
+    };
+    let Some(fresh) = frame::alloc_zeroed() else {
+        report.check("a frame to offer", false);
+        space.destroy();
+        return;
+    };
+    let offered = fresh.addr();
+
+    let handed_back =
+        crate::sync::without_interrupts(|irq| space.replace(VIRT, fresh, flags(), irq));
+    let refused = handed_back.is_none();
+    drop(handed_back);
+    let reaches = space.translate(VIRT);
+    let released = frame::frame_references(offered);
+
+    report.check("replacing what is not there is refused", refused);
+    report.check("and leaves the address with nothing at it", reaches.is_none());
+    report.check("and releases the frame it was offered", released == 0);
+    space.destroy();
+}
+
+/// A replacement that dropped the old entry's reference on the floor would
+/// cost one frame each time, and one that took an extra would cost one for
+/// every frame it handed back. A thousand of them cost neither.
+fn replacing_leaks_nothing(report: &mut Report) {
+    const ROUNDS: usize = 1000;
+    let (before, _) = frame::stats();
+    let mut reached = 0usize;
+    for _ in 0..ROUNDS {
+        let Some(space) = AddressSpace::new_user() else { break };
+        if space.map_new(VIRT, flags()).is_err() {
+            space.destroy();
+            break;
+        }
+        let Some(fresh) = frame::alloc_zeroed() else {
+            space.destroy();
+            break;
+        };
+        drop(crate::sync::without_interrupts(|irq| {
+            space.replace(VIRT, fresh, flags(), irq)
+        }));
+        space.destroy();
+        reached += 1;
+    }
+    let (after, _) = frame::stats();
+    report.check(
+        "a thousand replacements cost no memory",
         reached == ROUNDS && after == before,
     );
 }

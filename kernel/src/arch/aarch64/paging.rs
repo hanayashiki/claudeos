@@ -13,6 +13,7 @@
 
 use crate::mm::frame::{self, Frame};
 use crate::mm::{phys_to_virt, HHDM_BASE, PAGE_SIZE_U64};
+use crate::sync::NoInterrupts;
 use core::arch::asm;
 
 /// The descriptor is valid. At the last level a page descriptor also needs
@@ -291,7 +292,15 @@ impl AddressSpace {
     /// The descriptor is the only record of the reference the frame it names
     /// holds, so writing over it would leave that frame with no owner and no
     /// way back to the allocator.
-    pub fn map(&self, virt: u64, frame: Frame, flags: u64) -> Result<(), MapError> {
+    ///
+    /// Private. The one caller outside this file was the second half of a
+    /// change to a live address space, with `unmap` as the first, and between
+    /// the two the address had nothing at it -- a state everything else in the
+    /// kernel reads as a page that has never been touched. From outside, a
+    /// page that was not there goes in through `map_new` and a page that
+    /// stands in for one that was goes in through `replace`, which is one
+    /// store and so cannot be split.
+    fn map(&self, virt: u64, frame: Frame, flags: u64) -> Result<(), MapError> {
         unsafe {
             let entry = self.entry_for(virt, true)?;
             if (*entry).is_present() {
@@ -323,6 +332,103 @@ impl AddressSpace {
         let phys = frame.addr();
         self.map(virt, frame, flags)?;
         Ok(phys)
+    }
+
+    /// Print the walk of `virt` through this hierarchy, descriptor by
+    /// descriptor.
+    ///
+    /// A fault report that says a page is present and writable is a summary of
+    /// the last descriptor only. When that descriptor looks right and the
+    /// access faulted anyway, what is wanted is every descriptor the walker
+    /// actually reads, out of the tables the machine is pointed at rather than
+    /// the ones a task is recorded on.
+    ///
+    /// Only the ones that end the walk are named by their permissions. The
+    /// bits that say read-only and reachable from the level below mean nothing
+    /// in a descriptor that points at another table, so printing them there
+    /// would be reporting a permission the walk does not have.
+    pub fn dump_walk(&self, virt: u64) {
+        crate::println!("  walk of {:#018x} through {:#x}:", virt, self.root);
+        unsafe {
+            let mut table = self.root;
+            for level in (0..4).rev() {
+                let idx = index_of(virt, level);
+                let entry = *table_at(table).add(idx);
+                if !entry.is_present() {
+                    crate::println!(
+                        "    level {} index {:3} = {:#018x} absent",
+                        level + 1,
+                        idx,
+                        entry.bits(),
+                    );
+                    return;
+                }
+                let block = level > 0 && entry.bits() & PAGE_DESCRIPTOR == 0;
+                if !block && level > 0 {
+                    crate::println!(
+                        "    level {} index {:3} = {:#018x} present, a table",
+                        level + 1,
+                        idx,
+                        entry.bits(),
+                    );
+                    table = entry.addr();
+                    continue;
+                }
+                crate::println!(
+                    "    level {} index {:3} = {:#018x} present{}{}{}{}",
+                    level + 1,
+                    idx,
+                    entry.bits(),
+                    if entry.bits() & READ_ONLY != 0 { " read-only" } else { " writable" },
+                    if entry.bits() & USER != 0 { " user" } else { " supervisor" },
+                    if entry.bits() & COW != 0 { " copy-on-write" } else { "" },
+                    if block { ", a block" } else { "" },
+                );
+                return;
+            }
+        }
+    }
+
+    /// Put `frame` at `virt` in place of what is mapped there, handing back the
+    /// reference the old descriptor held. Dropping the result releases it.
+    ///
+    /// One store, because the two-step form is wrong and reads as if it were
+    /// not. Taking the old mapping away and putting the new one in as two
+    /// calls leaves the address with nothing at it in between, and a sibling
+    /// task on this address space that touches it there does not find a page
+    /// that is on its way back: it finds one that was never there, and the
+    /// fault handler gives it a fresh zero page over the top. The contents are
+    /// gone and the mapping that was coming in is then refused as well. A
+    /// fault from the level below is handled here with interrupts in the state
+    /// the faulting code was in, so on this machine the sibling needs nothing
+    /// unusual to get in.
+    ///
+    /// The token says nothing else runs between reading the old descriptor and
+    /// writing the new one, which is what stops the frame this hands back from
+    /// being released twice.
+    ///
+    /// `None` when nothing was mapped at `virt`: nothing is written and
+    /// `frame` is released, because putting it in would be creating a mapping
+    /// rather than replacing one.
+    #[must_use = "dropping the frame is what releases it"]
+    pub fn replace(
+        &self,
+        virt: u64,
+        frame: Frame,
+        flags: u64,
+        _irq: NoInterrupts,
+    ) -> Option<Frame> {
+        let old = unsafe {
+            let entry = self.entry_for(virt, false).ok()?;
+            if !(*entry).is_present() {
+                return None;
+            }
+            let old = (*entry).addr();
+            encode(frame.into_recorded(), flags).store(entry);
+            old
+        };
+        flush_tlb(virt);
+        Some(unsafe { Frame::from_recorded(old) })
     }
 
     /// Take the mapping away, handing back the reference it held.

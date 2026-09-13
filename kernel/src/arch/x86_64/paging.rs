@@ -5,6 +5,7 @@
 
 use crate::mm::frame::{self, Frame};
 use crate::mm::{page_align_down, page_align_up, phys_to_virt, HHDM_BASE, PAGE_SIZE_U64};
+use crate::sync::NoInterrupts;
 use core::arch::asm;
 
 pub const PRESENT: u64 = 1 << 0;
@@ -204,10 +205,16 @@ impl AddressSpace {
     /// An address that already has a mapping is refused rather than replaced.
     /// The entry is the only record of the reference the frame it names holds,
     /// so writing over it would leave that frame with no owner and no way back
-    /// to the allocator. A caller that means to replace a mapping takes the
-    /// old one away first and decides for itself what to do with what `unmap`
-    /// hands back.
-    pub fn map(&self, virt: u64, frame: Frame, flags: u64) -> Result<(), MapError> {
+    /// to the allocator.
+    ///
+    /// Private. The one caller outside this file was the second half of a
+    /// change to a live address space, with `unmap` as the first, and between
+    /// the two the address had nothing at it -- a state everything else in the
+    /// kernel reads as a page that has never been touched. From outside, a
+    /// page that was not there goes in through `map_new` and a page that
+    /// stands in for one that was goes in through `replace`, which is one
+    /// store and so cannot be split.
+    fn map(&self, virt: u64, frame: Frame, flags: u64) -> Result<(), MapError> {
         let virt = page_align_down(virt);
         unsafe {
             let entry = self.entry_for(virt, true, flags)?;
@@ -239,6 +246,86 @@ impl AddressSpace {
         let phys = frame.addr();
         self.map(virt, frame, flags)?;
         Ok(phys)
+    }
+
+    /// Print the walk of `virt` through this hierarchy, entry by entry.
+    ///
+    /// A fault report that says a page is present and writable is a summary of
+    /// the last entry only. When that entry looks right and the access faulted
+    /// anyway, what is wanted is every entry the walker actually reads, out of
+    /// the table the machine is pointed at rather than the one a task is
+    /// recorded on.
+    pub fn dump_walk(&self, virt: u64) {
+        crate::println!("  walk of {:#018x} through {:#x}:", virt, self.pml4);
+        unsafe {
+            let mut table = self.pml4;
+            for level in (0..4).rev() {
+                let idx = index_of(virt, level);
+                let entry = *table_at(table).add(idx);
+                if !entry.is_present() {
+                    crate::println!(
+                        "    level {} index {:3} = {:#018x} absent",
+                        level + 1,
+                        idx,
+                        entry.bits(),
+                    );
+                    return;
+                }
+                crate::println!(
+                    "    level {} index {:3} = {:#018x} present{}{}{}{}",
+                    level + 1,
+                    idx,
+                    entry.bits(),
+                    if entry.bits() & WRITABLE != 0 { " writable" } else { " read-only" },
+                    if entry.bits() & USER != 0 { " user" } else { " supervisor" },
+                    if entry.bits() & HUGE != 0 { " huge" } else { "" },
+                    if level == 0 && entry.bits() & COW != 0 { " copy-on-write" } else { "" },
+                );
+                if entry.bits() & HUGE != 0 {
+                    return;
+                }
+                table = entry.addr();
+            }
+        }
+    }
+
+    /// Put `frame` at `virt` in place of what is mapped there, handing back the
+    /// reference the old entry held. Dropping the result releases it.
+    ///
+    /// One store, because the two-step form is wrong and reads as if it were
+    /// not. Taking the old mapping away and putting the new one in as two
+    /// calls leaves the address with nothing at it in between, and a sibling
+    /// task on this address space that touches it there does not find a page
+    /// that is on its way back: it finds one that was never there, and the
+    /// fault handler gives it a fresh zero page over the top. The contents are
+    /// gone and the mapping that was coming in is then refused as well.
+    ///
+    /// The token says nothing else runs between reading the old entry and
+    /// writing the new one, which is what stops the frame this hands back from
+    /// being released twice.
+    ///
+    /// `None` when nothing was mapped at `virt`: nothing is written and
+    /// `frame` is released, because putting it in would be creating a mapping
+    /// rather than replacing one.
+    #[must_use = "dropping the frame is what releases it"]
+    pub fn replace(
+        &self,
+        virt: u64,
+        frame: Frame,
+        flags: u64,
+        _irq: NoInterrupts,
+    ) -> Option<Frame> {
+        let virt = page_align_down(virt);
+        unsafe {
+            let entry = self.entry_for(virt, false, flags).ok()?;
+            let old = *entry;
+            if !old.is_present() {
+                return None;
+            }
+            Entry::new((frame.into_recorded() & ADDR_MASK) | flags | PRESENT).store(entry);
+            flush_tlb(virt);
+            Some(Frame::from_recorded(old.addr()))
+        }
     }
 
     /// Take the mapping at `virt` away, handing back the reference the entry
