@@ -1,13 +1,29 @@
 //! Memory-related system calls.
 
 use crate::abi::*;
-use crate::arch::paging::{NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::arch::paging::{is_user_addr, NO_EXECUTE, PRESENT, USER, WRITABLE};
 use crate::mm::{page_align_down, page_align_up, PAGE_SIZE_U64, USER_MMAP_BASE};
 use crate::sched;
 use crate::uaccess;
 
 /// Upper bound on a single mapping, so a bogus length fails fast.
 const MAX_MAPPING: u64 = 1 << 40;
+
+/// True when `[addr, addr + len)` lies entirely in the half a program owns.
+///
+/// Every address in these calls comes from the program, and an address in the
+/// other half names the kernel's own memory. Those tables are shared by
+/// reference with every address space, so a mapping taken away there is taken
+/// away from the kernel as well and the frame goes back to the allocator while
+/// the kernel is still reading it. The comparison against `USER_MMAP_BASE`
+/// that the hint used to be given does not stand in for this: it is unsigned,
+/// and every kernel address is above it.
+fn in_user_space(addr: u64, len: u64) -> bool {
+    match addr.checked_add(len) {
+        Some(end) => is_user_addr(addr) && is_user_addr(end.saturating_sub(1)),
+        None => false,
+    }
+}
 
 fn prot_to_flags(prot: u64) -> u64 {
     let mut bits = PRESENT | USER;
@@ -59,7 +75,7 @@ pub fn mmap(
     let len = page_align_up(length);
 
     let base = if flags & MAP_FIXED != 0 {
-        if addr == 0 || addr & (PAGE_SIZE_U64 - 1) != 0 {
+        if addr == 0 || addr & (PAGE_SIZE_U64 - 1) != 0 || !in_user_space(addr, len) {
             return Err(Errno::EINVAL);
         }
         // Replace whatever was there.
@@ -68,7 +84,13 @@ pub fn mmap(
     } else {
         let task = sched::current();
         let hint = page_align_down(addr);
-        if hint != 0 && hint >= USER_MMAP_BASE && task.find_vma(hint).is_none() {
+        // A hint is a suggestion, so one that cannot be honoured is passed
+        // over rather than reported.
+        if hint != 0
+            && hint >= USER_MMAP_BASE
+            && in_user_space(hint, len)
+            && task.find_vma(hint).is_none()
+        {
             hint
         } else {
             task.find_free_region(len)
@@ -112,6 +134,12 @@ pub fn mmap(
 }
 
 fn unmap_range(addr: u64, len: u64) {
+    // Every path into here has already refused an address outside user space;
+    // this is the seam they all cross, so it is checked once more where a new
+    // caller cannot miss it.
+    if !in_user_space(addr, len) {
+        return;
+    }
     let task = sched::current();
     let start = page_align_down(addr);
     let end = page_align_up(addr + len);
@@ -124,7 +152,7 @@ fn unmap_range(addr: u64, len: u64) {
 }
 
 pub fn munmap(addr: u64, length: u64) -> SysResult {
-    if length == 0 || addr & (PAGE_SIZE_U64 - 1) != 0 {
+    if length == 0 || addr & (PAGE_SIZE_U64 - 1) != 0 || !in_user_space(addr, length) {
         return Err(Errno::EINVAL);
     }
     unmap_range(addr, length);
@@ -132,7 +160,7 @@ pub fn munmap(addr: u64, length: u64) -> SysResult {
 }
 
 pub fn mprotect(addr: u64, length: u64, prot: u64) -> SysResult {
-    if addr & (PAGE_SIZE_U64 - 1) != 0 {
+    if addr & (PAGE_SIZE_U64 - 1) != 0 || !in_user_space(addr, length) {
         return Err(Errno::EINVAL);
     }
     let task = sched::current();
@@ -164,6 +192,9 @@ pub fn mprotect(addr: u64, length: u64, prot: u64) -> SysResult {
 pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, _flags: u64) -> SysResult {
     let old_size = page_align_up(old_size);
     let new_size = page_align_up(new_size);
+    if !in_user_space(old_addr, old_size.max(new_size)) {
+        return Err(Errno::EINVAL);
+    }
     if new_size <= old_size {
         if new_size < old_size {
             unmap_range(old_addr + new_size, old_size - new_size);

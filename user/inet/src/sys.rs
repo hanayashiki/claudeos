@@ -85,6 +85,22 @@ pub fn mmap_anon(addr: u64, len: u64) -> i64 {
     }
 }
 
+/// The same, but demanding that address rather than suggesting it.
+pub fn mmap_fixed(addr: u64, len: u64) -> i64 {
+    const MAP_FIXED: u64 = 0x10;
+    unsafe {
+        syscall(
+            SYS_MMAP,
+            addr,
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+            -1i64 as u64,
+            0,
+        )
+    }
+}
+
 pub fn munmap(addr: u64, len: u64) -> i64 {
     unsafe { syscall(SYS_MUNMAP, addr, len, 0, 0, 0, 0) }
 }

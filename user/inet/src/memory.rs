@@ -13,6 +13,47 @@ pub fn run(report: &mut Report) {
     exec_that_fails_keeps_the_memory_state(report);
     a_thread_left_unreaped_keeps_the_space(report);
     argument_blocks_larger_than_the_stack_is_mapped_with(report);
+    addresses_outside_user_space_are_refused(report);
+}
+
+/// mmap takes an address from the program, and has to satisfy itself that it
+/// is one the program could reach. The upper half of the tables is the
+/// kernel's and is shared by reference with every address space, so taking a
+/// mapping away there takes it away from the kernel too and gives the frame
+/// back to the allocator while it is still being read.
+fn addresses_outside_user_space_are_refused(report: &mut Report) {
+    const EINVAL: i64 = -22;
+    // The base of the kernel heap, which every address space maps.
+    const KERNEL: u64 = 0xFFFF_C000_0000_0000;
+    // The lowest address the upper half starts at.
+    const USER_END: u64 = 0x0000_8000_0000_0000;
+    const LEN: u64 = 4096;
+
+    let demanded = sys::mmap_fixed(KERNEL, LEN);
+    report.check(
+        "a mapping demanded outside user space is refused",
+        demanded == EINVAL,
+        format!("mmap returned {:#x}", demanded),
+    );
+
+    let hinted = sys::mmap_anon(KERNEL, LEN);
+    let in_user_space = hinted > 0 && (hinted as u64) < USER_END;
+    report.check(
+        "a hint outside user space is not taken",
+        in_user_space,
+        format!("mmap returned {:#x}", hinted),
+    );
+    if in_user_space {
+        sys::munmap(hinted as u64, LEN);
+    }
+
+    // The kernel half is still there and still being used: anything that
+    // allocates in it after the calls above would have found a hole.
+    report.check(
+        "the machine still reads its own memory afterwards",
+        free_kib().is_some(),
+        String::from("/proc/meminfo could not be read"),
+    );
 }
 
 /// Exec `/bin/true` with `count` arguments of `bytes` each, in a child, and
