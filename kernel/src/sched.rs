@@ -283,7 +283,7 @@ pub fn sleep_ticks(ticks: u64) {
     // which is for good. Turning interrupts off only stops something else
     // starting now, so the question has to be asked again inside the same
     // window and the sleep skipped if the answer has changed.
-    crate::sync::without_interrupts(|| {
+    crate::sync::without_interrupts(|_irq| {
         if has_pending_signal() {
             return;
         }
@@ -407,7 +407,7 @@ pub fn exit_current(status: i32) -> ! {
         // same breath. A timer landing between the two would hand the CPU to
         // something else and never hand it back, leaving the parent's
         // wake-up undelivered by a task that can no longer deliver it.
-        crate::sync::without_interrupts(|| {
+        crate::sync::without_interrupts(|_irq| {
             let mut task = current();
             task.state = State::Zombie;
 
@@ -536,7 +536,7 @@ fn stop_current(signal: i32) {
     // never hands it back, because this task is no longer runnable, so the
     // notification is left undelivered by a task that can no longer deliver
     // it and the parent sleeps in wait4 for good.
-    let stopped = crate::sync::without_interrupts(|| {
+    let stopped = crate::sync::without_interrupts(|_irq| {
         let mut task = current();
         // The stop signal's pending bit was cleared before this was called, so
         // a continue that arrived since then found a runnable task with no

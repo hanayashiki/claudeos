@@ -156,7 +156,7 @@ fn abandon_exec(
     // and the CPU following it the two disagree. A sibling thread recorded on
     // the old space is then resumed with no reload and runs on the half-built
     // exec image. The pair has to move together.
-    crate::sync::without_interrupts(|| {
+    crate::sync::without_interrupts(|_irq| {
         task.space = old_space;
         task.mm = old_mm;
         unsafe { old_space.switch_to() };
@@ -208,7 +208,7 @@ pub fn exec_into_current(
     let mut task = sched::current();
     let old_mm = alloc::sync::Arc::clone(&task.mm);
     let new_mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
-    crate::sync::without_interrupts(|| {
+    crate::sync::without_interrupts(|_irq| {
         task.space = new_space;
         task.mm = new_mm;
         unsafe { new_space.switch_to() };
