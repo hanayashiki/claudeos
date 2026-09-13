@@ -113,6 +113,26 @@ pub fn fork(
     Ok(child_pid as u64)
 }
 
+/// Put the task back on the image it was running when an exec could not be
+/// finished.
+///
+/// Both halves of what was swapped out have to come back. The page tables are
+/// the obvious one; the record of regions and the program break is the other,
+/// and the fault handler consults it for every page that has not been touched
+/// yet, so a task left running with an empty one takes a fault it cannot serve
+/// on the first stack page or heap byte it reaches.
+fn abandon_exec(
+    task: &mut Task,
+    old_space: AddressSpace,
+    old_mm: alloc::sync::Arc<crate::sync::Spinlock<crate::task::MemState>>,
+    new_space: AddressSpace,
+) {
+    task.space = old_space;
+    task.mm = old_mm;
+    unsafe { old_space.switch_to() };
+    new_space.destroy();
+}
+
 /// Replace the current task's program image.
 pub fn exec_into_current(
     path: &str,
@@ -151,6 +171,10 @@ pub fn exec_into_current(
     let mut task = sched::current();
     task.space = new_space;
     // exec starts a fresh address space; a shared record must not follow it.
+    // The old record is kept until the image is known to load, because the
+    // page tables it describes are still there and the task goes back to
+    // running on them if it does not.
+    let old_mm = alloc::sync::Arc::clone(&task.mm);
     task.mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
     unsafe { new_space.switch_to() };
 
@@ -159,9 +183,7 @@ pub fn exec_into_current(
     let image = match elf::load_at(&new_space, &node.inner.lock().data, None, Some(node.clone())) {
         Ok(image) => image,
         Err(err) => {
-            task.space = old_space;
-            unsafe { old_space.switch_to() };
-            new_space.destroy();
+            abandon_exec(&mut task, old_space, old_mm, new_space);
             return Err(err);
         }
     };
@@ -222,9 +244,7 @@ pub fn exec_into_current(
                     interp_path,
                     err
                 );
-                task.space = old_space;
-                unsafe { old_space.switch_to() };
-                new_space.destroy();
+                abandon_exec(&mut task, old_space, old_mm, new_space);
                 return Err(Errno::ENOENT);
             }
         }
@@ -233,9 +253,7 @@ pub fn exec_into_current(
     let sp = match task::build_user_stack(&mut task, &image, &argv, &envp, &exec_path, interp_base) {
         Ok(sp) => sp,
         Err(err) => {
-            task.space = old_space;
-            unsafe { old_space.switch_to() };
-            new_space.destroy();
+            abandon_exec(&mut task, old_space, old_mm, new_space);
             return Err(err);
         }
     };
