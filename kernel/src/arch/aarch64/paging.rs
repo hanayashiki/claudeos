@@ -101,6 +101,19 @@ pub unsafe fn write_ttbr(phys: u64) {
     );
 }
 
+/// The operand `tlbi` by address takes: bits 55 to 12 of the address in the
+/// low forty-four bits, and a hint in bits 47 to 44 saying which level of the
+/// walk the entry came from. The mask is what keeps the address out of the
+/// hint. An address in the kernel's half is sign-extended, so shifting alone
+/// would leave its bits 59 to 56 sitting in that field, all ones, claiming a
+/// level that does not match this granule. The Pi 4's core does not implement
+/// the field and ignores it; on a part that does, the invalidation is then
+/// permitted not to happen.
+#[inline]
+pub const fn invalidation_operand(virt: u64) -> u64 {
+    (virt >> 12) & 0xFFF_FFFF_FFFF
+}
+
 #[inline]
 pub fn flush_tlb(virt: u64) {
     unsafe {
@@ -109,7 +122,7 @@ pub fn flush_tlb(virt: u64) {
             "tlbi vaae1is, {page}",
             "dsb ish",
             "isb",
-            page = in(reg) virt >> 12,
+            page = in(reg) invalidation_operand(virt),
         );
     }
 }

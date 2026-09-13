@@ -368,14 +368,16 @@ failures.
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
   subprocesses and `/proc`.
-- The `rtest` applet runs **37 checks** against the Rust standard library:
+- The `rtest` applet runs **38 checks** against the Rust standard library:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
   thread sleep against the monotonic clock, file read/write/seek/append,
   directory iteration, `std::process::Command` capturing a child's output
   through pipes, signal handlers running and returning, a `UnixStream` pair
-  carrying bytes both ways, and an epoll set woken by a counter and a socket,
-  timing out when it should and waking promptly when a write arrives.
+  carrying bytes both ways, an epoll set woken by a counter and a socket,
+  timing out when it should and waking promptly when a write arrives, and a
+  walk of the system call numbers past the end of the table, every one of which
+  has to answer ENOSYS.
 - `tests/busybox.sh` runs **39 checks** against an upstream busybox binary that
   this project did not build: `awk`, `sed`, `tar` create and extract, `find`,
   `md5sum` and `sha256sum` (whose digests are compared against the ones the

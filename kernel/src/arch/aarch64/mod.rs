@@ -71,14 +71,19 @@ extern "C" {
 /// of the address space are translated through separate base registers here,
 /// and everything from this address up goes through the second one.
 pub const HHDM_BASE: u64 = 0xFFFF_8000_0000_0000;
-/// Size of the region the boot code direct-maps: four 1 GiB blocks, which on
-/// this board is memory and then the peripherals.
+/// Size of the region the boot code direct-maps: the low four gigabytes,
+/// which on this board is memory and then the peripherals.
 pub const HHDM_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 /// Where the direct map stops covering memory and starts covering registers.
-/// The boot code gives the last of its four blocks device attributes, so
-/// anything from here up is already reachable uncached through `phys_to_virt`
-/// and a device found there needs no mapping of its own.
-pub const DEVICE_PHYS_BASE: u64 = 3 * 1024 * 1024 * 1024;
+/// Everything from here to `HHDM_LIMIT` carries device attributes, so a
+/// device found there is already reachable uncached through `phys_to_virt`
+/// and needs no mapping of its own.
+///
+/// It is also the ceiling on what the frame allocator may hand out: a frame
+/// above it has no cacheable alias, and the firmware on a 4 GiB or 8 GiB
+/// board reports memory running all the way up to this address. `boot.s`
+/// carries the same number, as the point its 2 MiB blocks change attribute.
+pub const DEVICE_PHYS_BASE: u64 = 0xFC00_0000;
 
 /// Virtual base the kernel image is linked at.
 pub const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;

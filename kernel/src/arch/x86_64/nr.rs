@@ -3,6 +3,13 @@
 //! The numbering is per-architecture: the same name carries a different number
 //! on every Linux port, so this table belongs on this side of the boundary.
 
+/// First of the numbers that name no call. Nothing below uses it: x86-64 kept
+/// its historical table and has a real Linux number for every name. It is
+/// here because the dispatcher stops at the same place on both machines, and
+/// on the other one this is where the placeholders for calls that machine has
+/// no number for begin. Linux numbers nothing anywhere near it.
+pub const ABSENT: u64 = 0x1_0000;
+
 pub const READ: u64 = 0;
 pub const WRITE: u64 = 1;
 pub const OPEN: u64 = 2;
