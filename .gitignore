@@ -3,3 +3,4 @@ build/
 *.o
 *.cpio
 .claude/
+.vscode/
