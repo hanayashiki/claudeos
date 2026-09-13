@@ -85,9 +85,32 @@ pub fn write_bytes(addr: u64, buf: &[u8]) -> Result<(), Errno> {
     write_bytes_in(&crate::sched::current(), addr, buf)
 }
 
+/// Copy into user memory a page at a time, checking each page and writing it
+/// with nothing else able to run in between.
+///
+/// A fork takes write permission away from every page of the address space it
+/// copies, the parent's included, so a thread that forks while a sibling is
+/// inside a write turns pages that sibling has already checked read-only. The
+/// store then faults in the kernel, which is fatal. Checking and copying under
+/// the same block closes that, and a page at a time is what keeps the block
+/// from being as long as whatever buffer the program passed.
 pub fn write_bytes_in(task: &Task, addr: u64, buf: &[u8]) -> Result<(), Errno> {
-    validate_in(task, addr, buf.len() as u64, true)?;
-    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), addr as *mut u8, buf.len()) };
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let end = addr.checked_add(buf.len() as u64).ok_or(Errno::EFAULT)?;
+    let mut at = addr;
+    while at < end {
+        let chunk_end = (page_align_down(at) + PAGE_SIZE_U64).min(end);
+        let from = (at - addr) as usize;
+        let len = (chunk_end - at) as usize;
+        crate::sync::without_interrupts(|| -> Result<(), Errno> {
+            validate_in(task, at, len as u64, true)?;
+            unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr().add(from), at as *mut u8, len) };
+            Ok(())
+        })?;
+        at = chunk_end;
+    }
     Ok(())
 }
 
@@ -133,9 +156,13 @@ pub fn read_struct<T: Copy>(addr: u64) -> Result<T, Errno> {
 
 pub fn write_struct<T: Copy>(addr: u64, value: &T) -> Result<(), Errno> {
     let size = core::mem::size_of::<T>();
-    validate(addr, size as u64, true)?;
-    unsafe { core::ptr::write_unaligned(addr as *mut T, *value) };
-    Ok(())
+    let task = crate::sched::current();
+    // Checked and written together, for the same reason `write_bytes_in` is.
+    crate::sync::without_interrupts(|| -> Result<(), Errno> {
+        validate_in(&task, addr, size as u64, true)?;
+        unsafe { core::ptr::write_unaligned(addr as *mut T, *value) };
+        Ok(())
+    })
 }
 
 /// Read a NUL-terminated string, at most `max` bytes long.

@@ -287,6 +287,68 @@ fn what_a_wait_does_with_signals(report: &mut Report) {
     );
 }
 
+/// A fork takes write permission away from every page of the address space it
+/// copies, the parent's included. A sibling thread inside a write to user
+/// memory has already had its buffer checked by then, so the copy that follows
+/// stores into a page that has just become read-only.
+fn a_fork_while_a_sibling_writes(report: &mut Report) {
+    use crate::sys;
+    use std::sync::atomic::AtomicBool;
+
+    static RUNNING: AtomicBool = AtomicBool::new(true);
+    let devnull = sys::open("/dev/null", sys::O_WRONLY, 0);
+    let writes = Arc::new(AtomicUsize::new(0));
+    let writer_count = Arc::clone(&writes);
+    let writer = std::thread::spawn(move || {
+        let buf = vec![7u8; 8192];
+        let mut back = vec![0u8; 8192];
+        let fd = sys::open("/tmp/forkrace.dat", sys::O_WRONLY | 0o100 | 0o1000, 0o644);
+        while RUNNING.load(Ordering::Relaxed) {
+            if fd >= 0 {
+                sys::write(fd as i32, &buf);
+            }
+            if devnull >= 0 {
+                sys::write(devnull as i32, &buf);
+            }
+            // A read is what puts the kernel on the writing side of a user
+            // buffer, which is where the store happens.
+            let rd = sys::open("/tmp/forkrace.dat", sys::O_RDONLY, 0);
+            if rd >= 0 {
+                sys::read(rd as i32, &mut back);
+                sys::close(rd as i32);
+            }
+            writer_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if fd >= 0 {
+            sys::close(fd as i32);
+        }
+    });
+
+    let mut rounds = 0;
+    for _ in 0..60 {
+        let child = sys::fork();
+        if child == 0 {
+            sys::exit_group(0);
+        }
+        let (pid, _) = sys::wait4(child as i32, 0);
+        if pid == child {
+            rounds += 1;
+        }
+    }
+    RUNNING.store(false, Ordering::Relaxed);
+    let _ = writer.join();
+    if devnull >= 0 {
+        sys::close(devnull as i32);
+    }
+    let _ = std::fs::remove_file("/tmp/forkrace.dat");
+
+    report.check(
+        "a fork does not fault a sibling's copy out of the kernel",
+        rounds == 60 && writes.load(Ordering::Relaxed) > 0,
+        format!("{} rounds, {} writes", rounds, writes.load(Ordering::Relaxed)),
+    );
+}
+
 /// A child that has not written to its stack since the fork still shares those
 /// pages with the parent, so the signal frame the kernel writes there goes
 /// through the path that breaks the sharing first.
@@ -801,6 +863,7 @@ pub fn main(_args: &[String]) -> i32 {
     thread_of_a_child_is_not_a_child(&mut report);
     a_child_exit_reaches_a_blocked_parent(&mut report);
     what_a_wait_does_with_signals(&mut report);
+    a_fork_while_a_sibling_writes(&mut report);
     a_signal_frame_on_a_shared_page(&mut report);
     stopping_a_job_reaches_the_parent(&mut report);
     a_signal_ends_a_sleep(&mut report);
