@@ -1,11 +1,14 @@
 //! Wall clock and monotonic time.
 //!
 //! The machine's real-time clock is read once at boot. Elapsed time comes from
-//! the CPU's free-running cycle counter, calibrated against the timer tick,
-//! because a clock that only advances 100 times a second cannot measure
-//! anything a program is likely to be timing.
+//! the CPU's free-running cycle counter, because a clock that only advances
+//! 100 times a second cannot measure anything a program is likely to be
+//! timing. What makes that counter a clock is the rate it runs at, and the
+//! machine is asked for that: `counter_frequency` reads it out of a register
+//! on one machine and measures it against the interval timer's own countdown
+//! on the other.
 
-use crate::arch::{cycle_counter, TICK_HZ};
+use crate::arch::{counter_frequency, cycle_counter, TICK_HZ};
 use crate::sync::Spinlock;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,13 +20,26 @@ static BOOT_UNIX_TIME: Spinlock<i64> = Spinlock::new(0);
 static CYCLES_BASE: AtomicU64 = AtomicU64::new(0);
 static CYCLES_PER_SECOND: AtomicU64 = AtomicU64::new(0);
 
-/// Measure the cycle counter against the timer tick.
+/// Find out what a unit of the cycle counter is worth, and start the clock.
 ///
-/// Called once interrupts are on and the tick is running. Ticks are the only
-/// other clock, so the calibration is no better than a tick: it waits for a
-/// tick edge, counts over several ticks, and divides.
+/// Called once interrupts are on and the tick is running, because the fallback
+/// below needs the tick.
 pub fn calibrate() {
-    const TICKS: u64 = 5;
+    let per_second = counter_frequency();
+    if per_second != 0 {
+        adopt(per_second);
+        return;
+    }
+    // Nothing on this machine would say, so the tick is what is left to
+    // measure against. It is a poor reference: a tick is delivered as late as
+    // interrupts happen to have been off for, and that lateness lands whole
+    // inside a window this short. The timer that raises it free-runs, so a
+    // late tick shortens the next one and only the first and last tick's
+    // lateness survives the run -- the error is their difference spread over
+    // the window, which is why the window is fifty ticks and not five. An
+    // emulated machine measured 2.1 per cent off over five ticks and 0.06 over
+    // fifty, at the cost of half a second of boot.
+    const TICKS: u64 = 50;
     let start_tick = crate::trap::ticks();
     while crate::trap::ticks() == start_tick {
         core::hint::spin_loop();
@@ -38,9 +54,15 @@ pub fn calibrate() {
     if elapsed_ticks == 0 || elapsed == 0 {
         return;
     }
-    let per_second = elapsed * TICK_HZ as u64 / elapsed_ticks;
-    // The counter's zero is whenever the machine started; take the reading at
-    // the end of calibration as the base and add the time already elapsed.
+    adopt(elapsed * TICK_HZ as u64 / elapsed_ticks);
+}
+
+/// Take `per_second` as the counter's rate and place the clock's zero.
+///
+/// The counter's own zero is whenever the machine started, which is earlier
+/// than anything the kernel saw, so the reading now is taken as the time the
+/// tick count says has passed.
+fn adopt(per_second: u64) {
     CYCLES_PER_SECOND.store(per_second, Ordering::Release);
     let elapsed_ns = crate::trap::ticks() * (1_000_000_000 / TICK_HZ as u64);
     let base = cycle_counter().saturating_sub(elapsed_ns * per_second / 1_000_000_000);

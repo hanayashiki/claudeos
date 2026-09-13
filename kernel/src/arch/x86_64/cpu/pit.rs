@@ -4,7 +4,9 @@ use super::super::io::outb;
 
 const CHANNEL0: u16 = 0x40;
 const COMMAND: u16 = 0x43;
-const BASE_FREQUENCY: u32 = 1_193_182;
+/// What the chip counts down at, which is one of the machine's fixed
+/// numbers rather than something it has to be asked.
+pub const BASE_FREQUENCY: u32 = 1_193_182;
 
 pub const TICK_HZ: u32 = 100;
 
