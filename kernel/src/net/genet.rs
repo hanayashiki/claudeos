@@ -99,11 +99,22 @@ const IRQ_RXDMA_DONE: u32 = 1 << 13;
 const IRQ_TXDMA_DONE: u32 = 1 << 16;
 
 const RBUF_CTRL: u32 = 0x0300;
+/// Put a 64-byte status block in front of every received frame. Left off: the
+/// only thing in it this driver would read is the length, and the descriptor
+/// carries that too.
+const RBUF_64B_EN: u32 = 1 << 0;
 /// Have the controller put two bytes in front of every received frame, so the
 /// IP header inside it lands on a four-byte boundary. Both references set it,
 /// and both then skip those two bytes on the way out.
 const RBUF_ALIGN_2B: u32 = 1 << 1;
 const RBUF_TBUF_SIZE_CTRL: u32 = 0x0300 + 0xB4;
+
+/// The transmit buffer block, at `tbuf_offset` for v5.
+const TBUF_CTRL: u32 = 0x0600;
+/// Expect a 64-byte status block in front of every frame handed over. Left
+/// off, to match the receive side: nothing here offloads a checksum, which is
+/// the only thing the block is for.
+const TBUF_64B_EN: u32 = 1 << 0;
 
 const UMAC: u32 = 0x0800;
 const UMAC_CMD: u32 = UMAC + 0x008;
@@ -664,6 +675,13 @@ impl Genet {
     /// With `rgmii-rxid`, which is what a Pi 4's tree says, the PHY delays the
     /// receive clock and does not delay the transmit clock: the controller
     /// does that end, and `ID_MODE_DIS` below is left clear so that it will.
+    ///
+    /// Neither register can be read back and checked against anything, and the
+    /// part fitted may well come out of reset with these already right --
+    /// u-boot never writes them and its network works. Writing them is the
+    /// deliberate choice: a strap is a property of the board and not of the
+    /// driver. If a write goes to the wrong window the link still comes up and
+    /// the symptom is the one below.
     fn set_clock_delays(&self) {
         let rx_delay = matches!(self.mode, PhyMode::RgmiiRxId | PhyMode::RgmiiId);
         let tx_delay = matches!(self.mode, PhyMode::RgmiiTxId | PhyMode::RgmiiId);
@@ -897,11 +915,21 @@ impl Genet {
 
         self.write(UMAC_MAX_FRAME_LEN, MAX_FRAME_LEN);
 
-        // Two bytes in front of every received frame. The status blocks Linux
-        // also turns on here are not: nothing here offloads a checksum, and
-        // leaving them off means a received descriptor's buffer holds the
-        // frame and nothing else. u-boot leaves them off for the same reason.
-        self.modify(RBUF_CTRL, 0, RBUF_ALIGN_2B);
+        // Two bytes in front of every received frame, and no status blocks in
+        // either direction. Linux turns the status blocks on here because it
+        // offloads checksums; u-boot does not and neither does this. Both
+        // reference drivers leave the enables to whatever reset put there,
+        // because each only ever sets bits; these two are cleared outright, so
+        // that a reset value of one cannot turn a frame into sixty-four bytes
+        // of status followed by a truncated frame.
+        //
+        // If the two-byte alignment is not what it is taken for, every
+        // received frame is offset by two: the destination address reads as
+        // the last four bytes of a real one, the stack's own filter throws all
+        // of them away, and the interface looks dead in one direction while
+        // transmitting perfectly.
+        self.modify(RBUF_CTRL, RBUF_64B_EN, RBUF_ALIGN_2B);
+        self.modify(TBUF_CTRL, TBUF_64B_EN, 0);
         self.write(RBUF_TBUF_SIZE_CTRL, 1);
 
         self.mask_interrupts();
@@ -1444,9 +1472,20 @@ pub fn probe() -> bool {
     *DEVICE.lock() = Some(card);
 
     // Only now may the controller interrupt: the ring, the queue and the
-    // handler's view of the device are all in place. Transmit completions are
-    // not asked for, because `transmit` reads the consumer index itself and
-    // an interrupt per frame sent would be work for nothing.
+    // handler's view of the device are all in place.
+    //
+    // Transmit completions are not asked for, because `transmit` reads the
+    // consumer index itself. That takes the index to be a counter the engine
+    // keeps whether or not anyone is listening, which is how both reference
+    // drivers read it -- u-boot polls exactly this register with no interrupt
+    // handler at all. If it were only updated on an acknowledged interrupt
+    // instead, the first sixty-four frames would go out and every one after
+    // that would be refused.
+    //
+    // The line number is the one the tree gives plus thirty-two, because the
+    // tree numbers shared interrupts from the start of their own group. If
+    // that were wrong nothing would ever be received: frames would pile up in
+    // the ring until the engine stopped, while transmitting carried on.
     arch::register_irq_handler(card.irq, interrupt);
     card.write(INTRL2_0 + INTRL2_CPU_MASK_CLEAR, IRQ_RXDMA_DONE | IRQ_RBUF_OVERFLOW);
     arch::unmask_irq(card.irq);

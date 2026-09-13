@@ -276,6 +276,7 @@ fn place(blob: &[u8]) -> Option<u64> {
 
 pub fn run(report: &mut Report) {
     device_tree(report);
+    real_device_tree(report);
     registers(report);
     rings(report);
     descriptors(report);
@@ -363,6 +364,42 @@ fn device_tree(report: &mut Report) {
     report.check(
         "so does a blob that is not one",
         arch::fdt::find_compatible_in(0, b"brcm,bcm2711-genet-v5").is_none(),
+    );
+}
+
+/// The same walk over the tree the machine was actually booted with, against
+/// something in it this kernel already knows the answer for.
+///
+/// The tree built above is a small one and the walk over it could be right for
+/// small trees and wrong for the sixty kilobytes of nodes a firmware hands
+/// over. The console's registers and interrupt are in that tree, and the
+/// kernel knows both from the chip rather than from the tree, so the two can
+/// be held up against each other. The console is on a different bus from the
+/// Ethernet and is translated through a different set of windows, which makes
+/// it a second case rather than the same one twice.
+///
+/// Nothing runs here when the machine was booted without a tree, which is what
+/// QEMU's Pi 4 does.
+fn real_device_tree(report: &mut Report) {
+    if arch::fdt::blob().is_none() {
+        crate::println!("  --    no device tree on this machine, so nothing to walk");
+        return;
+    }
+    let Some(node) = arch::fdt::find_compatible(b"arm,pl011") else {
+        report.check("the console is in the real tree", false);
+        return;
+    };
+    report.check("the console is in the real tree", true);
+    match node.reg(0) {
+        Some((base, _)) => {
+            report.value("and at the address the console driver uses", base, arch::CONSOLE_PHYS)
+        }
+        None => report.check("and at the address the console driver uses", false),
+    }
+    report.value(
+        "and on the line the interrupt table names",
+        node.interrupt(0).unwrap_or(0) as u64,
+        arch::SERIAL_IRQ as u64,
     );
 }
 

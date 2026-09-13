@@ -307,6 +307,10 @@ pub fn enable_interrupts() {
 // The debug console
 // ---------------------------------------------------------------------------
 
+/// Where the console's registers are. Named out here so that a check can hold
+/// the tree's answer up against the kernel's own.
+pub const CONSOLE_PHYS: u64 = uart::UART0;
+
 pub fn console_init() {
     uart::init();
 }

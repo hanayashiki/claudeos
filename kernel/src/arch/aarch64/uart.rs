@@ -7,7 +7,10 @@
 use super::PERIPHERAL_BASE;
 use crate::mm::phys_to_virt;
 
-const UART0: u64 = PERIPHERAL_BASE + 0x20_1000;
+/// Where this port's registers are, which the kernel knows from the chip
+/// rather than from the device tree. The boot-time check reads the same thing
+/// out of the tree and compares.
+pub const UART0: u64 = PERIPHERAL_BASE + 0x20_1000;
 
 const DR: u64 = 0x00;
 /// Flags: bit 4 is "nothing to read", bit 5 is "no room to write".
