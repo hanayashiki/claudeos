@@ -95,7 +95,7 @@ fn get32(buf: &[u8], offset: usize) -> u32 {
 /// `action.handler`. Returns false if the user stack could not be written or
 /// no restorer was registered, in which case the caller should kill the task.
 pub fn enter_signal_handler(
-    task: &mut Task,
+    task: &Task,
     signal: i32,
     action: &SigAction,
     frame: &mut TrapFrame,
@@ -121,7 +121,7 @@ pub fn enter_signal_handler(
     put64(&mut buf, UC_STACK, 0);
     put64(&mut buf, UC_STACK + 8, 0);
     put64(&mut buf, UC_STACK + 16, 0);
-    put64(&mut buf, UC_SIGMASK, task.signal_mask);
+    put64(&mut buf, UC_SIGMASK, task.signal_mask.get());
 
     put64(&mut buf, SC_FAULT_ADDRESS, frame.far);
     for (i, value) in frame.x.iter().enumerate() {
@@ -133,13 +133,14 @@ pub fn enter_signal_handler(
 
     // The handler runs on the same registers the interrupted code was using,
     // and nothing else would put the vector ones back.
-    task.cpu.fpu.save();
-    put32(&mut buf, FPSIMD, FPSIMD_MAGIC);
-    put32(&mut buf, FPSIMD + 4, FPSIMD_SIZE as u32);
-    put32(&mut buf, FPSIMD_STATUS, task.cpu.fpu.status_word());
-    put32(&mut buf, FPSIMD_CONTROL, task.cpu.fpu.control_word());
-    buf[FPSIMD_VECTORS..FPSIMD_VECTORS + VECTOR_BYTES]
-        .copy_from_slice(task.cpu.fpu.vectors());
+    task.with_cpu(|cpu| {
+        cpu.fpu.save();
+        put32(&mut buf, FPSIMD, FPSIMD_MAGIC);
+        put32(&mut buf, FPSIMD + 4, FPSIMD_SIZE as u32);
+        put32(&mut buf, FPSIMD_STATUS, cpu.fpu.status_word());
+        put32(&mut buf, FPSIMD_CONTROL, cpu.fpu.control_word());
+        buf[FPSIMD_VECTORS..FPSIMD_VECTORS + VECTOR_BYTES].copy_from_slice(cpu.fpu.vectors());
+    });
     put32(&mut buf, CHAIN_END, 0);
     put32(&mut buf, CHAIN_END + 4, 0);
 
@@ -157,9 +158,9 @@ pub fn enter_signal_handler(
     }
 
     // Block this signal for the duration of the handler unless asked not to.
-    task.signal_mask |= action.mask;
+    task.signal_mask.set(task.signal_mask.get() | action.mask);
     if action.flags & SA_NODEFER == 0 {
-        task.signal_mask |= 1u64 << (signal as u64 & 63);
+        task.signal_mask.set(task.signal_mask.get() | 1u64 << (signal as u64 & 63));
     }
 
     frame.elr = action.handler;
@@ -174,7 +175,7 @@ pub fn enter_signal_handler(
 
 /// Read the signal frame back and restore the register state the handler was
 /// entered with.
-pub fn leave_signal_handler(task: &mut Task, frame: &mut TrapFrame) -> SysResult {
+pub fn leave_signal_handler(task: &Task, frame: &mut TrapFrame) -> SysResult {
     // The restorer was reached by branching to it rather than by returning
     // through the stack, so the stack pointer is still at the frame.
     let base = frame.sp;
@@ -192,19 +193,20 @@ pub fn leave_signal_handler(task: &mut Task, frame: &mut TrapFrame) -> SysResult
     // exceptions are masked, and neither is a program's to choose.
     frame.spsr = get64(&buf, SC_PSTATE) & 0xF000_0000;
 
-    task.signal_mask = get64(&buf, UC_SIGMASK);
+    task.signal_mask.set(get64(&buf, UC_SIGMASK));
 
     // Put the interrupted code's vector registers back, if the record saying
     // where they are is the one this kernel wrote.
-    if get32(&buf, FPSIMD) == FPSIMD_MAGIC
-        && get32(&buf, FPSIMD + 4) as usize == FPSIMD_SIZE
-        && task.cpu.fpu.load(
-            &buf[FPSIMD_VECTORS..FPSIMD_VECTORS + VECTOR_BYTES],
-            get32(&buf, FPSIMD_CONTROL),
-            get32(&buf, FPSIMD_STATUS),
-        )
-    {
-        task.cpu.fpu.restore();
+    if get32(&buf, FPSIMD) == FPSIMD_MAGIC && get32(&buf, FPSIMD + 4) as usize == FPSIMD_SIZE {
+        task.with_cpu(|cpu| {
+            if cpu.fpu.load(
+                &buf[FPSIMD_VECTORS..FPSIMD_VECTORS + VECTOR_BYTES],
+                get32(&buf, FPSIMD_CONTROL),
+                get32(&buf, FPSIMD_STATUS),
+            ) {
+                cpu.fpu.restore();
+            }
+        });
     }
 
     // rt_sigreturn does not set a return value; the first register comes back

@@ -17,9 +17,13 @@ static FOREGROUND_PGID: Spinlock<u32> = Spinlock::new(0);
 /// The task the CPU is running, as a guard rather than a reference.
 ///
 /// Which task that is changes at every context switch, so handing out a
-/// `&'static mut Task` says something that is not true: the borrow would
-/// outlive the state it describes. The guard reads the current task on each
-/// use and cannot be stored anywhere with a longer life.
+/// `&'static Task` says something that is not true: the borrow would outlive
+/// the state it describes. The guard reads the current task on each use and
+/// cannot be stored anywhere with a longer life.
+///
+/// It hands out a shared reference and nothing else, which is what makes
+/// holding two of these, or one of these alongside a task the table handed
+/// out, mean nothing. A task changes its own fields through them.
 pub struct Current(());
 
 impl core::ops::Deref for Current {
@@ -29,15 +33,6 @@ impl core::ops::Deref for Current {
         unsafe {
             debug_assert!(!CURRENT.is_null());
             &*CURRENT
-        }
-    }
-}
-
-impl core::ops::DerefMut for Current {
-    fn deref_mut(&mut self) -> &mut Task {
-        unsafe {
-            debug_assert!(!CURRENT.is_null());
-            &mut *CURRENT
         }
     }
 }
@@ -74,11 +69,15 @@ impl<'a> Held<'a> {
         self.irq
     }
 
-    pub fn find(&self, pid: u32) -> Option<&'static mut Task> {
+    /// The task with `pid`, borrowed from the hold. Two of these at once name
+    /// two entries in one table and say nothing about each other, which is why
+    /// asking for the caller's own pid is an ordinary thing to do rather than
+    /// a second route to something it already has.
+    pub fn find(&self, pid: u32) -> Option<&'a Task> {
         self.tasks.iter().find(|t| t.get().pid == pid).map(|t| t.get())
     }
 
-    pub fn for_each(&self, mut f: impl FnMut(&'static mut Task)) {
+    pub fn for_each(&self, mut f: impl FnMut(&'a Task)) {
         for entry in self.tasks {
             f(entry.get());
         }
@@ -142,22 +141,14 @@ fn admit(task: Box<Task>, _irq: NoInterrupts) {
     TASKS.lock().push(TaskPtr(Box::into_raw(task)));
 }
 
-/// Look up a task and hand the reference out. The table is unlocked again
-/// before this returns, so the reference is only good for as long as nothing
-/// can reap the task: a field or two read or written with interrupts still off,
-/// or inside a block that holds them off itself. Anything longer takes the
-/// table with it through `with_task`.
-pub fn find(pid: u32) -> Option<&'static mut Task> {
-    let tasks = TASKS.lock();
-    tasks.iter().find(|t| t.get().pid == pid).map(|t| t.get())
-}
-
 /// Run `f` on the task with `pid`, with the table held for as long as it runs.
 ///
 /// A reader that walks a task -- every page of every region, every descriptor
 /// it has open -- is holding a pointer that a reap on another task would free
-/// underneath it. Holding the table is what stops that reap happening.
-pub fn with_task<R>(pid: u32, f: impl FnOnce(&mut Task) -> R) -> Option<R> {
+/// underneath it. Holding the table is what stops that reap happening, and
+/// taking the closure rather than returning the reference is what keeps the
+/// two the same length.
+pub fn with_task<R>(pid: u32, f: impl FnOnce(&Task) -> R) -> Option<R> {
     let tasks = TASKS.lock();
     let entry = tasks.iter().find(|t| t.get().pid == pid)?;
     Some(f(entry.get()))
@@ -179,7 +170,7 @@ pub fn task_count() -> usize {
 /// Run `f` on every task, with the table held for as long as it runs. The
 /// closure is handed the hold alongside each task, because a state change it
 /// makes may have to reach that task's parent, which is in the same table.
-pub fn for_each<F: FnMut(&'static mut Task, &Held)>(mut f: F) {
+pub fn for_each<F: FnMut(&Task, &Held)>(mut f: F) {
     with_tasks(|table| table.for_each(|task| f(task, table)));
 }
 
@@ -192,7 +183,7 @@ pub fn foreground() -> u32 {
 }
 
 pub fn current_pgid() -> u32 {
-    current().pgid
+    current().pgid.get()
 }
 
 /// True when any task on the machine still names `space`.
@@ -241,7 +232,7 @@ fn pick_next() -> Option<*mut Task> {
         }
     }
 
-    let current = unsafe { &mut *cur };
+    let current = unsafe { &*cur };
     if cur != idle && current.state() == State::Runnable {
         return None;
     }
@@ -256,15 +247,18 @@ unsafe fn switch_to(next: *mut Task) {
     if prev == next {
         return;
     }
-    let prev_task = &mut *prev;
-    let next_task = &mut *next;
+    // Shared references, because this runs from the timer: whatever was
+    // interrupted is holding one on the task it was running, and an exclusive
+    // one taken here would be a second reference to that same task.
+    let prev_task = &*prev;
+    let next_task = &*next;
 
     // The registers the trap frame does not hold, the thread pointer and the
     // floating point and vector file among them, are carried across by hand.
     // The kernel never touches the latter, so what is in them here is still
     // the outgoing task's.
-    prev_task.cpu.save();
-    next_task.cpu.restore();
+    prev_task.with_cpu(|cpu| cpu.save());
+    next_task.with_cpu(|cpu| cpu.restore());
 
     // Entry from user mode must land on the incoming task's kernel stack.
     arch::set_kernel_entry_stack(next_task.kstack_top);
@@ -275,8 +269,8 @@ unsafe fn switch_to(next: *mut Task) {
     }
 
     CURRENT = next;
-    prev_task.started = true;
-    arch::switch_context(&mut prev_task.kernel_sp, next_task.kernel_sp);
+    prev_task.mark_started();
+    arch::switch_context(prev_task.kernel_sp.as_ptr(), next_task.kernel_sp.get());
 }
 
 pub fn schedule() {
@@ -400,7 +394,7 @@ pub fn exit_group(status: i32) -> ! {
     let me = current().pid;
     for_each(|task, table| {
         if task.tgid == tgid && task.pid != me && task.state() != State::Zombie {
-            task.pending_signals |= 1u64 << (SIGKILL as u64 & 63);
+            task.add_pending(1u64 << (SIGKILL as u64 & 63));
             task.wake(table.irq());
         }
     });
@@ -414,8 +408,8 @@ pub fn exit_current(status: i32) -> ! {
         // what decides below whether the user memory may go.
         reap_dead_threads();
 
-        let mut task = current();
-        task.exit_code = status;
+        let task = current();
+        task.exit_code.set(status);
 
         // A thread that asked for it gets its tid slot cleared so whoever is
         // joining on it can see that it finished. This goes through the
@@ -428,9 +422,9 @@ pub fn exit_current(status: i32) -> ! {
         // will. Without one the joiner is released only if it happens to read
         // the zero before it goes to sleep, and loses that race as soon as
         // anything else on the machine gets the scheduler in first.
-        if task.clear_child_tid != 0 {
-            let address = task.clear_child_tid;
-            task.clear_child_tid = 0;
+        if task.clear_child_tid.get() != 0 {
+            let address = task.clear_child_tid.get();
+            task.clear_child_tid.set(0);
             let _ = crate::uaccess::write_u32_in(&task, address, 0);
             crate::futex::wake(crate::futex::futex_key(address), u32::MAX);
         }
@@ -442,19 +436,19 @@ pub fn exit_current(status: i32) -> ! {
 
         // Threads share an address space and its region list; only the last
         // thread out may tear either of them down.
-        let last_thread = alloc::sync::Arc::strong_count(task.mm()) == 1;
+        let last_thread = task.mm_shares() == 1;
         if last_thread {
             task.space().free_user_memory();
             task.clear_vmas();
         }
-        let ppid = task.ppid;
+        let ppid = task.ppid.get();
         let pid = task.pid;
 
         if pid == 1 {
             crate::println!();
             crate::println!(
                 "claudeos: init exited with status {:#x}; powering off",
-                task.exit_code
+                task.exit_code.get()
             );
             arch::power_off();
         }
@@ -471,8 +465,8 @@ pub fn exit_current(status: i32) -> ! {
             // to it.
             let mut adopted_zombie = false;
             table.for_each(|other| {
-                if other.ppid == pid {
-                    other.ppid = 1;
+                if other.ppid.get() == pid {
+                    other.ppid.set(1);
                     if other.state() == State::Zombie {
                         adopted_zombie = true;
                     }
@@ -493,7 +487,7 @@ pub fn exit_current(status: i32) -> ! {
 
 /// Terminate the current task as if `signal` had killed it.
 pub fn kill_current(signal: i32) -> ! {
-    let name = current().name.clone();
+    let name = current().name();
     let pid = current().pid;
     crate::println!("[kernel] pid {} ({}) killed by signal {}", pid, name, signal);
     exit_current(signal & 0x7F)
@@ -504,7 +498,7 @@ pub fn raise_on_current(signal: i32) {
     if !has_current() {
         return;
     }
-    current().pending_signals |= 1u64 << (signal as u64 & 63);
+    current().add_pending(1u64 << (signal as u64 & 63));
 }
 
 /// Make `signal` pending on `task`.
@@ -514,7 +508,7 @@ pub fn raise_on_current(signal: i32) {
 /// taken yet, and a stop discards a continue the same way. Restarting is what
 /// the parent has to be told about, and the table is held here, which is where
 /// the parent is found.
-pub fn post_signal(task: &mut Task, signal: i32, table: &Held) {
+pub fn post_signal(task: &Task, signal: i32, table: &Held) {
     const STOPS: u64 = (1 << (SIGSTOP as u64 & 63))
         | (1 << (SIGTSTP as u64 & 63))
         | (1 << (SIGTTIN as u64 & 63))
@@ -523,26 +517,26 @@ pub fn post_signal(task: &mut Task, signal: i32, table: &Held) {
         task.restart_for_kill(table.irq());
     }
     if signal == SIGCONT {
-        task.pending_signals &= !STOPS;
+        task.drop_pending(STOPS);
         task.continue_after_stop(table);
     } else if crate::abi::is_stop_signal(signal) {
-        task.pending_signals &= !(1u64 << (SIGCONT as u64 & 63));
+        task.drop_pending(1u64 << (SIGCONT as u64 & 63));
     }
-    task.pending_signals |= 1u64 << (signal as u64 & 63);
+    task.add_pending(1u64 << (signal as u64 & 63));
     task.wake(table.irq());
 }
 
 /// Stop the running task until something sends it SIGCONT.
 fn stop_current(signal: i32) {
     let stopped = with_tasks(|table| {
-        let mut task = current();
+        let task = current();
         // The stop signal's pending bit was cleared before this was called, so
         // a continue that arrived since then found a runnable task with no
         // stop to discard and nothing to restart: it recorded nothing. Asked
         // again here, where nothing else can run, it is a continue that beat
         // the stop, and stopping now would park the task with a continue
         // pending that nothing would ever act on.
-        if task.pending_signals & (1u64 << (SIGCONT as u64 & 63)) != 0 {
+        if task.pending_signals.get() & (1u64 << (SIGCONT as u64 & 63)) != 0 {
             return false;
         }
         task.stop(signal, table);
@@ -572,14 +566,14 @@ pub fn io_ready() {
 /// instead of failing, so the operation resumes where it left off. Only safe
 /// from a point in the kernel that holds no locks.
 pub fn stop_for_signal(signal: i32) {
-    current().pending_signals &= !(1u64 << (signal as u64 & 63));
+    current().drop_pending(1u64 << (signal as u64 & 63));
     stop_current(signal);
     // The continue that restarted this task has now had its default action,
     // which is to do exactly that. Leaving it pending would make the caller
     // think a signal is waiting and give up on what it was doing.
-    let mut task = current();
-    if task.signal_actions[SIGCONT as usize].handler == crate::signal::SIG_DFL {
-        task.pending_signals &= !(1u64 << (SIGCONT as u64 & 63));
+    let task = current();
+    if task.action(SIGCONT as usize).handler == crate::signal::SIG_DFL {
+        task.drop_pending(1u64 << (SIGCONT as u64 & 63));
     }
 }
 
@@ -592,12 +586,10 @@ pub fn stop_for_signal(signal: i32) {
 pub fn stop_if_requested() -> bool {
     let task = current();
     for signal in [SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU] {
-        if task.pending_signals & (1u64 << (signal as u64 & 63)) == 0 {
+        if task.pending_signals.get() & (1u64 << (signal as u64 & 63)) == 0 {
             continue;
         }
-        if signal != SIGSTOP
-            && task.signal_actions[signal as usize].handler != crate::signal::SIG_DFL
-        {
+        if signal != SIGSTOP && task.action(signal as usize).handler != crate::signal::SIG_DFL {
             continue;
         }
         stop_for_signal(signal);
@@ -617,7 +609,7 @@ pub fn signal_group(pgid: u32, signal: i32) {
         return;
     }
     for_each(|task, table| {
-        if task.pgid == pgid && task.pid != 1 && task.state() != State::Zombie {
+        if task.pgid.get() == pgid && task.pid != 1 && task.state() != State::Zombie {
             post_signal(task, signal, table);
         }
     });
@@ -643,8 +635,8 @@ pub fn has_pending_signal_except(ignore: u64) -> bool {
         return false;
     }
     let task = current();
-    let waiting = task.pending_signals & !ignore;
-    let mut pending = waiting & !task.signal_mask;
+    let waiting = task.pending_signals.get() & !ignore;
+    let mut pending = waiting & !task.signal_mask.get();
     // Neither of these can be blocked.
     pending |= waiting & ((1u64 << (SIGKILL as u64 & 63)) | (1u64 << (SIGSTOP as u64 & 63)));
     if pending == 0 {
@@ -654,7 +646,7 @@ pub fn has_pending_signal_except(ignore: u64) -> bool {
         if pending & (1u64 << (signal as u64 & 63)) == 0 {
             continue;
         }
-        let handler = task.signal_actions[signal as usize].handler;
+        let handler = task.action(signal as usize).handler;
         if handler == crate::signal::SIG_IGN {
             continue;
         }
@@ -672,21 +664,21 @@ pub fn check_signals() {
     if !has_current() {
         return;
     }
-    let mut task = current();
-    if task.pending_signals == 0 {
+    let task = current();
+    if task.pending_signals.get() == 0 {
         return;
     }
 
     for signal in 1..64i32 {
         let bit = 1u64 << (signal as u64 & 63);
-        if task.pending_signals & bit == 0 {
+        if task.pending_signals.get() & bit == 0 {
             continue;
         }
-        let blocked = task.signal_mask & bit != 0;
+        let blocked = task.signal_mask.get() & bit != 0;
         if blocked && signal != SIGKILL && signal != SIGSTOP {
             continue;
         }
-        task.pending_signals &= !bit;
+        task.drop_pending(bit);
 
         if signal == SIGKILL {
             exit_current(signal & 0x7F);
@@ -696,21 +688,20 @@ pub fn check_signals() {
         // of whatever it was doing, so both wait until the task is on its way
         // back to user mode; until then the signal stays pending.
         let stops = signal == SIGSTOP || {
-            let action = task.signal_actions[signal as usize];
-            crate::abi::is_stop_signal(signal)
-                && action.handler == crate::signal::SIG_DFL
+            let action = task.action(signal as usize);
+            crate::abi::is_stop_signal(signal) && action.handler == crate::signal::SIG_DFL
         };
         if stops {
             let frame = unsafe { &mut *task.trap_frame() };
             if !frame.from_user() {
-                task.pending_signals |= bit;
+                task.add_pending(bit);
                 return;
             }
             stop_current(signal);
             return;
         }
 
-        let action = task.signal_actions[signal as usize];
+        let action = task.action(signal as usize);
         match action.handler {
             crate::signal::SIG_IGN => continue,
             crate::signal::SIG_DFL => {
@@ -725,13 +716,13 @@ pub fn check_signals() {
         // A handler can only run on the way back to user mode.
         let frame = unsafe { &mut *task.trap_frame() };
         if !frame.from_user() {
-            task.pending_signals |= bit;
+            task.add_pending(bit);
             return;
         }
         if action.flags & crate::signal::SA_RESETHAND != 0 {
-            task.signal_actions[signal as usize] = crate::signal::SigAction::default();
+            task.set_action(signal as usize, crate::signal::SigAction::default());
         }
-        if !crate::signal::deliver(&mut task, signal, &action, frame) {
+        if !crate::signal::deliver(&task, signal, &action, frame) {
             exit_current(SIGSEGV & 0x7F);
         }
         return;
@@ -749,7 +740,7 @@ pub fn check_signals() {
 /// running. A thread is reported to a joiner inside the process and to nothing
 /// else.
 fn is_child_process(task: &Task, parent_pid: u32) -> bool {
-    task.ppid == parent_pid && task.pid == task.tgid
+    task.ppid.get() == parent_pid && task.pid == task.tgid
 }
 
 /// Does `task` match the pid argument `wait4` was given?
@@ -761,7 +752,7 @@ fn is_child_process(task: &Task, parent_pid: u32) -> bool {
 fn matches_want(task: &Task, want: i32) -> bool {
     match want {
         w if w > 0 => task.pid == w as u32,
-        w if w < -1 => task.pgid == (-w) as u32,
+        w if w < -1 => task.pgid.get() == (-w) as u32,
         _ => true,
     }
 }
@@ -779,7 +770,7 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
             if !matches_want(task, want) {
                 continue;
             }
-            found = Some((task.pid, task.exit_code, entry.0));
+            found = Some((task.pid, task.exit_code.get(), entry.0));
             break;
         }
     }
@@ -861,12 +852,12 @@ pub fn child_status_change(
         if !matches_want(task, want) {
             continue;
         }
-        if untraced && task.report_stop {
-            task.report_stop = false;
-            return Some((task.pid, ((task.stop_signal & 0xFF) << 8) | 0x7F));
+        if untraced && task.report_stop.get() {
+            task.report_stop.set(false);
+            return Some((task.pid, ((task.stop_signal.get() & 0xFF) << 8) | 0x7F));
         }
-        if continued && task.report_continue {
-            task.report_continue = false;
+        if continued && task.report_continue.get() {
+            task.report_continue.set(false);
             return Some((task.pid, 0xFFFF));
         }
     }
@@ -893,8 +884,8 @@ pub fn child_event_pending(
             return false;
         }
         task.state() == State::Zombie
-            || (untraced && task.report_stop)
-            || (continued && task.report_continue)
+            || (untraced && task.report_stop.get())
+            || (continued && task.report_continue.get())
     })
 }
 

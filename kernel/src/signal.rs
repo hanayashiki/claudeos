@@ -30,7 +30,7 @@ pub fn default_is_ignore(signal: i32) -> bool {
 /// Redirect `frame` into `action.handler`. Returns false if the user stack
 /// could not be written, in which case the caller should kill the task.
 pub fn deliver(
-    task: &mut crate::task::Task,
+    task: &crate::task::Task,
     signal: i32,
     action: &SigAction,
     frame: &mut crate::arch::TrapFrame,
@@ -39,6 +39,6 @@ pub fn deliver(
 }
 
 /// Restore the register state a handler was entered with.
-pub fn sigreturn(task: &mut crate::task::Task, frame: &mut crate::arch::TrapFrame) -> SysResult {
+pub fn sigreturn(task: &crate::task::Task, frame: &mut crate::arch::TrapFrame) -> SysResult {
     crate::arch::leave_signal_handler(task, frame)
 }

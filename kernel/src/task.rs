@@ -1,9 +1,14 @@
 //! Tasks: kernel stacks, address spaces, and the process table.
 //!
-//! The kernel runs on a single CPU with interrupt-disabling locks, and a task
-//! only ever mutates its own control block, so the current task is reached
-//! through a raw pointer rather than a lock that a blocking syscall would have
-//! to hold across a context switch.
+//! The kernel runs on a single CPU with interrupt-disabling locks, so the
+//! current task is reached through a raw pointer rather than a lock that a
+//! blocking syscall would have to hold across a context switch. What keeps a
+//! change to a task whole is the interrupt mask, not a lock on the task.
+//!
+//! A task that is in the table is reachable from two directions at once: the
+//! task itself has the running-task guard, and anything holding the table can
+//! look it up by pid. Neither direction hands out an exclusive reference, for
+//! the reason set out on `Task` below.
 
 use crate::abi::*;
 use crate::arch::paging::{
@@ -17,6 +22,7 @@ use alloc::string::{String, ToString};
 use crate::sync::{NoInterrupts, Spinlock};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cell::Cell;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 pub const KERNEL_STACK_SIZE: usize = 32 * 1024;
@@ -107,70 +113,92 @@ impl MemState {
     }
 }
 
+/// A task control block.
+///
+/// Everything a task changes after it is in the process table sits in a cell.
+/// That is not to make the changes atomic -- a single processor with interrupts
+/// masked is what does that, and a cell's load-modify-store is the same
+/// instructions the plain field was -- but so that changing it asks for a
+/// shared reference. A task in the table is reachable by two routes at once,
+/// through the running-task guard and through the table, and an exclusive
+/// reference from either would be an exclusive reference to something the other
+/// route hands out as well. With nothing to mutate through, the two references
+/// cannot be written down.
+///
+/// The fields that are not in cells are the ones fixed before the task is
+/// admitted. Until `sched::register` takes the box, the task is owned by one
+/// caller and reachable from nowhere else, which is the one place an exclusive
+/// reference to it is the truth.
 pub struct Task {
     pub pid: u32,
     pub tgid: u32,
-    pub ppid: u32,
-    pub pgid: u32,
+    pub ppid: Cell<u32>,
+    pub pgid: Cell<u32>,
     /// What the scheduler will do with this task, and when the timer should
     /// put it back on the run queue. Private, and changed only by the
     /// transitions below: every one of them is a step that has a second half
     /// somewhere else -- a parent to tell, a waiter to wake -- and a field
     /// anyone could assign to is how the two halves came apart.
-    state: State,
+    state: Cell<State>,
     /// Tick count to wake at when sleeping, or zero for no deadline.
-    wake_at: u64,
+    wake_at: Cell<u64>,
 
-    /// Saved kernel stack pointer between context switches.
-    pub kernel_sp: u64,
+    /// Saved kernel stack pointer between context switches. The switch stores
+    /// through the cell's pointer, which is what the assembly is given.
+    pub kernel_sp: Cell<u64>,
     kstack: *mut u8,
     pub kstack_top: u64,
 
     /// The page tables the task runs on, and the record of what is in them.
     /// Private for the same reason the scheduling state is: the two have to
     /// change together, and `run_on_space` is where that happens.
-    space: AddressSpace,
-    /// Shared with every thread running in the same address space.
-    mm: Arc<Spinlock<MemState>>,
+    space: Cell<AddressSpace>,
+    /// Shared with every thread running in the same address space. Exec gives
+    /// the task a different one and leaves the old to whatever still runs on
+    /// it, so the share itself is what changes, not only its contents.
+    mm: Spinlock<Arc<Spinlock<MemState>>>,
     /// Shared with every task that cloned with `CLONE_FILES`.
     pub fds: FdTable,
     /// Shared with every task that cloned with `CLONE_FS`, so that a directory
     /// one thread changes into is the one its siblings resolve against.
     pub cwd: Arc<Spinlock<String>>,
-    pub name: String,
+    name: Spinlock<String>,
     /// Path of the running executable, reported through /proc/self/exe.
-    pub exe_path: String,
+    exe_path: Spinlock<String>,
 
-    pub exit_code: i32,
+    pub exit_code: Cell<i32>,
     /// Registers only this architecture has, carried across context switches.
-    pub cpu: TaskContext,
-    pub clear_child_tid: u64,
-    pub set_child_tid: u64,
-    pub robust_list: u64,
+    cpu: Cell<TaskContext>,
+    pub clear_child_tid: Cell<u64>,
+    pub set_child_tid: Cell<u64>,
+    pub robust_list: Cell<u64>,
 
-    pub pending_signals: u64,
+    pub pending_signals: Cell<u64>,
     /// The scheduling nice value. Round robin does not act on it, but a
     /// program that sets it reads it back.
-    pub nice: i32,
+    pub nice: Cell<i32>,
     /// The signal that stopped this task, and whether the stop and the
     /// following continue have been reported to whoever is waiting.
-    pub stop_signal: i32,
-    pub report_stop: bool,
-    pub report_continue: bool,
-    pub signal_actions: [crate::signal::SigAction; 64],
-    pub signal_mask: u64,
+    pub stop_signal: Cell<i32>,
+    pub report_stop: Cell<bool>,
+    pub report_continue: Cell<bool>,
+    /// One cell holding the whole table, rather than sixty-four holding an
+    /// entry each, so that a fork copies it in one move the way the plain
+    /// field did. `as_slice_of_cells` gives the entries back one at a time.
+    signal_actions: Cell<[crate::signal::SigAction; 64]>,
+    pub signal_mask: Cell<u64>,
 
     /// Pid this task is waiting for, if it is in wait4.
-    pub waiting_for: Option<i32>,
+    pub waiting_for: Cell<Option<i32>>,
 
-    pub umask: u32,
+    pub umask: Cell<u32>,
     /// Set once the task has been switched away from at least once, so a
     /// freshly created task is not resumed from a stale frame.
-    pub started: bool,
+    started: Cell<bool>,
     /// Program a freshly created task should exec before reaching user mode.
-    pub pending_exec: Option<(String, Vec<String>, Vec<String>)>,
+    pending_exec: Spinlock<Option<(String, Vec<String>, Vec<String>)>>,
     /// Parent blocked in vfork, to be woken when this task execs or exits.
-    pub vfork_parent: Option<u32>,
+    pub vfork_parent: Cell<Option<u32>>,
 }
 
 unsafe impl Send for Task {}
@@ -213,37 +241,120 @@ impl Task {
         Some(alloc::boxed::Box::new(Task {
             pid,
             tgid: pid,
-            ppid: 0,
-            pgid: pid,
-            state: State::Runnable,
-            kernel_sp: 0,
+            ppid: Cell::new(0),
+            pgid: Cell::new(pid),
+            state: Cell::new(State::Runnable),
+            kernel_sp: Cell::new(0),
             kstack,
             kstack_top,
-            space,
-            mm: Arc::new(Spinlock::new(MemState::new())),
+            space: Cell::new(space),
+            mm: Spinlock::new(Arc::new(Spinlock::new(MemState::new()))),
             fds: FdTable::new(),
             cwd: Arc::new(Spinlock::new(String::from("/"))),
-            name: name.to_string(),
-            exe_path: String::new(),
-            exit_code: 0,
-            cpu: TaskContext::new(),
-            clear_child_tid: 0,
-            set_child_tid: 0,
-            robust_list: 0,
-            pending_signals: 0,
-            nice: 0,
-            stop_signal: 0,
-            report_stop: false,
-            report_continue: false,
-            signal_actions: [crate::signal::SigAction::default(); 64],
-            signal_mask: 0,
-            wake_at: 0,
-            waiting_for: None,
-            umask: 0o022,
-            started: false,
-            pending_exec: None,
-            vfork_parent: None,
+            name: Spinlock::new(name.to_string()),
+            exe_path: Spinlock::new(String::new()),
+            exit_code: Cell::new(0),
+            cpu: Cell::new(TaskContext::new()),
+            clear_child_tid: Cell::new(0),
+            set_child_tid: Cell::new(0),
+            robust_list: Cell::new(0),
+            pending_signals: Cell::new(0),
+            nice: Cell::new(0),
+            stop_signal: Cell::new(0),
+            report_stop: Cell::new(false),
+            report_continue: Cell::new(false),
+            signal_actions: Cell::new([crate::signal::SigAction::default(); 64]),
+            signal_mask: Cell::new(0),
+            wake_at: Cell::new(0),
+            waiting_for: Cell::new(None),
+            umask: Cell::new(0o022),
+            started: Cell::new(false),
+            pending_exec: Spinlock::new(None),
+            vfork_parent: Cell::new(None),
         }))
+    }
+
+    pub fn name(&self) -> String {
+        self.name.lock().clone()
+    }
+
+    pub fn set_name(&self, value: String) {
+        *self.name.lock() = value;
+    }
+
+    pub fn exe_path(&self) -> String {
+        self.exe_path.lock().clone()
+    }
+
+    pub fn set_exe_path(&self, value: String) {
+        *self.exe_path.lock() = value;
+    }
+
+    /// The program a task created by the kernel is to run, taken by the
+    /// bootstrap that runs it. Taking it is what leaves nothing to run twice.
+    pub fn take_pending_exec(&self) -> Option<(String, Vec<String>, Vec<String>)> {
+        self.pending_exec.lock().take()
+    }
+
+    pub fn set_pending_exec(&self, program: (String, Vec<String>, Vec<String>)) {
+        *self.pending_exec.lock() = Some(program);
+    }
+
+    /// The dispositions, one cell each.
+    fn actions(&self) -> &[Cell<crate::signal::SigAction>] {
+        let table: &Cell<[crate::signal::SigAction]> = &self.signal_actions;
+        table.as_slice_of_cells()
+    }
+
+    /// The disposition of one signal, and the way to change it.
+    pub fn action(&self, signal: usize) -> crate::signal::SigAction {
+        self.actions()[signal].get()
+    }
+
+    pub fn set_action(&self, signal: usize, action: crate::signal::SigAction) {
+        self.actions()[signal].set(action);
+    }
+
+    /// Take another task's dispositions, which is what a fork gives the child.
+    pub fn copy_actions_from(&self, other: &Task) {
+        self.signal_actions.set(other.signal_actions.get());
+    }
+
+    /// Handlers do not survive exec, but ignored signals stay ignored.
+    pub fn reset_actions_for_exec(&self) {
+        for action in self.actions() {
+            if action.get().handler != crate::signal::SIG_IGN {
+                action.set(crate::signal::SigAction::default());
+            }
+        }
+    }
+
+    /// Add and remove signals from the pending set. Every caller is a read,
+    /// an or or an and, and a write, which is what the plain field was.
+    pub fn add_pending(&self, signals: u64) {
+        self.pending_signals.set(self.pending_signals.get() | signals);
+    }
+
+    pub fn drop_pending(&self, signals: u64) {
+        self.pending_signals.set(self.pending_signals.get() & !signals);
+    }
+
+    /// Run `f` on the registers a context switch carries by hand.
+    ///
+    /// Reached through the cell's own pointer rather than by copying the value
+    /// out and back: on one of the two machines this is half a kilobyte of
+    /// vector state, and it is saved and restored at every switch. `as_ptr` is
+    /// what a shared reference to a cell yields for exactly this, and nothing
+    /// holds a reference into this one -- the field is private and this is the
+    /// only way to reach it.
+    pub fn with_cpu<R>(&self, f: impl FnOnce(&mut TaskContext) -> R) -> R {
+        f(unsafe { &mut *self.cpu.as_ptr() })
+    }
+
+    /// Record that the task has been switched away from at least once, so it
+    /// is not resumed from a frame it never built.
+    pub fn mark_started(&self) {
+        self.started.set(true);
     }
 
     /// The user register frame, which always sits at the top of the kernel
@@ -255,7 +366,17 @@ impl Task {
     /// Lay out the kernel stack so the first context switch into this task
     /// lands in `entry`.
     pub fn prepare_kernel_frame(&mut self, entry: u64) {
-        self.kernel_sp = arch::prepare_kernel_entry(self.kstack_top, entry);
+        self.kernel_sp.set(arch::prepare_kernel_entry(self.kstack_top, entry));
+    }
+
+    /// The record of what is in the address space, held for as long as the
+    /// call that asked for it runs. Two locks: the outer one holds the share
+    /// still, because exec replaces it with a different one, and the inner one
+    /// is the record's own.
+    fn with_mem<R>(&self, f: impl FnOnce(&mut MemState) -> R) -> R {
+        let mm = self.mm.lock();
+        let mut state = mm.lock();
+        f(&mut state)
     }
 
     pub fn cwd(&self) -> String {
@@ -267,93 +388,99 @@ impl Task {
     }
 
     pub fn brk_start(&self) -> u64 {
-        self.mm.lock().brk_start
+        self.with_mem(|mm| mm.brk_start)
     }
 
     pub fn brk(&self) -> u64 {
-        self.mm.lock().brk
+        self.with_mem(|mm| mm.brk)
     }
 
     pub fn set_brk(&self, value: u64) {
-        self.mm.lock().brk = value;
+        self.with_mem(|mm| mm.brk = value);
     }
 
     pub fn set_heap_base(&self, value: u64) {
-        let mut mm = self.mm.lock();
-        mm.brk_start = value;
-        mm.brk = value;
+        self.with_mem(|mm| {
+            mm.brk_start = value;
+            mm.brk = value;
+        });
     }
 
     pub fn add_vma(&self, start: u64, end: u64, prot: u64, flags: u64) {
-        self.mm.lock().vmas.push(Vma { start, end, prot, flags, file: None });
+        self.with_mem(|mm| mm.vmas.push(Vma { start, end, prot, flags, file: None }));
     }
 
     pub fn add_file_vma(&self, start: u64, end: u64, prot: u64, flags: u64, file: FileMap) {
-        self.mm.lock().vmas.push(Vma { start, end, prot, flags, file: Some(file) });
+        self.with_mem(|mm| mm.vmas.push(Vma { start, end, prot, flags, file: Some(file) }));
     }
 
     pub fn find_vma(&self, addr: u64) -> Option<Vma> {
-        self.mm.lock().vmas.iter().find(|v| v.contains(addr)).cloned()
+        self.with_mem(|mm| mm.vmas.iter().find(|v| v.contains(addr)).cloned())
     }
 
     /// True when no recorded region overlaps `[start, end)`.
     pub fn range_is_free(&self, start: u64, end: u64) -> bool {
-        self.mm.lock().vmas.iter().all(|v| v.end <= start || v.start >= end)
+        self.with_mem(|mm| mm.vmas.iter().all(|v| v.end <= start || v.start >= end))
     }
 
     pub fn clear_vmas(&self) {
-        let mut mm = self.mm.lock();
-        mm.vmas.clear();
-        mm.mmap_top = USER_MMAP_BASE;
+        self.with_mem(|mm| {
+            mm.vmas.clear();
+            mm.mmap_top = USER_MMAP_BASE;
+        });
     }
 
     /// Total size of every recorded region plus the heap, for /proc reporting.
     pub fn virtual_size(&self) -> u64 {
-        let mm = self.mm.lock();
-        let regions: u64 = mm.vmas.iter().map(|v| v.end - v.start).sum();
-        regions + mm.brk.saturating_sub(mm.brk_start)
+        self.with_mem(|mm| {
+            let regions: u64 = mm.vmas.iter().map(|v| v.end - v.start).sum();
+            regions + mm.brk.saturating_sub(mm.brk_start)
+        })
     }
 
     /// Pages actually backed by memory right now.
     pub fn resident_pages(&self) -> u64 {
-        let mm = self.mm.lock();
-        let mut pages = 0u64;
-        for vma in mm.vmas.iter() {
-            let mut page = vma.start;
-            while page < vma.end {
-                if self.space.translate(page).is_some() {
+        let space = self.space.get();
+        self.with_mem(|mm| {
+            let mut pages = 0u64;
+            for vma in mm.vmas.iter() {
+                let mut page = vma.start;
+                while page < vma.end {
+                    if space.translate(page).is_some() {
+                        pages += 1;
+                    }
+                    page += PAGE_SIZE_U64;
+                }
+            }
+            let mut page = mm.brk_start;
+            while page < mm.brk {
+                if space.translate(page).is_some() {
                     pages += 1;
                 }
                 page += PAGE_SIZE_U64;
             }
-        }
-        let mut page = mm.brk_start;
-        while page < mm.brk {
-            if self.space.translate(page).is_some() {
-                pages += 1;
-            }
-            page += PAGE_SIZE_U64;
-        }
-        pages
+            pages
+        })
     }
 
     pub fn snapshot_vmas(&self) -> Vec<Vma> {
-        self.mm.lock().vmas.clone()
+        self.with_mem(|mm| mm.vmas.clone())
     }
 
     /// Give every region overlapping `[start, end)` the new protection.
     pub fn set_vma_prot(&self, start: u64, end: u64, prot: u64) {
-        let mut mm = self.mm.lock();
-        for vma in mm.vmas.iter_mut() {
-            if vma.start < end && start < vma.end {
-                vma.prot = prot;
+        self.with_mem(|mm| {
+            for vma in mm.vmas.iter_mut() {
+                if vma.start < end && start < vma.end {
+                    vma.prot = prot;
+                }
             }
-        }
+        });
     }
 
     /// Remove `[start, end)` from the recorded regions, splitting as needed.
     pub fn remove_vma_range(&self, start: u64, end: u64) {
-        let mut mm = self.mm.lock();
+        self.with_mem(|mm| {
         let mut out: Vec<Vma> = Vec::new();
         for vma in mm.vmas.iter().cloned() {
             if vma.end <= start || vma.start >= end {
@@ -381,24 +508,27 @@ impl Task {
             }
         }
         mm.vmas = out;
+        });
     }
 
     /// Find a free span of `len` bytes in the mmap area.
     pub fn find_free_region(&self, len: u64) -> u64 {
         let len = page_align_up(len);
-        let mut mm = self.mm.lock();
-        let mut candidate = mm.mmap_top;
-        loop {
-            let end = candidate + len;
-            let clash = mm.vmas.iter().find(|v| v.start < end && candidate < v.end).map(|v| v.end);
-            match clash {
-                Some(v) => candidate = v,
-                None => {
-                    mm.mmap_top = end;
-                    return candidate;
+        self.with_mem(|mm| {
+            let mut candidate = mm.mmap_top;
+            loop {
+                let end = candidate + len;
+                let clash =
+                    mm.vmas.iter().find(|v| v.start < end && candidate < v.end).map(|v| v.end);
+                match clash {
+                    Some(v) => candidate = v,
+                    None => {
+                        mm.mmap_top = end;
+                        return candidate;
+                    }
                 }
             }
-        }
+        })
     }
 
     /// Give this task a private copy of a shared page it is trying to write.
@@ -423,22 +553,20 @@ impl Task {
     pub fn handle_cow(&self, addr: u64, irq: NoInterrupts) -> bool {
         use crate::arch::paging::COW;
         let page = page_align_down(addr);
-        let Some(flags) = self.space.flags_of(page) else {
+        let space = self.space.get();
+        let Some(flags) = space.flags_of(page) else {
             return false;
         };
         if flags & COW == 0 {
             return false;
         }
-        let Some(phys) = self.space.translate(page).map(page_align_down) else {
+        let Some(phys) = space.translate(page).map(page_align_down) else {
             return false;
         };
 
         // The last owner can simply take the page back.
         if crate::mm::frame::frame_references(phys) <= 1 {
-            return self
-                .space
-                .set_flags(page, (flags & !COW) | WRITABLE)
-                .is_some();
+            return space.set_flags(page, (flags & !COW) | WRITABLE).is_some();
         }
 
         let Some(copy) = crate::mm::frame::alloc() else {
@@ -462,7 +590,7 @@ impl Task {
         // The copy goes in over the shared page in one store, which hands back
         // the reference this table held on the frame it was sharing. Dropping
         // it is the release.
-        let shared = self.space.replace(page, copy, (flags & !COW) | WRITABLE, irq);
+        let shared = space.replace(page, copy, (flags & !COW) | WRITABLE, irq);
         let replaced = shared.is_some();
         drop(shared);
         replaced
@@ -478,7 +606,8 @@ impl Task {
     /// already in it.
     pub fn fault_in(&self, addr: u64) -> bool {
         let page = page_align_down(addr);
-        if self.space.translate(page).is_some() {
+        let space = self.space.get();
+        if space.translate(page).is_some() {
             // The hardware found nothing at this address and the tables have
             // something at it: two readings of one entry either side of a
             // sibling's store. The faulting instruction can run again. A fault
@@ -487,21 +616,20 @@ impl Task {
             // decided before this is called.
             return true;
         }
-        let (in_heap, vma) = {
-            let mm = self.mm.lock();
+        let (in_heap, vma) = self.with_mem(|mm| {
             (
                 page >= mm.brk_start && page < mm.brk,
                 mm.vmas.iter().find(|v| v.contains(page)).cloned(),
             )
-        };
+        });
         if in_heap {
-            return served(self.space.map_new(page, PRESENT | WRITABLE | USER | NO_EXECUTE));
+            return served(space.map_new(page, PRESENT | WRITABLE | USER | NO_EXECUTE));
         }
         let Some(vma) = vma else {
             return false;
         };
         let Some(file) = &vma.file else {
-            return served(self.space.map_new(page, vma.page_flags()));
+            return served(space.map_new(page, vma.page_flags()));
         };
 
         // A page of an executable is filled before it is published, and goes
@@ -528,7 +656,7 @@ impl Task {
                 crate::arch::sync_instruction_cache(fresh.bytes().as_ptr() as u64, filled);
             }
         }
-        served(self.space.publish(page, fresh, flags))
+        served(space.publish(page, fresh, flags))
     }
 
     pub fn free_kernel_stack(&mut self) {
@@ -539,22 +667,42 @@ impl Task {
     }
 
     pub fn state(&self) -> State {
-        self.state
+        self.state.get()
     }
 
     /// The tick this task is due to be woken at, or zero for no deadline.
     pub fn wake_at(&self) -> u64 {
-        self.wake_at
+        self.wake_at.get()
     }
 
     /// The page tables the task runs on.
     pub fn space(&self) -> AddressSpace {
-        self.space
+        self.space.get()
     }
 
     /// The record of what is in them, shared with this task's threads.
-    pub fn mm(&self) -> &Arc<Spinlock<MemState>> {
-        &self.mm
+    pub fn mm(&self) -> Arc<Spinlock<MemState>> {
+        self.mm.lock().clone()
+    }
+
+    /// How many tasks hold that record: the threads running in this address
+    /// space, this one among them. The last one out is the only task that may
+    /// tear the address space down, and this is how it knows it is the last.
+    pub fn mm_shares(&self) -> usize {
+        Arc::strong_count(&self.mm.lock())
+    }
+
+    /// Take a copy of `other`'s region list, which is what a fork that does
+    /// not share the address space gives the child.
+    pub fn copy_mem_from(&self, other: &Task) {
+        let source = other.mm();
+        let source = source.lock();
+        self.with_mem(|target| {
+            target.vmas = source.vmas.clone();
+            target.brk_start = source.brk_start;
+            target.brk = source.brk;
+            target.mmap_top = source.mmap_top;
+        });
     }
 
     /// Run in the address space `other` runs in, sharing its region list.
@@ -563,9 +711,9 @@ impl Task {
     /// is why it asks for no proof of anything: nothing can see this task to
     /// be confused by a half-done change. A task that is already running
     /// changes address space through `run_on_space`.
-    pub fn share_space_of(&mut self, other: &Task) {
-        self.space = other.space;
-        self.mm = other.mm.clone();
+    pub fn share_space_of(&self, other: &Task) {
+        self.space.set(other.space.get());
+        *self.mm.lock() = other.mm();
     }
 
     // -----------------------------------------------------------------------
@@ -589,27 +737,27 @@ impl Task {
     /// finds a runnable task and wakes nothing, and the task then sleeps out
     /// the whole of the time it asked for with the reason to run already
     /// delivered.
-    pub fn sleep(&mut self, wake_at: u64, _irq: NoInterrupts) {
-        self.state = State::Sleeping;
-        self.wake_at = wake_at;
+    pub fn sleep(&self, wake_at: u64, _irq: NoInterrupts) {
+        self.state.set(State::Sleeping);
+        self.wake_at.set(wake_at);
     }
 
     /// Put a sleeping task back on the run queue, clearing its deadline.
     /// A task that is stopped stays stopped: only a continue restarts one.
-    pub fn wake(&mut self, _irq: NoInterrupts) {
-        if self.state == State::Sleeping {
-            self.state = State::Runnable;
-            self.wake_at = 0;
+    pub fn wake(&self, _irq: NoInterrupts) {
+        if self.state.get() == State::Sleeping {
+            self.state.set(State::Runnable);
+            self.wake_at.set(0);
         }
     }
 
     /// Restart a stopped task without the report a continue owes its parent.
     /// A kill it can never look at is not a kill, and nothing else gets a
     /// stopped task running again.
-    pub fn restart_for_kill(&mut self, _irq: NoInterrupts) {
-        if self.state == State::Stopped {
-            self.state = State::Runnable;
-            self.wake_at = 0;
+    pub fn restart_for_kill(&self, _irq: NoInterrupts) {
+        if self.state.get() == State::Stopped {
+            self.state.set(State::Runnable);
+            self.wake_at.set(0);
         }
     }
 
@@ -619,29 +767,29 @@ impl Task {
     /// halves it hands the CPU to something else and never hands it back,
     /// because this task is no longer runnable, so the notification is left
     /// undelivered by a task that can no longer deliver it.
-    pub fn stop(&mut self, signal: i32, table: &crate::sched::Held) {
-        self.stop_signal = signal;
-        self.report_stop = true;
-        self.state = State::Stopped;
-        table.notify_parent(self.ppid);
+    pub fn stop(&self, signal: i32, table: &crate::sched::Held) {
+        self.stop_signal.set(signal);
+        self.report_stop.set(true);
+        self.state.set(State::Stopped);
+        table.notify_parent(self.ppid.get());
     }
 
     /// Restart a stopped task and record the continue for whoever waits.
     ///
     /// Returns false when the task was not stopped, which is a continue with
     /// nothing to undo.
-    pub fn continue_after_stop(&mut self, table: &crate::sched::Held) -> bool {
-        if self.state != State::Stopped {
+    pub fn continue_after_stop(&self, table: &crate::sched::Held) -> bool {
+        if self.state.get() != State::Stopped {
             return false;
         }
-        self.state = State::Runnable;
-        self.wake_at = 0;
+        self.state.set(State::Runnable);
+        self.wake_at.set(0);
         // A stop nobody has been told about yet has stopped being true. Left
         // standing it is handed to whatever asks next, which is a suspension
         // reported after the job is running again.
-        self.report_stop = false;
-        self.report_continue = true;
-        table.notify_parent(self.ppid);
+        self.report_stop.set(false);
+        self.report_continue.set(true);
+        table.notify_parent(self.ppid.get());
         true
     }
 
@@ -652,15 +800,15 @@ impl Task {
     /// address space open, and, for a process rather than one of the threads
     /// inside one, the parent that may be in wait4. A thread's exit is not a
     /// child exit; whoever joins it is woken through its cleared tid word.
-    pub fn become_zombie(&mut self, table: &crate::sched::Held) {
-        self.state = State::Zombie;
+    pub fn become_zombie(&self, table: &crate::sched::Held) {
+        self.state.set(State::Zombie);
         if let Some(parent_pid) = self.vfork_parent.take() {
             if let Some(parent) = table.find(parent_pid) {
                 parent.wake(table.irq());
             }
         }
         if self.pid == self.tgid {
-            table.notify_parent(self.ppid);
+            table.notify_parent(self.ppid.get());
         }
     }
 
@@ -672,21 +820,21 @@ impl Task {
     /// reading its terminal has a handler for this one and would otherwise not
     /// learn that a background job had finished until the next key was
     /// pressed.
-    pub fn child_changed_state(&mut self, irq: NoInterrupts) {
-        self.pending_signals |= 1u64 << (SIGCHLD as u64 & 63);
+    pub fn child_changed_state(&self, irq: NoInterrupts) {
+        self.add_pending(1u64 << (SIGCHLD as u64 & 63));
         self.wake(irq);
     }
 
     /// The timer found this task's deadline passed.
-    pub fn deadline_reached(&mut self, _irq: NoInterrupts) {
-        self.wake_at = 0;
-        self.state = State::Runnable;
+    pub fn deadline_reached(&self, _irq: NoInterrupts) {
+        self.wake_at.set(0);
+        self.state.set(State::Runnable);
     }
 
     /// The task's memory has been handed back and its entry is out of the
     /// table. Nothing can reach it from here.
     pub fn mark_dead(&mut self) {
-        self.state = State::Dead;
+        self.state.set(State::Dead);
     }
 
     /// Run on `space` from here on, with `mm` as the record of what is in it.
@@ -697,13 +845,13 @@ impl Task {
     /// other one is resumed with no reload. The record and the register move
     /// together or not at all.
     pub fn run_on_space(
-        &mut self,
+        &self,
         space: AddressSpace,
         mm: Arc<Spinlock<MemState>>,
         _irq: NoInterrupts,
     ) {
-        self.space = space;
-        self.mm = mm;
+        self.space.set(space);
+        *self.mm.lock() = mm;
         unsafe { space.switch_to() };
     }
 }
@@ -752,7 +900,7 @@ pub fn build_user_stack(
     let prefault_from = USER_STACK_TOP - STACK_PREFAULT;
     let mut page = prefault_from;
     while page < USER_STACK_TOP {
-        task.space
+        task.space()
             .map_new(page, PRESENT | WRITABLE | USER | NO_EXECUTE)
             .map_err(|_| Errno::ENOMEM)?;
         page += PAGE_SIZE_U64;
@@ -853,13 +1001,13 @@ pub fn build_user_stack(
 }
 
 /// Populate a task's trap frame so it starts at `entry` with stack `sp`.
-pub fn set_user_entry(task: &mut Task, entry: u64, sp: u64) {
+pub fn set_user_entry(task: &Task, entry: u64, sp: u64) {
     let frame = task.trap_frame();
     unsafe { arch::start_user_at(&mut *frame, entry, sp) };
 }
 
 /// Open the standard descriptors on the console.
-pub fn attach_console(task: &mut Task) -> Result<(), Errno> {
+pub fn attach_console(task: &Task) -> Result<(), Errno> {
     let console = crate::fs::lookup("/dev/console")?;
     let stdin = OpenFile::from_node_at(console.clone(), O_RDONLY, "/dev/console");
     let stdout = OpenFile::from_node_at(console.clone(), O_WRONLY, "/dev/console");
@@ -915,8 +1063,7 @@ pub fn read_executable(
 /// Entry point for a task created by the kernel rather than by fork: load the
 /// program it was created for, then drop into user mode.
 pub extern "C" fn user_bootstrap() -> ! {
-    let mut task = crate::sched::current();
-    let Some((path, argv, envp)) = task.pending_exec.take() else {
+    let Some((path, argv, envp)) = crate::sched::current().take_pending_exec() else {
         crate::println!("[kernel] bootstrap task has no program");
         crate::sched::exit_current(1 << 8);
     };
@@ -945,14 +1092,14 @@ pub fn spawn(
         space.destroy();
         return Err(Errno::ENOMEM);
     };
-    task.ppid = parent_pid;
-    task.pgid = task.pid;
-    if let Err(err) = attach_console(&mut task) {
+    task.ppid.set(parent_pid);
+    task.pgid.set(task.pid);
+    if let Err(err) = attach_console(&task) {
         task.free_kernel_stack();
         space.destroy();
         return Err(err);
     }
-    task.pending_exec = Some((path.to_string(), argv, envp));
+    task.set_pending_exec((path.to_string(), argv, envp));
     task.prepare_kernel_frame(user_bootstrap as extern "C" fn() -> ! as usize as u64);
     Ok(crate::sched::register(task))
 }
@@ -961,8 +1108,11 @@ pub struct TaskPtr(pub *mut Task);
 unsafe impl Send for TaskPtr {}
 
 impl TaskPtr {
-    pub fn get(&self) -> &'static mut Task {
-        unsafe { &mut *self.0 }
+    /// The task, borrowed for as long as the entry that names it. The entry is
+    /// in the process table, so what the borrow comes from is a hold on the
+    /// table, and the reference cannot outlive it.
+    pub fn get(&self) -> &Task {
+        unsafe { &*self.0 }
     }
 }
 

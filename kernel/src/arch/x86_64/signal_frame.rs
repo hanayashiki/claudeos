@@ -64,7 +64,7 @@ fn get64(buf: &[u8], offset: usize) -> u64 {
 /// `action.handler`. Returns false if the user stack could not be written, in
 /// which case the caller should kill the task.
 pub fn enter_signal_handler(
-    task: &mut Task,
+    task: &Task,
     signal: i32,
     action: &SigAction,
     frame: &mut TrapFrame,
@@ -109,13 +109,14 @@ pub fn enter_signal_handler(
     put64(&mut buf, m + SC_EFLAGS, frame.rflags);
     buf[m + SC_CS..m + SC_CS + 2].copy_from_slice(&(frame.cs as u16).to_le_bytes());
 
-    put64(&mut buf, UC_SIGMASK, task.signal_mask);
+    put64(&mut buf, UC_SIGMASK, task.signal_mask.get());
 
     // The handler runs on the same registers the interrupted code was using,
     // and nothing else would put the floating point and vector ones back.
-    task.cpu.fpu.save();
-    buf[FPSTATE_OFFSET..FPSTATE_OFFSET + FPU_STATE_SIZE]
-        .copy_from_slice(task.cpu.fpu.bytes());
+    task.with_cpu(|cpu| {
+        cpu.fpu.save();
+        buf[FPSTATE_OFFSET..FPSTATE_OFFSET + FPU_STATE_SIZE].copy_from_slice(cpu.fpu.bytes());
+    });
     put64(&mut buf, m + SC_FPSTATE, sp + FPSTATE_OFFSET as u64);
 
     // siginfo: si_signo, si_errno, si_code.
@@ -128,9 +129,9 @@ pub fn enter_signal_handler(
     }
 
     // Block this signal for the duration of the handler unless asked not to.
-    task.signal_mask |= action.mask;
+    task.signal_mask.set(task.signal_mask.get() | action.mask);
     if action.flags & SA_NODEFER == 0 {
-        task.signal_mask |= 1u64 << (signal as u64 & 63);
+        task.signal_mask.set(task.signal_mask.get() | 1u64 << (signal as u64 & 63));
     }
 
     frame.rip = action.handler;
@@ -144,7 +145,7 @@ pub fn enter_signal_handler(
 
 /// Read the signal frame back and restore the register state the handler was
 /// entered with.
-pub fn leave_signal_handler(task: &mut Task, frame: &mut TrapFrame) -> SysResult {
+pub fn leave_signal_handler(task: &Task, frame: &mut TrapFrame) -> SysResult {
     // The restorer was reached by returning into it, so the frame starts one
     // word below the current stack pointer.
     let base = frame.rsp.wrapping_sub(8);
@@ -173,16 +174,15 @@ pub fn leave_signal_handler(task: &mut Task, frame: &mut TrapFrame) -> SysResult
     let flags = get64(&buf, m + SC_EFLAGS);
     frame.rflags = (flags & 0x0000_08D5) | 0x202;
 
-    task.signal_mask = get64(&buf, UC_SIGMASK);
+    task.signal_mask.set(get64(&buf, UC_SIGMASK));
 
     // Put the interrupted code's floating point and vector registers back.
-    if get64(&buf, m + SC_FPSTATE) != 0
-        && task
-            .cpu
-            .fpu
-            .from_bytes(&buf[FPSTATE_OFFSET..FPSTATE_OFFSET + FPU_STATE_SIZE])
-    {
-        task.cpu.fpu.restore();
+    if get64(&buf, m + SC_FPSTATE) != 0 {
+        task.with_cpu(|cpu| {
+            if cpu.fpu.from_bytes(&buf[FPSTATE_OFFSET..FPSTATE_OFFSET + FPU_STATE_SIZE]) {
+                cpu.fpu.restore();
+            }
+        });
     }
 
     // rt_sigreturn does not set a return value; rax comes back from the frame.
