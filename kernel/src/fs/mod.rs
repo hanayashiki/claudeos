@@ -272,7 +272,7 @@ pub fn normalize(cwd: &str, path: &str) -> String {
     out
 }
 
-const SYMLINK_DEPTH: usize = 16;
+pub const SYMLINK_DEPTH: usize = 16;
 
 /// Look up an absolute, normalised path.
 pub fn lookup(path: &str) -> Result<NodeRef, Errno> {

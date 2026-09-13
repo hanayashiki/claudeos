@@ -178,24 +178,84 @@ pub fn pwrite(fd: i32, buf_addr: u64, len: u64, offset: u64) -> SysResult {
     Ok(n as u64)
 }
 
+/// The descriptor `path` names, when it is one of the calling process's own
+/// entries under /proc/<pid>/fd.
+///
+/// The table is what such an entry stands for, so it is asked directly rather
+/// than through the directory that lists it: that directory is rebuilt on
+/// demand and is not there at all for the first moments of a task's life, so
+/// a child that redirects to one of its own descriptors before the fork that
+/// made it has finished would otherwise be told the name does not exist.
+fn own_descriptor(path: &str) -> Option<i32> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (owner, rest) = rest.split_once('/')?;
+    if owner.parse::<u32>().ok()? != sched::current().pid {
+        return None;
+    }
+    rest.strip_prefix("fd/")?.parse::<i32>().ok()
+}
+
+/// Another handle on the open file a descriptor already holds.
+fn open_descriptor(fd: i32, flags: u32) -> SysResult {
+    // A descriptor that is not open has no entry, so the answer is the one a
+    // missing name gets rather than the one a bad descriptor gets.
+    let file = sched::current().fds.get(fd).map_err(|_| Errno::ENOENT)?;
+    let new = sched::current().fds.alloc(file, flags & O_CLOEXEC != 0)?;
+    Ok(new as u64)
+}
+
+/// Where a trailing symbolic link points, when `path` ends in one.
+fn final_link_target(path: &str) -> Option<String> {
+    let node = fs::lookup_nofollow(path).ok()?;
+    if node.kind != fs::NodeKind::Symlink {
+        return None;
+    }
+    let target = node.symlink_target()?;
+    let (dir, _) = path.rsplit_once('/')?;
+    Some(fs::normalize(if dir.is_empty() { "/" } else { dir }, &target))
+}
+
 pub fn openat(dirfd: i64, path_addr: u64, flags: u32, mode: u32) -> SysResult {
     let mut path = resolve_at(dirfd, path_addr)?;
-    if let Some(target) = procfs_override(&path) {
-        path = target;
+    let mut found = None;
+
+    // A trailing symbolic link whose target is not there is followed here
+    // rather than left to the lookup, because what the name stands for is
+    // what it points at: O_CREAT has to make the target, and a link to a
+    // descriptor still has to reach that descriptor. Opening the link itself
+    // would replace the path it holds with whatever was written to it.
+    for _ in 0..fs::SYMLINK_DEPTH {
+        if let Some(target) = procfs_override(&path) {
+            path = target;
+        }
+        if let Some(fd) = own_descriptor(&path) {
+            return open_descriptor(fd, flags);
+        }
+        match fs::lookup(&path) {
+            Ok(node) => {
+                found = Some(node);
+                break;
+            }
+            Err(Errno::ENOENT) => match final_link_target(&path) {
+                Some(target) => path = target,
+                None => break,
+            },
+            Err(err) => return Err(err),
+        }
     }
 
-    let node = match fs::lookup(&path) {
-        Ok(node) => {
+    let node = match found {
+        Some(node) => {
             if flags & O_EXCL != 0 && flags & O_CREAT != 0 {
                 return Err(Errno::EEXIST);
             }
             node
         }
-        Err(Errno::ENOENT) if flags & O_CREAT != 0 => {
+        None if flags & O_CREAT != 0 => {
             let umask = sched::current().umask;
             fs::create(&path, mode & !umask)?
         }
-        Err(err) => return Err(err),
+        None => return Err(Errno::ENOENT),
     };
 
     // An entry in /proc/<pid>/fd is that descriptor. Opening it hands back
@@ -203,10 +263,7 @@ pub fn openat(dirfd: i64, path_addr: u64, flags: u32, mode: u32) -> SysResult {
     // to /dev/stdout reach the terminal or the pipe stdout is attached to.
     if let fs::NodeKind::Fd(owner, fd) = node.kind {
         if owner == sched::current().pid {
-            let file = sched::current().fds.get(fd)?;
-            let cloexec = flags & O_CLOEXEC != 0;
-            let new = sched::current().fds.alloc(file, cloexec)?;
-            return Ok(new as u64);
+            return open_descriptor(fd, flags);
         }
         return Err(Errno::EACCES);
     }
