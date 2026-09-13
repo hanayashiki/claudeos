@@ -264,6 +264,8 @@ pub fn run() -> bool {
     refused(&mut report, nic);
     crate::println!("net: a served connection");
     connection(&mut report, nic);
+    crate::println!("net: segments that are nobody's business");
+    unacceptable_segments(&mut report, nic);
     crate::println!("net: datagrams");
     datagrams(&mut report, nic);
     // The driver for this board's own Ethernet, as far as it can be exercised
@@ -756,6 +758,237 @@ fn retransmit_pending(socket: &Arc<InetSocket>) -> bool {
         Protocol::Tcp(tcb) => tcb.retransmit_at != 0,
         Protocol::Udp(_) => false,
     }
+}
+
+/// One connection that has finished its handshake, for the checks that drive
+/// segments at a connection already up.
+struct Connection {
+    listener: Arc<InetSocket>,
+    socket: Arc<InetSocket>,
+    port: u16,
+    /// The next sequence number each end expects from the other.
+    client_next: u32,
+    server_next: u32,
+}
+
+/// Take a connection through its handshake and hand back both ends' numbers.
+fn establish(nic: &FakeNic, server_port: u16, client_port: u16, client_iss: u32) -> Option<Connection> {
+    let listener = InetSocket::new(true);
+    listener.bind(Endpoint::new(Ipv4Addr::UNSPECIFIED, server_port)).ok()?;
+    listener.listen(4).ok()?;
+    nic.take();
+
+    deliver_ip(
+        ip::PROTO_TCP,
+        &segment(client_port, server_port, client_iss, 0, tcp::SYN, 64240, &[], &[], PEER_IP, OUR_IP),
+    );
+    let sent = nic.take();
+    if sent.len() != 1 {
+        return None;
+    }
+    let answer = tcp::Segment::parse(&sent[0][34..])?;
+    let server_iss = answer.sequence;
+    deliver_ip(
+        ip::PROTO_TCP,
+        &segment(
+            client_port,
+            server_port,
+            client_iss.wrapping_add(1),
+            server_iss.wrapping_add(1),
+            tcp::ACK,
+            64240,
+            &[],
+            &[],
+            PEER_IP,
+            OUR_IP,
+        ),
+    );
+    nic.take();
+    let socket = listener.accept_ready().ok()??;
+    Some(Connection {
+        listener,
+        socket,
+        port: client_port,
+        client_next: client_iss.wrapping_add(1),
+        server_next: server_iss.wrapping_add(1),
+    })
+}
+
+fn fin_received_of(socket: &Arc<InetSocket>) -> bool {
+    match &*socket.inner.lock() {
+        Protocol::Tcp(tcb) => tcb.fin_received,
+        Protocol::Udp(_) => false,
+    }
+}
+
+/// The acknowledgement this stack would send: where it is in both directions.
+fn is_bare_ack(frame: &[u8], port: u16, sequence: u32, acknowledgement: u32) -> bool {
+    // Through the IPv4 header's own length: the link pads a short frame, and
+    // that padding would read as payload.
+    let Some((_, datagram)) = ip::parse(&frame[14..]) else { return false };
+    let Some(parsed) = tcp::Segment::parse(datagram) else { return false };
+    parsed.destination_port == port
+        && parsed.flags == tcp::ACK
+        && parsed.sequence == sequence
+        && parsed.acknowledgement == acknowledgement
+        && parsed.payload.is_empty()
+}
+
+/// A segment whose sequence number is nowhere near what this end wants next
+/// says nothing about the connection, whatever it is flagged as. Anyone who
+/// can send us a packet can guess at these, so acting on one closes a
+/// connection for a stranger who never saw a byte of it.
+fn unacceptable_segments(report: &mut Report, nic: &FakeNic) {
+    const SERVER_PORT: u16 = 8081;
+
+    // ---- a reset at a sequence number nobody is waiting for ----
+    socket::reset();
+    let Some(connection) = establish(nic, SERVER_PORT, 40100, 2_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    deliver_ip(
+        ip::PROTO_TCP,
+        &segment(
+            connection.port,
+            SERVER_PORT,
+            0xDEAD_BEEF,
+            connection.server_next,
+            tcp::RST | tcp::ACK,
+            64240,
+            &[],
+            &[],
+            PEER_IP,
+            OUR_IP,
+        ),
+    );
+    report.check(
+        "a reset outside the window leaves the connection up",
+        state_of(&connection.socket) == tcp::State::Established,
+    );
+    // RFC 5961: answering would tell a blind sender how close it got.
+    report.check("and is not answered", nic.take().is_empty());
+    socket::close(&connection.socket);
+    socket::close(&connection.listener);
+    nic.take();
+
+    // ---- a connection request in the middle of a connection ----
+    socket::reset();
+    let Some(connection) = establish(nic, SERVER_PORT, 40101, 3_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    deliver_ip(
+        ip::PROTO_TCP,
+        &segment(
+            connection.port,
+            SERVER_PORT,
+            0x1234_5678,
+            0,
+            tcp::SYN,
+            64240,
+            &[],
+            &[],
+            PEER_IP,
+            OUR_IP,
+        ),
+    );
+    report.check(
+        "a stray connection request leaves the connection up",
+        state_of(&connection.socket) == tcp::State::Established,
+    );
+    let sent = nic.take();
+    // RFC 5961 section 4: the challenge acknowledgement. The peer that really
+    // lost our answer is the only one it helps, and it costs a blind sender
+    // the one thing it does not have.
+    report.check(
+        "and draws an acknowledgement of where we are",
+        sent.len() == 1
+            && is_bare_ack(&sent[0], connection.port, connection.server_next, connection.client_next),
+    );
+    socket::close(&connection.socket);
+    socket::close(&connection.listener);
+    nic.take();
+
+    // ---- a finish at a sequence number long since passed ----
+    socket::reset();
+    let Some(connection) = establish(nic, SERVER_PORT, 40102, 1_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    deliver_ip(
+        ip::PROTO_TCP,
+        &segment(
+            connection.port,
+            SERVER_PORT,
+            7,
+            connection.server_next,
+            tcp::FIN | tcp::ACK,
+            64240,
+            &[],
+            &[],
+            PEER_IP,
+            OUR_IP,
+        ),
+    );
+    report.check(
+        "a stale finish is not the end of the stream",
+        !fin_received_of(&connection.socket)
+            && state_of(&connection.socket) == tcp::State::Established,
+    );
+    let sent = nic.take();
+    report.check(
+        "and draws an acknowledgement of where we are",
+        sent.len() == 1
+            && is_bare_ack(&sent[0], connection.port, connection.server_next, connection.client_next),
+    );
+
+    // ---- the request again, because our answer was lost ----
+    // The one case where a repeated connection request is not an attack: the
+    // handshake has to carry on rather than be challenged.
+    socket::reset();
+    let listener = InetSocket::new(true);
+    if listener.bind(Endpoint::new(Ipv4Addr::UNSPECIFIED, SERVER_PORT)).is_err()
+        || listener.listen(4).is_err()
+    {
+        report.check("a listening socket", false);
+        return;
+    }
+    nic.take();
+    let request = segment(
+        40103,
+        SERVER_PORT,
+        4_000_000,
+        0,
+        tcp::SYN,
+        64240,
+        &[],
+        &[],
+        PEER_IP,
+        OUR_IP,
+    );
+    deliver_ip(ip::PROTO_TCP, &request);
+    let first = nic.take();
+    deliver_ip(ip::PROTO_TCP, &request);
+    let again = nic.take();
+    let repeated = match (first.first(), again.first()) {
+        (Some(first), Some(again)) => {
+            match (tcp::Segment::parse(&first[34..]), tcp::Segment::parse(&again[34..])) {
+                (Some(first), Some(again)) => {
+                    first.flags == (tcp::SYN | tcp::ACK)
+                        && again.flags == (tcp::SYN | tcp::ACK)
+                        && first.sequence == again.sequence
+                        && again.acknowledgement == 4_000_001
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    report.check("a repeated connection request is answered again", repeated);
+    socket::close(&listener);
+    socket::reset();
+    nic.take();
 }
 
 /// A datagram socket takes what arrives and sends what it is given.

@@ -566,6 +566,55 @@ impl Tcb {
 
     // ---- input -----------------------------------------------------------
 
+    /// RFC 793 section 3.9's first test: does this segment fall anywhere in
+    /// the window this end is waiting for? A segment that does not belongs to
+    /// some other conversation, or to nobody at all, and nothing in it may be
+    /// acted on -- not the flags, not the acknowledgement, not the data.
+    fn acceptable(&self, segment: &Segment) -> bool {
+        let window = self.advertised_window() as u32;
+        let length = segment.length();
+        let first = segment.sequence;
+        if length == 0 {
+            if window == 0 {
+                return first == self.receive_next;
+            }
+            return seq_le(self.receive_next, first)
+                && seq_lt(first, self.receive_next.wrapping_add(window));
+        }
+        if window == 0 {
+            return false;
+        }
+        let last = first.wrapping_add(length - 1);
+        let right = self.receive_next.wrapping_add(window);
+        (seq_le(self.receive_next, first) && seq_lt(first, right))
+            || (seq_le(self.receive_next, last) && seq_lt(last, right))
+    }
+
+    /// What to do with a segment that fell outside the window. Nothing in it
+    /// is believed; the answer says where this end actually is, which is what
+    /// a peer that is genuinely out of step needs and what someone guessing
+    /// at the connection cannot see.
+    fn on_unacceptable(&mut self, segment: &Segment) -> bool {
+        if segment.flags & RST != 0 {
+            // RFC 5961 section 3: a reset this far out is not answered at
+            // all. An answer would tell whoever guessed how close they came.
+            return false;
+        }
+        if self.state == State::SynReceived
+            && segment.flags & SYN != 0
+            && segment.flags & ACK == 0
+            && segment.sequence == self.irs
+        {
+            // The connection request again, because our answer was lost. It
+            // sits one before what is wanted next, so the window test turns
+            // it away, and it is still the handshake carrying on.
+            self.send_syn_ack();
+            return false;
+        }
+        self.acknowledge();
+        false
+    }
+
     /// Returns true when something a waiter cares about changed.
     pub fn on_segment(&mut self, segment: &Segment) -> bool {
         match self.state {
@@ -574,7 +623,19 @@ impl Tcb {
             _ => {}
         }
 
+        if !self.acceptable(segment) {
+            return self.on_unacceptable(segment);
+        }
+
         if segment.flags & RST != 0 {
+            if segment.sequence != self.receive_next {
+                // RFC 5961 section 3: inside the window, but not the byte
+                // that is wanted next. Say where this end is and wait for a
+                // reset that names it, which leaves a blind sender one number
+                // to find rather than a whole window of them.
+                self.acknowledge();
+                return false;
+            }
             self.state = State::Closed;
             self.retransmit_at = 0;
             self.pending.clear();
@@ -585,15 +646,12 @@ impl Tcb {
         }
 
         if segment.flags & SYN != 0 {
-            if self.state == State::SynReceived && segment.flags & ACK == 0 {
-                // The connection request again, because our answer was lost.
-                self.send_syn_ack();
-                return false;
-            }
-            self.send_segment(RST, self.send_next, &[], false);
-            self.state = State::Closed;
-            self.error = Some(Errno::ECONNRESET);
-            return true;
+            // RFC 5961 section 4: a connection request inside an open
+            // connection draws the same acknowledgement rather than a reset.
+            // A peer that really has restarted answers that with a reset of
+            // its own, which does carry the sequence number this end named.
+            self.acknowledge();
+            return false;
         }
 
         if segment.flags & ACK == 0 {
