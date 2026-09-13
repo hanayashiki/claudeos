@@ -85,6 +85,35 @@ if [ -x "$ROOT/build/thirdparty/busybox-aarch64" ]; then
   chmod +x "$RFS/bin/busybox"
 fi
 
+# Cloudflare's own cloudflared, if ARCH=aarch64 scripts/fetch-cloudflared.sh
+# has been run. It is a static Go program, and Go brings its own threads, its
+# own resolver and its own TLS rather than calling a libc for any of them, so
+# it asks for things nothing built against musl here has asked for.
+if [ -x "$ROOT/build/thirdparty/cloudflared-aarch64" ]; then
+  cp "$ROOT/build/thirdparty/cloudflared-aarch64" "$RFS/bin/cloudflared"
+  chmod +x "$RFS/bin/cloudflared"
+fi
+
+# What a program that resolves names itself reads to find a name server. The
+# address is the one QEMU's user-mode network answers on, which is also what
+# the kernel's own `nameserver=` defaults to.
+cat > "$RFS/etc/resolv.conf" <<'RESOLV'
+nameserver 10.0.2.3
+RESOLV
+
+# A certificate store, so a program with its own TLS has roots to verify
+# against. Nothing here builds one; this is the bundle out of the Alpine root
+# filesystem scripts/fetch-alpine.sh downloads. Alpine publishes the same one
+# for both machines, so either tree's copy will do.
+for CERTS in "$ROOT/build/alpine-rootfs-aarch64/etc/ssl/certs/ca-certificates.crt" \
+             "$ROOT/build/alpine-rootfs/etc/ssl/certs/ca-certificates.crt"; do
+  [ -f "$CERTS" ] || continue
+  mkdir -p "$RFS/etc/ssl/certs"
+  cp "$CERTS" "$RFS/etc/ssl/certs/ca-certificates.crt"
+  ln -sf certs/ca-certificates.crt "$RFS/etc/ssl/cert.pem"
+  break
+done
+
 cat > "$RFS/etc/motd" <<'MOTD'
 Welcome to claudeos.
 

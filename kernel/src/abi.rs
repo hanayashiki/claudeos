@@ -317,6 +317,50 @@ pub struct RLimit {
 
 pub const RLIM_INFINITY: u64 = u64::MAX;
 
+/// `stack_t`: the alternate stack a handler runs on when its disposition
+/// asked for one. Twenty-four bytes on both machines, the flags word padded
+/// out to the alignment the two pointers need.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SigAltStack {
+    pub ss_sp: u64,
+    pub ss_flags: i32,
+    /// What the compiler would leave between the flags and the size anyway.
+    /// It is named because the structure is written to user memory as a value
+    /// rather than as bytes, and a hole nothing assigns to is whatever the
+    /// kernel stack held there.
+    pub _pad: u32,
+    pub ss_size: u64,
+}
+
+impl SigAltStack {
+    /// Whether a stack has been installed at all. Taking it away is `ss_size`
+    /// going to zero, which is what `SS_DISABLE` asks for.
+    pub fn installed(&self) -> bool {
+        self.ss_size != 0
+    }
+
+    /// Whether `sp` is inside it.
+    pub fn contains(&self, sp: u64) -> bool {
+        self.installed() && sp >= self.ss_sp && sp < self.ss_sp + self.ss_size
+    }
+
+    /// What `sigaltstack` reports for the stack in place, given where the
+    /// program's stack pointer is now.
+    pub fn flags_at(&self, sp: u64) -> i32 {
+        if !self.installed() {
+            SS_DISABLE
+        } else if self.contains(sp) {
+            SS_ONSTACK
+        } else {
+            0
+        }
+    }
+}
+
+pub const SS_ONSTACK: i32 = 1;
+pub const SS_DISABLE: i32 = 2;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WinSize {
@@ -326,11 +370,19 @@ pub struct WinSize {
     pub ws_ypixel: u16,
 }
 
-/// `struct termios`, in the shape musl gives it: 32 control characters and the
-/// two speeds, where Linux's own structure has 19 characters and stops after
-/// them. x86-64 and aarch64 both take the asm-generic definition, and musl
-/// gives them both this same userspace one, so a TCGETS fills exactly what the
-/// caller allocated on either.
+/// `struct termios`, in the shape the kernel interface gives it: nineteen
+/// control characters and nothing after them, thirty-six bytes in all. x86-64
+/// and aarch64 both take the asm-generic definition, so it is the same on
+/// either.
+///
+/// This is the size the call writes, and it is not the size of the structure a
+/// C library declares. musl's has thirty-two control characters and two speeds
+/// after them, glibc's the same, and Go's is thirty-six bytes plus two speeds:
+/// each is at least as large, and Linux fills the first thirty-six bytes of
+/// whichever it is handed and leaves the rest alone. Writing the larger shape
+/// instead puts the two speeds past the end of a caller whose structure ends at
+/// thirty-six, over whatever is next -- a return address, where the structure
+/// is a local.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Termios {
@@ -339,9 +391,7 @@ pub struct Termios {
     pub c_cflag: u32,
     pub c_lflag: u32,
     pub c_line: u8,
-    pub c_cc: [u8; 32],
-    pub c_ispeed: u32,
-    pub c_ospeed: u32,
+    pub c_cc: [u8; 19],
 }
 
 // termios c_lflag bits
@@ -357,26 +407,23 @@ pub const IXON: u32 = 0o002000;
 pub const OPOST: u32 = 0o000001;
 pub const ONLCR: u32 = 0o000004;
 
+impl Termios {
+    /// What the terminal starts out set to.
+    pub const CONSOLE: Termios = Termios {
+        c_iflag: ICRNL | IXON,
+        c_oflag: OPOST | ONLCR,
+        c_cflag: 0o2277, // B38400 | CS8 | CREAD
+        c_lflag: ISIG | ICANON | ECHO | ECHOE,
+        c_line: 0,
+        // VINTR, VQUIT, VERASE, VKILL, VEOF, VTIME, VMIN, VSWTC, VSTART,
+        // VSTOP, VSUSP, then the rest unset.
+        c_cc: [3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 0, 0, 0, 0, 0, 0, 0],
+    };
+}
+
 impl Default for Termios {
     fn default() -> Self {
-        let mut c_cc = [0u8; 32];
-        c_cc[0] = 3; // VINTR
-        c_cc[1] = 28; // VQUIT
-        c_cc[2] = 127; // VERASE
-        c_cc[3] = 21; // VKILL
-        c_cc[4] = 4; // VEOF
-        c_cc[6] = 1; // VMIN
-        c_cc[5] = 0; // VTIME
-        Termios {
-            c_iflag: ICRNL | IXON,
-            c_oflag: OPOST | ONLCR,
-            c_cflag: 0o2277, // B38400 | CS8 | CREAD
-            c_lflag: ISIG | ICANON | ECHO | ECHOE,
-            c_line: 0,
-            c_cc,
-            c_ispeed: 38400,
-            c_ospeed: 38400,
-        }
+        Termios::CONSOLE
     }
 }
 

@@ -11,6 +11,7 @@ pub const SIG_IGN: u64 = 1;
 
 pub const SA_SIGINFO: u64 = 0x0000_0004;
 pub const SA_RESTORER: u64 = 0x0400_0000;
+pub const SA_ONSTACK: u64 = 0x0800_0000;
 pub const SA_NODEFER: u64 = 0x4000_0000;
 pub const SA_RESETHAND: u64 = 0x8000_0000;
 

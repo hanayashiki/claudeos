@@ -50,6 +50,7 @@ make test                    # run every self-test suite
 make demo                    # run the scripted tour
 make busybox                 # fetch an upstream busybox to test against
 make alpine                  # fetch an Alpine root filesystem to boot
+make cloudflared             # fetch Cloudflare's own cloudflared to run
 ```
 
 After `make alpine`, boot into Alpine itself:
@@ -327,7 +328,15 @@ loader bring up Alpine's userland.
 **Signals.** A handler installed with `rt_sigaction` is really entered: the
 kernel writes the same `rt_sigframe` Linux does onto the user stack, points the
 return address at the libc restorer, and `rt_sigreturn` puts the interrupted
-state back. Terminal signals are raised from the interrupt that receives the
+state back. A disposition that asked for `SA_ONSTACK` is entered on the stack
+`sigaltstack` named rather than on the interrupted one, and `sigaltstack` is
+answered rather than accepted and forgotten: a program that asks where its
+handler would run is told, and one that has named no stack is told that. A
+runtime that reads the answer back before deciding what to do needs both, and
+Go is one -- its scheduler interrupts a running thread with a signal, and the
+first thing its handler does is work out which stack it is standing on.
+
+Terminal signals are raised from the interrupt that receives the
 character, so `Ctrl-C` reaches a running job while the shell is blocked waiting
 for it. The shell puts each job in its own process group and hands it the
 terminal, so interrupting a job leaves the shell running.
@@ -416,6 +425,44 @@ Content-Length: 20
 
 hello from claudeos
 ```
+
+**Something large that is not ours.** `make cloudflared` fetches Cloudflare's
+own `cloudflared`, a forty-megabyte static Go program, and puts it in the
+image. It is the largest thing here that this project did not build, and it
+asks for a different half of the interface from everything else: Go brings its
+own threads, its own scheduler, its own resolver and its own TLS rather than
+calling a libc for any of them.
+
+```
+/ # cloudflared tunnel --protocol http2 --url http://localhost:8080
+INF Requesting new quick Tunnel on trycloudflare.com...
+INF |  Your quick Tunnel has been created! Visit it at:                 |
+INF |  https://success-intermediate-debian-generating.trycloudflare.com |
+INF Registered tunnel connection connIndex=0 location=nrt07 protocol=http2
+inet: connection from 127.0.0.1:49247
+```
+
+```
+$ curl -i https://success-intermediate-debian-generating.trycloudflare.com/
+HTTP/2 200
+server: cloudflare
+
+hello from claudeos
+```
+
+It resolves `api.cloudflare.com` with its own resolver over this stack's UDP,
+verifies the certificate against the bundle in `/etc/ssl/certs`, opens an
+HTTP/2 tunnel to the edge, and proxies what arrives into the server above.
+
+`--protocol http2` is on that command line because the default transport is
+QUIC and QUIC does not work here. A QUIC sender holds one unconnected socket
+and names a destination on each datagram; `sendmsg` drops that name and sends
+on the descriptor, which an unconnected socket refuses, and the batching read
+it pairs with, `recvmmsg`, is not implemented. Everything else cloudflared asks
+for it gets. On aarch64 it does not get that far: Go registers its handlers
+without a restorer, which is right for that machine because Linux returns
+through a page of its own there, and this kernel has no such page, so the first
+signal its scheduler sends kills it.
 
 **Console.** A 16550 UART and a PS/2 keyboard feed one input ring. A line
 discipline implements canonical mode with echo, backspace, `Ctrl-C`, `Ctrl-D`
@@ -631,6 +678,13 @@ acknowledgement: every segment goes as soon as there is a window for it and is
 answered as soon as it arrives. There is no DHCP and no resolver, so addresses
 come from the kernel command line. IPv4 only, and fragments are dropped rather
 than reassembled.
+
+`sendmsg` drops the address a message names and sends on the descriptor
+instead, so it reaches a connected socket and nothing else: a datagram sent
+through it from an unconnected socket is refused. `recvmsg` says nothing about
+where what it returned came from, and `recvmmsg` is not implemented at all.
+Between them that is what a QUIC implementation uses -- one unconnected socket,
+a destination per datagram, a batch per read -- so QUIC does not work here.
 
 QEMU cannot be asked to lose a packet -- its netfilters delay, dump, mirror,
 redirect and rewrite, and none of them drops one, nor is there a knob for it on

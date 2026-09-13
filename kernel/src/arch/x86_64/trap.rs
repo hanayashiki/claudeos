@@ -138,6 +138,12 @@ pub fn instruction_pointer(frame: &TrapFrame) -> u64 {
     frame.rip
 }
 
+/// Where the interrupted code's own stack pointer was.
+#[inline]
+pub fn stack_pointer(frame: &TrapFrame) -> u64 {
+    frame.rsp
+}
+
 /// Which exception or interrupt built this frame.
 #[inline]
 pub fn trap_vector(frame: &TrapFrame) -> u64 {

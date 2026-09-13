@@ -198,6 +198,11 @@ pub struct Task {
     /// field did. `as_slice_of_cells` gives the entries back one at a time.
     signal_actions: Cell<[crate::signal::SigAction; 64]>,
     pub signal_mask: Cell<u64>,
+    /// The stack a handler whose disposition says `SA_ONSTACK` runs on.
+    /// Per-thread: a thread that shares its siblings' stack would have two
+    /// handlers writing over each other, so a `CLONE_VM` child starts without
+    /// one and installs its own. Empty means none is installed.
+    pub sig_stack: Cell<crate::abi::SigAltStack>,
 
     /// Pid this task is waiting for, if it is in wait4.
     pub waiting_for: Cell<Option<i32>>,
@@ -276,6 +281,7 @@ impl Task {
             report_continue: Cell::new(false),
             signal_actions: Cell::new([crate::signal::SigAction::default(); 64]),
             signal_mask: Cell::new(0),
+            sig_stack: Cell::new(crate::abi::SigAltStack::default()),
             wake_at: Cell::new(0),
             waiting_for: Cell::new(None),
             umask: Cell::new(0o022),
@@ -331,13 +337,15 @@ impl Task {
         self.signal_actions.set(other.signal_actions.get());
     }
 
-    /// Handlers do not survive exec, but ignored signals stay ignored.
+    /// Handlers do not survive exec, but ignored signals stay ignored. Nor
+    /// does the alternate stack: it was an address in the image that has gone.
     pub fn reset_actions_for_exec(&self) {
         for action in self.actions() {
             if action.get().handler != crate::signal::SIG_IGN {
                 action.set(crate::signal::SigAction::default());
             }
         }
+        self.sig_stack.set(crate::abi::SigAltStack::default());
     }
 
     /// Add and remove signals from the pending set. Every caller is a read,
