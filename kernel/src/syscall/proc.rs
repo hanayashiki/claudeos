@@ -619,8 +619,9 @@ pub fn nanosleep(req: u64, rem: u64) -> SysResult {
     if spec.tv_sec < 0 || spec.tv_nsec < 0 || spec.tv_nsec >= 1_000_000_000 {
         return Err(Errno::EINVAL);
     }
-    let total_ns = spec.tv_sec as u64 * 1_000_000_000 + spec.tv_nsec as u64;
-    let ticks = crate::time::ns_to_ticks(total_ns);
+    let total_ns =
+        (spec.tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(spec.tv_nsec as u64);
+    let ticks = super::wait_ticks(total_ns);
     if ticks == 0 {
         sched::yield_now();
         if rem != 0 {
@@ -737,8 +738,10 @@ pub fn futex(uaddr: u64, op: u32, val: u32, timeout: u64) -> SysResult {
                 u64::MAX
             } else {
                 let spec: Timespec = uaccess::read_struct(timeout)?;
-                let ns = spec.tv_sec as u64 * 1_000_000_000 + spec.tv_nsec as u64;
-                crate::trap::ticks() + crate::time::ns_to_ticks(ns)
+                let ns = (spec.tv_sec as u64)
+                    .saturating_mul(1_000_000_000)
+                    .saturating_add(spec.tv_nsec as u64);
+                super::deadline_in(ns)
             };
             let key = crate::futex::futex_key(uaddr);
             loop {

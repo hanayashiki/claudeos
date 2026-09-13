@@ -16,6 +16,32 @@ pub fn init() {
     arch::init_syscall_entry();
 }
 
+/// `nanos` as a whole number of timer ticks, rounding up.
+///
+/// How long to wait reaches the kernel in a register, and turning it into
+/// ticks multiplies it out: milliseconds by a million, seconds by a thousand
+/// million. A length with no tick count wraps to a short one, and the wait
+/// ends at once instead of not at all, so anything past what the conversion
+/// holds is capped here at about a hundred and forty years.
+fn wait_ticks(nanos: u64) -> u64 {
+    const LONGEST_NS: u64 = 1 << 62;
+    crate::time::ns_to_ticks(nanos.min(LONGEST_NS))
+}
+
+/// The tick count a wait of `nanos` nanoseconds ends at.
+pub fn deadline_in(nanos: u64) -> u64 {
+    crate::trap::ticks() + wait_ticks(nanos)
+}
+
+/// The same for a wait given in milliseconds, where a negative count is the
+/// wait with no end.
+pub fn deadline_in_ms(timeout_ms: i64) -> u64 {
+    if timeout_ms < 0 {
+        return u64::MAX;
+    }
+    deadline_in((timeout_ms as u64).saturating_mul(1_000_000))
+}
+
 /// Which system calls to log: -1 for none, -2 for all, otherwise the number
 /// of the one to follow. A signed sentinel keeps 0 (read) traceable.
 pub static mut TRACE: i64 = -1;

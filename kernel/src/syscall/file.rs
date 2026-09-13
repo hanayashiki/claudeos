@@ -1,7 +1,8 @@
 //! File and descriptor system calls.
 
+use super::{deadline_in, deadline_in_ms};
 use crate::abi::*;
-use crate::fs::{self, pipe, FileBacking, Node, NodeKind, OpenFile};
+use crate::fs::{self, pipe, FileBacking, Node, NodeKind, Offset, OpenFile};
 use crate::sched;
 use crate::uaccess;
 use alloc::string::{String, ToString};
@@ -163,7 +164,7 @@ pub fn pread(fd: i32, buf_addr: u64, len: u64, offset: u64) -> SysResult {
     let node = file.node().ok_or(Errno::ESPIPE)?;
     let len = (len as usize).min(MAX_IO);
     let mut buf = vec![0u8; len];
-    let n = node.read_at(offset, &mut buf)?;
+    let n = node.read_at(Offset::new(offset), &mut buf)?;
     uaccess::write_bytes(buf_addr, &buf[..n])?;
     Ok(n as u64)
 }
@@ -174,7 +175,7 @@ pub fn pwrite(fd: i32, buf_addr: u64, len: u64, offset: u64) -> SysResult {
     let len = (len as usize).min(MAX_IO);
     let mut buf = vec![0u8; len];
     uaccess::read_bytes(buf_addr, &mut buf)?;
-    let n = node.write_at(offset, &buf)?;
+    let n = node.write_at(Offset::new(offset), &buf)?;
     Ok(n as u64)
 }
 
@@ -275,7 +276,7 @@ pub fn openat(dirfd: i64, path_addr: u64, flags: u32, mode: u32) -> SysResult {
         return Err(Errno::EISDIR);
     }
     if flags & O_TRUNC != 0 && !node.is_dir() {
-        node.truncate(0)?;
+        node.truncate(Offset::START)?;
     }
 
     if node.kind == fs::NodeKind::Fifo {
@@ -568,13 +569,13 @@ pub fn fchmod(fd: i32, mode: u32) -> SysResult {
 
 pub fn truncate(path_addr: u64, len: u64) -> SysResult {
     let path = resolve_at(AT_FDCWD, path_addr)?;
-    fs::lookup(&path)?.truncate(len)?;
+    fs::lookup(&path)?.truncate(Offset::new(len))?;
     Ok(0)
 }
 
 pub fn ftruncate(fd: i32, len: u64) -> SysResult {
     let file = sched::current().fds.get(fd)?;
-    file.node().ok_or(Errno::EINVAL)?.truncate(len)?;
+    file.node().ok_or(Errno::EINVAL)?.truncate(Offset::new(len))?;
     Ok(0)
 }
 
@@ -779,7 +780,7 @@ pub fn ppoll(fds_addr: u64, count: usize, timeout_addr: u64) -> SysResult {
         if spec.tv_sec < 0 || spec.tv_nsec < 0 || spec.tv_nsec >= 1_000_000_000 {
             return Err(Errno::EINVAL);
         }
-        spec.tv_sec * 1_000 + spec.tv_nsec / 1_000_000
+        spec.tv_sec.saturating_mul(1_000).saturating_add(spec.tv_nsec / 1_000_000)
     };
     poll(fds_addr, count, timeout_ms)
 }
@@ -788,11 +789,7 @@ pub fn poll(fds_addr: u64, count: usize, timeout_ms: i64) -> SysResult {
     if count > 1024 {
         return Err(Errno::EINVAL);
     }
-    let deadline = if timeout_ms < 0 {
-        u64::MAX
-    } else {
-        crate::trap::ticks() + crate::time::ns_to_ticks(timeout_ms as u64 * 1_000_000)
-    };
+    let deadline = deadline_in_ms(timeout_ms);
 
     // Read the request once and hold the descriptors it names. Readiness has
     // to be testable from inside the sleep, where user memory must not be
@@ -872,7 +869,7 @@ pub fn select(
         let nanos = seconds
             .saturating_mul(1_000_000_000)
             .saturating_add(fraction.saturating_mul(fraction_ns));
-        crate::trap::ticks() + crate::time::ns_to_ticks(nanos)
+        deadline_in(nanos)
     };
     let words = ((nfds as usize) + 63) / 64;
 
@@ -1092,11 +1089,7 @@ pub fn epoll_wait(epfd: i32, events_addr: u64, max: i32, timeout_ms: i64) -> Sys
         FileBacking::Epoll(set) => set.clone(),
         _ => return Err(Errno::EINVAL),
     };
-    let deadline = if timeout_ms < 0 {
-        u64::MAX
-    } else {
-        crate::trap::ticks() + crate::time::ns_to_ticks(timeout_ms as u64 * 1_000_000)
-    };
+    let deadline = deadline_in_ms(timeout_ms);
 
     /// What one watched descriptor would report right now.
     fn state(file: &Result<Arc<OpenFile>, Errno>, events: u32) -> u32 {
@@ -1280,10 +1273,10 @@ pub fn sendfile(out_fd: i32, in_fd: i32, offset_addr: u64, count: usize) -> SysR
     let mut buf = vec![0u8; count];
 
     let n = if offset_addr != 0 {
-        let offset = uaccess::read_u64(offset_addr)?;
+        let offset = Offset::new(uaccess::read_u64(offset_addr)?);
         let node = input.node().ok_or(Errno::EINVAL)?;
         let n = node.read_at(offset, &mut buf)?;
-        uaccess::write_u64(offset_addr, offset + n as u64)?;
+        uaccess::write_u64(offset_addr, offset.advanced(n as u64)?.raw())?;
         n
     } else {
         input.read(&mut buf)?

@@ -57,6 +57,47 @@ pub struct Node {
 
 static NEXT_INO: AtomicU64 = AtomicU64::new(1);
 
+/// A byte position in a file, as a system call register carries it.
+///
+/// Every such position is on its way to a pair of indices into the file's
+/// contents, and making that pair is the one place the number can be checked.
+/// A position near the top of the range plus the length of a buffer is not a
+/// position at all: added and cast where it is used, it wraps to a small one,
+/// and the routine that makes room is then asked for a file the caller never
+/// named. So the addition and the cast happen here and nowhere else, and a
+/// position with no range answers EINVAL.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Offset(u64);
+
+impl Offset {
+    /// The first byte of the file.
+    pub const START: Offset = Offset(0);
+
+    /// The position a system call was given.
+    pub fn new(raw: u64) -> Offset {
+        Offset(raw)
+    }
+
+    /// The `len` bytes that begin here, as indices into a file's contents.
+    pub fn range(self, len: usize) -> Result<core::ops::Range<usize>, Errno> {
+        let end = self.0.checked_add(len as u64).ok_or(Errno::EINVAL)?;
+        let start = usize::try_from(self.0).map_err(|_| Errno::EINVAL)?;
+        let end = usize::try_from(end).map_err(|_| Errno::EINVAL)?;
+        Ok(start..end)
+    }
+
+    /// This position `delta` bytes further into the file.
+    pub fn advanced(self, delta: u64) -> Result<Offset, Errno> {
+        self.0.checked_add(delta).map(Offset).ok_or(Errno::EINVAL)
+    }
+
+    /// The number itself, for a caller that has to hand it back the way it
+    /// arrived.
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// How big a buffer to ask for so a file holding `current` bytes of room can
 /// hold `target` bytes of contents.
 ///
@@ -185,19 +226,20 @@ impl Node {
         }
     }
 
-    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+    pub fn read_at(&self, offset: Offset, buf: &mut [u8]) -> Result<usize, Errno> {
         match self.kind {
             NodeKind::Device(kind) => dev::read(kind, buf),
             NodeKind::Generated(kind) => procfs::read(kind, offset, buf),
             NodeKind::Dir => Err(Errno::EISDIR),
             _ => {
+                let want = offset.range(buf.len())?;
                 let inner = self.inner.lock();
-                let start = offset as usize;
-                if start >= inner.data.len() {
+                if want.start >= inner.data.len() {
                     return Ok(0);
                 }
-                let n = buf.len().min(inner.data.len() - start);
-                buf[..n].copy_from_slice(&inner.data[start..start + n]);
+                let end = want.end.min(inner.data.len());
+                let n = end - want.start;
+                buf[..n].copy_from_slice(&inner.data[want.start..end]);
                 Ok(n)
             }
         }
@@ -274,29 +316,30 @@ impl Node {
         Ok(())
     }
 
-    pub fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, Errno> {
+    pub fn write_at(&self, offset: Offset, buf: &[u8]) -> Result<usize, Errno> {
         match self.kind {
             NodeKind::Device(kind) => dev::write(kind, buf),
             NodeKind::Generated(_) => Err(Errno::EACCES),
             NodeKind::Dir => Err(Errno::EISDIR),
             _ => {
-                let start = offset as usize;
-                let end = start + buf.len();
+                let want = offset.range(buf.len())?;
                 let change = self.change();
-                self.make_room(end, &change)?;
+                self.make_room(want.end, &change)?;
                 let mut inner = self.inner.lock();
-                inner.data[start..end].copy_from_slice(buf);
+                inner.data[want].copy_from_slice(buf);
                 inner.mtime = crate::time::unix_time();
                 Ok(buf.len())
             }
         }
     }
 
-    pub fn truncate(&self, len: u64) -> Result<(), Errno> {
+    pub fn truncate(&self, len: Offset) -> Result<(), Errno> {
         if self.is_dir() {
             return Err(Errno::EISDIR);
         }
-        let target = len as usize;
+        // A truncation names the file's new end, which is the empty range
+        // that begins there.
+        let target = len.range(0)?.end;
         let change = self.change();
         self.make_room(target, &change)?;
         let mut inner = self.inner.lock();
@@ -746,11 +789,11 @@ impl OpenFile {
                 // offset lock across it would also hold interrupts off, which
                 // would stop the very device the read is waiting on.
                 if matches!(node.kind, NodeKind::Device(_)) {
-                    return node.read_at(0, buf);
+                    return node.read_at(Offset::START, buf);
                 }
-                let offset = *self.offset.lock();
+                let offset = Offset::new(*self.offset.lock());
                 let n = node.read_at(offset, buf)?;
-                *self.offset.lock() = offset + n as u64;
+                *self.offset.lock() = offset.advanced(n as u64)?.raw();
                 Ok(n)
             }
             FileBacking::Pipe(pipe, _) => pipe.read(buf, self.flags() & O_NONBLOCK != 0),
@@ -771,15 +814,15 @@ impl OpenFile {
         match &self.backing {
             FileBacking::Node(node) => {
                 if matches!(node.kind, NodeKind::Device(_)) {
-                    return node.write_at(0, buf);
+                    return node.write_at(Offset::START, buf);
                 }
-                let offset = if self.flags() & O_APPEND != 0 {
+                let offset = Offset::new(if self.flags() & O_APPEND != 0 {
                     node.size()
                 } else {
                     *self.offset.lock()
-                };
+                });
                 let n = node.write_at(offset, buf)?;
-                *self.offset.lock() = offset + n as u64;
+                *self.offset.lock() = offset.advanced(n as u64)?.raw();
                 Ok(n)
             }
             FileBacking::Pipe(pipe, _) => pipe.write(buf, self.flags() & O_NONBLOCK != 0),

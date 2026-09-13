@@ -328,15 +328,16 @@ pub fn render(kind: Generated) -> String {
     }
 }
 
-pub fn read(kind: Generated, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+pub fn read(kind: Generated, offset: super::Offset, buf: &mut [u8]) -> Result<usize, Errno> {
     let text = render(kind);
     let bytes = text.as_bytes();
-    let start = offset as usize;
-    if start >= bytes.len() {
+    let want = offset.range(buf.len())?;
+    if want.start >= bytes.len() {
         return Ok(0);
     }
-    let n = buf.len().min(bytes.len() - start);
-    buf[..n].copy_from_slice(&bytes[start..start + n]);
+    let end = want.end.min(bytes.len());
+    let n = end - want.start;
+    buf[..n].copy_from_slice(&bytes[want.start..end]);
     Ok(n)
 }
 
