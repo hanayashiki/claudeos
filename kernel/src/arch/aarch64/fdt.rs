@@ -86,13 +86,23 @@ pub fn blob() -> Option<u64> {
     }
 }
 
-/// Read the blob at `phys` into `info`. Returns false if there is no device
-/// tree there, in which case `info` is untouched.
+/// Read the blob at `phys` into `info` and remember it as the machine's own,
+/// which is the tree every later device lookup goes through. Returns false if
+/// there is no device tree there, in which case `info` is untouched.
 pub fn parse(phys: u64, info: &mut BootInfo) -> bool {
-    if !present(phys) {
+    if !read_into(phys, info) {
         return false;
     }
     BLOB.store(phys, Ordering::Relaxed);
+    true
+}
+
+/// The same without remembering it. A check reading a tree it built itself
+/// wants this: the machine's own tree is the one the drivers have to keep.
+pub fn read_into(phys: u64, info: &mut BootInfo) -> bool {
+    if !present(phys) {
+        return false;
+    }
     let base = phys_to_virt(phys);
     unsafe {
         let total_size = be32(base + 4) as u64;

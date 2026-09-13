@@ -69,6 +69,11 @@ extern "C" {
 pub const HHDM_BASE: u64 = 0xFFFF_8000_0000_0000;
 /// Size of the region the boot trampoline direct-maps (low 4 GiB).
 pub const HHDM_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+/// Where the direct map stops covering memory, which here is nowhere: the
+/// trampoline maps all four gigabytes write-back, and what is registers
+/// rather than memory is what the loader's map calls unusable. The frame
+/// allocator asks every machine this, so the answer has to be a number.
+pub const DEVICE_PHYS_BASE: u64 = HHDM_LIMIT;
 
 /// Virtual base the kernel image is linked at.
 pub const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;

@@ -32,6 +32,12 @@ _image_start:
     .long 0x644d5241             /* "ARM\x64" */
     .long 0                      /* reserved */
 
+/* Which 2 MiB block of the fourth gigabyte is the first that is registers
+ * rather than memory. The peripherals on this chip start at 0xFC000000, which
+ * is what DEVICE_PHYS_BASE in mod.rs says as well; the two have to agree,
+ * because the allocator hands out every frame below it. */
+.equ FIRST_DEVICE_BLOCK, (0xFC000000 - 0xC0000000) / 0x200000
+
 .section .text.boot, "ax"
 .global _start
 _start:
@@ -95,16 +101,16 @@ _start:
     ldr  x0, =higher_half
     br   x0
 
-/* Four 1 GiB blocks covering the low four gigabytes, reachable three ways:
- * where they physically are, through the direct map, and through the kernel's
- * own base. The first two hold the same second-level table, because the direct
- * map is the identity map moved up; the third is a separate one so that the
- * kernel's base can be an alias of physical zero.
+/* The low four gigabytes, reachable three ways: where they physically are,
+ * through the direct map, and through the kernel's own base. The first two
+ * hold the same second-level table, because the direct map is the identity map
+ * moved up; the third is a separate one so that the kernel's base can be an
+ * alias of physical zero.
  */
 build_page_tables:
-    /* Zero the three tables. */
+    /* Zero the four tables. */
     ldr  x0, =level0
-    mov  x1, #(3 * 4096 / 8)
+    mov  x1, #(4 * 4096 / 8)
 5:  str  xzr, [x0], #8
     subs x1, x1, #1
     b.ne 5b
@@ -118,24 +124,47 @@ build_page_tables:
     orr  x2, x1, #3
     str  x2, [x0, #(511 * 8)]
 
-    /* Gigabytes 0..2 are memory, gigabyte 3 holds the peripherals and so is
-     * device registers: uncached, unmerged, and never executed. */
+    /* Gigabytes 0..2 are memory, one block each. */
     ldr  x0, =level1_low
     mov  x1, xzr                 /* physical address of the block */
     mov  x2, xzr                 /* index */
     mov  x4, #0x4000
     lsl  x4, x4, #16             /* one gigabyte, too wide for an immediate */
 6:  mov  x3, #0x701              /* valid block | inner shareable | accessed */
-    cmp  x2, #3
-    b.lo 7f
-    mov  x3, #0x405              /* valid block | accessed | device attributes */
-    movk x3, #0x60, lsl #48      /* never execute, from either level */
-7:  orr  x3, x3, x1
+    orr  x3, x3, x1
     str  x3, [x0, x2, lsl #3]
     add  x1, x1, x4
     add  x2, x2, #1
-    cmp  x2, #4
+    cmp  x2, #3
     b.lo 6b
+
+    /* Gigabyte 3 is both: memory up to the peripheral base and registers from
+     * there to the top. A block per two megabytes is what lets the two halves
+     * carry different attributes. One block for the whole gigabyte would make
+     * the memory under the peripherals device memory as well, and a 4 GiB
+     * board reports that memory as ordinary RAM, so the frame allocator would
+     * hand out frames whose only kernel-side alias is device memory. */
+    ldr  x1, =level2_dev
+    orr  x3, x1, #3              /* valid, and a table rather than a block */
+    str  x3, [x0, #(3 * 8)]
+
+    mov  x0, x1
+    mov  x1, #0xC000
+    lsl  x1, x1, #16             /* three gigabytes: the first address covered */
+    mov  x2, xzr
+    mov  x4, #0x20
+    lsl  x4, x4, #16             /* two megabytes */
+7:  mov  x3, #0x701              /* valid block | inner shareable | accessed */
+    cmp  x2, #FIRST_DEVICE_BLOCK
+    b.lo 8f
+    mov  x3, #0x405              /* valid block | accessed | device attributes */
+    movk x3, #0x60, lsl #48      /* never execute, from either level */
+8:  orr  x3, x3, x1
+    str  x3, [x0, x2, lsl #3]
+    add  x1, x1, x4
+    add  x2, x2, #1
+    cmp  x2, #512
+    b.lo 7b
 
     /* The kernel's base is an alias of physical zero: index 510 of the table
      * under the topmost entry is where 0xFFFFFFFF80000000 lands. */
@@ -191,6 +220,8 @@ level0:
 level1_low:
     .space 4096
 level1_high:
+    .space 4096
+level2_dev:
     .space 4096
 
 .section .text, "ax"
