@@ -32,12 +32,6 @@ _image_start:
     .long 0x644d5241             /* "ARM\x64" */
     .long 0                      /* reserved */
 
-/* Which 2 MiB block of the fourth gigabyte is the first that is registers
- * rather than memory. The peripherals on this chip start at 0xFC000000, which
- * is what DEVICE_PHYS_BASE in mod.rs says as well; the two have to agree,
- * because the allocator hands out every frame below it. */
-.equ FIRST_DEVICE_BLOCK, (0xFC000000 - 0xC0000000) / 0x200000
-
 .section .text.boot, "ax"
 .global _start
 _start:
@@ -154,8 +148,13 @@ build_page_tables:
     mov  x2, xzr
     mov  x4, #0x20
     lsl  x4, x4, #16             /* two megabytes */
+    /* Which 2 MiB block is the first that is registers rather than memory
+     * comes in from DEVICE_PHYS_BASE in mod.rs, which is also the ceiling on
+     * what the frame allocator hands out. A number of its own here that drifted
+     * above that ceiling would leave the allocator handing out frames whose
+     * only kernel mapping is device memory. */
 7:  mov  x3, #0x701              /* valid block | inner shareable | accessed */
-    cmp  x2, #FIRST_DEVICE_BLOCK
+    cmp  x2, #{FIRST_DEVICE_BLOCK}
     b.lo 8f
     mov  x3, #0x405              /* valid block | accessed | device attributes */
     movk x3, #0x60, lsl #48      /* never execute, from either level */
@@ -174,6 +173,31 @@ build_page_tables:
     ret
 
 enable_mmu:
+    /* The four tables were written with translation off, which makes those
+     * stores uncached, while the walkers read them cacheable as soon as
+     * translation is on. A line either cache still held for that memory would
+     * be read in preference to what was just written, and the walk would
+     * follow whatever the firmware had left there. On this board the cores
+     * invalidate at reset and the firmware brought the image in from the other
+     * side of the caches, so there should be nothing; that is an assumption
+     * about hardware this has never run on, and Linux invalidates its own
+     * initial tables rather than make it.
+     *
+     * The step is the smallest data cache line any level implements, which
+     * CTR_EL0 reports as a log2 count of words. A wider step would leave lines
+     * between untouched. */
+    mrs  x2, ctr_el0
+    ubfx x2, x2, #16, #4
+    mov  x3, #4
+    lsl  x2, x3, x2
+    ldr  x0, =level0
+    add  x1, x0, #(4 * 4096)
+11: dc   ivac, x0
+    add  x0, x0, x2
+    cmp  x0, x1
+    b.lo 11b
+    dsb  sy
+
     /* Nothing the firmware left in the translation buffers or the instruction
      * cache is ours, and on the board it will not be what the emulator leaves.
      * Throw both away before the tables built above start being used.

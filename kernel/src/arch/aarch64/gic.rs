@@ -32,11 +32,14 @@ const GICC_EOIR: u64 = 0x010;
 /// allowed to claim it, which is what a group-zero acknowledge gets when the
 /// interrupt is in group one. Neither can be ended, so neither may be treated
 /// as a line number.
-pub const NOT_A_LINE: u32 = 1020;
+const NOT_A_LINE: u32 = 1020;
 
 /// The one of those four that means there was an interrupt and this interface
 /// was not allowed to claim it, because it is in the other group.
-pub const NOT_OURS: u32 = 1022;
+const NOT_OURS: u32 = 1022;
+
+/// The widest interrupt number the acknowledge register can report.
+const ID_MASK: u32 = 0x3FF;
 
 /// The first interrupt number that is not per-core: everything below this is a
 /// software-generated or private interrupt and belongs to one core.
@@ -152,22 +155,87 @@ pub fn unmask(irq: u8) {
 }
 
 pub fn mask(irq: u8) {
-    let line = irq as u32;
+    disable_line(irq as u32);
+}
+
+/// Stop the distributor delivering `line`. Takes the full width the
+/// acknowledge register reports rather than a handler-table index, because the
+/// lines that have to be stopped this way are the ones with no handler.
+fn disable_line(line: u32) {
     unsafe {
         dist_write(GICD_ICENABLER + ((line / 32) * 4) as u64, 1 << (line % 32));
     }
 }
 
-/// Take the next interrupt from the controller. Until `end_of_interrupt` is
-/// called with what this returned, no further interrupt of the same or lower
-/// priority is delivered.
-///
-/// A number at or above `SPURIOUS` means there was nothing to claim, which
-/// includes the case of an interrupt this interface is not allowed to take.
-pub fn acknowledge() -> u32 {
-    unsafe { cpu_read(GICC_IAR) & 0x3FF }
+/// What an acknowledge got.
+pub enum Acknowledged {
+    /// A line, now claimed by this interface.
+    Line(Claimed),
+    /// There was an interrupt and this interface was not allowed to claim it,
+    /// because it is in the other group. Nothing was claimed.
+    NotOurs(Ended),
+    /// There was nothing to claim.
+    Spurious(Ended),
 }
 
-pub fn end_of_interrupt(irq: u8) {
-    unsafe { cpu_write(GICC_EOIR, irq as u32) };
+/// A line this interface has claimed.
+///
+/// Claiming raises the running priority to the line's, and the controller
+/// delivers nothing of that priority or lower -- the timer and the console
+/// among them -- until the claim is ended. So it has to be ended on every path
+/// out, and ending is the only thing that can be done with one: `end` and
+/// `mask_and_end` consume the claim, and what they give back is the only way
+/// to produce an `Ended`. A caller that owes one cannot drop a claim instead.
+#[must_use = "a line that is claimed and never ended stops every interrupt of               its priority or lower"]
+pub struct Claimed {
+    line: u32,
+}
+
+impl Claimed {
+    /// Which line was claimed.
+    pub fn line(&self) -> u32 {
+        self.line
+    }
+
+    /// Tell the controller the handler is finished, which drops the running
+    /// priority back to what it was.
+    pub fn end(self) -> Ended {
+        // The number the acknowledge handed out, rather than the line the
+        // caller believes it handled: the controller accepts no other.
+        unsafe { cpu_write(GICC_EOIR, self.line) };
+        Ended(())
+    }
+
+    /// Stop the distributor delivering this line, then end the claim.
+    ///
+    /// For a line nothing will ever clear. Ending it alone drops the running
+    /// priority, and a level-triggered line that is still asserting is then
+    /// delivered again at once and for ever.
+    pub fn mask_and_end(self) -> Ended {
+        disable_line(self.line);
+        self.end()
+    }
+}
+
+/// That an acknowledge has been finished with: either the line it claimed was
+/// ended, or it claimed nothing. Built here and nowhere else.
+pub struct Ended(#[allow(dead_code)] ());
+
+/// Take the next interrupt from the controller.
+pub fn acknowledge() -> Acknowledged {
+    let id = unsafe { cpu_read(GICC_IAR) & ID_MASK };
+    match id {
+        NOT_OURS => Acknowledged::NotOurs(Ended(())),
+        NOT_A_LINE..=ID_MASK => Acknowledged::Spurious(Ended(())),
+        line => Acknowledged::Line(Claimed { line }),
+    }
+}
+
+/// End `claim` if there still is one. Nothing left to end means someone took
+/// the claim and ended it, which is the only way one can be got rid of.
+pub fn end_outstanding(claim: Option<Claimed>) -> Ended {
+    match claim {
+        Some(claim) => claim.end(),
+        None => Ended(()),
+    }
 }

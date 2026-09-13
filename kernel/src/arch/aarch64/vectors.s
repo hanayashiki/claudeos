@@ -10,6 +10,10 @@
  * the handler is ordinary compiled code and will use those registers for its
  * own purposes. Returning without putting them back leaves the interrupted
  * program running on someone else's values.
+ *
+ * Every offset into the frame comes in as a constant from trap.rs, so a field
+ * added to or moved within `TrapFrame` moves the instruction that saves it
+ * rather than leaving it reading the field that took its place.
  */
 
 /* The saved state, in the order a `TrapFrame` reads it: the thirty-one general
@@ -18,22 +22,22 @@
  * and last the two words the dispatcher fills in.
  */
 .macro SAVE_STATE
-    sub  sp, sp, #304
-    stp  x0,  x1,  [sp, #16 * 0]
-    stp  x2,  x3,  [sp, #16 * 1]
-    stp  x4,  x5,  [sp, #16 * 2]
-    stp  x6,  x7,  [sp, #16 * 3]
-    stp  x8,  x9,  [sp, #16 * 4]
-    stp  x10, x11, [sp, #16 * 5]
-    stp  x12, x13, [sp, #16 * 6]
-    stp  x14, x15, [sp, #16 * 7]
-    stp  x16, x17, [sp, #16 * 8]
-    stp  x18, x19, [sp, #16 * 9]
-    stp  x20, x21, [sp, #16 * 10]
-    stp  x22, x23, [sp, #16 * 11]
-    stp  x24, x25, [sp, #16 * 12]
-    stp  x26, x27, [sp, #16 * 13]
-    stp  x28, x29, [sp, #16 * 14]
+    sub  sp, sp, #{FRAME_SIZE}
+    stp  x0,  x1,  [sp, #({OFF_X} + 16 * 0)]
+    stp  x2,  x3,  [sp, #({OFF_X} + 16 * 1)]
+    stp  x4,  x5,  [sp, #({OFF_X} + 16 * 2)]
+    stp  x6,  x7,  [sp, #({OFF_X} + 16 * 3)]
+    stp  x8,  x9,  [sp, #({OFF_X} + 16 * 4)]
+    stp  x10, x11, [sp, #({OFF_X} + 16 * 5)]
+    stp  x12, x13, [sp, #({OFF_X} + 16 * 6)]
+    stp  x14, x15, [sp, #({OFF_X} + 16 * 7)]
+    stp  x16, x17, [sp, #({OFF_X} + 16 * 8)]
+    stp  x18, x19, [sp, #({OFF_X} + 16 * 9)]
+    stp  x20, x21, [sp, #({OFF_X} + 16 * 10)]
+    stp  x22, x23, [sp, #({OFF_X} + 16 * 11)]
+    stp  x24, x25, [sp, #({OFF_X} + 16 * 12)]
+    stp  x26, x27, [sp, #({OFF_X} + 16 * 13)]
+    stp  x28, x29, [sp, #({OFF_X} + 16 * 14)]
     mrs  x22, elr_el1
     mrs  x23, spsr_el1
     /* Where the stack pointer was when the exception was taken. An exception
@@ -45,14 +49,14 @@
      * that report is the whole of the evidence, and a kernel stack overflow
      * is exactly what it is needed for. */
     mrs  x21, sp_el0
-    add  x24, sp, #304
+    add  x24, sp, #{FRAME_SIZE}
     tst  x23, #0xf
     csel x21, x21, x24, eq
-    stp  x30, x21, [sp, #16 * 15]
-    stp  x22, x23, [sp, #16 * 16]
+    stp  x30, x21, [sp, #{OFF_X30}]
+    stp  x22, x23, [sp, #{OFF_ELR}]
     mrs  x22, esr_el1
     mrs  x23, far_el1
-    stp  x22, x23, [sp, #16 * 17]
+    stp  x22, x23, [sp, #{OFF_ESR}]
 .endm
 
 .macro LOAD_STATE
@@ -66,10 +70,10 @@
      * what is mapped. The ERET takes the processor state from SPSR_EL1, so
      * the mask does not outlive the return. */
     msr  daifset, #0xf
-    ldp  x22, x23, [sp, #16 * 16]
+    ldp  x22, x23, [sp, #{OFF_ELR}]
     msr  elr_el1, x22
     msr  spsr_el1, x23
-    ldp  x30, x21, [sp, #16 * 15]
+    ldp  x30, x21, [sp, #{OFF_X30}]
     /* SP_EL0 belongs to the level below. A return to EL1 carries on with the
      * stack this frame sits on, and what the frame holds for it is that
      * stack's own address rather than something to install. */
@@ -77,22 +81,22 @@
     b.ne 1f
     msr  sp_el0, x21
 1:
-    ldp  x0,  x1,  [sp, #16 * 0]
-    ldp  x2,  x3,  [sp, #16 * 1]
-    ldp  x4,  x5,  [sp, #16 * 2]
-    ldp  x6,  x7,  [sp, #16 * 3]
-    ldp  x8,  x9,  [sp, #16 * 4]
-    ldp  x10, x11, [sp, #16 * 5]
-    ldp  x12, x13, [sp, #16 * 6]
-    ldp  x14, x15, [sp, #16 * 7]
-    ldp  x16, x17, [sp, #16 * 8]
-    ldp  x18, x19, [sp, #16 * 9]
-    ldp  x20, x21, [sp, #16 * 10]
-    ldp  x22, x23, [sp, #16 * 11]
-    ldp  x24, x25, [sp, #16 * 12]
-    ldp  x26, x27, [sp, #16 * 13]
-    ldp  x28, x29, [sp, #16 * 14]
-    add  sp, sp, #304
+    ldp  x0,  x1,  [sp, #({OFF_X} + 16 * 0)]
+    ldp  x2,  x3,  [sp, #({OFF_X} + 16 * 1)]
+    ldp  x4,  x5,  [sp, #({OFF_X} + 16 * 2)]
+    ldp  x6,  x7,  [sp, #({OFF_X} + 16 * 3)]
+    ldp  x8,  x9,  [sp, #({OFF_X} + 16 * 4)]
+    ldp  x10, x11, [sp, #({OFF_X} + 16 * 5)]
+    ldp  x12, x13, [sp, #({OFF_X} + 16 * 6)]
+    ldp  x14, x15, [sp, #({OFF_X} + 16 * 7)]
+    ldp  x16, x17, [sp, #({OFF_X} + 16 * 8)]
+    ldp  x18, x19, [sp, #({OFF_X} + 16 * 9)]
+    ldp  x20, x21, [sp, #({OFF_X} + 16 * 10)]
+    ldp  x22, x23, [sp, #({OFF_X} + 16 * 11)]
+    ldp  x24, x25, [sp, #({OFF_X} + 16 * 12)]
+    ldp  x26, x27, [sp, #({OFF_X} + 16 * 13)]
+    ldp  x28, x29, [sp, #({OFF_X} + 16 * 14)]
+    add  sp, sp, #{FRAME_SIZE}
 .endm
 
 .macro ENTRY n
@@ -104,8 +108,8 @@
 body_\n:
     SAVE_STATE
     mov  x0, #\n
-    str  x0, [sp, #(16 * 18 + 8)]
-    str  xzr, [sp, #(16 * 18)]
+    str  x0, [sp, #{OFF_SLOT}]
+    str  xzr, [sp, #{OFF_VECTOR}]
     mov  x0, sp
     bl   exception_entry
     LOAD_STATE

@@ -25,9 +25,53 @@ pub mod nr;
 pub mod paging;
 
 global_asm!(include_str!("boot.s"), options(att_syntax));
-global_asm!(include_str!("cpu/interrupts.s"), options(att_syntax));
-global_asm!(include_str!("switch.s"), options(att_syntax));
-global_asm!(include_str!("syscall_entry.s"), options(att_syntax));
+// The three paths in and out of a task address the trap frame, the per-CPU
+// block and the user selectors by the numbers the Rust that defines them
+// actually has, rather than by numbers written out beside them.
+global_asm!(
+    include_str!("cpu/interrupts.s"),
+    OFF_CS = const cpu::idt::OFF_CS,
+    OFF_VECTOR = const cpu::idt::OFF_VECTOR,
+    OFF_RIP = const cpu::idt::OFF_RIP,
+    options(att_syntax),
+);
+global_asm!(
+    include_str!("switch.s"),
+    FRAME_WORDS = const task::SWITCH_FRAME_WORDS,
+    options(att_syntax),
+);
+global_asm!(
+    include_str!("syscall_entry.s"),
+    FRAME_SIZE = const cpu::idt::FRAME_SIZE,
+    OFF_RAX = const cpu::idt::OFF_RAX,
+    OFF_RBX = const cpu::idt::OFF_RBX,
+    OFF_RCX = const cpu::idt::OFF_RCX,
+    OFF_RDX = const cpu::idt::OFF_RDX,
+    OFF_RSI = const cpu::idt::OFF_RSI,
+    OFF_RDI = const cpu::idt::OFF_RDI,
+    OFF_RBP = const cpu::idt::OFF_RBP,
+    OFF_R8 = const cpu::idt::OFF_R8,
+    OFF_R9 = const cpu::idt::OFF_R9,
+    OFF_R10 = const cpu::idt::OFF_R10,
+    OFF_R11 = const cpu::idt::OFF_R11,
+    OFF_R12 = const cpu::idt::OFF_R12,
+    OFF_R13 = const cpu::idt::OFF_R13,
+    OFF_R14 = const cpu::idt::OFF_R14,
+    OFF_R15 = const cpu::idt::OFF_R15,
+    OFF_VECTOR = const cpu::idt::OFF_VECTOR,
+    OFF_ERROR_CODE = const cpu::idt::OFF_ERROR_CODE,
+    OFF_RIP = const cpu::idt::OFF_RIP,
+    OFF_CS = const cpu::idt::OFF_CS,
+    OFF_RFLAGS = const cpu::idt::OFF_RFLAGS,
+    OFF_RSP = const cpu::idt::OFF_RSP,
+    OFF_SS = const cpu::idt::OFF_SS,
+    PER_CPU_KERNEL_RSP = const cpu::OFF_KERNEL_RSP,
+    PER_CPU_USER_RSP = const cpu::OFF_USER_RSP,
+    USER_CS = const cpu::gdt::USER_CODE,
+    USER_SS = const cpu::gdt::USER_DATA,
+    VECTOR_SYSCALL = const task::VECTOR_SYSCALL,
+    options(att_syntax),
+);
 
 // Some of these name a part of the interface without being called from the
 // portable half today; they are listed here because this file is the contract.

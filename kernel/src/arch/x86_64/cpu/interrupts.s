@@ -3,7 +3,12 @@
  * Every vector gets a stub that normalises the CPU's frame (pushing a zero
  * error code where the CPU does not push one) and appends the vector number,
  * then falls into a common path that saves the general-purpose registers.
- * The resulting layout is `TrapFrame` in idt.rs.
+ * The resulting layout is `TrapFrame` in idt.rs, whose offsets come in here as
+ * constants rather than being written out: the saved code selector in
+ * particular decides whether GS is swapped, and reading the wrong word leaves
+ * the swap happening an odd number of times, after which the kernel runs on
+ * the user's GS base and the next system call takes its stack pointer from
+ * memory the program chose.
  */
 
 .altmacro
@@ -64,8 +69,8 @@ isr_common:
     pushq %rbx
     pushq %rax
 
-    /* Saved CS sits at offset 144; ring 3 means we must swap in kernel GS. */
-    movq 144(%rsp), %rax
+    /* Ring 3 in the saved code selector means we must swap in kernel GS. */
+    movq {OFF_CS}(%rsp), %rax
     andq $3, %rax
     jz 1f
     swapgs
@@ -74,7 +79,7 @@ isr_common:
     movq %rsp, %rdi
     call interrupt_dispatch
 
-    movq 144(%rsp), %rax
+    movq {OFF_CS}(%rsp), %rax
     andq $3, %rax
     jz 2f
     swapgs
@@ -95,7 +100,9 @@ isr_common:
     popq %r14
     popq %r15
 
-    addq $16, %rsp          /* discard vector and error code */
+    /* Discard the vector and the error code, which is everything between the
+     * last register popped and what the CPU pushed. */
+    addq $({OFF_RIP} - {OFF_VECTOR}), %rsp
     iretq
 
 /* Enter user mode with a fully populated TrapFrame in RDI. Never returns. */
@@ -119,5 +126,5 @@ enter_user_mode:
     popq %r13
     popq %r14
     popq %r15
-    addq $16, %rsp
+    addq $({OFF_RIP} - {OFF_VECTOR}), %rsp
     iretq
