@@ -195,6 +195,51 @@ impl Entry {
         asm!("dsb ishst", options(nostack, preserves_flags));
         core::ptr::write(at, self);
     }
+
+    /// Take away the mapping at `at`, which translated `virt`, handing back
+    /// what it held. `None`, and nothing written, when there was no mapping.
+    ///
+    /// Clearing the descriptor and invalidating the address are one operation
+    /// because a translation the hardware has cached outlives the descriptor
+    /// it was read from. Written apart, a tick lands between them, and a
+    /// sibling thread on this address space still reaches the page: a switch
+    /// to a task on the same tables writes no base register, so nothing throws
+    /// the translation away. Where the frame is released in the same breath --
+    /// and taking a table away releases one -- that is a page the allocator
+    /// has given to somebody else. Being one operation is what stops the two
+    /// being written apart; the token is what says nothing runs between them.
+    #[inline]
+    pub unsafe fn take(at: *mut Entry, virt: u64, _irq: NoInterrupts) -> Option<Entry> {
+        let old = *at;
+        if !old.is_present() {
+            return None;
+        }
+        Entry::EMPTY.store(at);
+        flush_tlb(virt);
+        Some(old)
+    }
+
+    /// The same for a descriptor that names a table rather than a page.
+    ///
+    /// What this descriptor covered is every address under it, and the walker
+    /// caches the descriptors of walks it has not finished as well as the
+    /// translations it has; this architecture requires every address a changed
+    /// table descriptor mapped to be invalidated, so naming one of them
+    /// invalidates nothing that matters. This core has no invalidation by
+    /// range, which leaves five hundred and twelve operations at the last
+    /// level and a quarter of a million above it against one that takes the
+    /// whole space, so the whole space goes. The trailing barrier in
+    /// `flush_tlb_all` is what the caller waits on before releasing the frame.
+    #[inline]
+    pub unsafe fn take_table(at: *mut Entry, _irq: NoInterrupts) -> Option<Entry> {
+        let old = *at;
+        if !old.is_present() {
+            return None;
+        }
+        Entry::EMPTY.store(at);
+        flush_tlb_all();
+        Some(old)
+    }
 }
 
 /// Put a fresh table under `at` and link it there.
@@ -214,6 +259,22 @@ unsafe fn publish_table(at: *mut Entry) -> Result<u64, MapError> {
 #[inline]
 unsafe fn table_at(phys: u64) -> *mut Entry {
     phys_to_virt(phys) as *mut Entry
+}
+
+/// True when nothing in the table at `phys` is present.
+///
+/// The sweep starts one past `cleared`, the descriptor an unmap has just
+/// emptied, because a range taken away a page at a time still has the next
+/// page in place there and the sweep stops on its first look. Only the last
+/// page of a table costs all five hundred and twelve.
+unsafe fn table_is_empty(phys: u64, cleared: usize) -> bool {
+    let table = table_at(phys);
+    for step in 1..=512 {
+        if (*table.add((cleared + step) % 512)).is_present() {
+            return false;
+        }
+    }
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,6 +379,71 @@ impl AddressSpace {
             }
         }
         Ok(table_at(table).add(index_of(virt, 0)))
+    }
+
+    /// The descriptor the walk of `virt` reads at `level`: the one in the top
+    /// table when `level` is 3, the last-level one when it is 0. `None` when
+    /// the walk does not get that far, or when a block descriptor ends it
+    /// first.
+    unsafe fn entry_at(&self, virt: u64, level: u32) -> Option<*mut Entry> {
+        let mut table = self.root;
+        for above in (level + 1..4).rev() {
+            let entry = *table_at(table).add(index_of(virt, above));
+            if !entry.is_present() || entry.bits() & PAGE_DESCRIPTOR == 0 {
+                return None;
+            }
+            table = entry.addr();
+        }
+        Some(table_at(table).add(index_of(virt, level)))
+    }
+
+    /// Give back the tables the unmap of `virt` has left with nothing in them,
+    /// from the last level upwards, stopping at the first that still holds a
+    /// mapping. The top table is not among them: it belongs to the address
+    /// space and goes back when the space does.
+    ///
+    /// A last-level table covers two megabytes. Without this, a program that
+    /// maps one page, touches it and takes it away again at one fresh
+    /// two-megabyte-aligned address after another gets every page back and
+    /// leaves a table behind each time: kernel memory no program owns, which
+    /// nothing asks for again until the process ends.
+    ///
+    /// A table freed here must be named by nothing else. The kernel's own
+    /// tables are named by every address space, because `new_user` copies the
+    /// top table's upper half rather than taking a reference on what it points
+    /// at, so an address outside the half a program owns is declined whatever
+    /// its tables hold. Below that the frame's reference count is the answer,
+    /// which is the same question a shared page is asked: a fork builds the
+    /// child's tables with `map` rather than pointing at the parent's, so a
+    /// live table's count is one, and a path that did share one would be
+    /// declined here rather than freed under the other side.
+    ///
+    /// The frame goes back only after `take_table` has invalidated what it
+    /// covered and waited for that to take effect, and the whole of this is
+    /// inside the section that did the unmap: with a gap there another task
+    /// maps into a table between its being found empty and its being freed.
+    unsafe fn reclaim_tables(&self, virt: u64, irq: NoInterrupts) {
+        if !is_user_addr(virt) {
+            return;
+        }
+        for level in 1..4 {
+            let Some(parent) = self.entry_at(virt, level) else {
+                return;
+            };
+            let entry = *parent;
+            if !entry.is_present() || entry.bits() & PAGE_DESCRIPTOR == 0 {
+                return;
+            }
+            let table = entry.addr();
+            if !table_is_empty(table, index_of(virt, level - 1))
+                || frame::frame_references(table) != 1
+            {
+                return;
+            }
+            if Entry::take_table(parent, irq).is_some() {
+                drop(Frame::from_recorded(table));
+            }
+        }
     }
 
     /// Map `frame` at `virt`. The descriptor holds the reference from here on,
@@ -485,19 +611,22 @@ impl AddressSpace {
 
     /// Take the mapping at `virt` away, handing back the reference the
     /// descriptor held. Dropping the result releases the frame.
+    ///
+    /// The table the descriptor was in goes back too when it holds nothing
+    /// else, and the ones above it while they keep emptying. The token is what
+    /// says nothing runs between the descriptor being cleared and that
+    /// decision being made on it.
     #[must_use = "dropping the frame is what releases it"]
-    pub fn unmap(&self, virt: u64) -> Option<Frame> {
-        let frame = unsafe {
+    pub fn unmap(&self, virt: u64, irq: NoInterrupts) -> Option<Frame> {
+        unsafe {
+            // The walk creates nothing, so there is no allocation inside the
+            // section this opens: a descriptor that is not there is an address
+            // with nothing mapped at it, which is what this reports.
             let entry = self.entry_for(virt, false).ok()?;
-            if !(*entry).is_present() {
-                return None;
-            }
-            let phys = (*entry).addr();
-            Entry::EMPTY.store(entry);
-            Frame::from_recorded(phys)
-        };
-        flush_tlb(virt);
-        Some(frame)
+            let old = Entry::take(entry, virt, irq)?;
+            self.reclaim_tables(virt, irq);
+            Some(Frame::from_recorded(old.addr()))
+        }
     }
 
     /// The physical address `virt` reaches, including its offset in the page.

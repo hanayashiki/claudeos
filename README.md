@@ -184,6 +184,19 @@ by remembering to call free. Physical memory is also mapped in one piece at
 temporary mappings. On top of that sit a 4-level page table implementation and
 a coalescing kernel heap.
 
+The tables themselves are given back the same way. A last-level table covers
+two megabytes, and the one an unmap leaves with nothing in it is freed, and the
+ones above it while they keep emptying, so a program that maps and unmaps its
+way across a wide range costs nothing that the width of the range decides.
+Taking a table away throws every translation on the machine away with it: the
+address translation hardware caches walks it has not finished as well as ones
+it has, and the entry that named the table is in them, so invalidating the one
+address the unmap removed would leave the other five hundred and eleven able to
+reach a frame that has gone back to the allocator. Naming those addresses one
+at a time instead was measured: a loop that empties a table on every unmap ran
+five times slower on x86-64 and eighteen times slower on the emulated Pi, which
+has no invalidation by range.
+
 **Processes.** Each task owns a kernel stack, a file descriptor table, and a
 page table hierarchy whose upper half is shared with the kernel. `fork` is
 copy-on-write: the two sides share every writable page read-only until one of
@@ -488,7 +501,7 @@ failures.
   them run a thread alongside a sibling failing an exec over and over, which is
   a smoke test for a race rather than proof of its absence.
 - The **network protocols** run against a card that only records what it is
-  asked to send: **139 checks** with frames handed in by hand and frames out
+  asked to send: **145 checks** with frames handed in by hand and frames out
   compared byte for byte. Above that sits a peer with a link in each direction
   that is told before the run what to do with each segment -- lose this one,
   hold that one back behind the next, deliver the one after twice, damage the
@@ -502,7 +515,7 @@ failures.
   once a round trip has been measured and stays doubled after one that was not;
   and a segment lost out of the middle of a 32 KiB stream is recovered by the
   third acknowledgement that repeats, with the clock never waited out. On
-  aarch64 the same run adds the Pi's own Ethernet driver, for 210.
+  aarch64 the same run adds the Pi's own Ethernet driver, for 216.
 - `tests/busybox.sh` runs **39 checks** against an upstream busybox binary that
   this project did not build: `awk`, `sed`, `tar` create and extract, `find`,
   `md5sum` and `sha256sum` (whose digests are compared against the ones the

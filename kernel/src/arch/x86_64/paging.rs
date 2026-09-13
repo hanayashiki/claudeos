@@ -102,6 +102,48 @@ impl Entry {
     pub unsafe fn store(self, at: *mut Entry) {
         core::ptr::write(at, self);
     }
+
+    /// Take away the mapping at `at`, which translated `virt`, handing back
+    /// what it held. `None`, and nothing written, when there was no mapping.
+    ///
+    /// Clearing the entry and invalidating the address are one operation
+    /// because a translation the hardware has cached outlives the entry it was
+    /// read from. Written apart, a tick lands between them, and a sibling
+    /// thread on this address space still reaches the page: a switch to a task
+    /// on the same tables reloads nothing, so nothing throws the translation
+    /// away. Where the frame is released in the same breath -- and taking a
+    /// table away releases one -- that is a page the allocator has given to
+    /// somebody else. Being one operation is what stops the two being written
+    /// apart; the token is what says nothing runs between them.
+    #[inline]
+    pub unsafe fn take(at: *mut Entry, virt: u64, _irq: NoInterrupts) -> Option<Entry> {
+        let old = *at;
+        if !old.is_present() {
+            return None;
+        }
+        Entry::EMPTY.store(at);
+        flush_tlb(virt);
+        Some(old)
+    }
+
+    /// The same for an entry that names a table rather than a page.
+    ///
+    /// What this entry covered is every address under it, and what the
+    /// hardware holds of it is the unfinished walks it has cached as well as
+    /// the finished translations, so naming one address invalidates nothing
+    /// that matters. The whole space goes: on this processor that is a reload
+    /// of the table base register, and since no entry in this kernel is marked
+    /// global it discards the unfinished walks with everything else.
+    #[inline]
+    pub unsafe fn take_table(at: *mut Entry, _irq: NoInterrupts) -> Option<Entry> {
+        let old = *at;
+        if !old.is_present() {
+            return None;
+        }
+        Entry::EMPTY.store(at);
+        flush_tlb_all();
+        Some(old)
+    }
 }
 
 /// Put a fresh table under `at` and link it there.
@@ -121,6 +163,22 @@ unsafe fn publish_table(at: *mut Entry, flags: u64) -> Result<u64, MapError> {
 #[inline]
 unsafe fn table_at(phys: u64) -> *mut Entry {
     phys_to_virt(phys) as *mut Entry
+}
+
+/// True when nothing in the table at `phys` is present.
+///
+/// The sweep starts one past `cleared`, the entry an unmap has just emptied,
+/// because a range taken away a page at a time still has the next page in
+/// place there and the sweep stops on its first look. Only the last page of a
+/// table costs all five hundred and twelve.
+unsafe fn table_is_empty(phys: u64, cleared: usize) -> bool {
+    let table = table_at(phys);
+    for step in 1..=512 {
+        if (*table.add((cleared + step) % 512)).is_present() {
+            return false;
+        }
+    }
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +290,70 @@ impl AddressSpace {
             }
         }
         Ok(table_at(table).add(index_of(virt, 0)))
+    }
+
+    /// The entry the walk of `virt` reads at `level`: the one in the top table
+    /// when `level` is 3, the last-level one when it is 0. `None` when the walk
+    /// does not get that far, or when a large page ends it first.
+    unsafe fn entry_at(&self, virt: u64, level: u32) -> Option<*mut Entry> {
+        let mut table = self.pml4;
+        for above in (level + 1..4).rev() {
+            let entry = *table_at(table).add(index_of(virt, above));
+            if !entry.is_present() || entry.bits() & HUGE != 0 {
+                return None;
+            }
+            table = entry.addr();
+        }
+        Some(table_at(table).add(index_of(virt, level)))
+    }
+
+    /// Give back the tables the unmap of `virt` has left with nothing in them,
+    /// from the last level upwards, stopping at the first that still holds a
+    /// mapping. The top table is not among them: it belongs to the address
+    /// space and goes back when the space does.
+    ///
+    /// A last-level table covers two megabytes. Without this, a program that
+    /// maps one page, touches it and takes it away again at one fresh
+    /// two-megabyte-aligned address after another gets every page back and
+    /// leaves a table behind each time: kernel memory no program owns, which
+    /// nothing asks for again until the process ends.
+    ///
+    /// A table freed here must be named by nothing else. The kernel's own
+    /// tables are named by every address space, because `new_user` copies the
+    /// top table's upper half rather than taking a reference on what it points
+    /// at, so an address outside the half a program owns is declined whatever
+    /// its tables hold. Below that the frame's reference count is the answer,
+    /// which is the same question a shared page is asked: a fork builds the
+    /// child's tables with `map` rather than pointing at the parent's, so a
+    /// live table's count is one, and a path that did share one would be
+    /// declined here rather than freed under the other side.
+    ///
+    /// The frame goes back only after `take_table` has invalidated what it
+    /// covered and waited for that to take effect, and the whole of this is
+    /// inside the section that did the unmap: with a gap there another task
+    /// maps into a table between its being found empty and its being freed.
+    unsafe fn reclaim_tables(&self, virt: u64, irq: NoInterrupts) {
+        if !is_user_addr(virt) {
+            return;
+        }
+        for level in 1..4 {
+            let Some(parent) = self.entry_at(virt, level) else {
+                return;
+            };
+            let entry = *parent;
+            if !entry.is_present() || entry.bits() & HUGE != 0 {
+                return;
+            }
+            let table = entry.addr();
+            if !table_is_empty(table, index_of(virt, level - 1))
+                || frame::frame_references(table) != 1
+            {
+                return;
+            }
+            if Entry::take_table(parent, irq).is_some() {
+                drop(Frame::from_recorded(table));
+            }
+        }
     }
 
     /// Map `frame` at `virt`. The entry holds the reference from here on, and
@@ -382,18 +504,22 @@ impl AddressSpace {
 
     /// Take the mapping at `virt` away, handing back the reference the entry
     /// held. Dropping the result releases the frame.
+    ///
+    /// The table the entry was in goes back too when it holds nothing else,
+    /// and the ones above it while they keep emptying. The token is what says
+    /// nothing runs between the entry being cleared and that decision being
+    /// made on it.
     #[must_use = "dropping the frame is what releases it"]
-    pub fn unmap(&self, virt: u64) -> Option<Frame> {
+    pub fn unmap(&self, virt: u64, irq: NoInterrupts) -> Option<Frame> {
         let virt = page_align_down(virt);
         unsafe {
+            // The walk creates nothing, so there is no allocation inside the
+            // section this opens: an entry that is not there is an address
+            // with nothing mapped at it, which is what this reports.
             let entry = self.entry_for(virt, false, 0).ok()?;
-            let value = *entry;
-            if !value.is_present() {
-                return None;
-            }
-            Entry::EMPTY.store(entry);
-            flush_tlb(virt);
-            Some(Frame::from_recorded(value.addr()))
+            let old = Entry::take(entry, virt, irq)?;
+            self.reclaim_tables(virt, irq);
+            Some(Frame::from_recorded(old.addr()))
         }
     }
 
