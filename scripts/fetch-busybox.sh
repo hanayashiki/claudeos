@@ -27,8 +27,20 @@ case "$ARCH" in
 esac
 
 mkdir -p "$(dirname "$DEST")"
+# The userland build copies this binary into the root filesystem, so fetching
+# it after building leaves it out, and the suite then skips with nothing to
+# run rather than failing.
+remind() {
+  if [ "$ARCH" = aarch64 ]; then
+    echo "then run ./scripts/build-user-aarch64.sh, or this will not reach the initramfs"
+  else
+    echo "then run ./scripts/build-user.sh, or this will not reach the initramfs"
+  fi
+}
+
 if [ -x "$DEST" ]; then
   echo "already present: $DEST"
+  remind
   exit 0
 fi
 echo "fetching $URL"
@@ -64,3 +76,4 @@ if "$LLVMBIN/llvm-readobj" --elf-output-style=GNU -l "$DEST" | grep -q INTERP; t
 fi
 ls -la "$DEST"
 file "$DEST"
+remind
