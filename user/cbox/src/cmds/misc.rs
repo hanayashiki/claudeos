@@ -1,6 +1,8 @@
 //! Small applets.
 
 use super::split_flags;
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 
 pub fn yes(args: &[String]) -> i32 {
     use std::io::Write;
@@ -85,42 +87,49 @@ fn evaluate(terms: &[&str]) -> bool {
 
 /// Split standard input into the items xargs will pass on. Quotes group
 /// words, which is what keeps a name with a space in it in one piece.
-fn split_items(text: &str, separator: Option<char>) -> Vec<String> {
+///
+/// The input is split as bytes. What xargs is given is most often a list of
+/// file names, and a file name is a string of bytes that is not required to
+/// decode as anything.
+fn split_items(data: &[u8], separator: Option<u8>) -> Vec<Vec<u8>> {
     if let Some(separator) = separator {
-        return text
-            .split(separator)
+        return data
+            .split(|byte| *byte == separator)
             .filter(|piece| !piece.is_empty())
-            .map(|piece| piece.to_string())
+            .map(|piece| piece.to_vec())
             .collect();
     }
     let mut items = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
+    let mut current: Vec<u8> = Vec::new();
+    let mut quote: Option<u8> = None;
     let mut started = false;
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
+    let mut at = 0;
+    while at < data.len() {
+        let byte = data[at];
+        at += 1;
         match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => current.push(c),
-            None => match c {
-                '\'' | '"' => {
-                    quote = Some(c);
+            Some(q) if byte == q => quote = None,
+            Some(_) => current.push(byte),
+            None => match byte {
+                b'\'' | b'"' => {
+                    quote = Some(byte);
                     started = true;
                 }
-                '\\' => {
-                    if let Some(next) = chars.next() {
-                        current.push(next);
+                b'\\' => {
+                    if at < data.len() {
+                        current.push(data[at]);
+                        at += 1;
                         started = true;
                     }
                 }
-                c if c.is_whitespace() => {
+                byte if byte.is_ascii_whitespace() => {
                     if started || !current.is_empty() {
                         items.push(std::mem::take(&mut current));
                         started = false;
                     }
                 }
-                c => {
-                    current.push(c);
+                byte => {
+                    current.push(byte);
                     started = true;
                 }
             },
@@ -144,7 +153,7 @@ pub fn xargs(args: &[String]) -> i32 {
 
     while index < args.len() {
         match args[index].as_str() {
-            "-0" | "--null" => separator = Some('\0'),
+            "-0" | "--null" => separator = Some(0),
             "-r" | "--no-run-if-empty" => no_run_if_empty = true,
             "-n" => {
                 index += 1;
@@ -163,12 +172,12 @@ pub fn xargs(args: &[String]) -> i32 {
         command.push("echo".to_string());
     }
 
-    let mut text = String::new();
-    if std::io::stdin().read_to_string(&mut text).is_err() {
+    let mut data = Vec::new();
+    if std::io::stdin().read_to_end(&mut data).is_err() {
         eprintln!("xargs: cannot read input");
         return 1;
     }
-    let items = split_items(&text, separator);
+    let items = split_items(&data, separator);
     if items.is_empty() && (no_run_if_empty || replace.is_some()) {
         return 0;
     }
@@ -177,16 +186,14 @@ pub fn xargs(args: &[String]) -> i32 {
     if let Some(marker) = replace {
         let mut status = 0;
         for item in &items {
-            let argv: Vec<String> = command
-                .iter()
-                .map(|word| word.replace(&marker, item))
-                .collect();
+            let argv: Vec<OsString> =
+                command.iter().map(|word| fill_marker(word, &marker, item)).collect();
             status = run_command(&argv);
         }
         return status;
     }
 
-    let chunks: Vec<&[String]> = if per_run == usize::MAX || items.is_empty() {
+    let chunks: Vec<&[Vec<u8>]> = if per_run == usize::MAX || items.is_empty() {
         vec![&items[..]]
     } else {
         items.chunks(per_run).collect()
@@ -196,18 +203,35 @@ pub fn xargs(args: &[String]) -> i32 {
         if chunk.is_empty() && no_run_if_empty {
             continue;
         }
-        let mut argv = command.clone();
-        argv.extend(chunk.iter().cloned());
+        let mut argv: Vec<OsString> = command.iter().map(OsString::from).collect();
+        argv.extend(chunk.iter().map(|item| OsString::from_vec(item.clone())));
         status = run_command(&argv);
     }
     status
 }
 
-fn run_command(argv: &[String]) -> i32 {
+/// Put `item` where `marker` appears in `word`, for xargs -I.
+fn fill_marker(word: &str, marker: &str, item: &[u8]) -> OsString {
+    let (word, marker) = (word.as_bytes(), marker.as_bytes());
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < word.len() {
+        if !marker.is_empty() && word[at..].starts_with(marker) {
+            out.extend_from_slice(item);
+            at += marker.len();
+            continue;
+        }
+        out.push(word[at]);
+        at += 1;
+    }
+    OsString::from_vec(out)
+}
+
+fn run_command(argv: &[OsString]) -> i32 {
     match std::process::Command::new(&argv[0]).args(&argv[1..]).status() {
         Ok(status) => status.code().unwrap_or(1),
         Err(err) => {
-            eprintln!("xargs: {}: {}", argv[0], err);
+            eprintln!("xargs: {}: {}", argv[0].to_string_lossy(), err);
             127
         }
     }
