@@ -478,6 +478,10 @@ pub fn trace_received(on: bool) {
 
 static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static OVERRUNS: AtomicU64 = AtomicU64::new(0);
+/// The highest the receive engine's own count of discarded frames has been
+/// seen at. It is cumulative and there is no way to clear it that does not
+/// also write the producer index, which belongs to the device.
+static DISCARDS: AtomicU64 = AtomicU64::new(0);
 /// Frames given up on because the transmit ring stayed full.
 static TX_BLOCKED: AtomicU64 = AtomicU64::new(0);
 
@@ -489,8 +493,11 @@ pub fn interrupts() -> u64 {
     IRQ_COUNT.load(Ordering::Relaxed)
 }
 
+/// Times the controller had nowhere to put a frame: once for each overflow it
+/// interrupted about, plus the count the receive engine keeps of frames it
+/// discarded because no descriptor was free.
 pub fn overruns() -> u64 {
-    OVERRUNS.load(Ordering::Relaxed)
+    OVERRUNS.load(Ordering::Relaxed) + DISCARDS.load(Ordering::Relaxed)
 }
 
 pub fn dropped() -> u64 {
@@ -1106,7 +1113,12 @@ impl Genet {
     /// Called from the interrupt handler, so it copies and does nothing else.
     fn drain_rx(&self) -> usize {
         let mut rx = self.rx.lock();
-        let producer = self.read(RDMA_RING + RDMA_PROD_INDEX) & INDEX_MASK;
+        // The engine keeps a count of frames it had nowhere to put in the top
+        // half of the same register the producer index is in, so the index has
+        // to be masked out of it before it is compared with anything.
+        let cursor = self.read(RDMA_RING + RDMA_PROD_INDEX);
+        let producer = cursor & INDEX_MASK;
+        DISCARDS.fetch_max(((cursor >> DISCARD_SHIFT) & INDEX_MASK) as u64, Ordering::Relaxed);
         let mut taken = 0;
         let mut ready = outstanding(producer, rx.consumer);
         // A ring cannot have more outstanding than it has descriptors; more
