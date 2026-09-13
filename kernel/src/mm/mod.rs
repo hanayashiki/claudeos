@@ -2,6 +2,7 @@
 
 pub mod frame;
 pub mod heap;
+pub mod selftest;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_SIZE_U64: u64 = 4096;

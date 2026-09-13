@@ -211,6 +211,13 @@ impl AddressSpace {
         Ok(table_at(table).add(index_of(virt, 0)))
     }
 
+    /// Map `frame` at `virt`. The descriptor holds the reference from here on,
+    /// and `unmap` or teardown gives it back.
+    ///
+    /// An address that already has a mapping is refused rather than replaced.
+    /// The descriptor is the only record of the reference the frame it names
+    /// holds, so writing over it would leave that frame with no owner and no
+    /// way back to the allocator.
     pub fn map(&self, virt: u64, frame: Frame, flags: u64) -> Result<(), MapError> {
         unsafe {
             let entry = self.entry_for(virt, true)?;

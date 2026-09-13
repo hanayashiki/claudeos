@@ -138,10 +138,20 @@ impl AddressSpace {
 
     /// Map `frame` at `virt`. The entry holds the reference from here on, and
     /// `unmap` or teardown gives it back. A mapping that fails releases it.
+    ///
+    /// An address that already has a mapping is refused rather than replaced.
+    /// The entry is the only record of the reference the frame it names holds,
+    /// so writing over it would leave that frame with no owner and no way back
+    /// to the allocator. A caller that means to replace a mapping takes the
+    /// old one away first and decides for itself what to do with what `unmap`
+    /// hands back.
     pub fn map(&self, virt: u64, frame: Frame, flags: u64) -> Result<(), MapError> {
         let virt = page_align_down(virt);
         unsafe {
             let entry = self.entry_for(virt, true, flags)?;
+            if *entry & PRESENT != 0 {
+                return Err(MapError::AlreadyMapped);
+            }
             *entry = (frame.into_recorded() & ADDR_MASK) | flags | PRESENT;
         }
         flush_tlb(virt);
