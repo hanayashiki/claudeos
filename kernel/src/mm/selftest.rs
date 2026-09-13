@@ -34,6 +34,7 @@ impl Report {
 }
 
 pub fn run(report: &mut Report) {
+    the_margin_keeps_an_allocation_from_mapping(report);
     refuses_a_second_mapping(report);
     refusing_leaks_nothing(report);
     replacing_hands_the_old_frame_back(report);
@@ -43,6 +44,58 @@ pub fn run(report: &mut Report) {
     device_window::run(report);
     #[cfg(target_arch = "aarch64")]
     invalidation_operands(report);
+}
+
+/// An allocation made inside another lock's critical section must not be the
+/// one that maps pages: the lock masks interrupts over the top of the mapping,
+/// and the heap cannot see who is holding what.
+///
+/// The free list is driven down past the margin first, which is the state the
+/// defect needs. Topping up from there -- which is what the way out of a
+/// system call does -- has to leave enough that the allocation below, made
+/// with interrupts masked as a lock would leave them, moves nothing.
+///
+/// Without the top-up the last two checks fail: the ballast leaves less free
+/// than the block asks for, so the block is answered by mapping eight
+/// megabytes, which held the timer off for 6.1 ms on x86-64 and 14.5 ms on
+/// aarch64 when it was measured that way.
+fn the_margin_keeps_an_allocation_from_mapping(report: &mut Report) {
+    use crate::mm::{heap, HEAP_MARGIN};
+    use alloc::vec::Vec;
+
+    /// Larger than what the ballast leaves free, so a block the free list can
+    /// answer is one the margin paid for and not one it happened to have.
+    const BLOCK: usize = 1024 * 1024;
+
+    // Each round takes all but a little of what is free, so this converges on
+    // an empty free list rather than stepping towards it by a fixed size. The
+    // bound is there because an allocation can grow the heap and put the free
+    // bytes back.
+    let mut ballast: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..16 {
+        let (used, total) = heap::stats();
+        let free = total - used;
+        if free <= BLOCK / 2 {
+            break;
+        }
+        ballast.push(alloc::vec![0u8; (free - BLOCK / 2).min(4 * BLOCK)]);
+    }
+    let (used, total) = heap::stats();
+    report.check("the free list can be emptied", total - used < BLOCK);
+
+    heap::top_up();
+    let (used, total) = heap::stats();
+    report.check("topping up puts the margin back", total - used >= HEAP_MARGIN);
+
+    let mapped = heap::mapped_bytes();
+    let block = crate::sync::without_interrupts(|_| alloc::vec![0u8; BLOCK]);
+    report.check(
+        "an allocation made with interrupts masked maps nothing",
+        heap::mapped_bytes() == mapped,
+    );
+
+    drop(block);
+    drop(ballast);
 }
 
 /// The operand a translation invalidation by address takes.
