@@ -257,6 +257,17 @@ pub fn run() -> bool {
     connection(&mut report, nic);
     crate::println!("net: datagrams");
     datagrams(&mut report, nic);
+    // The driver for this board's own Ethernet, as far as it can be exercised
+    // with no such Ethernet anywhere: nothing emulates it, so this is the only
+    // thing that runs against it before it meets a board.
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::println!("net: the board's own ethernet");
+        let mut genet = super::genettest::Report { passed: 0, failed: 0 };
+        super::genettest::run(&mut genet);
+        report.passed += genet.passed;
+        report.failed += genet.failed;
+    }
 
     socket::reset();
     crate::println!();
