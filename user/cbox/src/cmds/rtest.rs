@@ -183,6 +183,94 @@ fn thread_of_a_child_is_not_a_child(report: &mut Report) {
     );
 }
 
+/// Stopping a job and telling its parent are one step. A tick between them
+/// takes the CPU away from a task that is no longer runnable, so the parent is
+/// never told and sleeps in wait4 for good: the shell that pressed the suspend
+/// key never gets its prompt back.
+///
+/// Forty rounds is a smoke test, not proof: the window is two instructions
+/// wide. A watchdog kills the child if a round takes too long, so a regression
+/// reads as a failed check rather than a suite that never finishes.
+fn stopping_a_job_reaches_the_parent(report: &mut Report) {
+    use crate::sys;
+    use std::sync::atomic::AtomicBool;
+
+    const SIGKILL: i32 = 9;
+    const SIGCONT: i32 = 18;
+    const SIGTSTP: i32 = 20;
+    const WUNTRACED: u64 = 2;
+    const WCONTINUED: u64 = 8;
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+
+    let child = sys::fork();
+    if child == 0 {
+        loop {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let child = child as i32;
+
+    let watchdog = std::thread::spawn(move || {
+        for _ in 0..100 {
+            if DONE.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        sys::kill(child, SIGKILL);
+    });
+
+    let mut rounds = 0;
+    let mut detail = String::new();
+    for round in 0..40 {
+        sys::kill(child, SIGTSTP);
+        let (pid, status) = sys::wait4(child, WUNTRACED);
+        if pid != child as i64 || sys::stop_signal_of(status) != Some(SIGTSTP) {
+            detail = format!("round {}: stop reported as {} {:#x}", round, pid, status);
+            break;
+        }
+        sys::kill(child, SIGCONT);
+        let (pid, status) = sys::wait4(child, WCONTINUED);
+        if pid != child as i64 || !sys::is_continued(status) {
+            detail = format!("round {}: continue reported as {} {:#x}", round, pid, status);
+            break;
+        }
+        rounds += 1;
+    }
+    // A continue that lands while the task is on its way into a stop finds it
+    // still runnable, so it has nothing to restart; the stop that follows must
+    // give way to it rather than park the task with a continue pending that
+    // nothing will ever look at. Back-to-back pairs is the closest a program
+    // can get to that from outside.
+    for _ in 0..60 {
+        sys::kill(child, SIGTSTP);
+        sys::kill(child, SIGCONT);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let state = std::fs::read_to_string(format!("/proc/{}/stat", child))
+        .ok()
+        .and_then(|line| line.split(' ').nth(2).map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    DONE.store(true, Ordering::Relaxed);
+    let _ = watchdog.join();
+    sys::kill(child, SIGCONT);
+    sys::kill(child, SIGKILL);
+    let _ = sys::wait4(child, 0);
+
+    report.check(
+        "a stop and a continue both reach the parent",
+        rounds == 40,
+        format!("{} rounds; {}", rounds, detail),
+    );
+    report.check(
+        "a continue is not lost to the stop it races",
+        state != "T" && !state.is_empty(),
+        format!("child state {:?} after 60 stop-continue pairs", state),
+    );
+}
+
 /// A failed exec has to put the task back on the address space it came from
 /// and on the page tables that go with it together. A thread running in the
 /// same address space is what notices if it does not: it is resumed on the
@@ -514,6 +602,7 @@ pub fn main(_args: &[String]) -> i32 {
     println!();
     println!("-- threads, processes and waiting --");
     thread_of_a_child_is_not_a_child(&mut report);
+    stopping_a_job_reaches_the_parent(&mut report);
     failed_exec_and_siblings(&mut report);
 
     println!();

@@ -488,13 +488,32 @@ pub fn post_signal(task: &mut Task, signal: i32) -> Option<u32> {
 
 /// Stop the running task until something sends it SIGCONT.
 fn stop_current(signal: i32) {
-    let mut task = current();
-    task.stop_signal = signal;
-    task.report_stop = true;
-    task.state = State::Stopped;
-    let ppid = task.ppid;
-    notify_parent(ppid);
-    schedule();
+    // Leaving the run queue and telling the parent about it have to happen in
+    // the same breath. A tick in between hands the CPU to something else and
+    // never hands it back, because this task is no longer runnable, so the
+    // notification is left undelivered by a task that can no longer deliver
+    // it and the parent sleeps in wait4 for good.
+    let stopped = crate::sync::without_interrupts(|| {
+        let mut task = current();
+        // The stop signal's pending bit was cleared before this was called, so
+        // a continue that arrived since then found a runnable task with no
+        // stop to discard and nothing to restart: it recorded nothing. Asked
+        // again here, where nothing else can run, it is a continue that beat
+        // the stop, and stopping now would park the task with a continue
+        // pending that nothing would ever act on.
+        if task.pending_signals & (1u64 << (SIGCONT as u64 & 63)) != 0 {
+            return false;
+        }
+        task.stop_signal = signal;
+        task.report_stop = true;
+        task.state = State::Stopped;
+        let ppid = task.ppid;
+        notify_parent(ppid);
+        true
+    });
+    if stopped {
+        schedule();
+    }
 }
 
 /// Woken whenever a descriptor changes what it would report to a poll: bytes
