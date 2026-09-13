@@ -1,7 +1,7 @@
 //! ELF64 program loader for static executables.
 
 use crate::abi::Errno;
-use crate::arch::paging::{AddressSpace, NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::arch::paging::{AddressSpace, FreshPage, NO_EXECUTE, PRESENT, USER, WRITABLE};
 use crate::mm::{page_align_down, PAGE_SIZE_U64};
 use alloc::collections::{BTreeMap, BTreeSet};
 
@@ -295,9 +295,8 @@ impl Extent {
     }
 }
 
-/// Map the PT_LOAD segments of the program in `node` into `space`, which must
-/// be the active address space so the segment contents can be written
-/// directly. `base_override` says where to put a relocatable image.
+/// Map the PT_LOAD segments of the program in `node` into `space`.
+/// `base_override` says where to put a relocatable image.
 ///
 /// The file is read a piece at a time rather than held under its lock for the
 /// length of the load. That lock masks interrupts, and what happens here is
@@ -306,6 +305,12 @@ impl Extent {
 /// fault. The header and the program header table are read once and kept; the
 /// bytes of a segment are copied a page at a time, with the lock taken for
 /// each page and let go after it.
+///
+/// The pages this assembles are filled before they are published, so nothing
+/// reaches an address of the image until it holds what it is going to hold.
+/// That is also why `space` need not be the address space the processor is
+/// on: the contents go in through the frames rather than through the
+/// addresses they will be read at.
 pub fn load_at(
     space: &AddressSpace,
     node: &crate::fs::NodeRef,
@@ -385,41 +390,49 @@ pub fn load_at(
         }
     }
 
-    for page in page_flags.keys() {
-        if !eager.contains(page) {
-            continue;
-        }
-        space
-            .map_new(*page, PRESENT | WRITABLE | USER)
-            .map_err(|_| Errno::ENOMEM)?;
+    // The frames those pages will be, held here until every source has been
+    // copied into them. A page two segments share is written by both passes
+    // and each finds it through this map, so there is no point at which the
+    // image has an address a program could reach that is not finished.
+    //
+    // What is held at once is the assembled pages rather than the image: a
+    // partial head and tail per segment, and any page two of them share. An
+    // image of many small segments can make nearly every page one of those,
+    // and MAX_IMAGE_PAGES allows 64K of them, which is 256 MiB. That is the
+    // same memory either way -- mapping each page as the copy reached it
+    // would commit exactly as much -- but until the end it is held here
+    // instead of in the page tables.
+    let mut fresh: BTreeMap<u64, FreshPage> = BTreeMap::new();
+    for page in eager {
+        fresh.insert(page, FreshPage::new().ok_or(Errno::ENOMEM)?);
     }
 
     for (_, extent) in &loads {
-        // Copy only what lands in a page that was mapped here. A fresh frame
-        // is already zero, so .bss needs nothing written.
+        // Copy only what lands in a page assembled here. A fresh frame is
+        // already zero, so .bss needs nothing written.
         let mut offset = 0u64;
         while offset < extent.file_len {
             let address = extent.vaddr + offset;
             let page = page_align_down(address);
             let chunk = (page + PAGE_SIZE_U64 - address).min(extent.file_len - offset);
-            if eager.contains(&page) {
-                // The page is mapped, present and writable, and this task is
-                // the only one on the address space it is in.
-                let dst =
-                    unsafe { core::slice::from_raw_parts_mut(address as *mut u8, chunk as usize) };
-                let n = read_into(node, extent.file_offset + offset, dst);
+            if let Some(fresh) = fresh.get_mut(&page) {
+                let at = (address - page) as usize;
+                let end = at + chunk as usize;
+                let n = read_into(node, extent.file_offset + offset, &mut fresh.bytes()[at..end]);
                 // These bytes are about to be executed, and on some machines
-                // writing them is not enough to make them fetchable.
-                crate::arch::sync_instruction_cache(address, n);
+                // writing them is not enough to make them fetchable. What the
+                // maintenance names is the address they were written through,
+                // which is not the one they will be fetched from.
+                crate::arch::sync_instruction_cache(fresh.bytes()[at..].as_ptr() as u64, n);
             }
             offset += chunk;
         }
     }
 
     for (page, flags) in &page_flags {
-        if !eager.contains(page) {
+        let Some(fresh) = fresh.remove(page) else {
             continue;
-        }
+        };
         let mut bits = PRESENT | USER;
         if flags & PF_W != 0 {
             bits |= WRITABLE;
@@ -427,7 +440,7 @@ pub fn load_at(
         if flags & PF_X == 0 {
             bits |= NO_EXECUTE;
         }
-        space.set_flags(*page, bits);
+        space.publish(*page, fresh, bits).map_err(|_| Errno::ENOMEM)?;
     }
 
     // AT_PHDR must point at the program headers as they sit in memory.
