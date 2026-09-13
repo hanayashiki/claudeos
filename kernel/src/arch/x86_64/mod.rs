@@ -244,8 +244,9 @@ pub fn console_init() {
     uart::init();
 }
 
-pub fn console_write_byte(byte: u8) {
-    uart::write_byte(byte);
+/// Take one byte if the transmitter has room for it, and say whether it did.
+pub fn console_try_write_byte(byte: u8) -> bool {
+    uart::try_write_byte(byte)
 }
 
 pub fn console_read_byte() -> Option<u8> {

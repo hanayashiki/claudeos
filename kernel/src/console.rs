@@ -1,8 +1,8 @@
 //! Console: serial and PS/2 keyboard input with a line discipline, and
 //! serial output.
 
-use crate::abi::{Errno, Termios, ECHO, ICANON};
-use crate::serial::SERIAL;
+use crate::abi::{Errno, Termios, ECHO, ICANON, ONLCR, OPOST};
+use crate::serial::{Chunk, SERIAL};
 use crate::sync::Spinlock;
 use core::fmt::Write;
 
@@ -123,18 +123,51 @@ pub fn available() -> usize {
     INPUT.lock().len()
 }
 
+/// Write a program's output to the terminal, ending lines the way the terminal
+/// settings say to.
 pub fn write(buf: &[u8]) {
-    let mut serial = SERIAL.lock();
-    for &byte in buf {
-        serial.write_byte(byte);
+    let onlcr = {
+        let termios = TERMIOS.lock();
+        termios.c_oflag & OPOST != 0 && termios.c_oflag & ONLCR != 0
+    };
+    emit(buf, onlcr);
+}
+
+/// Write a kernel message.
+///
+/// Always a carriage return before a line feed, where a program's output
+/// obeys the settings above. A kernel message is not the foreground program's
+/// output and is not the program's to reformat, and the boot log, which is
+/// printed before any program exists, has no settings to consult anyway. A
+/// terminal reading a bare line feed as a line feed and nothing else is what
+/// makes a boot log walk down the right margin.
+pub fn write_kernel(bytes: &[u8]) {
+    emit(bytes, true);
+}
+
+/// Put bytes on the wire.
+///
+/// The one place a line ending is decided: the ports take what they are given
+/// and change nothing, so the two machines cannot disagree about what a
+/// newline is.
+///
+/// The loop is here rather than inside the console lock, and the lock is taken
+/// once per chunk: a program's write is as long as the program says, and the
+/// port waits for the transmitter between bytes, so a hold that covered the
+/// whole buffer would be interrupts masked for as long as the write takes. On
+/// the board that is 86.8 microseconds a byte.
+fn emit(bytes: &[u8], onlcr: bool) {
+    let mut out = Chunk::new();
+    for &byte in bytes {
+        if onlcr && byte == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(byte);
     }
 }
 
 fn echo(bytes: &[u8]) {
-    let mut serial = SERIAL.lock();
-    for &byte in bytes {
-        serial.write_byte(byte);
-    }
+    write(bytes);
 }
 
 /// Read from the console, honouring the current terminal settings.
@@ -346,6 +379,17 @@ pub fn init() {
     crate::arch::unmask_irq(crate::arch::SERIAL_IRQ);
 }
 
+/// Somewhere for `format_args!` to go that is the terminal rather than the
+/// kernel log.
+struct Terminal;
+
+impl Write for Terminal {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        write(s.as_bytes());
+        Ok(())
+    }
+}
+
 pub fn print_fmt(args: core::fmt::Arguments) {
-    let _ = SERIAL.lock().write_fmt(args);
+    let _ = Terminal.write_fmt(args);
 }
