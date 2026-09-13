@@ -8,6 +8,7 @@
 
 use core::arch::asm;
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 mod clock;
 mod cpu;
@@ -251,6 +252,81 @@ pub fn pci_config_write32(bus: u8, device: u8, function: u8, offset: u8, value: 
         io::outl(PCI_CONFIG_ADDRESS, pci_config_address(bus, device, function, offset));
         io::outl(PCI_CONFIG_DATA, value);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The processor's own random numbers
+// ---------------------------------------------------------------------------
+
+/// Which instruction this processor answers with, worked out once.
+///
+/// RDSEED is the entropy source itself and RDRAND is a generator reseeded from
+/// it, so RDSEED is preferred where both are there; a processor with neither
+/// leaves `hardware_random` with nothing to offer.
+static RANDOM_SOURCE: AtomicU8 = AtomicU8::new(SOURCE_UNKNOWN);
+const SOURCE_UNKNOWN: u8 = 0;
+const SOURCE_NONE: u8 = 1;
+const SOURCE_RDRAND: u8 = 2;
+const SOURCE_RDSEED: u8 = 3;
+
+fn random_source() -> u8 {
+    let known = RANDOM_SOURCE.load(Ordering::Relaxed);
+    if known != SOURCE_UNKNOWN {
+        return known;
+    }
+    // CPUID leaf 7 does not exist on a processor whose leaf 0 does not reach
+    // it, and asking for a leaf that is not there answers with some other
+    // leaf's contents rather than with zeroes.
+    let highest = cpu::cpuid(0, 0).eax;
+    let found = if highest >= 7 && cpu::cpuid(7, 0).ebx & (1 << 18) != 0 {
+        SOURCE_RDSEED
+    } else if cpu::cpuid(1, 0).ecx & (1 << 30) != 0 {
+        SOURCE_RDRAND
+    } else {
+        SOURCE_NONE
+    };
+    RANDOM_SOURCE.store(found, Ordering::Relaxed);
+    found
+}
+
+/// A word from the processor's own generator, or nothing if it has none.
+///
+/// Both instructions report through the carry flag that they had nothing ready
+/// rather than by blocking, and Intel's own guidance is to ask again a handful
+/// of times before giving up. Giving up is not a failure here: the caller
+/// treats this as one source among several.
+pub fn hardware_random() -> Option<u64> {
+    let source = random_source();
+    if source == SOURCE_NONE {
+        return None;
+    }
+    for _ in 0..16 {
+        let value: u64;
+        let ok: u8;
+        unsafe {
+            if source == SOURCE_RDSEED {
+                asm!(
+                    "rdseed {value}",
+                    "setc {ok}",
+                    value = out(reg) value,
+                    ok = out(reg_byte) ok,
+                    options(nomem, nostack),
+                );
+            } else {
+                asm!(
+                    "rdrand {value}",
+                    "setc {ok}",
+                    value = out(reg) value,
+                    ok = out(reg_byte) ok,
+                    options(nomem, nostack),
+                );
+            }
+        }
+        if ok != 0 {
+            return Some(value);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------

@@ -260,6 +260,14 @@ pub fn run() -> bool {
     report.passed += memory.passed;
     report.failed += memory.failed;
 
+    // The generator, which is neither memory nor network but is checked here
+    // for the same reason the memory checks are: one summary line per boot.
+    crate::println!("random: chacha20 against the published vectors");
+    let mut rng = crate::rng::selftest::Report { passed: 0, failed: 0 };
+    crate::rng::selftest::run(&mut rng);
+    report.passed += rng.passed;
+    report.failed += rng.failed;
+
     crate::println!("net: checksums");
     checksums(&mut report);
     crate::println!("net: address resolution");

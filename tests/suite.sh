@@ -376,6 +376,22 @@ echo "-- devices --"
 check "/dev/null read"    "0"        "$(wc -c < /dev/null)"
 check "/dev/null write"   "0"        "$(echo discard > /dev/null; echo $?)"
 check "/dev/zero"         "16"       "$(head -c 16 < /dev/zero | wc -c)"
+# hexdump rather than wc -c throughout: wc counts the characters of a text
+# file and gives nothing for bytes that are not one.
+check "/dev/urandom"      "00000010" "$(head -c 16 /dev/urandom | hexdump | tail -n 1)"
+check "/dev/random"       "00000010" "$(head -c 16 /dev/random | hexdump | tail -n 1)"
+# Two reads of a generator that is running cannot agree. Two that did would
+# mean it had stopped advancing.
+first="$(head -c 16 /dev/urandom | hexdump | head -n 1)"
+second="$(head -c 16 /dev/urandom | hexdump | head -n 1)"
+check "two reads differ"  "differ"   "$([ "$first" = "$second" ] && echo same || echo differ)"
+# In 4096 bytes each of the 256 values is expected sixteen times, so nearly all
+# of them turn up; fewer than 250 is far outside what chance does, and is what
+# a generator stuck in a short cycle would give. This says nothing about
+# whether the output can be predicted -- the kernel's own checks are where that
+# is looked at.
+seen="$(head -c 4096 /dev/urandom | hexdump | cut -d'|' -f1 | tr -s ' ' '\n' | grep '^[0-9a-f][0-9a-f]$' | sort -u | wc -l)"
+check "byte values turn up" "most"   "$([ "$seen" -ge 250 ] && echo most || echo "$seen")"
 
 echo
 echo "-- processes --"

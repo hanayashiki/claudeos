@@ -24,6 +24,10 @@ pub fn ticks() -> u64 {
 
 fn timer(frame: &mut TrapFrame) {
     TICKS.fetch_add(1, Ordering::Relaxed);
+    // When a tick is delivered varies by however long interrupts happened to
+    // have been off, and on a machine with nothing else to do it is the only
+    // new thing the random number generator gets to see.
+    crate::rng::observe(arch::TIMER_IRQ as u64);
     arch::end_of_interrupt(arch::TIMER_IRQ);
     // A task killed while spinning in user mode notices here.
     if frame.from_user() {
@@ -34,6 +38,9 @@ fn timer(frame: &mut TrapFrame) {
 
 fn device(frame: &mut TrapFrame) {
     let Some(irq) = arch::vector_irq(arch::trap_vector(frame)) else { return };
+    // A device's timing is outside this machine's control, which is what makes
+    // it worth the generator having.
+    crate::rng::observe(irq as u64);
     if irq == arch::SERIAL_IRQ || irq == arch::SERIAL_IRQ_ALT {
         crate::console::serial_irq();
     } else if irq == arch::KEYBOARD_IRQ {

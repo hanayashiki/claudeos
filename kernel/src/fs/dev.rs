@@ -2,7 +2,6 @@
 
 use super::{link_node, Node, NodeKind};
 use crate::abi::{Errno, S_IFCHR};
-use core::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
@@ -54,29 +53,13 @@ pub fn populate() {
     let _ = super::symlink("/dev/stderr", "/proc/self/fd/2");
 }
 
-static RNG_STATE: AtomicU64 = AtomicU64::new(0x2545F4914F6CDD1D);
-
-/// xorshift64*, seeded from the CPU's cycle counter at first use.
-pub fn random_u64() -> u64 {
-    let mut x = RNG_STATE.load(Ordering::Relaxed);
-    if x == 0x2545F4914F6CDD1D {
-        x ^= crate::arch::cycle_counter().wrapping_mul(0x9E3779B97F4A7C15);
-    }
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    RNG_STATE.store(x, Ordering::Relaxed);
-    x.wrapping_mul(0x2545F4914F6CDD1D)
-}
-
+/// `/dev/random` and `/dev/urandom` are the same device here, as they are on
+/// Linux once its pool has been filled: both hand out the kernel generator's
+/// output and neither ever blocks. The generator is seeded before the first
+/// process runs, so there is no window in which one of them would have to wait
+/// for the other.
 pub fn fill_random(buf: &mut [u8]) {
-    let mut i = 0;
-    while i < buf.len() {
-        let value = random_u64().to_le_bytes();
-        let n = (buf.len() - i).min(8);
-        buf[i..i + n].copy_from_slice(&value[..n]);
-        i += n;
-    }
+    crate::rng::fill(buf)
 }
 
 pub fn read(kind: DeviceKind, buf: &mut [u8]) -> Result<usize, Errno> {
