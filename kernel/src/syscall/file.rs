@@ -61,7 +61,7 @@ fn procfs_override_for(path: &str, for_link: bool) -> Option<String> {
     let own_prefix = alloc::format!("/proc/{}/", pid);
     if let Some(entry) = effective.strip_prefix(&own_prefix) {
         match entry {
-            "exe" => return Some(task.exe_path.clone()),
+            "exe" => return Some(task.exe_path()),
             "cwd" => return Some(task.cwd()),
             _ => {}
         }
@@ -78,8 +78,8 @@ fn procfs_override_for(path: &str, for_link: bool) -> Option<String> {
         // Another process's exe link.
         if let Some((number, "exe")) = rest.split_once('/') {
             if let Ok(other) = number.parse::<u32>() {
-                if let Some(target) = sched::find(other) {
-                    return Some(target.exe_path.clone());
+                if let Some(path) = sched::with_task(other, |target| target.exe_path()) {
+                    return Some(path);
                 }
             }
         }
@@ -252,7 +252,7 @@ pub fn openat(dirfd: i64, path_addr: u64, flags: u32, mode: u32) -> SysResult {
             node
         }
         None if flags & O_CREAT != 0 => {
-            let umask = sched::current().umask;
+            let umask = sched::current().umask.get();
             fs::create(&path, mode & !umask)?
         }
         None => return Err(Errno::ENOENT),

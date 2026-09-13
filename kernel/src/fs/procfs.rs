@@ -207,10 +207,10 @@ pub fn render(kind: Generated) -> String {
                 out.push_str(&format!(
                     "{} {} {} {} {}\n",
                     task.pid,
-                    task.ppid,
-                    task.pgid,
+                    task.ppid.get(),
+                    task.pgid.get(),
                     state_char(task.state()),
-                    task.name
+                    task.name()
                 ));
             });
             out
@@ -225,11 +225,11 @@ pub fn render(kind: Generated) -> String {
             out.push_str(&format!(
                 "{} ({}) {} {} {} {} 0 -1 0 ",
                 task.pid,
-                task.name,
+                task.name(),
                 state_char(task.state()),
-                task.ppid,
-                task.pgid,
-                task.pgid, // session
+                task.ppid.get(),
+                task.pgid.get(),
+                task.pgid.get(), // session
             ));
             // minflt cminflt majflt cmajflt utime stime cutime cstime
             out.push_str(&format!("0 0 0 0 {} 0 0 0 ", ticks));
@@ -240,7 +240,11 @@ pub fn render(kind: Generated) -> String {
             // startcode endcode startstack kstkesp kstkeip
             out.push_str("0 0 0 0 0 ");
             // signal blocked sigignore sigcatch wchan nswap cnswap
-            out.push_str(&format!("{} {} 0 0 0 0 0 ", task.pending_signals, task.signal_mask));
+            out.push_str(&format!(
+                "{} {} 0 0 0 0 0 ",
+                task.pending_signals.get(),
+                task.signal_mask.get()
+            ));
             // exit_signal processor rt_priority policy delayacct_blkio
             out.push_str("17 0 0 0 0 ");
             // guest_time cguest_time start_data end_data start_brk
@@ -256,7 +260,7 @@ pub fn render(kind: Generated) -> String {
                  Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\n\
                  VmSize:\t{} kB\nVmRSS:\t{} kB\nVmData:\t{} kB\n\
                  SigPnd:\t{:016x}\nSigBlk:\t{:016x}\n",
-                task.name,
+                task.name(),
                 state_char(task.state()),
                 match task.state() {
                     crate::task::State::Runnable => "running",
@@ -267,12 +271,12 @@ pub fn render(kind: Generated) -> String {
                 },
                 task.tgid,
                 task.pid,
-                task.ppid,
+                task.ppid.get(),
                 task.virtual_size() / 1024,
                 task.resident_pages() * 4,
                 (task.brk().saturating_sub(task.brk_start())) / 1024,
-                task.pending_signals,
-                task.signal_mask,
+                task.pending_signals.get(),
+                task.signal_mask.get(),
             )
         })
         .unwrap_or_default(),
@@ -318,7 +322,8 @@ pub fn render(kind: Generated) -> String {
         })
         .unwrap_or_default(),
         Generated::PidCmdline(pid) => {
-            crate::sched::with_task(pid, |task| format!("{}\0", task.exe_path)).unwrap_or_default()
+            crate::sched::with_task(pid, |task| format!("{}\0", task.exe_path()))
+                .unwrap_or_default()
         }
     }
 }

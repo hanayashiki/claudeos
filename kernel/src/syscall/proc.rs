@@ -36,7 +36,7 @@ pub fn fork(
         space
     };
 
-    let Some(mut child) = Task::new(&parent.name, space) else {
+    let Some(mut child) = Task::new(&parent.name(), space) else {
         if !share_vm {
             space.destroy();
         }
@@ -46,19 +46,14 @@ pub fn fork(
         // Threads must see each other's mappings, so they share one record.
         child.share_space_of(&parent);
     } else {
-        let source = parent.mm().lock();
-        let mut target = child.mm().lock();
-        target.vmas = source.vmas.clone();
-        target.brk_start = source.brk_start;
-        target.brk = source.brk;
-        target.mmap_top = source.mmap_top;
+        child.copy_mem_from(&parent);
     }
     let child_pid = child.pid;
     let is_thread = flags & CLONE_THREAD != 0;
 
-    child.ppid = if is_thread { parent.ppid } else { parent.pid };
+    child.ppid.set(if is_thread { parent.ppid.get() } else { parent.pid });
     child.tgid = if is_thread { parent.tgid } else { child_pid };
-    child.pgid = parent.pgid;
+    child.pgid.set(parent.pgid.get());
     // Two more things a thread shares with the task that started it. Without
     // these a descriptor one thread opens is a descriptor the others do not
     // have, and a directory one changes into is one the others do not resolve
@@ -74,19 +69,19 @@ pub fn fork(
     } else {
         parent.fds.clone_table()
     };
-    child.exe_path = parent.exe_path.clone();
-    child.name = parent.name.clone();
-    child.umask = parent.umask;
-    child.signal_actions = parent.signal_actions;
+    child.set_exe_path(parent.exe_path());
+    child.set_name(parent.name());
+    child.umask.set(parent.umask.get());
+    child.copy_actions_from(&parent);
     // The child carries on from the same instruction, so it starts on the
     // registers the parent is holding right now, thread pointer included
     // unless the caller named a new one.
-    child.cpu.save();
+    child.with_cpu(|cpu| cpu.save());
     if flags & CLONE_SETTLS != 0 {
-        child.cpu.set_thread_pointer(tls);
+        child.with_cpu(|cpu| cpu.set_thread_pointer(tls));
     }
     if flags & CLONE_CHILD_CLEARTID != 0 {
-        child.clear_child_tid = child_tid;
+        child.clear_child_tid.set(child_tid);
     }
 
     // The child resumes from the same point with a zero return value.
@@ -106,7 +101,7 @@ pub fn fork(
 
     let vfork = flags & CLONE_VFORK != 0;
     if vfork {
-        child.vfork_parent = Some(parent.pid);
+        child.vfork_parent.set(Some(parent.pid));
     }
 
     sched::register(child);
@@ -123,8 +118,8 @@ pub fn fork(
         // link is gone rather than once.
         loop {
             let waiting = crate::sync::without_interrupts(|irq| {
-                let waiting =
-                    sched::find(child_pid).map_or(false, |c| c.vfork_parent.is_some());
+                let waiting = sched::with_task(child_pid, |c| c.vfork_parent.get().is_some())
+                    .unwrap_or(false);
                 if waiting {
                     sched::current().sleep(0, irq);
                 }
@@ -148,7 +143,7 @@ pub fn fork(
 /// yet, so a task left running with an empty one takes a fault it cannot serve
 /// on the first stack page or heap byte it reaches.
 fn abandon_exec(
-    task: &mut Task,
+    task: &Task,
     old_space: AddressSpace,
     old_mm: alloc::sync::Arc<crate::sync::Spinlock<crate::task::MemState>>,
     new_space: AddressSpace,
@@ -203,8 +198,8 @@ pub fn exec_into_current(
     // The old record is kept until the image is known to load, because the page
     // tables it describes are still there and the task goes back to running on
     // them if it does not.
-    let mut task = sched::current();
-    let old_mm = alloc::sync::Arc::clone(task.mm());
+    let task = sched::current();
+    let old_mm = task.mm();
     let new_mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
     crate::sync::without_interrupts(|irq| task.run_on_space(new_space, new_mm, irq));
 
@@ -214,7 +209,7 @@ pub fn exec_into_current(
     let image = match elf::load_at(&new_space, &node, None) {
         Ok(image) => image,
         Err(err) => {
-            abandon_exec(&mut task, old_space, old_mm, new_space);
+            abandon_exec(&task, old_space, old_mm, new_space);
             return Err(err);
         }
     };
@@ -264,7 +259,7 @@ pub fn exec_into_current(
                     interp_path,
                     err
                 );
-                abandon_exec(&mut task, old_space, old_mm, new_space);
+                abandon_exec(&task, old_space, old_mm, new_space);
                 return Err(Errno::ENOENT);
             }
         }
@@ -273,7 +268,7 @@ pub fn exec_into_current(
     let sp = match task::build_user_stack(&task, &image, &argv, &envp, &exec_path, interp_base) {
         Ok(sp) => sp,
         Err(err) => {
-            abandon_exec(&mut task, old_space, old_mm, new_space);
+            abandon_exec(&task, old_space, old_mm, new_space);
             return Err(err);
         }
     };
@@ -292,21 +287,12 @@ pub fn exec_into_current(
     task.fds.close_on_exec();
     // A new program starts on a clean register file, not the one the program
     // that called exec left behind.
-    task.cpu.reset_for_exec();
-    task.name = exec_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(&exec_path)
-        .to_string();
-    task.exe_path = exec_path;
-    // Handlers do not survive exec, but ignored signals stay ignored.
-    for action in task.signal_actions.iter_mut() {
-        if action.handler != crate::signal::SIG_IGN {
-            *action = crate::signal::SigAction::default();
-        }
-    }
+    task.with_cpu(|cpu| cpu.reset_for_exec());
+    task.set_name(exec_path.rsplit('/').next().unwrap_or(&exec_path).to_string());
+    task.set_exe_path(exec_path);
+    task.reset_actions_for_exec();
 
-    task::set_user_entry(&mut task, entry, sp);
+    task::set_user_entry(&task, entry, sp);
     Ok(())
 }
 
@@ -368,14 +354,14 @@ pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
             ) {
                 return false;
             }
-            let mut task = sched::current();
-            task.waiting_for = Some(pid as i32);
+            let task = sched::current();
+            task.waiting_for.set(Some(pid as i32));
             task.sleep(0, irq);
             true
         });
         if sleep {
             sched::schedule();
-            sched::current().waiting_for = None;
+            sched::current().waiting_for.set(None);
         }
         // A signal arriving while blocked interrupts the wait, but only one
         // that will do something when it is delivered. Asking the raw pending
@@ -389,10 +375,10 @@ pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
         // give up; but clearing it outright means a process with a handler
         // never sees that handler run for a child it reaped itself. Only the
         // dispositions that would discard it on delivery are cleared here.
-        let mut task = sched::current();
-        let handler = task.signal_actions[SIGCHLD as usize].handler;
+        let task = sched::current();
+        let handler = task.action(SIGCHLD as usize).handler;
         if handler == crate::signal::SIG_DFL || handler == crate::signal::SIG_IGN {
-            task.pending_signals &= !child_bit;
+            task.drop_pending(child_bit);
         }
     }
 }
@@ -407,9 +393,9 @@ pub fn kill(pid: i64, signal: i32) -> SysResult {
     sched::for_each(|task, table| {
         let target = match pid {
             p if p > 0 => task.pid == p as u32,
-            0 => task.pgid == my_pgid,
+            0 => task.pgid.get() == my_pgid,
             -1 => task.pid != me && task.pid != 0,
-            p => task.pgid == (-p) as u32,
+            p => task.pgid.get() == (-p) as u32,
         };
         if target && task.state() != State::Zombie && task.pid != 0 {
             if !probe {
@@ -430,23 +416,25 @@ pub fn kill(pid: i64, signal: i32) -> SysResult {
     Ok(0)
 }
 
-/// `which` is PRIO_PROCESS, PRIO_PGRP or PRIO_USER; only the first selects a
-/// single task, and `who` of 0 means the caller.
-fn priority_target(which: u64, who: u64) -> Option<&'static mut crate::task::Task> {
+/// Run `f` on the task a priority call names. `which` is PRIO_PROCESS,
+/// PRIO_PGRP or PRIO_USER; only the first selects a single task, and `who` of
+/// 0 means the caller.
+fn with_priority_target<R>(
+    which: u64,
+    who: u64,
+    f: impl FnOnce(&crate::task::Task) -> R,
+) -> Option<R> {
     if which != 0 {
         return None;
     }
     let pid = if who == 0 { sched::current().pid } else { who as u32 };
-    sched::find(pid)
+    sched::with_task(pid, f)
 }
 
 pub fn setpriority(which: u64, who: u64, value: i64) -> SysResult {
     let nice = value.clamp(-20, 19) as i32;
-    match priority_target(which, who) {
-        Some(task) => {
-            task.nice = nice;
-            Ok(0)
-        }
+    match with_priority_target(which, who, |task| task.nice.set(nice)) {
+        Some(()) => Ok(0),
         None if which <= 2 => Ok(0),
         None => Err(Errno::EINVAL),
     }
@@ -454,8 +442,8 @@ pub fn setpriority(which: u64, who: u64, value: i64) -> SysResult {
 
 pub fn getpriority(which: u64, who: u64) -> SysResult {
     // The raw call returns 20 - nice so the result is never negative.
-    match priority_target(which, who) {
-        Some(task) => Ok((20 - task.nice) as u64),
+    match with_priority_target(which, who, |task| task.nice.get()) {
+        Some(nice) => Ok((20 - nice) as u64),
         None if which <= 2 => Ok(20),
         None => Err(Errno::EINVAL),
     }
@@ -506,11 +494,8 @@ pub fn syslog(action: u64, buf: u64, len: i64) -> SysResult {
 pub fn setpgid(pid: u32, pgid: u32) -> SysResult {
     let target = if pid == 0 { sched::current().pid } else { pid };
     let value = if pgid == 0 { target } else { pgid };
-    match sched::find(target) {
-        Some(task) => {
-            task.pgid = value;
-            Ok(0)
-        }
+    match sched::with_task(target, |task| task.pgid.set(value)) {
+        Some(()) => Ok(0),
         None => Err(Errno::ESRCH),
     }
 }
@@ -688,10 +673,10 @@ pub fn rt_sigaction(signal: usize, act: u64, old: u64) -> SysResult {
     if signal == 0 || signal >= 64 || signal == SIGKILL as usize || signal == SIGSTOP as usize {
         return Err(Errno::EINVAL);
     }
-    let mut task = sched::current();
+    let task = sched::current();
     if old != 0 {
         // struct sigaction: handler, flags, restorer, mask.
-        let existing = task.signal_actions[signal];
+        let existing = task.action(signal);
         let mut buf = [0u8; 32];
         buf[0..8].copy_from_slice(&existing.handler.to_le_bytes());
         buf[8..16].copy_from_slice(&existing.flags.to_le_bytes());
@@ -707,32 +692,35 @@ pub fn rt_sigaction(signal: usize, act: u64, old: u64) -> SysResult {
             bytes.copy_from_slice(&buf[offset..offset + 8]);
             u64::from_le_bytes(bytes)
         };
-        task.signal_actions[signal] = crate::signal::SigAction {
-            handler: read(0),
-            flags: read(8),
-            restorer: read(16),
-            mask: read(24),
-        };
+        task.set_action(
+            signal,
+            crate::signal::SigAction {
+                handler: read(0),
+                flags: read(8),
+                restorer: read(16),
+                mask: read(24),
+            },
+        );
     }
     Ok(0)
 }
 
 pub fn rt_sigreturn(frame: &mut TrapFrame) -> SysResult {
-    crate::signal::sigreturn(&mut sched::current(), frame)
+    crate::signal::sigreturn(&sched::current(), frame)
 }
 
 pub fn rt_sigprocmask(how: u32, set: u64, old: u64) -> SysResult {
-    let mut task = sched::current();
+    let task = sched::current();
     if old != 0 {
-        uaccess::write_u64_in(&task, old, task.signal_mask)?;
+        uaccess::write_u64_in(&task, old, task.signal_mask.get())?;
     }
     if set != 0 {
         let value = uaccess::read_u64_in(&task, set)?;
-        task.signal_mask = match how {
-            0 => task.signal_mask | value,  // SIG_BLOCK
-            1 => task.signal_mask & !value, // SIG_UNBLOCK
-            _ => value,                     // SIG_SETMASK
-        };
+        task.signal_mask.set(match how {
+            0 => task.signal_mask.get() | value,  // SIG_BLOCK
+            1 => task.signal_mask.get() & !value, // SIG_UNBLOCK
+            _ => value,                           // SIG_SETMASK
+        });
     }
     Ok(0)
 }

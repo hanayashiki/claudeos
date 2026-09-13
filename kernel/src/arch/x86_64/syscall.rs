@@ -75,14 +75,14 @@ pub fn arch_prctl(code: u64, addr: u64) -> SysResult {
     match code {
         ARCH_SET_FS => {
             msr::write(msr::IA32_FS_BASE, addr);
-            sched::current().cpu.set_thread_pointer(addr);
+            sched::current().with_cpu(|cpu| cpu.set_thread_pointer(addr));
             Ok(0)
         }
         ARCH_SET_GS => {
             // The user GS base lives in KERNEL_GS_BASE while we are in the
             // kernel; swapgs puts it back on the way out.
             msr::write(msr::IA32_KERNEL_GS_BASE, addr);
-            sched::current().cpu.gs_base = addr;
+            sched::current().with_cpu(|cpu| cpu.gs_base = addr);
             Ok(0)
         }
         ARCH_GET_FS => {

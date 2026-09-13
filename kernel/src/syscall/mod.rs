@@ -144,9 +144,9 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::CHOWN | nr::FCHOWN | nr::LCHOWN | nr::FCHOWNAT => Ok(0),
         nr::FSYNC | nr::SYNC | nr::MSYNC => Ok(0),
         nr::UMASK => {
-            let mut task = sched::current();
-            let old = task.umask;
-            task.umask = args[0] as u32 & 0o777;
+            let task = sched::current();
+            let old = task.umask.get();
+            task.umask.set(args[0] as u32 & 0o777);
             Ok(old as u64)
         }
         nr::STATFS => file::statfs(args[0], args[1]),
@@ -179,10 +179,10 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::TGKILL => proc::kill(args[1] as i64, args[2] as i32),
         nr::GETPID => Ok(sched::current().tgid as u64),
         nr::GETTID => Ok(sched::current().pid as u64),
-        nr::GETPPID => Ok(sched::current().ppid as u64),
-        nr::GETPGRP | nr::GETPGID => Ok(sched::current().pgid as u64),
+        nr::GETPPID => Ok(sched::current().ppid.get() as u64),
+        nr::GETPGRP | nr::GETPGID => Ok(sched::current().pgid.get() as u64),
         nr::SETPGID => proc::setpgid(args[0] as u32, args[1] as u32),
-        nr::GETSID | nr::SETSID => Ok(sched::current().pgid as u64),
+        nr::GETSID | nr::SETSID => Ok(sched::current().pgid.get() as u64),
         nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID => Ok(0),
         nr::SETUID | nr::SETGID => Ok(0),
         nr::GETGROUPS => Ok(0),
@@ -193,11 +193,11 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         }
         nr::ARCH_PRCTL => arch::arch_prctl(args[0], args[1]),
         nr::SET_TID_ADDRESS => {
-            sched::current().clear_child_tid = args[0];
+            sched::current().clear_child_tid.set(args[0]);
             Ok(sched::current().pid as u64)
         }
         nr::SET_ROBUST_LIST => {
-            sched::current().robust_list = args[0];
+            sched::current().robust_list.set(args[0]);
             Ok(0)
         }
         nr::GET_ROBUST_LIST => Ok(0),

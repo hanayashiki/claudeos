@@ -90,7 +90,7 @@ fn page_fault(frame: &mut TrapFrame) {
     live.dump_walk(addr);
     if crate::sched::has_current() {
         let task = crate::sched::current();
-        println!("  faulted in pid {} ({})", task.pid, task.name);
+        println!("  faulted in pid {} ({})", task.pid, task.name());
         // The same tables in every path that reaches user memory through a
         // task. Printed when they are not, because a check made against one
         // and an access made through the other explains a fault that neither
@@ -142,7 +142,8 @@ pub fn unhandled(frame: &mut TrapFrame) {
 /// was inside a region at all.
 fn dump_regions(addr: u64) {
     let task = crate::sched::current();
-    let mm = task.mm().lock();
+    let mm = task.mm();
+    let mm = mm.lock();
     println!(
         "  regions: brk {:#x}..{:#x}  mmap_top {:#x}  {} vmas",
         mm.brk_start,

@@ -230,7 +230,7 @@ fn panic(info: &PanicInfo) -> ! {
     println!("KERNEL PANIC: {}", info);
     if sched::has_current() {
         let task = sched::current();
-        println!("  in pid {} ({})", task.pid, task.name);
+        println!("  in pid {} ({})", task.pid, task.name());
     }
     loop {
         arch::halt();

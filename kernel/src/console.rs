@@ -160,17 +160,17 @@ fn claim_terminal() -> Result<(), Errno> {
             return Ok(());
         }
         let task = crate::sched::current();
-        if task.pid == 1 || task.pgid == 0 || task.pgid == foreground {
+        if task.pid == 1 || task.pgid.get() == 0 || task.pgid.get() == foreground {
             return Ok(());
         }
         // A process that has said it does not want SIGTTIN cannot be stopped
         // by it, so the read fails outright rather than looping.
         let bit = 1u64 << (crate::abi::SIGTTIN as u64 & 63);
-        let action = task.signal_actions[crate::abi::SIGTTIN as usize];
-        if task.signal_mask & bit != 0 || action.handler == crate::signal::SIG_IGN {
+        let action = task.action(crate::abi::SIGTTIN as usize);
+        if task.signal_mask.get() & bit != 0 || action.handler == crate::signal::SIG_IGN {
             return Err(Errno::EIO);
         }
-        let pgid = task.pgid;
+        let pgid = task.pgid.get();
         crate::sched::signal_group(pgid, crate::abi::SIGTTIN);
         crate::sched::stop_for_signal(crate::abi::SIGTTIN);
         // Continued. Anything else waiting unwinds the read so it can be
