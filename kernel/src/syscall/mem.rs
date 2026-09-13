@@ -146,12 +146,18 @@ fn unmap_range(addr: u64, len: u64) {
     let task = sched::current();
     let start = page_align_down(addr);
     let end = page_align_up(addr + len);
+    // The region goes first. A thread sharing the address space that touches
+    // this range while the pages are being taken away faults, and a fault
+    // inside a region that is still recorded is served a fresh page of zeroes:
+    // one that this call has already walked past and so leaves behind, at an
+    // address the program was told nothing is at. With the region gone first
+    // there is nothing here to fault into, which is what an unmapped range is.
+    task.remove_vma_range(start, end);
     let mut page = start;
     while page < end {
         drop(task.space().unmap(page));
         page += PAGE_SIZE_U64;
     }
-    task.remove_vma_range(start, end);
 }
 
 pub fn munmap(addr: u64, length: u64) -> SysResult {
