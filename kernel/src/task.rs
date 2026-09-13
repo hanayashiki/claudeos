@@ -190,7 +190,7 @@ pub struct Task {
     pub nice: Cell<i32>,
     /// The signal that stopped this task, and whether the stop and the
     /// following continue have been reported to whoever is waiting.
-    pub stop_signal: Cell<i32>,
+    pub stop_signal: Cell<Option<crate::signal::Signal>>,
     pub report_stop: Cell<bool>,
     pub report_continue: Cell<bool>,
     /// One cell holding the whole table, rather than sixty-four holding an
@@ -271,7 +271,7 @@ impl Task {
             robust_list: Cell::new(0),
             pending_signals: Cell::new(0),
             nice: Cell::new(0),
-            stop_signal: Cell::new(0),
+            stop_signal: Cell::new(None),
             report_stop: Cell::new(false),
             report_continue: Cell::new(false),
             signal_actions: Cell::new([crate::signal::SigAction::default(); 64]),
@@ -318,12 +318,12 @@ impl Task {
     }
 
     /// The disposition of one signal, and the way to change it.
-    pub fn action(&self, signal: usize) -> crate::signal::SigAction {
-        self.actions()[signal].get()
+    pub fn action(&self, signal: crate::signal::Signal) -> crate::signal::SigAction {
+        self.actions()[signal.index()].get()
     }
 
-    pub fn set_action(&self, signal: usize, action: crate::signal::SigAction) {
-        self.actions()[signal].set(action);
+    pub fn set_action(&self, signal: crate::signal::Signal, action: crate::signal::SigAction) {
+        self.actions()[signal.index()].set(action);
     }
 
     /// Take another task's dispositions, which is what a fork gives the child.
@@ -813,8 +813,8 @@ impl Task {
     /// halves it hands the CPU to something else and never hands it back,
     /// because this task is no longer runnable, so the notification is left
     /// undelivered by a task that can no longer deliver it.
-    pub fn stop(&self, signal: i32, table: &crate::sched::Held) {
-        self.stop_signal.set(signal);
+    pub fn stop(&self, signal: crate::signal::Signal, table: &crate::sched::Held) {
+        self.stop_signal.set(Some(signal));
         self.report_stop.set(true);
         self.state.set(State::Stopped);
         table.notify_parent(self.ppid.get());
@@ -867,7 +867,7 @@ impl Task {
     /// learn that a background job had finished until the next key was
     /// pressed.
     pub fn child_changed_state(&self, irq: NoInterrupts) {
-        self.add_pending(1u64 << (SIGCHLD as u64 & 63));
+        self.add_pending(SIGCHLD.bit());
         self.wake(irq);
     }
 

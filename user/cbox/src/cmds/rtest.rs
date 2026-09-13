@@ -693,6 +693,66 @@ fn stopping_a_job_reaches_the_parent(report: &mut Report) {
     );
 }
 
+/// A number no signal has, sent to a stopped child.
+///
+/// The number arrives in a register, and it used to be folded into the range
+/// on its way to the pending set: 73 masked to six bits is 9, so a send Linux
+/// refuses set the bit for the kill signal instead. The code that restarts a
+/// stopped task for a kill compared the number it was given, saw 73, and did
+/// nothing, so the child stayed stopped with a kill pending that nothing could
+/// take away -- and took it the moment anything continued it. Negative numbers
+/// fold into the range the same way.
+fn a_number_no_signal_has(report: &mut Report) {
+    use crate::sys;
+
+    const EINVAL: i64 = -22;
+    const SIGKILL: i32 = 9;
+    const SIGCONT: i32 = 18;
+    const SIGSTOP: i32 = 19;
+    const WNOHANG: u64 = 1;
+
+    let child = sys::fork();
+    if child == 0 {
+        loop {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let child = child as i32;
+
+    let stopping = sys::kill(child, SIGSTOP);
+    std::thread::sleep(Duration::from_millis(150));
+    let above = sys::kill(child, 73);
+    let below = sys::kill(child, -55);
+    report.check(
+        "a number no signal has is refused",
+        stopping == 0 && above == EINVAL && below == EINVAL,
+        format!("stop {} 73 {} -55 {}", stopping, above, below),
+    );
+
+    // Continuing the child is what shows whether either send left a kill
+    // behind: a child carrying one dies here rather than running on.
+    sys::kill(child, SIGCONT);
+    std::thread::sleep(Duration::from_millis(200));
+    let (reaped, status) = sys::wait4(child, WNOHANG);
+    let state = std::fs::read_to_string(format!("/proc/{}/stat", child))
+        .ok()
+        .and_then(|line| line.split(' ').nth(2).map(|s| s.to_string()))
+        .unwrap_or_default();
+    report.check(
+        "and the child it was sent to is running afterwards",
+        reaped == 0 && (state == "S" || state == "R"),
+        format!("wait4 {} status {:#x} state {:?}", reaped, status, state),
+    );
+
+    sys::kill(child, SIGKILL);
+    let (pid, status) = sys::wait4(child, 0);
+    report.check(
+        "a kill that is one still lands",
+        pid == child as i64 && sys::signal_of(status) == Some(SIGKILL),
+        format!("{} status {:#x}", pid, status),
+    );
+}
+
 /// A signal that arrives while a task is still runnable finds nothing to wake.
 /// If the task then parks itself without asking again, the signal waits out the
 /// whole sleep: a minute for a bounded one, and for good for the unbounded
@@ -1325,6 +1385,7 @@ pub fn main(_args: &[String]) -> i32 {
     reading_proc_while_a_child_is_reaped(&mut report);
     a_signal_frame_on_a_shared_page(&mut report);
     stopping_a_job_reaches_the_parent(&mut report);
+    a_number_no_signal_has(&mut report);
     a_signal_ends_a_sleep(&mut report);
     failed_exec_and_siblings(&mut report);
 

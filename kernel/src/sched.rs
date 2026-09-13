@@ -5,6 +5,7 @@ use crate::arch;
 use crate::sync::{
     disable_interrupts, enable_interrupts, interrupts_enabled, NoInterrupts, Spinlock,
 };
+use crate::signal::Signal;
 use crate::task::{State, Task, TaskPtr};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -394,7 +395,7 @@ pub fn exit_group(status: i32) -> ! {
     let me = current().pid;
     for_each(|task, table| {
         if task.tgid == tgid && task.pid != me && task.state() != State::Zombie {
-            task.add_pending(1u64 << (SIGKILL as u64 & 63));
+            task.add_pending(SIGKILL.bit());
             task.wake(table.irq());
         }
     });
@@ -486,19 +487,19 @@ pub fn exit_current(status: i32) -> ! {
 }
 
 /// Terminate the current task as if `signal` had killed it.
-pub fn kill_current(signal: i32) -> ! {
+pub fn kill_current(signal: Signal) -> ! {
     let name = current().name();
     let pid = current().pid;
-    crate::println!("[kernel] pid {} ({}) killed by signal {}", pid, name, signal);
-    exit_current(signal & 0x7F)
+    crate::println!("[kernel] pid {} ({}) killed by signal {}", pid, name, signal.number());
+    exit_current(signal.number())
 }
 
 /// Raise a signal on the running task.
-pub fn raise_on_current(signal: i32) {
+pub fn raise_on_current(signal: Signal) {
     if !has_current() {
         return;
     }
-    current().add_pending(1u64 << (signal as u64 & 63));
+    current().add_pending(signal.bit());
 }
 
 /// Make `signal` pending on `task`.
@@ -508,26 +509,23 @@ pub fn raise_on_current(signal: i32) {
 /// taken yet, and a stop discards a continue the same way. Restarting is what
 /// the parent has to be told about, and the table is held here, which is where
 /// the parent is found.
-pub fn post_signal(task: &Task, signal: i32, table: &Held) {
-    const STOPS: u64 = (1 << (SIGSTOP as u64 & 63))
-        | (1 << (SIGTSTP as u64 & 63))
-        | (1 << (SIGTTIN as u64 & 63))
-        | (1 << (SIGTTOU as u64 & 63));
+pub fn post_signal(task: &Task, signal: Signal, table: &Held) {
+    const STOPS: u64 = SIGSTOP.bit() | SIGTSTP.bit() | SIGTTIN.bit() | SIGTTOU.bit();
     if signal == SIGKILL {
         task.restart_for_kill(table.irq());
     }
     if signal == SIGCONT {
         task.drop_pending(STOPS);
         task.continue_after_stop(table);
-    } else if crate::abi::is_stop_signal(signal) {
-        task.drop_pending(1u64 << (SIGCONT as u64 & 63));
+    } else if signal.stops() {
+        task.drop_pending(SIGCONT.bit());
     }
-    task.add_pending(1u64 << (signal as u64 & 63));
+    task.add_pending(signal.bit());
     task.wake(table.irq());
 }
 
 /// Stop the running task until something sends it SIGCONT.
-fn stop_current(signal: i32) {
+fn stop_current(signal: Signal) {
     let stopped = with_tasks(|table| {
         let task = current();
         // The stop signal's pending bit was cleared before this was called, so
@@ -536,7 +534,7 @@ fn stop_current(signal: i32) {
         // again here, where nothing else can run, it is a continue that beat
         // the stop, and stopping now would park the task with a continue
         // pending that nothing would ever act on.
-        if task.pending_signals.get() & (1u64 << (SIGCONT as u64 & 63)) != 0 {
+        if task.pending_signals.get() & SIGCONT.bit() != 0 {
             return false;
         }
         task.stop(signal, table);
@@ -565,15 +563,15 @@ pub fn io_ready() {
 /// A syscall that cannot make progress until the job is continued calls this
 /// instead of failing, so the operation resumes where it left off. Only safe
 /// from a point in the kernel that holds no locks.
-pub fn stop_for_signal(signal: i32) {
-    current().drop_pending(1u64 << (signal as u64 & 63));
+pub fn stop_for_signal(signal: Signal) {
+    current().drop_pending(signal.bit());
     stop_current(signal);
     // The continue that restarted this task has now had its default action,
     // which is to do exactly that. Leaving it pending would make the caller
     // think a signal is waiting and give up on what it was doing.
     let task = current();
-    if task.action(SIGCONT as usize).handler == crate::signal::SIG_DFL {
-        task.drop_pending(1u64 << (SIGCONT as u64 & 63));
+    if task.action(SIGCONT).handler == crate::signal::SIG_DFL {
+        task.drop_pending(SIGCONT.bit());
     }
 }
 
@@ -586,10 +584,10 @@ pub fn stop_for_signal(signal: i32) {
 pub fn stop_if_requested() -> bool {
     let task = current();
     for signal in [SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU] {
-        if task.pending_signals.get() & (1u64 << (signal as u64 & 63)) == 0 {
+        if task.pending_signals.get() & signal.bit() == 0 {
             continue;
         }
-        if signal != SIGSTOP && task.action(signal as usize).handler != crate::signal::SIG_DFL {
+        if signal != SIGSTOP && task.action(signal).handler != crate::signal::SIG_DFL {
             continue;
         }
         stop_for_signal(signal);
@@ -599,12 +597,12 @@ pub fn stop_if_requested() -> bool {
 }
 
 /// Mark every task in the foreground group as having a pending signal.
-pub fn signal_foreground(signal: i32) {
+pub fn signal_foreground(signal: Signal) {
     signal_group(foreground(), signal);
 }
 
 /// Mark every task in `pgid` as having a pending signal.
-pub fn signal_group(pgid: u32, signal: i32) {
+pub fn signal_group(pgid: u32, signal: Signal) {
     if pgid == 0 {
         return;
     }
@@ -638,15 +636,15 @@ pub fn has_pending_signal_except(ignore: u64) -> bool {
     let waiting = task.pending_signals.get() & !ignore;
     let mut pending = waiting & !task.signal_mask.get();
     // Neither of these can be blocked.
-    pending |= waiting & ((1u64 << (SIGKILL as u64 & 63)) | (1u64 << (SIGSTOP as u64 & 63)));
+    pending |= waiting & (SIGKILL.bit() | SIGSTOP.bit());
     if pending == 0 {
         return false;
     }
-    for signal in 1..64i32 {
-        if pending & (1u64 << (signal as u64 & 63)) == 0 {
+    for signal in Signal::all() {
+        if pending & signal.bit() == 0 {
             continue;
         }
-        let handler = task.action(signal as usize).handler;
+        let handler = task.action(signal).handler;
         if handler == crate::signal::SIG_IGN {
             continue;
         }
@@ -669,8 +667,8 @@ pub fn check_signals() {
         return;
     }
 
-    for signal in 1..64i32 {
-        let bit = 1u64 << (signal as u64 & 63);
+    for signal in Signal::all() {
+        let bit = signal.bit();
         if task.pending_signals.get() & bit == 0 {
             continue;
         }
@@ -681,15 +679,15 @@ pub fn check_signals() {
         task.drop_pending(bit);
 
         if signal == SIGKILL {
-            exit_current(signal & 0x7F);
+            exit_current(signal.number());
         }
 
         // Stopping and running a handler both leave the kernel in the middle
         // of whatever it was doing, so both wait until the task is on its way
         // back to user mode; until then the signal stays pending.
         let stops = signal == SIGSTOP || {
-            let action = task.action(signal as usize);
-            crate::abi::is_stop_signal(signal) && action.handler == crate::signal::SIG_DFL
+            let action = task.action(signal);
+            signal.stops() && action.handler == crate::signal::SIG_DFL
         };
         if stops {
             let frame = unsafe { &mut *task.trap_frame() };
@@ -701,14 +699,14 @@ pub fn check_signals() {
             return;
         }
 
-        let action = task.action(signal as usize);
+        let action = task.action(signal);
         match action.handler {
             crate::signal::SIG_IGN => continue,
             crate::signal::SIG_DFL => {
                 if crate::signal::default_is_ignore(signal) {
                     continue;
                 }
-                exit_current(signal & 0x7F);
+                exit_current(signal.number());
             }
             _ => {}
         }
@@ -720,10 +718,10 @@ pub fn check_signals() {
             return;
         }
         if action.flags & crate::signal::SA_RESETHAND != 0 {
-            task.set_action(signal as usize, crate::signal::SigAction::default());
+            task.set_action(signal, crate::signal::SigAction::default());
         }
         if !crate::signal::deliver(&task, signal, &action, frame) {
-            exit_current(SIGSEGV & 0x7F);
+            exit_current(SIGSEGV.number());
         }
         return;
     }
@@ -854,7 +852,8 @@ pub fn child_status_change(
         }
         if untraced && task.report_stop.get() {
             task.report_stop.set(false);
-            return Some((task.pid, ((task.stop_signal.get() & 0xFF) << 8) | 0x7F));
+            let signal = task.stop_signal.get().map_or(0, Signal::number);
+            return Some((task.pid, (signal << 8) | 0x7F));
         }
         if continued && task.report_continue.get() {
             task.report_continue.set(false);

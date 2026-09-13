@@ -8,7 +8,7 @@ use core::panic::PanicInfo;
 
 #[macro_use]
 mod serial;
-mod abi;
+pub mod abi;
 mod arch;
 mod boot;
 mod console;
