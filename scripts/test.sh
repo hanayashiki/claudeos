@@ -105,6 +105,42 @@ run_interactive() {
   echo
 }
 
+# The interrupt key, pressed at a terminal rather than written to a socket.
+# A socket hands the guest every byte as it stands, so it cannot tell whether
+# the terminal in front of QEMU would have kept Ctrl-C for the host; only this
+# form goes through the path a person's keyboard takes.
+run_interrupt_key() {
+  banner "interrupt key at a terminal"
+  local output
+  output="$(python3 "$ROOT/tools/drive.py" --tty --timeout 60 --initramfs "$IMAGE" -- \
+      "until:claudeos shell" "wait:1" \
+      "cat\n" "wait:1" "into-cat\n" "wait:1" "\x03" "wait:1.5" \
+      "echo prompt-came-back\n" "wait:1.5" \
+      "exit\n" "wait:4" 2>&1 | tr -d '\r')"
+  echo "$output"
+  echo
+
+  local ok=1
+  # "^C" is what the line discipline echoes for the interrupt character, so it
+  # is there only if the key reached the guest at all. "prompt-came-back" on a
+  # line of its own is the shell running a command afterwards: the same text
+  # echoed by a cat that was never interrupted keeps "echo " in front of it.
+  for expected in "^into-cat$" "\^C" "^prompt-came-back$" "session ended"; do
+    if ! echo "$output" | grep -q "$expected"; then
+      echo "   missing expected output: $expected"
+      ok=0
+    fi
+  done
+
+  if [ $ok -eq 1 ]; then
+    echo ">> interrupt key at a terminal: OK"
+  else
+    echo ">> interrupt key at a terminal: FAILED"
+    status=1
+  fi
+  echo
+}
+
 run_suite "userland and shell" "/root/suite.sh" 240
 run_suite "rust standard library" "init=/bin/rtest" 300
 # The protocols against a card that only records what it is asked to send:
@@ -130,6 +166,7 @@ else
   echo
 fi
 run_interactive
+run_interrupt_key
 
 if [ $status -ne 0 ]; then
   echo "some suites failed"
