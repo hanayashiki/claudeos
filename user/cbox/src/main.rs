@@ -93,7 +93,12 @@ pub fn shell_glob(name: &str, pattern: &str) -> bool {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    // args_os, because args panics on an argument that is not valid text and
+    // a file name handed on by xargs need not be. The applets hold their
+    // arguments as text, so such a name still does not survive intact; what
+    // this settles is that the process does not abort over one.
+    let args: Vec<String> =
+        std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()).collect();
     let program = args
         .first()
         .map(|a| a.rsplit('/').next().unwrap_or(a).to_string())

@@ -1,6 +1,8 @@
 //! Small applets.
 
 use super::split_flags;
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 
 pub fn yes(args: &[String]) -> i32 {
     use std::io::Write;
@@ -85,42 +87,49 @@ fn evaluate(terms: &[&str]) -> bool {
 
 /// Split standard input into the items xargs will pass on. Quotes group
 /// words, which is what keeps a name with a space in it in one piece.
-fn split_items(text: &str, separator: Option<char>) -> Vec<String> {
+///
+/// The input is split as bytes. What xargs is given is most often a list of
+/// file names, and a file name is a string of bytes that is not required to
+/// decode as anything.
+fn split_items(data: &[u8], separator: Option<u8>) -> Vec<Vec<u8>> {
     if let Some(separator) = separator {
-        return text
-            .split(separator)
+        return data
+            .split(|byte| *byte == separator)
             .filter(|piece| !piece.is_empty())
-            .map(|piece| piece.to_string())
+            .map(|piece| piece.to_vec())
             .collect();
     }
     let mut items = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
+    let mut current: Vec<u8> = Vec::new();
+    let mut quote: Option<u8> = None;
     let mut started = false;
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
+    let mut at = 0;
+    while at < data.len() {
+        let byte = data[at];
+        at += 1;
         match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => current.push(c),
-            None => match c {
-                '\'' | '"' => {
-                    quote = Some(c);
+            Some(q) if byte == q => quote = None,
+            Some(_) => current.push(byte),
+            None => match byte {
+                b'\'' | b'"' => {
+                    quote = Some(byte);
                     started = true;
                 }
-                '\\' => {
-                    if let Some(next) = chars.next() {
-                        current.push(next);
+                b'\\' => {
+                    if at < data.len() {
+                        current.push(data[at]);
+                        at += 1;
                         started = true;
                     }
                 }
-                c if c.is_whitespace() => {
+                byte if byte.is_ascii_whitespace() => {
                     if started || !current.is_empty() {
                         items.push(std::mem::take(&mut current));
                         started = false;
                     }
                 }
-                c => {
-                    current.push(c);
+                byte => {
+                    current.push(byte);
                     started = true;
                 }
             },
@@ -144,7 +153,7 @@ pub fn xargs(args: &[String]) -> i32 {
 
     while index < args.len() {
         match args[index].as_str() {
-            "-0" | "--null" => separator = Some('\0'),
+            "-0" | "--null" => separator = Some(0),
             "-r" | "--no-run-if-empty" => no_run_if_empty = true,
             "-n" => {
                 index += 1;
@@ -163,12 +172,12 @@ pub fn xargs(args: &[String]) -> i32 {
         command.push("echo".to_string());
     }
 
-    let mut text = String::new();
-    if std::io::stdin().read_to_string(&mut text).is_err() {
+    let mut data = Vec::new();
+    if std::io::stdin().read_to_end(&mut data).is_err() {
         eprintln!("xargs: cannot read input");
         return 1;
     }
-    let items = split_items(&text, separator);
+    let items = split_items(&data, separator);
     if items.is_empty() && (no_run_if_empty || replace.is_some()) {
         return 0;
     }
@@ -177,16 +186,14 @@ pub fn xargs(args: &[String]) -> i32 {
     if let Some(marker) = replace {
         let mut status = 0;
         for item in &items {
-            let argv: Vec<String> = command
-                .iter()
-                .map(|word| word.replace(&marker, item))
-                .collect();
+            let argv: Vec<OsString> =
+                command.iter().map(|word| fill_marker(word, &marker, item)).collect();
             status = run_command(&argv);
         }
         return status;
     }
 
-    let chunks: Vec<&[String]> = if per_run == usize::MAX || items.is_empty() {
+    let chunks: Vec<&[Vec<u8>]> = if per_run == usize::MAX || items.is_empty() {
         vec![&items[..]]
     } else {
         items.chunks(per_run).collect()
@@ -196,18 +203,35 @@ pub fn xargs(args: &[String]) -> i32 {
         if chunk.is_empty() && no_run_if_empty {
             continue;
         }
-        let mut argv = command.clone();
-        argv.extend(chunk.iter().cloned());
+        let mut argv: Vec<OsString> = command.iter().map(OsString::from).collect();
+        argv.extend(chunk.iter().map(|item| OsString::from_vec(item.clone())));
         status = run_command(&argv);
     }
     status
 }
 
-fn run_command(argv: &[String]) -> i32 {
+/// Put `item` where `marker` appears in `word`, for xargs -I.
+fn fill_marker(word: &str, marker: &str, item: &[u8]) -> OsString {
+    let (word, marker) = (word.as_bytes(), marker.as_bytes());
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < word.len() {
+        if !marker.is_empty() && word[at..].starts_with(marker) {
+            out.extend_from_slice(item);
+            at += marker.len();
+            continue;
+        }
+        out.push(word[at]);
+        at += 1;
+    }
+    OsString::from_vec(out)
+}
+
+fn run_command(argv: &[OsString]) -> i32 {
     match std::process::Command::new(&argv[0]).args(&argv[1..]).status() {
         Ok(status) => status.code().unwrap_or(1),
         Err(err) => {
-            eprintln!("xargs: {}: {}", argv[0], err);
+            eprintln!("xargs: {}: {}", argv[0].to_string_lossy(), err);
             127
         }
     }
@@ -271,6 +295,10 @@ fn primary(terms: &[&str]) -> bool {
 }
 
 /// `printf FORMAT [ARG...]` with the conversions scripts actually use.
+///
+/// The format is scanned as bytes and the result is built as bytes: an escape
+/// such as `\377` names one byte, and a format that is not valid text still
+/// has to come out the way it went in.
 pub fn printf(args: &[String]) -> i32 {
     use std::io::Write;
     let Some(format) = args.get(1) else {
@@ -278,99 +306,99 @@ pub fn printf(args: &[String]) -> i32 {
         return 2;
     };
     let operands = &args[2..];
-    let chars: Vec<char> = format.chars().collect();
-    let mut out = String::new();
+    let spec = format.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
     let mut next = 0usize;
     let mut i = 0;
 
     // The format is used again from the start while operands are left, so
     // `printf '%s\n' a b c` prints three lines.
     loop {
-    while i < chars.len() {
-        if chars[i] == '\\' && i + 1 < chars.len() {
-            out.push_str(&escape_char(&chars, &mut i));
+    while i < spec.len() {
+        if spec[i] == b'\\' && i + 1 < spec.len() {
+            out.push(escape_byte(spec, &mut i));
             continue;
         }
-        if chars[i] != '%' {
-            out.push(chars[i]);
+        if spec[i] != b'%' {
+            out.push(spec[i]);
             i += 1;
             continue;
         }
 
         i += 1;
-        if chars.get(i) == Some(&'%') {
-            out.push('%');
+        if spec.get(i) == Some(&b'%') {
+            out.push(b'%');
             i += 1;
             continue;
         }
 
         // [-][width][.precision]conversion
-        let left = chars.get(i) == Some(&'-');
+        let left = spec.get(i) == Some(&b'-');
         if left {
             i += 1;
         }
         let mut width = String::new();
-        while i < chars.len() && chars[i].is_ascii_digit() {
-            width.push(chars[i]);
+        while i < spec.len() && spec[i].is_ascii_digit() {
+            width.push(spec[i] as char);
             i += 1;
         }
         let mut precision = String::new();
-        if chars.get(i) == Some(&'.') {
+        if spec.get(i) == Some(&b'.') {
             i += 1;
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                precision.push(chars[i]);
+            while i < spec.len() && spec[i].is_ascii_digit() {
+                precision.push(spec[i] as char);
                 i += 1;
             }
         }
-        let Some(&conversion) = chars.get(i) else { break };
+        let Some(&conversion) = spec.get(i) else { break };
         i += 1;
 
         let argument = operands.get(next).cloned().unwrap_or_default();
         let rendered = match conversion {
-            's' => {
+            b's' => {
                 next += 1;
                 match precision.parse::<usize>() {
                     Ok(limit) => argument.chars().take(limit).collect(),
                     Err(_) => argument,
                 }
             }
-            'd' | 'i' => {
+            b'd' | b'i' => {
                 next += 1;
                 argument.trim().parse::<i64>().unwrap_or(0).to_string()
             }
-            'x' => {
+            b'x' => {
                 next += 1;
                 format!("{:x}", argument.trim().parse::<i64>().unwrap_or(0))
             }
-            'X' => {
+            b'X' => {
                 next += 1;
                 format!("{:X}", argument.trim().parse::<i64>().unwrap_or(0))
             }
-            'o' => {
+            b'o' => {
                 next += 1;
                 format!("{:o}", argument.trim().parse::<i64>().unwrap_or(0))
             }
-            'f' | 'F' => {
+            b'f' | b'F' => {
                 next += 1;
                 let value = argument.trim().parse::<f64>().unwrap_or(0.0);
                 let places = precision.parse::<usize>().unwrap_or(6);
                 format!("{:.*}", places, value)
             }
-            'c' => {
+            b'c' => {
                 next += 1;
                 argument.chars().next().map(String::from).unwrap_or_default()
             }
             other => {
                 let mut literal = String::from("%");
-                literal.push(other);
+                literal.push(other as char);
                 literal
             }
         };
 
         match width.parse::<usize>() {
-            Ok(width) if left => out.push_str(&format!("{:<1$}", rendered, width)),
-            Ok(width) => out.push_str(&format!("{:>1$}", rendered, width)),
-            Err(_) => out.push_str(&rendered),
+            Ok(width) if left => out.extend_from_slice(format!("{:<1$}", rendered, width).as_bytes()),
+            Ok(width) => out.extend_from_slice(format!("{:>1$}", rendered, width).as_bytes()),
+            Err(_) => out.extend_from_slice(rendered.as_bytes()),
         }
     }
         // Another pass only if this one used an operand and some are left,
@@ -383,37 +411,37 @@ pub fn printf(args: &[String]) -> i32 {
 
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    if handle.write_all(out.as_bytes()).is_err() || handle.flush().is_err() {
+    if handle.write_all(&out).is_err() || handle.flush().is_err() {
         eprintln!("printf: write error");
         return 1;
     }
     0
 }
 
-/// Decode one backslash escape, advancing past it.
-fn escape_char(chars: &[char], i: &mut usize) -> String {
-    let next = chars[*i + 1];
+/// Decode one backslash escape into the byte it names, advancing past it.
+fn escape_byte(spec: &[u8], i: &mut usize) -> u8 {
+    let next = spec[*i + 1];
     *i += 2;
     match next {
-        'n' => "\n".to_string(),
-        't' => "\t".to_string(),
-        'r' => "\r".to_string(),
-        'a' => "\u{07}".to_string(),
-        'b' => "\u{08}".to_string(),
-        'f' => "\u{0c}".to_string(),
-        'v' => "\u{0b}".to_string(),
-        '\\' => "\\".to_string(),
-        '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' => {
-            let mut value = next.to_digit(8).unwrap();
+        b'n' => b'\n',
+        b't' => b'\t',
+        b'r' => b'\r',
+        b'a' => 0x07,
+        b'b' => 0x08,
+        b'f' => 0x0c,
+        b'v' => 0x0b,
+        b'\\' => b'\\',
+        b'0'..=b'7' => {
+            let mut value = (next - b'0') as u32;
             let mut taken = 1;
-            while taken < 3 && *i < chars.len() && chars[*i].is_digit(8) {
-                value = value * 8 + chars[*i].to_digit(8).unwrap();
+            while taken < 3 && *i < spec.len() && spec[*i].is_ascii_digit() && spec[*i] < b'8' {
+                value = value * 8 + (spec[*i] - b'0') as u32;
                 *i += 1;
                 taken += 1;
             }
-            char::from_u32(value).map(String::from).unwrap_or_default()
+            value as u8
         }
-        other => other.to_string(),
+        other => other,
     }
 }
 

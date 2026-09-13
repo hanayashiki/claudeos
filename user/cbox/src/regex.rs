@@ -1,5 +1,10 @@
 //! A small backtracking regular expression matcher for grep and sed.
 //!
+//! Both the pattern and the text it is matched against are sequences of
+//! bytes. A tool that searches a file has no say in whether that file is
+//! text, and a byte that is not part of any valid encoding still has to be
+//! something `.` matches and something a class can name.
+//!
 //! Supports anchors, `.`, character classes, and the `*` repeat. Groups are
 //! written `\(...\)` in basic mode and `(...)` in extended mode, which also
 //! gives `+`, `?` and bare alternation; basic mode spells alternation `\|`.
@@ -8,9 +13,9 @@
 
 #[derive(Debug, Clone)]
 enum Atom {
-    Char(char),
+    Char(u8),
     Any,
-    Class { ranges: Vec<(char, char)>, negated: bool },
+    Class { ranges: Vec<(u8, u8)>, negated: bool },
     /// A group and the number it answers to.
     Group(Vec<Branch>, usize),
     /// Matches nothing; records where a group started or ended.
@@ -50,7 +55,7 @@ pub struct Regex {
 pub type Captures = Vec<Option<(usize, usize)>>;
 
 struct Parser<'a> {
-    chars: &'a [char],
+    bytes: &'a [u8],
     position: usize,
     extended: bool,
     /// Groups opened so far, which is how each one gets its number.
@@ -58,21 +63,21 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.position).copied()
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.position).copied()
     }
 
     fn parse_alternation(&mut self, nested: bool) -> Vec<Branch> {
         let mut branches = Vec::new();
         loop {
             branches.push(self.parse_branch(nested));
-            if self.extended && self.peek() == Some('|') {
+            if self.extended && self.peek() == Some(b'|') {
                 self.position += 1;
                 continue;
             }
             if !self.extended
-                && self.peek() == Some('\\')
-                && self.chars.get(self.position + 1) == Some(&'|')
+                && self.peek() == Some(b'\\')
+                && self.bytes.get(self.position + 1) == Some(&b'|')
             {
                 self.position += 2;
                 continue;
@@ -87,19 +92,19 @@ impl<'a> Parser<'a> {
         let mut anchored_start = false;
         let mut anchored_end = false;
 
-        if self.peek() == Some('^') {
+        if self.peek() == Some(b'^') {
             anchored_start = true;
             self.position += 1;
         }
 
         while let Some(c) = self.peek() {
-            if self.extended && c == '|' {
+            if self.extended && c == b'|' {
                 break;
             }
-            if nested && c == ')' {
+            if nested && c == b')' {
                 break;
             }
-            if c == '$' && self.at_branch_end(nested) {
+            if c == b'$' && self.at_branch_end(nested) {
                 anchored_end = true;
                 self.position += 1;
                 break;
@@ -108,51 +113,51 @@ impl<'a> Parser<'a> {
             // In basic mode a group is spelled with backslashes, and so is
             // alternation, so both have to be looked at before the escape is
             // treated as a literal character.
-            if !self.extended && c == '\\' {
-                match self.chars.get(self.position + 1) {
-                    Some(')') if nested => break,
-                    Some('|') => break,
+            if !self.extended && c == b'\\' {
+                match self.bytes.get(self.position + 1) {
+                    Some(b')') if nested => break,
+                    Some(b'|') => break,
                     _ => {}
                 }
             }
 
             let atom = match c {
-                '\\' if !self.extended && self.chars.get(self.position + 1) == Some(&'(') => {
+                b'\\' if !self.extended && self.bytes.get(self.position + 1) == Some(&b'(') => {
                     self.position += 2;
                     self.groups += 1;
                     let index = self.groups;
                     let inner = self.parse_alternation(true);
-                    if self.chars.get(self.position) == Some(&'\\')
-                        && self.chars.get(self.position + 1) == Some(&')')
+                    if self.bytes.get(self.position) == Some(&b'\\')
+                        && self.bytes.get(self.position + 1) == Some(&b')')
                     {
                         self.position += 2;
                     }
                     Atom::Group(inner, index)
                 }
-                '\\' => {
+                b'\\' => {
                     self.position += 1;
                     match self.peek() {
                         Some(escaped) => {
                             self.position += 1;
                             Atom::Char(escaped)
                         }
-                        None => Atom::Char('\\'),
+                        None => Atom::Char(b'\\'),
                     }
                 }
-                '.' => {
+                b'.' => {
                     self.position += 1;
                     Atom::Any
                 }
-                '[' => {
+                b'[' => {
                     self.position += 1;
                     self.parse_class()
                 }
-                '(' if self.extended => {
+                b'(' if self.extended => {
                     self.position += 1;
                     self.groups += 1;
                     let index = self.groups;
                     let inner = self.parse_alternation(true);
-                    if self.peek() == Some(')') {
+                    if self.peek() == Some(b')') {
                         self.position += 1;
                     }
                     Atom::Group(inner, index)
@@ -164,26 +169,26 @@ impl<'a> Parser<'a> {
             };
 
             let repeat = match self.peek() {
-                Some('*') => {
+                Some(b'*') => {
                     self.position += 1;
                     Repeat::Star
                 }
-                Some('+') if self.extended => {
+                Some(b'+') if self.extended => {
                     self.position += 1;
                     Repeat::Plus
                 }
-                Some('?') if self.extended => {
+                Some(b'?') if self.extended => {
                     self.position += 1;
                     Repeat::Optional
                 }
                 // GNU basic mode spells the same two with a backslash.
-                Some('\\')
+                Some(b'\\')
                     if !self.extended
-                        && matches!(self.chars.get(self.position + 1), Some('+') | Some('?')) =>
+                        && matches!(self.bytes.get(self.position + 1), Some(b'+') | Some(b'?')) =>
                 {
-                    let which = self.chars[self.position + 1];
+                    let which = self.bytes[self.position + 1];
                     self.position += 2;
-                    if which == '+' {
+                    if which == b'+' {
                         Repeat::Plus
                     } else {
                         Repeat::Optional
@@ -199,10 +204,10 @@ impl<'a> Parser<'a> {
 
     /// `$` is an anchor only at the end of the pattern or of a branch.
     fn at_branch_end(&self, nested: bool) -> bool {
-        match self.chars.get(self.position + 1) {
+        match self.bytes.get(self.position + 1) {
             None => true,
-            Some('|') if self.extended => true,
-            Some(')') if nested => true,
+            Some(b'|') if self.extended => true,
+            Some(b')') if nested => true,
             _ => false,
         }
     }
@@ -210,33 +215,33 @@ impl<'a> Parser<'a> {
     fn parse_class(&mut self) -> Atom {
         let mut ranges = Vec::new();
         let mut negated = false;
-        if self.peek() == Some('^') {
+        if self.peek() == Some(b'^') {
             negated = true;
             self.position += 1;
         }
         // A ']' first is a literal.
-        if self.peek() == Some(']') {
-            ranges.push((']', ']'));
+        if self.peek() == Some(b']') {
+            ranges.push((b']', b']'));
             self.position += 1;
         }
         while let Some(c) = self.peek() {
-            if c == ']' {
+            if c == b']' {
                 self.position += 1;
                 break;
             }
             self.position += 1;
-            let start = if c == '\\' {
+            let start = if c == b'\\' {
                 match self.peek() {
                     Some(escaped) => {
                         self.position += 1;
                         escaped
                     }
-                    None => '\\',
+                    None => b'\\',
                 }
             } else {
                 c
             };
-            if self.peek() == Some('-') && self.chars.get(self.position + 1) != Some(&']') {
+            if self.peek() == Some(b'-') && self.bytes.get(self.position + 1) != Some(&b']') {
                 self.position += 1;
                 if let Some(end) = self.peek() {
                     self.position += 1;
@@ -253,8 +258,8 @@ impl<'a> Parser<'a> {
 impl Regex {
     /// Compile `pattern`. `extended` enables `+`, `?`, `|` and groups.
     pub fn new(pattern: &str, extended: bool) -> Regex {
-        let chars: Vec<char> = pattern.chars().collect();
-        let mut parser = Parser { chars: &chars, position: 0, extended, groups: 0 };
+        let mut parser =
+            Parser { bytes: pattern.as_bytes(), position: 0, extended, groups: 0 };
         let branches = parser.parse_alternation(false);
         Regex { branches, groups: parser.groups }
     }
@@ -262,8 +267,8 @@ impl Regex {
     /// A pattern to be taken literally, for grep -F.
     pub fn literal(pattern: &str) -> Regex {
         let pieces = pattern
-            .chars()
-            .map(|c| Piece { atom: Atom::Char(c), repeat: Repeat::One })
+            .bytes()
+            .map(|b| Piece { atom: Atom::Char(b), repeat: Repeat::One })
             .collect();
         Regex {
             branches: vec![Branch { pieces, anchored_start: false, anchored_end: false }],
@@ -271,9 +276,9 @@ impl Regex {
         }
     }
 
-    /// The first place `text` matches, as a half-open range of character
-    /// positions. Leftmost first, and greedy from there.
-    pub fn find(&self, text: &[char], from: usize) -> Option<(usize, usize)> {
+    /// The first place `text` matches, as a half-open range of byte offsets.
+    /// Leftmost first, and greedy from there.
+    pub fn find(&self, text: &[u8], from: usize) -> Option<(usize, usize)> {
         let mut caps = Vec::new();
         self.find_captures(text, from, &mut caps)
     }
@@ -281,7 +286,7 @@ impl Regex {
     /// As `find`, filling `caps` with where each group matched.
     pub fn find_captures(
         &self,
-        text: &[char],
+        text: &[u8],
         from: usize,
         caps: &mut Captures,
     ) -> Option<(usize, usize)> {
@@ -305,13 +310,12 @@ impl Regex {
         None
     }
 
-    pub fn is_match(&self, text: &str) -> bool {
-        let chars: Vec<char> = text.chars().collect();
+    pub fn is_match(&self, text: &[u8]) -> bool {
         for branch in &self.branches {
             let starts: Vec<usize> =
-                if branch.anchored_start { vec![0] } else { (0..=chars.len()).collect() };
+                if branch.anchored_start { vec![0] } else { (0..=text.len()).collect() };
             for start in starts {
-                if match_branch(&branch.pieces, &chars, start, branch.anchored_end) {
+                if match_branch(&branch.pieces, text, start, branch.anchored_end) {
                     return true;
                 }
             }
@@ -322,14 +326,14 @@ impl Regex {
 
 /// Match `pieces` starting at `pos`, requiring the end of the text when the
 /// branch was anchored with `$`.
-fn match_branch(pieces: &[Piece], text: &[char], pos: usize, to_end: bool) -> bool {
+fn match_branch(pieces: &[Piece], text: &[u8], pos: usize, to_end: bool) -> bool {
     let mut caps: Captures = Vec::new();
     match_branch_caps(pieces, text, pos, to_end, &mut caps)
 }
 
 fn match_branch_caps(
     pieces: &[Piece],
-    text: &[char],
+    text: &[u8],
     pos: usize,
     to_end: bool,
     caps: &mut Captures,
@@ -394,7 +398,7 @@ fn note(caps: &mut Captures, index: usize, open: bool, pos: usize) {
 }
 
 /// Every position this piece could leave the cursor at, shortest first.
-fn candidates(piece: &Piece, text: &[char], pos: usize) -> Vec<usize> {
+fn candidates(piece: &Piece, text: &[u8], pos: usize) -> Vec<usize> {
     match piece.repeat {
         Repeat::One => match_atom(&piece.atom, text, pos).into_iter().collect(),
         Repeat::Optional => {
@@ -422,14 +426,14 @@ fn candidates(piece: &Piece, text: &[char], pos: usize) -> Vec<usize> {
     }
 }
 
-fn match_pieces(pieces: &[Piece], text: &[char], pos: usize) -> Option<usize> {
+fn match_pieces(pieces: &[Piece], text: &[u8], pos: usize) -> Option<usize> {
     let mut caps: Captures = Vec::new();
     match_pieces_caps(pieces, text, pos, &mut caps)
 }
 
 fn match_pieces_caps(
     pieces: &[Piece],
-    text: &[char],
+    text: &[u8],
     pos: usize,
     caps: &mut Captures,
 ) -> Option<usize> {
@@ -474,7 +478,7 @@ fn match_pieces_caps(
     None
 }
 
-fn match_atom(atom: &Atom, text: &[char], pos: usize) -> Option<usize> {
+fn match_atom(atom: &Atom, text: &[u8], pos: usize) -> Option<usize> {
     match atom {
         Atom::Char(expected) => {
             if text.get(pos) == Some(expected) {
@@ -491,8 +495,8 @@ fn match_atom(atom: &Atom, text: &[char], pos: usize) -> Option<usize> {
             }
         }
         Atom::Class { ranges, negated } => {
-            let c = *text.get(pos)?;
-            let inside = ranges.iter().any(|(low, high)| c >= *low && c <= *high);
+            let byte = *text.get(pos)?;
+            let inside = ranges.iter().any(|(low, high)| byte >= *low && byte <= *high);
             if inside != *negated {
                 Some(pos + 1)
             } else {

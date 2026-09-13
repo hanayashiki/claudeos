@@ -388,33 +388,76 @@ fn print_entries(items: &[Entry], options: &ListOptions, show_total: bool) {
     }
 }
 
-pub fn cat(args: &[String]) -> i32 {
-    let (flags, operands) = split_flags(args);
-    let number = flags.contains('n');
-    let show_ends = flags.contains('e') || flags.contains('E') || flags.contains('A');
-    let mut status = 0;
-    let mut line_number = 1;
+/// The state -n and -E need. A line can arrive in two reads, and the number
+/// and the `$` belong to the line rather than to the chunk it turned up in.
+struct Marker {
+    number: bool,
+    show_ends: bool,
+    count: usize,
+    pending: Vec<u8>,
+}
 
-    let mut emit = |text: &str| -> std::io::Result<()> {
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        if number || show_ends {
-            for line in text.lines() {
-                if number {
-                    write!(out, "{:>6}  ", line_number)?;
-                    line_number += 1;
-                }
-                out.write_all(line.as_bytes())?;
-                if show_ends {
-                    out.write_all(b"$")?;
-                }
-                out.write_all(b"\n")?;
-            }
-        } else {
-            out.write_all(text.as_bytes())?;
+impl Marker {
+    /// With neither flag the bytes go out as they came in, so nothing has to
+    /// be held back to find where a line ends.
+    fn plain(&self) -> bool {
+        !self.number && !self.show_ends
+    }
+
+    fn push(&mut self, out: &mut dyn Write, data: &[u8]) -> std::io::Result<()> {
+        if self.plain() {
+            return out.write_all(data);
+        }
+        self.pending.extend_from_slice(data);
+        while let Some(at) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=at).collect();
+            self.write_line(out, &line[..at], true)?;
         }
         Ok(())
+    }
+
+    /// Whatever is left when the input ends: a last line with no newline
+    /// after it, which has no line end to mark and gets none written.
+    fn finish(&mut self, out: &mut dyn Write) -> std::io::Result<()> {
+        if self.plain() || self.pending.is_empty() {
+            return Ok(());
+        }
+        let line = std::mem::take(&mut self.pending);
+        self.write_line(out, &line, false)
+    }
+
+    fn write_line(
+        &mut self,
+        out: &mut dyn Write,
+        body: &[u8],
+        terminated: bool,
+    ) -> std::io::Result<()> {
+        if self.number {
+            self.count += 1;
+            write!(out, "{:>6}\t", self.count)?;
+        }
+        out.write_all(body)?;
+        if terminated {
+            if self.show_ends {
+                out.write_all(b"$")?;
+            }
+            out.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+}
+
+pub fn cat(args: &[String]) -> i32 {
+    let (flags, operands) = split_flags(args);
+    let mut marker = Marker {
+        number: flags.contains('n'),
+        show_ends: flags.contains('e') || flags.contains('E') || flags.contains('A'),
+        count: 0,
+        pending: Vec::new(),
     };
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut status = 0;
 
     if operands.is_empty() {
         // Copy standard input through in chunks, so a character device that
@@ -426,31 +469,28 @@ pub fn cat(args: &[String]) -> i32 {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if emit(&String::from_utf8_lossy(&buffer[..n])).is_err() {
+                    if marker.push(&mut out, &buffer[..n]).is_err() {
                         eprintln!("cat: write error");
                         return 1;
                     }
                 }
-                Err(err) => {
-                    return fail("cat", "-", err);
-                }
+                Err(err) => return fail("cat", "-", err),
             }
         }
-        let _ = std::io::stdout().flush();
-        return 0;
-    }
-    for path in &operands {
-        match fs::read(path) {
-            Ok(bytes) => {
-                if emit(&String::from_utf8_lossy(&bytes)).is_err() {
-                    eprintln!("cat: write error");
-                    return 1;
+    } else {
+        for path in &operands {
+            match fs::read(path) {
+                Ok(bytes) => {
+                    if marker.push(&mut out, &bytes).is_err() {
+                        eprintln!("cat: write error");
+                        return 1;
+                    }
                 }
+                Err(err) => status = fail("cat", path, err),
             }
-            Err(err) => status = fail("cat", path, err),
         }
     }
-    if std::io::stdout().flush().is_err() {
+    if marker.finish(&mut out).is_err() || out.flush().is_err() {
         eprintln!("cat: write error");
         return 1;
     }
