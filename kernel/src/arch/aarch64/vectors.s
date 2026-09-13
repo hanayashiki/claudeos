@@ -34,10 +34,21 @@
     stp  x24, x25, [sp, #16 * 12]
     stp  x26, x27, [sp, #16 * 13]
     stp  x28, x29, [sp, #16 * 14]
-    mrs  x21, sp_el0
-    stp  x30, x21, [sp, #16 * 15]
     mrs  x22, elr_el1
     mrs  x23, spsr_el1
+    /* Where the stack pointer was when the exception was taken. An exception
+     * from EL0 left it in SP_EL0; one from EL1 was taken on this stack, so it
+     * is the address this frame ends at. Saving SP_EL0 for those names the
+     * current task's user stack, which has nothing to do with a kernel fault,
+     * and the fault report then prints it and dumps four lines of user memory
+     * at an unrelated address -- on a board with nothing but a serial cable
+     * that report is the whole of the evidence, and a kernel stack overflow
+     * is exactly what it is needed for. */
+    mrs  x21, sp_el0
+    add  x24, sp, #304
+    tst  x23, #0xf
+    csel x21, x21, x24, eq
+    stp  x30, x21, [sp, #16 * 15]
     stp  x22, x23, [sp, #16 * 16]
     mrs  x22, esr_el1
     mrs  x23, far_el1
@@ -59,7 +70,13 @@
     msr  elr_el1, x22
     msr  spsr_el1, x23
     ldp  x30, x21, [sp, #16 * 15]
+    /* SP_EL0 belongs to the level below. A return to EL1 carries on with the
+     * stack this frame sits on, and what the frame holds for it is that
+     * stack's own address rather than something to install. */
+    tst  x23, #0xf
+    b.ne 1f
     msr  sp_el0, x21
+1:
     ldp  x0,  x1,  [sp, #16 * 0]
     ldp  x2,  x3,  [sp, #16 * 1]
     ldp  x4,  x5,  [sp, #16 * 2]

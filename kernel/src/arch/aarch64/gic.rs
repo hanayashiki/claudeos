@@ -34,6 +34,10 @@ const GICC_EOIR: u64 = 0x010;
 /// as a line number.
 pub const NOT_A_LINE: u32 = 1020;
 
+/// The one of those four that means there was an interrupt and this interface
+/// was not allowed to claim it, because it is in the other group.
+pub const NOT_OURS: u32 = 1022;
+
 /// The first interrupt number that is not per-core: everything below this is a
 /// software-generated or private interrupt and belongs to one core.
 const SHARED_BASE: u32 = 32;
@@ -88,18 +92,16 @@ pub fn init() {
         }
 
         // Every line in group zero, said out loud rather than left at whatever
-        // the controller reset to. The interface below is enabled for group
-        // zero only, and the two have to agree: a group-zero acknowledge
-        // cannot claim a group-one interrupt, and rather than failing it hands
-        // back 1022. The handler then has an interrupt it can neither name nor
-        // finish, and it arrives again for ever.
-        //
-        // This controller reports no security extensions, so group zero is
-        // delivered as an ordinary interrupt rather than a fast one, which is
-        // what makes the pairing usable at all.
+        // the controller reset to. The interface below is enabled with a
+        // single bit, and the two have to agree: an acknowledge from an
+        // interface enabled for one group cannot claim an interrupt in the
+        // other, and rather than failing it hands back 1022. The handler then
+        // has an interrupt it can neither name nor finish, and it arrives
+        // again for ever.
         for word in 0..(lines / 32) {
             dist_write(GICD_IGROUPR + (word * 4) as u64, 0);
         }
+        report_grouping();
 
         dist_write(GICD_CTLR, 1);
 
@@ -107,6 +109,38 @@ pub fn init() {
         cpu_write(GICC_PMR, 0xF0);
         cpu_write(GICC_BPR, 0);
         cpu_write(GICC_CTLR, 1);
+    }
+}
+
+/// Say at boot whether the grouping above is this kernel's to set, because
+/// the code above cannot tell on its own.
+///
+/// Which group the single enable bit in `GICC_CTLR` names depends on which
+/// view of the controller this is: the Secure view's bit zero is group zero,
+/// the Non-secure view's is group one. A GIC-400 does implement the two
+/// groups, and this kernel runs Non-secure, where the group registers are the
+/// Secure view's -- writes to them do nothing and reads give zero whatever
+/// the grouping really is. So correct operation there rests on the board's
+/// boot stub having put every line in group one, which the Pi's does. The
+/// type register says whether the groups exist, and a write read back says
+/// whether this view may set them; when either answers otherwise than the
+/// code above assumes, the grouping came from the firmware and an
+/// acknowledge that hands back 1022 rather than a line number is that
+/// assumption failing.
+unsafe fn report_grouping() {
+    let extensions = dist_read(GICD_TYPER) & (1 << 10) != 0;
+    // Lines 32 to 63: shared, and every one of them masked at this point, so
+    // moving them between groups for the length of a read delivers nothing.
+    let probe = GICD_IGROUPR + 4;
+    dist_write(probe, 0xFFFF_FFFF);
+    let writable = dist_read(probe) != 0;
+    dist_write(probe, 0);
+    if extensions || !writable {
+        crate::println!(
+            "[gic] grouping is the firmware's: security extensions {}, group register {}",
+            if extensions { "present" } else { "absent" },
+            if writable { "writable" } else { "ignores writes" },
+        );
     }
 }
 

@@ -11,6 +11,10 @@
 use super::gic;
 use crate::abi::{SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether the message below has been printed already.
+static SAID_NOT_OURS: AtomicBool = AtomicBool::new(false);
 
 /// What an exception entry saves, in the order `vectors.s` writes it.
 #[repr(C)]
@@ -42,7 +46,16 @@ impl TrapFrame {
     pub fn from_user(&self) -> bool {
         self.spsr & 0xF == 0
     }
+
+    /// True when interrupts were enabled in the code this exception
+    /// interrupted. The bit is a mask, so it is set when they were off.
+    fn interrupts_were_enabled(&self) -> bool {
+        self.spsr & SPSR_I == 0
+    }
 }
+
+/// The interrupt mask in a saved processor state.
+const SPSR_I: u64 = 1 << 7;
 
 /// Vectors 0..EXCEPTION_COUNT are the exception classes the syndrome register
 /// reports, of which there are as many as six bits can hold.
@@ -71,8 +84,13 @@ pub const SERIAL_IRQ: u8 = 153;
 /// The second UART's line, which is where a board wired to the cut-down serial
 /// port announces input.
 pub const SERIAL_IRQ_ALT: u8 = 125;
-/// There is no keyboard on this board. The number has to be one the controller
-/// will accept an enable for and never raise.
+/// The number the portable console knows a keyboard's line by. There is no
+/// keyboard on this board and no number free to stand in for one: every number
+/// this controller implements is a line the chip can raise, and this one is a
+/// shared peripheral interrupt two above the Ethernet controller's. So the
+/// line is left masked -- `unmask_irq` declines it -- because a handler that
+/// ends an interrupt it never cleared leaves a level-triggered line asserting
+/// again as soon as it returns.
 pub const KEYBOARD_IRQ: u8 = 191;
 
 /// Timer interrupts per second. Every timeout in the kernel is a whole number
@@ -162,6 +180,11 @@ fn rearm_timer() {
 
 /// Let interrupts from `irq` through.
 pub fn unmask_irq(irq: u8) {
+    // Except the keyboard's, which names a device this board does not have on
+    // a line that belongs to something else: see KEYBOARD_IRQ.
+    if irq == KEYBOARD_IRQ {
+        return;
+    }
     gic::unmask(irq);
 }
 
@@ -189,7 +212,36 @@ pub extern "C" fn exception_entry(frame: &mut TrapFrame) {
     }
 }
 
+/// A synchronous exception, run with interrupts in the state the code that
+/// took it was in.
+///
+/// The hardware sets all four masks on entry to EL1 and nothing below needs
+/// them: the frame is complete before this is reached, and every lock the
+/// handlers take masks for itself and puts back what it found. Left masked,
+/// a system call that never blocks runs that way from entry to return, so the
+/// timer does not tick for as long as the longest call takes: a 16 MiB copy
+/// here, and on a board whose console is driven a character at a time, a
+/// third of a second for a 4 KiB write. Sleeps and poll deadlines stretch by
+/// that much, typed input is dropped, and a receive ring overruns.
+///
+/// The saved state decides rather than a blanket enable, so a fault taken
+/// inside a kernel critical section is handled as masked as the code that
+/// faulted was.
 fn synchronous(frame: &mut TrapFrame) {
+    let unmask = frame.interrupts_were_enabled();
+    if unmask {
+        super::enable_interrupts();
+    }
+    handle_synchronous(frame);
+    // The return path masks everything again before it touches ELR and SPSR,
+    // but this is not the only way out of here: a handler can switch away and
+    // come back, and what it comes back to must be what it left.
+    if unmask {
+        super::disable_interrupts();
+    }
+}
+
+fn handle_synchronous(frame: &mut TrapFrame) {
     let class = frame.esr >> 26;
     if class == EC_SVC {
         frame.vector = super::task::VECTOR_SYSCALL;
@@ -213,6 +265,18 @@ fn interrupt(frame: &mut TrapFrame) {
     // way there is nothing to end, because a number in that range was never a
     // claim in the first place.
     if line >= gic::NOT_A_LINE || line >= IRQ_COUNT as u32 {
+        // One of those numbers means there was an interrupt and this
+        // interface was not allowed to take it. Nothing cleared the device
+        // and nothing can end what was never claimed, so a level-triggered
+        // line arrives again as soon as this returns and the machine makes no
+        // further progress. Said once: saying it every time is the same
+        // livelock with output.
+        if line == gic::NOT_OURS && !SAID_NOT_OURS.swap(true, Ordering::Relaxed) {
+            crate::println!(
+                "[gic] an interrupt arrived that this interface may not claim; \
+                 it cannot be ended and will arrive again"
+            );
+        }
         return;
     }
     if line == TIMER_IRQ as u32 {
