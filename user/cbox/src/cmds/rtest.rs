@@ -785,25 +785,75 @@ fn failed_exec_and_siblings(report: &mut Report) {
     );
 }
 
+/// How long a tick lasts by the monotonic clock, measured over `SPAN` of them
+/// with nothing else to run.
+///
+/// The two clocks are independent: the tick is counted by the timer interrupt
+/// and the monotonic clock is a cycle counter, which keeps running whatever
+/// the interrupt mask says. This is the rate between them while nothing is
+/// holding the timer off, and it is not 10 ms -- see `timer_under_load` for
+/// why not.
+fn tick_period() -> Duration {
+    use crate::sys;
+    const SPAN: u64 = 20;
+    // Start on an edge, or part of a tick is counted as a whole one. Both
+    // ends are read the same way, a call late, so the two errors cancel.
+    let entry = sys::tick_count();
+    while sys::tick_count() == entry {}
+    let first = sys::tick_count();
+    let started = Instant::now();
+    while sys::tick_count() < first + SPAN {}
+    started.elapsed() / SPAN as u32
+}
+
 /// The timer has to keep arriving while another task is inside a long system
 /// call. A sleep's deadline is counted in timer ticks, and a tick that finds
 /// interrupts masked is delivered late rather than twice, so a call that runs
 /// masked from entry to return costs its own length out of every sleep and
 /// every timeout in the system that spans it.
+///
+/// The time that costs is what is measured here, by playing the two clocks
+/// against each other: the cycle counter behind CLOCK_MONOTONIC runs whatever
+/// the mask says and the tick count does not, so a round that took longer than
+/// the ticks it consumed account for is a round with the timer held off for
+/// the difference.
+///
+/// Bounding the wall-clock lateness of the sleeps instead measures something
+/// else, which is why it was replaced. CLOCK_MONOTONIC is the cycle counter
+/// divided by a count of it taken over five ticks at boot, so its second is
+/// however long a tick was during those 50 ms, while a sleep of 100 ms waits
+/// ten whole ticks however long they turn out to be. The lateness of one is
+/// therefore ten times the difference between the tick period now and the tick
+/// period during that window, which settles per boot and is a few milliseconds
+/// either way on an emulated board, where a tick takes 14.8 ms of the host's
+/// time rather than 10 and how much of that is the emulator's own latency
+/// varies. Ten boots of this suite on aarch64 measured the tick at 9484 to
+/// 11018 us and the sleeps at 4782 us early to 9778 us late, the two tracking
+/// each other to within a millisecond, with almost no spread inside a run. A
+/// bound on the lateness reads which side of its own calibration the boot
+/// landed on. On x86-64 it reads zero whatever the timer does, because the
+/// same calibration lands 4 per cent short there and every sleep comes back
+/// early.
 fn timer_under_load(report: &mut Report) {
+    use crate::sys;
     const ROUNDS: usize = 12;
     // Each sleep spans several of the writes below, so what is measured is
     // the delay they add over a stretch of time rather than whichever part of
     // one of them a shorter sleep happened to overlap.
     const NAP: Duration = Duration::from_millis(100);
     // Each write copies 32 MiB, which is more than two ticks' worth, so with
-    // the timer held off a sleep of ten ticks takes more than twice as long as
-    // it asked for: measured, 120 ms late against 0 to 8 ms when the timer
-    // gets through. The bound sits between the two in the same ratio, a
-    // quarter of the one and four times the other, because the milliseconds
-    // on the working side are not all the kernel's: the emulator has a host
-    // scheduler above it, and the kernel heap still maps the pages it grows by
-    // with the heap locked.
+    // the timer masked for a whole call every round of this length loses one
+    // of them: 78 ms in the middle round, measured here against a kernel put
+    // back the way it was before an interrupt was let through a system call on
+    // aarch64. With the timer getting through, the middle round came to 2.2 ms
+    // at worst over ten boots. The bound sits between the two.
+    //
+    // The middle round decides rather than the worst, which is printed. Not
+    // every round is measured against as much of the emulator's own latency as
+    // the tick period above was: the worst of ten boots was 9.5 ms where the
+    // middle round of the same twelve was 0.4 ms. That lands in the tail. A
+    // call that runs masked holds the timer off in every round it spans, so it
+    // lands in the middle.
     const BOUND: Duration = Duration::from_millis(30);
 
     // Two of these in one call: a system call is what has to stay
@@ -823,6 +873,25 @@ fn timer_under_load(report: &mut Report) {
     // what is being measured here, so pay it before the clock starts.
     let _ = sink.write_vectored(&[IoSlice::new(&block), IoSlice::new(&block)]);
 
+    // Before the load starts, so that the rate between the two clocks is
+    // taken while nothing in the system can be holding the timer off. Taken
+    // with the load running it would absorb the very delay this is looking
+    // for and every round would measure zero.
+    let tick = tick_period();
+    // A sleep waits whole ticks of the length the kernel counts deadlines in,
+    // which it reports as the resolution of the clock, and not of the length
+    // the monotonic clock measured above. A resolution that is not roughly
+    // that tick is not the unit the rounds below are counted in, and neither
+    // is no resolution at all: either way the count means nothing, so it
+    // becomes no ticks due and the check fails rather than passing on a
+    // number nothing stands behind.
+    let resolution = sys::tick_nanoseconds() as u128;
+    let due = if resolution * 2 > tick.as_nanos() && resolution < tick.as_nanos() * 2 {
+        (NAP.as_nanos() / resolution) as u64
+    } else {
+        0
+    };
+
     let stop = Arc::new(AtomicUsize::new(0));
     let running = Arc::clone(&stop);
     let load = std::thread::spawn(move || {
@@ -831,34 +900,62 @@ fn timer_under_load(report: &mut Report) {
         }
     });
 
-    let mut late = Vec::with_capacity(ROUNDS);
+    let mut held = Vec::with_capacity(ROUNDS);
+    let mut slept = Vec::with_capacity(ROUNDS);
+    let mut overran = 0;
     for _ in 0..ROUNDS {
+        let entry = sys::tick_count();
         let started = Instant::now();
         std::thread::sleep(NAP);
-        late.push(started.elapsed().saturating_sub(NAP));
+        let took = started.elapsed();
+        let ticks = (sys::tick_count() - entry) as u32;
+        held.push(took.saturating_sub(tick * ticks));
+        slept.push(took.as_micros());
+        if ticks as u64 > due {
+            overran += 1;
+        }
     }
     stop.store(1, Ordering::Relaxed);
     let _ = load.join();
 
-    late.sort();
-    // The middle round decides rather than the mean: an emulator is at the
-    // mercy of the host's own scheduler, and one stalled round should not
-    // read as a kernel that holds interrupts off. What this catches is
-    // systematic -- with the timer held off every sleep here is late -- so it
-    // is in the middle of the distribution and not only in its tail.
-    let median = late[ROUNDS / 2];
-    let mean = late.iter().sum::<Duration>() / ROUNDS as u32;
-    let measured = format!(
-        "median {} us late, mean {} us, worst {} us",
-        median.as_micros(),
-        mean.as_micros(),
-        late[ROUNDS - 1].as_micros()
+    held.sort();
+    slept.sort();
+    let middle = held[ROUNDS / 2];
+    println!(
+        "      {} sleeps of {} ms over a {} us tick: timer held off {} us in the middle \
+         round, {} us at worst; the middle sleep itself took {} us",
+        ROUNDS,
+        NAP.as_millis(),
+        tick.as_micros(),
+        middle.as_micros(),
+        held[ROUNDS - 1].as_micros(),
+        slept[ROUNDS / 2],
     );
-    println!("      {} sleeps of {} ms: {}", ROUNDS, NAP.as_millis(), measured);
     report.check(
-        "a sleep wakes on time while another task is in a long call",
-        median < BOUND,
-        measured,
+        "the timer keeps arriving while another task is in a long call",
+        middle < BOUND,
+        format!(
+            "held off {} us in the middle round, {} us at worst",
+            middle.as_micros(),
+            held[ROUNDS - 1].as_micros()
+        ),
+    );
+    // The other half of a sleep waking on time, and the half that survives the
+    // calibration above: the tick it is due on has to be the one it wakes on,
+    // which needs the woken task to run before the next tick arrives. One
+    // round of the twelve is allowed a tick more, because a tick landing
+    // between the count read here and the kernel's own read inside the sleep
+    // buys that round a later deadline; that is a phase, not a delay.
+    report.check(
+        "a sleep wakes on the tick it is due on",
+        due > 0 && overran <= 1,
+        format!(
+            "{} of {} rounds woke later than the {} ticks of {} us they were due",
+            overran,
+            ROUNDS,
+            due,
+            resolution / 1000
+        ),
     );
 }
 
