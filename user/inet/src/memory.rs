@@ -242,35 +242,15 @@ fn a_thread_left_unreaped_keeps_the_space(report: &mut Report) {
 /// onto the new address space, so this is a load that fails with the old image
 /// gone and the new one not there.
 fn unloadable_elf() -> Vec<u8> {
-    #[cfg(target_arch = "x86_64")]
-    const MACHINE: u16 = 0x3E;
-    #[cfg(target_arch = "aarch64")]
-    const MACHINE: u16 = 0xB7;
     // Past USER_MMAP_BASE, which is as high as an image may go.
     const TOO_HIGH: u64 = 0x0000_7FF0_0000_0000;
 
-    let mut out = vec![0u8; 120];
-    out[0..4].copy_from_slice(b"\x7FELF");
-    out[4] = 2; // 64-bit
-    out[5] = 1; // little-endian
-    out[6] = 1; // version
-    out[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
-    out[18..20].copy_from_slice(&MACHINE.to_le_bytes());
-    out[20..24].copy_from_slice(&1u32.to_le_bytes());
-    out[24..32].copy_from_slice(&TOO_HIGH.to_le_bytes()); // e_entry
-    out[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
-    out[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
-    out[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
-    out[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
-
-    let ph = 64;
-    out[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
-    out[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes()); // read, execute
-    out[ph + 16..ph + 24].copy_from_slice(&TOO_HIGH.to_le_bytes()); // p_vaddr
-    out[ph + 24..ph + 32].copy_from_slice(&TOO_HIGH.to_le_bytes()); // p_paddr
-    out[ph + 40..ph + 48].copy_from_slice(&0x1000u64.to_le_bytes()); // p_memsz
-    out[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
-    out
+    let mut image = crate::loader::Image::new(Vec::new());
+    image.entry = TOO_HIGH;
+    image.p_vaddr = TOO_HIGH;
+    image.p_filesz = 0;
+    image.p_memsz = 0x1000;
+    image.bytes()
 }
 
 /// An exec that could not go through has to leave the program that asked for

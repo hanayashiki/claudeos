@@ -7,10 +7,12 @@
 //! Nothing here knows it is running on claudeos: this is `std::net` making the
 //! same system calls it would make on Linux.
 //!
-//! The memory checks ride along here rather than in a suite of their own: the
-//! harness boots the machine once per suite and reads one summary line out of
-//! each, and these are things only a real process can ask about.
+//! The memory and program loader checks ride along here rather than in a
+//! suite of their own: the harness boots the machine once per suite and reads
+//! one summary line out of each, and these are things only a real process can
+//! ask about.
 
+mod loader;
 mod memory;
 mod sys;
 mod threads;
@@ -71,6 +73,8 @@ fn test() {
     memory::run(&mut report);
     println!("-- what threads share --");
     threads::run(&mut report);
+    println!("-- the program loader --");
+    loader::run(&mut report);
 
     println!();
     println!("=== {} passed, {} failed ===", report.passed, report.failed);

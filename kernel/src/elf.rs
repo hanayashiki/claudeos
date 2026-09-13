@@ -2,7 +2,7 @@
 
 use crate::abi::Errno;
 use crate::arch::paging::{AddressSpace, NO_EXECUTE, PRESENT, USER, WRITABLE};
-use crate::mm::{page_align_down, page_align_up, PAGE_SIZE_U64};
+use crate::mm::{page_align_down, PAGE_SIZE_U64};
 use alloc::collections::{BTreeMap, BTreeSet};
 
 pub const ET_EXEC: u16 = 2;
@@ -116,6 +116,95 @@ pub fn program_headers(data: &[u8]) -> Result<alloc::vec::Vec<ProgramHeader>, Er
     Ok(out)
 }
 
+/// The sum of numbers that came out of the file.
+///
+/// Every field of an ELF header is chosen by whoever wrote the file, and the
+/// release build has overflow checks off, so an unchecked sum of two of them
+/// wraps to a small number that passes whatever bound it is then checked
+/// against. There is no useful saturating answer either: a header whose
+/// arithmetic does not fit is a file to refuse.
+fn sum(values: &[u64]) -> Result<u64, Errno> {
+    let mut total: u64 = 0;
+    for value in values {
+        total = total.checked_add(*value).ok_or(Errno::ENOEXEC)?;
+    }
+    Ok(total)
+}
+
+/// Round a value from the file up to a page boundary. The rounding is itself
+/// an addition, so a value in the last page of the address space wraps to zero.
+fn page_up(value: u64) -> Result<u64, Errno> {
+    Ok(page_align_down(sum(&[value, PAGE_SIZE_U64 - 1])?))
+}
+
+/// How many pages of segment the loader will describe. It keeps one map entry
+/// per page while it works out the protection each page ends up with, so what
+/// bounds a segment is the heap those entries live in rather than where user
+/// space ends. The largest image here is a few thousand pages.
+const MAX_IMAGE_PAGES: u64 = 64 * 1024;
+
+/// Where one PT_LOAD segment lands, worked out once with checked arithmetic.
+///
+/// The three sums a segment needs -- its first address, its last, and the end
+/// of its bytes in the file -- were each written out again at every place that
+/// wanted them, which is five places to forget the check in. Deriving them
+/// here instead means the rest of the loader has nothing left to add up.
+struct Extent {
+    /// The segment's first byte, and the page it falls in.
+    vaddr: u64,
+    start: u64,
+    /// First page-aligned address past the segment.
+    end: u64,
+    /// Where the segment's bytes are in the file.
+    file_offset: u64,
+    file_len: u64,
+}
+
+impl Extent {
+    fn of(ph: &ProgramHeader, base: u64, file_size: usize) -> Result<Extent, Errno> {
+        // The ELF ABI has a segment's bytes fit inside it and start at the
+        // same offset into a page as they do into the file. The loader reads a
+        // page from the file at a fixed distance from the segment's start, and
+        // subtracts that distance below, so a header that says otherwise has no
+        // reading that works.
+        if ph.p_filesz > ph.p_memsz {
+            return Err(Errno::ENOEXEC);
+        }
+        if ph.p_offset % PAGE_SIZE_U64 != ph.p_vaddr % PAGE_SIZE_U64 {
+            return Err(Errno::ENOEXEC);
+        }
+        if sum(&[ph.p_offset, ph.p_filesz])? > file_size as u64 {
+            return Err(Errno::ENOEXEC);
+        }
+        let vaddr = sum(&[base, ph.p_vaddr])?;
+        let end = page_up(sum(&[vaddr, ph.p_memsz])?)?;
+        if end > crate::mm::USER_MMAP_BASE {
+            return Err(Errno::ENOMEM);
+        }
+        Ok(Extent {
+            vaddr,
+            start: page_align_down(vaddr),
+            end,
+            file_offset: ph.p_offset,
+            file_len: ph.p_filesz,
+        })
+    }
+
+    fn pages(&self) -> u64 {
+        (self.end - self.start) / PAGE_SIZE_U64
+    }
+
+    /// Past the segment's bytes from the file; from here to `end` is .bss.
+    fn file_end(&self) -> u64 {
+        self.vaddr + self.file_len
+    }
+
+    /// How far into its first page the segment's bytes begin.
+    fn into_page(&self) -> u64 {
+        self.vaddr - self.start
+    }
+}
+
 /// Map `data`'s PT_LOAD segments into `space`, which must be the active
 /// address space so the segment contents can be written directly.
 pub fn load(space: &AddressSpace, data: &[u8]) -> Result<LoadedImage, Errno> {
@@ -144,32 +233,41 @@ pub fn load_at(
         _ => 0,
     };
 
+    // Where every segment lands, worked out before anything is mapped. A
+    // header whose numbers do not add up is refused here rather than being
+    // discovered halfway through the mapping.
+    let mut loads: alloc::vec::Vec<(usize, Extent)> = alloc::vec::Vec::new();
+    let mut pages = 0u64;
+    for (index, ph) in phdrs.iter().enumerate() {
+        if ph.p_type != PT_LOAD {
+            continue;
+        }
+        let extent = Extent::of(ph, base, data.len())?;
+        if ph.p_memsz == 0 {
+            continue;
+        }
+        pages = pages.checked_add(extent.pages()).ok_or(Errno::ENOMEM)?;
+        if pages > MAX_IMAGE_PAGES {
+            return Err(Errno::ENOMEM);
+        }
+        loads.push((index, extent));
+    }
+    if loads.is_empty() {
+        return Err(Errno::ENOEXEC);
+    }
+
     // Collect the final protection for every page first: two segments may
     // share a page when the linker did not pad them apart.
     let mut page_flags: BTreeMap<u64, u32> = BTreeMap::new();
     let mut brk_start = 0u64;
-    let mut any_load = false;
-
-    for ph in &phdrs {
-        if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
-            continue;
-        }
-        any_load = true;
-        let start = page_align_down(base + ph.p_vaddr);
-        let end = page_align_up(base + ph.p_vaddr + ph.p_memsz);
-        if end > crate::mm::USER_MMAP_BASE {
-            return Err(Errno::ENOMEM);
-        }
-        let mut page = start;
-        while page < end {
+    for (index, extent) in &loads {
+        let mut page = extent.start;
+        while page < extent.end {
             let entry = page_flags.entry(page).or_insert(0);
-            *entry |= ph.p_flags;
+            *entry |= phdrs[*index].p_flags;
             page += PAGE_SIZE_U64;
         }
-        brk_start = brk_start.max(end);
-    }
-    if !any_load {
-        return Err(Errno::ENOEXEC);
+        brk_start = brk_start.max(extent.end);
     }
 
     // Pages that cannot be left to a fault: a partial head or tail, anything
@@ -177,31 +275,21 @@ pub fn load_at(
     // one of those cases has to be assembled from more than one source, and
     // the fault handler only knows how to fill a page from one.
     let mut eager: BTreeSet<u64> = BTreeSet::new();
-    for ph in &phdrs {
-        if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
-            continue;
-        }
-        let start = base + ph.p_vaddr;
-        let file_end = start + ph.p_filesz;
-        let end = page_align_up(start + ph.p_memsz);
-        eager.insert(page_align_down(start));
-        let mut page = page_align_down(file_end);
-        while page < end {
+    for (_, extent) in &loads {
+        eager.insert(extent.start);
+        let mut page = page_align_down(extent.file_end());
+        while page < extent.end {
             eager.insert(page);
             page += PAGE_SIZE_U64;
         }
     }
     // A page inside more than one segment has to be assembled here too.
     let mut seen: BTreeMap<u64, usize> = BTreeMap::new();
-    for (index, ph) in phdrs.iter().enumerate() {
-        if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
-            continue;
-        }
-        let mut page = page_align_down(base + ph.p_vaddr);
-        let end = page_align_up(base + ph.p_vaddr + ph.p_memsz);
-        while page < end {
-            match seen.insert(page, index) {
-                Some(other) if other != index => {
+    for (index, extent) in &loads {
+        let mut page = extent.start;
+        while page < extent.end {
+            match seen.insert(page, *index) {
+                Some(other) if other != *index => {
                     eager.insert(page);
                 }
                 _ => {}
@@ -223,25 +311,17 @@ pub fn load_at(
             .map_err(|_| Errno::ENOMEM)?;
     }
 
-    for ph in &phdrs {
-        if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
-            continue;
-        }
-        let dest = base + ph.p_vaddr;
-        let file_end = (ph.p_offset + ph.p_filesz) as usize;
-        if file_end > data.len() {
-            return Err(Errno::ENOEXEC);
-        }
+    for (_, extent) in &loads {
         // Copy only what lands in a page that was mapped here. A fresh frame
         // is already zero, so .bss needs nothing written.
         let mut offset = 0u64;
-        while offset < ph.p_filesz {
-            let address = dest + offset;
+        while offset < extent.file_len {
+            let address = extent.vaddr + offset;
             let page = page_align_down(address);
-            let chunk = (page + PAGE_SIZE_U64 - address).min(ph.p_filesz - offset);
+            let chunk = (page + PAGE_SIZE_U64 - address).min(extent.file_len - offset);
             if eager.contains(&page) {
                 unsafe {
-                    let src = data.as_ptr().add((ph.p_offset + offset) as usize);
+                    let src = data.as_ptr().add((extent.file_offset + offset) as usize);
                     core::ptr::copy_nonoverlapping(src, address as *mut u8, chunk as usize);
                 }
                 // These bytes are about to be executed, and on some machines
@@ -270,16 +350,15 @@ pub fn load_at(
     let mut phdr_addr = 0u64;
     for ph in &phdrs {
         if ph.p_type == PT_PHDR {
-            phdr_addr = base + ph.p_vaddr;
+            phdr_addr = sum(&[base, ph.p_vaddr])?;
         }
     }
     if phdr_addr == 0 {
-        for ph in &phdrs {
-            if ph.p_type == PT_LOAD
-                && phoff >= ph.p_offset
-                && phoff + phnum * phentsize <= ph.p_offset + ph.p_filesz
-            {
-                phdr_addr = base + ph.p_vaddr + (phoff - ph.p_offset);
+        let table_end = sum(&[phoff, phnum * phentsize])?;
+        for (index, extent) in &loads {
+            let ph = &phdrs[*index];
+            if phoff >= ph.p_offset && table_end <= extent.file_offset + extent.file_len {
+                phdr_addr = extent.vaddr + (phoff - ph.p_offset);
                 break;
             }
         }
@@ -289,51 +368,61 @@ pub fn load_at(
     let mut tls = (0u64, 0u64, 0u64, 0u64);
     for ph in &phdrs {
         if ph.p_type == PT_INTERP {
-            let start = ph.p_offset as usize;
-            let end = (start + ph.p_filesz as usize).min(data.len());
-            if let Ok(text) = core::str::from_utf8(&data[start..end]) {
+            let end = sum(&[ph.p_offset, ph.p_filesz])?;
+            let name = data
+                .get(ph.p_offset as usize..end as usize)
+                .ok_or(Errno::ENOEXEC)?;
+            if let Ok(text) = core::str::from_utf8(name) {
                 interp = Some(alloc::string::String::from(text.trim_end_matches('\0')));
             }
         }
         if ph.p_type == PT_TLS {
-            tls = (base + ph.p_vaddr, ph.p_filesz, ph.p_memsz, ph.p_align.max(1));
+            tls = (
+                sum(&[base, ph.p_vaddr])?,
+                ph.p_filesz,
+                ph.p_memsz,
+                ph.p_align.max(1),
+            );
         }
     }
 
     let mut segments = alloc::vec::Vec::new();
-    for ph in &phdrs {
-        if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
-            continue;
-        }
+    for (index, extent) in &loads {
+        let flags = phdrs[*index].p_flags;
         let mut prot = 0u64;
-        if ph.p_flags & PF_R != 0 {
+        if flags & PF_R != 0 {
             prot |= crate::abi::PROT_READ;
         }
-        if ph.p_flags & PF_W != 0 {
+        if flags & PF_W != 0 {
             prot |= crate::abi::PROT_WRITE;
         }
-        if ph.p_flags & PF_X != 0 {
+        if flags & PF_X != 0 {
             prot |= crate::abi::PROT_EXEC;
         }
-        let start = page_align_down(base + ph.p_vaddr);
-        let end = page_align_up(base + ph.p_vaddr + ph.p_memsz);
         // The region's file mapping is described from its page-aligned start,
-        // which is where the fault handler measures from.
+        // which is where the fault handler measures from. The offset the
+        // segment's bytes begin at within their page is the same in the file,
+        // which is what makes the subtraction below sound.
         let file = node.as_ref().map(|node| crate::task::FileMap {
             node: node.clone(),
-            offset: ph.p_offset - (base + ph.p_vaddr - start),
-            length: ph.p_filesz + (base + ph.p_vaddr - start),
+            offset: extent.file_offset - extent.into_page(),
+            length: extent.file_len + extent.into_page(),
         });
-        segments.push(Segment { start, end, prot, file });
+        segments.push(Segment {
+            start: extent.start,
+            end: extent.end,
+            prot,
+            file,
+        });
     }
 
     Ok(LoadedImage {
-        entry: base + e_entry,
+        entry: sum(&[base, e_entry])?,
         phdr_addr,
         phent: phentsize,
         phnum,
         base,
-        brk_start: page_align_up(brk_start),
+        brk_start,
         interp,
         tls_vaddr: tls.0,
         tls_filesz: tls.1,
