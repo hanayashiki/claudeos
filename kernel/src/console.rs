@@ -2,7 +2,7 @@
 //! serial output.
 
 use crate::abi::{Errno, Termios, ECHO, ICANON};
-use crate::serial::SERIAL;
+use crate::serial::{Chunk, SERIAL};
 use crate::sync::Spinlock;
 use core::fmt::Write;
 
@@ -135,18 +135,22 @@ pub fn available() -> usize {
     INPUT.lock().len()
 }
 
+/// Write to the terminal.
+///
+/// The loop is here rather than inside the console lock, and the lock is taken
+/// once per chunk: a program's write is as long as the program says, and the
+/// port waits for the transmitter between bytes, so a hold that covered the
+/// whole buffer would be interrupts masked for as long as the write takes. On
+/// the board that is 86.8 microseconds a byte.
 pub fn write(buf: &[u8]) {
-    let mut serial = SERIAL.lock();
+    let mut out = Chunk::new();
     for &byte in buf {
-        serial.write_byte(byte);
+        out.push(byte);
     }
 }
 
 fn echo(bytes: &[u8]) {
-    let mut serial = SERIAL.lock();
-    for &byte in bytes {
-        serial.write_byte(byte);
-    }
+    write(bytes);
 }
 
 /// Read from the console, honouring the current terminal settings.
@@ -358,6 +362,17 @@ pub fn init() {
     crate::arch::unmask_irq(crate::arch::SERIAL_IRQ);
 }
 
+/// Somewhere for `format_args!` to go that is the terminal rather than the
+/// kernel log.
+struct Terminal;
+
+impl Write for Terminal {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        write(s.as_bytes());
+        Ok(())
+    }
+}
+
 pub fn print_fmt(args: core::fmt::Arguments) {
-    let _ = SERIAL.lock().write_fmt(args);
+    let _ = Terminal.write_fmt(args);
 }

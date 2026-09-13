@@ -6,8 +6,8 @@
 use crate::sync::Spinlock;
 use core::fmt::{self, Write};
 
-/// The machine's debug console, held behind a lock so a line from one writer
-/// is not interleaved with another's.
+/// The machine's debug console, held behind a lock so that two writers cannot
+/// be inside the port's registers at once.
 pub struct Console;
 
 impl Console {
@@ -25,21 +25,71 @@ impl Console {
         crate::arch::console_enable_rx_interrupt();
     }
 
-    pub fn write_byte(&mut self, byte: u8) {
-        crate::arch::console_write_byte(byte);
-    }
-}
-
-impl Write for Console {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        for byte in s.bytes() {
+    /// Write a bounded run of bytes.
+    ///
+    /// A `Chunk` rather than a slice, so that no caller can hold the lock
+    /// across a buffer whose length a program chose. Private, so `Chunk` is
+    /// the only way in.
+    fn write_chunk(&mut self, chunk: &Chunk) {
+        for &byte in &chunk.bytes[..chunk.len] {
             crate::arch::console_write_byte(byte);
         }
-        Ok(())
     }
 }
 
 pub static SERIAL: Spinlock<Console> = Spinlock::new(Console);
+
+/// The most bytes written under one hold of the console lock.
+///
+/// The lock masks interrupts for as long as it is held, and the port waits for
+/// the transmitter between bytes: 86.8 microseconds a byte at 115200 baud once
+/// the port's own buffer is full. So the length of what is written under one
+/// hold is how long the clock stops for. Thirty-two is the depth of the
+/// transmit FIFO on the board's port, and thirty-two byte times is 2.8 ms,
+/// under a third of the 10 ms tick.
+const CHUNK: usize = 32;
+
+/// Bytes gathered outside the console lock and written under it.
+///
+/// This is what the sink takes, and it is the reason the loop over a whole
+/// write is out here rather than in there: filling one copies out of the
+/// caller's buffer with interrupts still on, and each hold covers at most
+/// `CHUNK` bytes however long that buffer is.
+pub struct Chunk {
+    bytes: [u8; CHUNK],
+    len: usize,
+}
+
+impl Chunk {
+    pub const fn new() -> Self {
+        Chunk { bytes: [0; CHUNK], len: 0 }
+    }
+
+    /// Add a byte, writing out what has gathered if there is no room for it.
+    pub fn push(&mut self, byte: u8) {
+        if self.len == CHUNK {
+            self.write_out();
+        }
+        self.bytes[self.len] = byte;
+        self.len += 1;
+    }
+
+    fn write_out(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        SERIAL.lock().write_chunk(self);
+        self.len = 0;
+    }
+}
+
+impl Drop for Chunk {
+    /// What is left goes out when the chunk does, so the tail of a write
+    /// cannot be lost by a caller that did not ask for it.
+    fn drop(&mut self) {
+        self.write_out();
+    }
+}
 
 /// Everything the kernel has printed, which is what `dmesg` reads back.
 ///
@@ -87,7 +137,11 @@ struct Logged;
 
 impl Write for Logged {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        SERIAL.lock().write_str(s)?;
+        let mut out = Chunk::new();
+        for &byte in s.as_bytes() {
+            out.push(byte);
+        }
+        drop(out);
         LOG.lock().push(s.as_bytes());
         Ok(())
     }
