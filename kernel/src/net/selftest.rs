@@ -276,6 +276,8 @@ pub fn run() -> bool {
     abandoned_connection(&mut report, nic);
     crate::println!("net: addresses this machine does not have");
     foreign_addresses(&mut report, nic);
+    crate::println!("net: initial sequence numbers");
+    initial_sequence_numbers(&mut report, nic);
     crate::println!("net: datagrams");
     datagrams(&mut report, nic);
     // The driver for this board's own Ethernet, as far as it can be exercised
@@ -1276,6 +1278,85 @@ fn foreign_addresses(report: &mut Report, nic: &FakeNic) {
         Err(_) => report.check("a broadcast datagram still arrives", false),
     }
     socket::close(&socket);
+    socket::reset();
+    nic.take();
+}
+
+/// The sequence number this stack picks for a connection request from
+/// `client_port`, taken off the wire.
+fn answered_sequence(nic: &FakeNic, server_port: u16, client_port: u16) -> Option<u32> {
+    deliver_ip(
+        ip::PROTO_TCP,
+        &segment(
+            client_port, server_port, 9_000_000, 0, tcp::SYN, 64240, &[], &[], PEER_IP, OUR_IP,
+        ),
+    );
+    let sent = nic.take();
+    if sent.len() != 1 {
+        return None;
+    }
+    let (_, datagram) = ip::parse(&sent[0][14..])?;
+    Some(tcp::Segment::parse(datagram)?.sequence)
+}
+
+/// An initial sequence number must not be something the other end can work
+/// out. It used to be the uptime plus a published function of the two ports
+/// and the peer's address, so one connection gave away the clock and every
+/// other connection's number followed from it -- which is the whole of what a
+/// blind attacker is otherwise missing.
+fn initial_sequence_numbers(report: &mut Report, nic: &FakeNic) {
+    const SERVER_PORT: u16 = 8084;
+
+    /// The published half of it: what an attacker who has one number and the
+    /// port numbers computes for any other connection.
+    fn salt(local_port: u16, remote_port: u16, remote: Ipv4Addr) -> u32 {
+        let salt =
+            ((local_port as u32) << 16) ^ (remote_port as u32) ^ remote.0.rotate_left(13);
+        salt.wrapping_mul(0x9E37_79B9)
+    }
+
+    socket::reset();
+    let listener = InetSocket::new(true);
+    if listener.bind(Endpoint::new(Ipv4Addr::UNSPECIFIED, SERVER_PORT)).is_err()
+        || listener.listen(8).is_err()
+    {
+        report.check("a listening socket", false);
+        return;
+    }
+    nic.take();
+
+    const PORTS: [u16; 4] = [40400, 40401, 40402, 40403];
+    let mut numbers = [0u32; PORTS.len()];
+    for (slot, port) in numbers.iter_mut().zip(PORTS) {
+        match answered_sequence(nic, SERVER_PORT, port) {
+            Some(sequence) => *slot = sequence,
+            None => {
+                report.check("four connection requests answered", false);
+                socket::reset();
+                nic.take();
+                return;
+            }
+        }
+    }
+
+    // The first number and the published function give the clock; the rest
+    // follow from it. A count of ticks is 4 microseconds, and these four
+    // requests are one after another, so a prediction that is right to within
+    // a quarter of a second is a prediction. Two of the three landing inside
+    // that by chance is a one in a billion event, so the check tolerates one.
+    let clock = numbers[0].wrapping_sub(salt(SERVER_PORT, PORTS[0], PEER_IP));
+    let mut predicted = 0;
+    for (number, port) in numbers.iter().zip(PORTS).skip(1) {
+        let guess = clock.wrapping_add(salt(SERVER_PORT, port, PEER_IP));
+        if (number.wrapping_sub(guess) as i32).unsigned_abs() < 1 << 16 {
+            predicted += 1;
+        }
+    }
+    report.check(
+        "one connection's initial sequence number does not give away another's",
+        predicted <= 1,
+    );
+    socket::close(&listener);
     socket::reset();
     nic.take();
 }

@@ -245,15 +245,55 @@ pub fn build(
     segment
 }
 
+/// A secret drawn once per boot and mixed into every initial sequence number.
+///
+/// It comes from the kernel's own generator, which is a xorshift seeded from
+/// the cycle counter. That is the best source here, and it is worth being
+/// plain about what it buys: someone off the machine cannot work the secret
+/// out from the sequence numbers it produces, and it is not a cryptographic
+/// hash and is not claimed to be one. Anyone who can read kernel memory, or
+/// who can watch this machine's start-up timing closely enough to guess the
+/// seed, has the secret and everything that follows from it.
+static ISN_SECRET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn isn_secret() -> u64 {
+    use core::sync::atomic::Ordering;
+    let held = ISN_SECRET.load(Ordering::Relaxed);
+    if held != 0 {
+        return held;
+    }
+    // Zero is what says it has not been drawn yet, so it is not a value the
+    // secret may take.
+    let drawn = crate::fs::dev::random_u64() | 1;
+    match ISN_SECRET.compare_exchange(0, drawn, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => drawn,
+        Err(other) => other,
+    }
+}
+
+/// splitmix64's finalizer: every input bit reaches the whole word.
+fn mix(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
 /// A starting sequence number that differs between connections and advances
 /// with the clock, so a segment left over from an earlier connection between
 /// the same two ports falls outside the new one's window.
+///
+/// RFC 6528: the clock, plus a hash of the connection's own addresses and
+/// ports with a secret this machine keeps to itself. The clock is what keeps
+/// the old segment out; the secret is what stops one connection's number,
+/// which the other end sees, from giving away every other connection's.
 fn initial_sequence(local: Endpoint, remote: Endpoint) -> u32 {
     let clock = (crate::time::monotonic_ns() / 4000) as u32;
-    let salt = ((local.port as u32) << 16)
-        ^ (remote.port as u32)
-        ^ remote.address.0.rotate_left(13);
-    clock.wrapping_add(salt.wrapping_mul(0x9E37_79B9))
+    let addresses = ((local.address.0 as u64) << 32) | remote.address.0 as u64;
+    let ports = ((local.port as u64) << 16) | remote.port as u64;
+    let hash = mix(mix(isn_secret() ^ addresses) ^ ports);
+    clock.wrapping_add(hash as u32)
 }
 
 // ---- the transmission control block --------------------------------------
