@@ -123,7 +123,7 @@ pub fn enter_signal_handler(
     buf[INFO_OFFSET + 4..INFO_OFFSET + 8].copy_from_slice(&0i32.to_le_bytes());
     buf[INFO_OFFSET + 8..INFO_OFFSET + 12].copy_from_slice(&0i32.to_le_bytes());
 
-    if uaccess::write_bytes(sp, &buf).is_err() {
+    if uaccess::write_bytes_in(task, sp, &buf).is_err() {
         return false;
     }
 
@@ -149,7 +149,7 @@ pub fn leave_signal_handler(task: &mut Task, frame: &mut TrapFrame) -> SysResult
     // word below the current stack pointer.
     let base = frame.rsp.wrapping_sub(8);
     let mut buf = [0u8; FRAME_SIZE];
-    uaccess::read_bytes(base, &mut buf)?;
+    uaccess::read_bytes_in(task, base, &mut buf)?;
 
     let m = MCONTEXT;
     frame.r8 = get64(&buf, m + SC_R8);

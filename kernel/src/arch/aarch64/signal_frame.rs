@@ -143,7 +143,7 @@ pub fn enter_signal_handler(
     put32(&mut buf, CHAIN_END, 0);
     put32(&mut buf, CHAIN_END + 4, 0);
 
-    if uaccess::write_bytes(sp, &buf).is_err() {
+    if uaccess::write_bytes_in(task, sp, &buf).is_err() {
         return false;
     }
 
@@ -152,7 +152,7 @@ pub fn enter_signal_handler(
     let mut record = [0u8; RECORD_SIZE];
     put64(&mut record, 0, frame.x[29]);
     put64(&mut record, 8, frame.x[30]);
-    if uaccess::write_bytes(sp + FRAME_SIZE as u64, &record).is_err() {
+    if uaccess::write_bytes_in(task, sp + FRAME_SIZE as u64, &record).is_err() {
         return false;
     }
 
@@ -179,7 +179,7 @@ pub fn leave_signal_handler(task: &mut Task, frame: &mut TrapFrame) -> SysResult
     // through the stack, so the stack pointer is still at the frame.
     let base = frame.sp;
     let mut buf = [0u8; WRITTEN_SIZE];
-    uaccess::read_bytes(base, &mut buf)?;
+    uaccess::read_bytes_in(task, base, &mut buf)?;
 
     for (i, value) in frame.x.iter_mut().enumerate() {
         *value = get64(&buf, SC_REGS + i * 8);
