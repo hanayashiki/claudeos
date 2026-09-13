@@ -12,6 +12,55 @@ use crate::Report;
 pub fn run(report: &mut Report) {
     exec_that_fails_keeps_the_memory_state(report);
     a_thread_left_unreaped_keeps_the_space(report);
+    argument_blocks_larger_than_the_stack_is_mapped_with(report);
+}
+
+/// Exec `/bin/true` with `count` arguments of `bytes` each, in a child, and
+/// report what became of it: zero if the program ran, 2 if the exec came back
+/// with E2BIG, 3 if it came back with anything else.
+fn exec_with_arguments(bytes: usize, count: usize) -> Option<i32> {
+    const E2BIG: i64 = 7;
+    let filler = "x".repeat(bytes);
+    let mut argv: Vec<&str> = Vec::with_capacity(count + 1);
+    argv.push("true");
+    for _ in 0..count {
+        argv.push(&filler);
+    }
+    let pid = sys::fork();
+    if pid == 0 {
+        let rc = sys::execve("/bin/true", &argv);
+        sys::exit_group(if rc == -E2BIG { 2 } else { 3 });
+    }
+    if pid < 0 {
+        return None;
+    }
+    let (rc, code) = sys::wait4(pid as i32, 0);
+    if rc < 0 {
+        None
+    } else {
+        Some(code)
+    }
+}
+
+/// The arguments and the environment are written onto the new program's stack
+/// before it starts, and only the top of that stack is mapped when the writing
+/// begins. A block past that has to grow the stack; a block past the whole
+/// stack has to come back as an error. Neither may be a fault taken in the
+/// kernel, which is fatal.
+fn argument_blocks_larger_than_the_stack_is_mapped_with(report: &mut Report) {
+    // About 300 KiB, past the quarter megabyte mapped up front.
+    report.check(
+        "an argument block past what the stack is mapped with is written anyway",
+        exec_with_arguments(4000, 77) == Some(0),
+        String::from("the program did not run"),
+    );
+    // About 2.8 MiB, past the whole stack reserve.
+    let refused = exec_with_arguments(4000, 700);
+    report.check(
+        "an argument block past the whole stack is refused",
+        refused == Some(2),
+        format!("the child reported {:?} rather than E2BIG", refused),
+    );
 }
 
 /// How much memory the machine says is unspoken for, in kibibytes.

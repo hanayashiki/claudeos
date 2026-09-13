@@ -23,6 +23,11 @@ pub const KERNEL_STACK_SIZE: usize = 32 * 1024;
 pub const STACK_RESERVE: u64 = 8 * 1024 * 1024;
 /// How much of it is mapped up front; the rest faults in on demand.
 pub const STACK_PREFAULT: u64 = 256 * 1024;
+/// The most the arguments, the environment and the strings alongside them may
+/// come to. They are written onto the new stack before the program starts, so
+/// a block larger than the stack has nowhere to go; a quarter of the reserve
+/// is the share Linux gives them and leaves the program the rest.
+pub const MAX_ARG_BYTES: u64 = STACK_RESERVE / 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -486,6 +491,23 @@ pub fn build_user_stack(
     exec_path: &str,
     interp_base: u64,
 ) -> Result<u64, Errno> {
+    // The strings go on the stack before the program exists to grow it, so
+    // what they come to has to be known to fit before any of it is written.
+    // A quarter of the reserve is the share Linux gives them out of the stack
+    // limit, and it leaves the program the rest to run in.
+    let text: u64 = argv
+        .iter()
+        .chain(envp.iter())
+        .map(|value| value.len() as u64 + 1)
+        .sum::<u64>()
+        + crate::arch::MACHINE.len() as u64
+        + 1
+        + exec_path.len() as u64
+        + 1;
+    if text > MAX_ARG_BYTES {
+        return Err(Errno::E2BIG);
+    }
+
     let stack_low = USER_STACK_TOP - STACK_RESERVE;
     task.add_vma(stack_low, USER_STACK_TOP, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
 
@@ -501,40 +523,39 @@ pub fn build_user_stack(
 
     let mut sp = USER_STACK_TOP;
 
-    // Strings first, from the very top down.
-    let push_bytes = |sp: &mut u64, bytes: &[u8]| -> u64 {
+    // Strings first, from the very top down. These go through the checked
+    // path: only the top of the stack is mapped at this point, and a block
+    // longer than that lands on a page nothing has faulted in, which in the
+    // kernel is fatal rather than a fault the handler can serve.
+    let push_bytes = |sp: &mut u64, bytes: &[u8]| -> Result<u64, Errno> {
         *sp -= bytes.len() as u64 + 1;
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), *sp as *mut u8, bytes.len());
-            *(( *sp + bytes.len() as u64) as *mut u8) = 0;
-        }
-        *sp
+        crate::uaccess::write_bytes(*sp, bytes)?;
+        crate::uaccess::write_bytes(*sp + bytes.len() as u64, &[0])?;
+        Ok(*sp)
     };
 
     let mut envp_addrs = Vec::with_capacity(envp.len());
     for value in envp.iter().rev() {
-        envp_addrs.push(push_bytes(&mut sp, value.as_bytes()));
+        envp_addrs.push(push_bytes(&mut sp, value.as_bytes())?);
     }
     envp_addrs.reverse();
 
     let mut argv_addrs = Vec::with_capacity(argv.len());
     for value in argv.iter().rev() {
-        argv_addrs.push(push_bytes(&mut sp, value.as_bytes()));
+        argv_addrs.push(push_bytes(&mut sp, value.as_bytes())?);
     }
     argv_addrs.reverse();
 
-    let platform_addr = push_bytes(&mut sp, crate::arch::MACHINE.as_bytes());
-    let execfn_addr = push_bytes(&mut sp, exec_path.as_bytes());
+    let platform_addr = push_bytes(&mut sp, crate::arch::MACHINE.as_bytes())?;
+    let execfn_addr = push_bytes(&mut sp, exec_path.as_bytes())?;
 
     // 16 bytes of randomness for AT_RANDOM (stack guard, pointer mangling).
     sp -= 16;
     sp &= !0xF;
     let random_addr = sp;
-    unsafe {
-        let mut bytes = [0u8; 16];
-        crate::fs::dev::fill_random(&mut bytes);
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), random_addr as *mut u8, 16);
-    }
+    let mut bytes = [0u8; 16];
+    crate::fs::dev::fill_random(&mut bytes);
+    crate::uaccess::write_bytes(random_addr, &bytes)?;
 
     let auxv: [(u64, u64); 14] = [
         (AT_PHDR, image.phdr_addr),
@@ -566,32 +587,27 @@ pub fn build_user_stack(
     let block = (words * 8) as u64;
     sp = (sp - block) & !0xF;
 
-    unsafe {
-        let mut p = sp as *mut u64;
-        *p = argv.len() as u64;
-        p = p.add(1);
-        for addr in &argv_addrs {
-            *p = *addr;
-            p = p.add(1);
-        }
-        *p = 0;
-        p = p.add(1);
-        for addr in &envp_addrs {
-            *p = *addr;
-            p = p.add(1);
-        }
-        *p = 0;
-        p = p.add(1);
-        for (key, value) in auxv.iter().chain(extra.iter()) {
-            *p = *key;
-            p = p.add(1);
-            *p = *value;
-            p = p.add(1);
-        }
-        *p = AT_NULL;
-        p = p.add(1);
-        *p = 0;
+    let mut at = sp;
+    let push_word = |value: u64, at: &mut u64| -> Result<(), Errno> {
+        crate::uaccess::write_u64(*at, value)?;
+        *at += 8;
+        Ok(())
+    };
+    push_word(argv.len() as u64, &mut at)?;
+    for addr in &argv_addrs {
+        push_word(*addr, &mut at)?;
     }
+    push_word(0, &mut at)?;
+    for addr in &envp_addrs {
+        push_word(*addr, &mut at)?;
+    }
+    push_word(0, &mut at)?;
+    for (key, value) in auxv.iter().chain(extra.iter()) {
+        push_word(*key, &mut at)?;
+        push_word(*value, &mut at)?;
+    }
+    push_word(AT_NULL, &mut at)?;
+    push_word(0, &mut at)?;
 
     Ok(sp)
 }
