@@ -8,7 +8,7 @@
 use super::cpu::idt::TrapFrame;
 use super::task::FPU_STATE_SIZE;
 use crate::abi::SysResult;
-use crate::signal::{SigAction, SA_NODEFER};
+use crate::signal::{SigAction, SA_NODEFER, SA_ONSTACK};
 use crate::task::Task;
 use crate::uaccess;
 
@@ -50,6 +50,11 @@ const SC_CS: usize = 144;
 /// Where `struct sigcontext` keeps the pointer to the saved x87/SSE image.
 const SC_FPSTATE: usize = 184;
 
+/// The least an alternate stack may be and still be accepted, which is what
+/// Linux asks for on this machine. The frame this file writes is smaller than
+/// it, so a stack that passes has room for one.
+pub const MIN_ALT_STACK: u64 = 2048;
+
 fn put64(buf: &mut [u8], offset: usize, value: u64) {
     buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
@@ -58,6 +63,26 @@ fn get64(buf: &[u8], offset: usize) -> u64 {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&buf[offset..offset + 8]);
     u64::from_le_bytes(bytes)
+}
+
+/// Take the alternate stack back from `uc_stack`, which is where the handler
+/// could have changed it. A handler that left the field alone puts back what
+/// was already there.
+fn restore_alt_stack(task: &Task, buf: &[u8], sp: u64) {
+    // A handler still standing on the stack cannot have it taken away or
+    // moved, so what the frame says is not acted on there.
+    if task.sig_stack.get().contains(sp) {
+        return;
+    }
+    let ss_sp = get64(buf, UC_STACK);
+    let ss_flags = get64(buf, UC_STACK + 8) as u32 as i32;
+    let ss_size = get64(buf, UC_STACK + 16);
+    let stack = if ss_flags & crate::abi::SS_DISABLE != 0 || ss_size < MIN_ALT_STACK {
+        crate::abi::SigAltStack::default()
+    } else {
+        crate::abi::SigAltStack { ss_sp, ss_flags: 0, _pad: 0, ss_size }
+    };
+    task.sig_stack.set(stack);
 }
 
 /// Build a signal frame on the user stack and redirect `frame` into
@@ -69,9 +94,17 @@ pub fn enter_signal_handler(
     action: &SigAction,
     frame: &mut TrapFrame,
 ) -> bool {
+    // A disposition that asked for its own stack gets it, unless a handler is
+    // already running on it -- nesting continues down the same stack rather
+    // than starting again at its top, which would write over the frame the
+    // outer handler is using.
+    let alt = task.sig_stack.get();
+    let on_alt = action.flags & SA_ONSTACK != 0 && alt.installed() && !alt.contains(frame.rsp);
     // Leave the red zone alone, then place the frame so that the handler sees
-    // the alignment a `call` would have produced.
-    let mut sp = frame.rsp.saturating_sub(128);
+    // the alignment a `call` would have produced. The red zone belongs to the
+    // interrupted function's own stack, so a frame that starts at the top of a
+    // fresh one has nothing below it to leave alone.
+    let mut sp = if on_alt { alt.ss_sp + alt.ss_size } else { frame.rsp.saturating_sub(128) };
     sp = sp.saturating_sub(FRAME_SIZE as u64);
     sp &= !0xFu64;
     sp = sp.wrapping_sub(8);
@@ -83,10 +116,12 @@ pub fn enter_signal_handler(
 
     put64(&mut buf, UC_FLAGS, 0);
     put64(&mut buf, UC_LINK, 0);
-    // uc_stack: no alternate stack is in use.
-    put64(&mut buf, UC_STACK, 0);
-    put64(&mut buf, UC_STACK + 8, 0);
-    put64(&mut buf, UC_STACK + 16, 0);
+    // uc_stack: the alternate stack as it stood when the handler was entered,
+    // which is what `rt_sigreturn` puts back and what a handler asking where
+    // it is reads.
+    put64(&mut buf, UC_STACK, alt.ss_sp);
+    put64(&mut buf, UC_STACK + 8, alt.flags_at(frame.rsp) as u32 as u64);
+    put64(&mut buf, UC_STACK + 16, alt.ss_size);
 
     let m = MCONTEXT;
     put64(&mut buf, m + SC_R8, frame.r8);
@@ -175,6 +210,7 @@ pub fn leave_signal_handler(task: &Task, frame: &mut TrapFrame) -> SysResult {
     frame.rflags = (flags & 0x0000_08D5) | 0x202;
 
     task.signal_mask.set(get64(&buf, UC_SIGMASK));
+    restore_alt_stack(task, &buf, base);
 
     // Put the interrupted code's floating point and vector registers back.
     if get64(&buf, m + SC_FPSTATE) != 0 {

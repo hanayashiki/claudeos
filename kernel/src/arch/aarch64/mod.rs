@@ -30,7 +30,7 @@ global_asm!(include_str!("switch.s"));
 // portable half today; they are listed here because this file is the contract.
 #[allow(unused_imports)]
 pub use clock::{counter_frequency, cycle_counter, read_wall_clock, WallClock};
-pub use signal_frame::{enter_signal_handler, leave_signal_handler};
+pub use signal_frame::{enter_signal_handler, leave_signal_handler, MIN_ALT_STACK};
 pub use syscall::{
     arch_prctl, clone_args, fork_child_frame, init_syscall_entry, set_syscall_result, syscall_args,
     syscall_number, syscall_result,
@@ -43,9 +43,9 @@ pub use task::{
 pub use trap::{
     dump_registers, end_of_interrupt, exception_name, exception_signal, fault_probe_registers,
     init_interrupt_controller, init_timer, instruction_pointer, irq_vector, mask_irq, page_fault,
-    register_irq_handler, register_trap_handler, trap_error_code, trap_vector, unmask_irq,
-    vector_irq, Handler, PageFault, TrapFrame, EXCEPTION_COUNT, IRQ_COUNT, KEYBOARD_IRQ,
-    PAGE_FAULT_VECTOR, SERIAL_IRQ, SERIAL_IRQ_ALT, TICK_HZ, TIMER_IRQ,
+    register_irq_handler, register_trap_handler, stack_pointer, trap_error_code, trap_vector,
+    unmask_irq, vector_irq, Handler, PageFault, TrapFrame, EXCEPTION_COUNT, IRQ_COUNT,
+    KEYBOARD_IRQ, PAGE_FAULT_VECTOR, SERIAL_IRQ, SERIAL_IRQ_ALT, TICK_HZ, TIMER_IRQ,
 };
 
 /// What this machine calls itself: `uname`'s `machine` field, and the string a

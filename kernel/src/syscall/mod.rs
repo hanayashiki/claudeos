@@ -243,7 +243,7 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::RT_SIGACTION => proc::rt_sigaction(args[0] as usize, args[1], args[2]),
         nr::RT_SIGPROCMASK => proc::rt_sigprocmask(args[0] as u32, args[1], args[2]),
         nr::RT_SIGSUSPEND => Err(Errno::EINTR),
-        nr::SIGALTSTACK => Ok(0),
+        nr::SIGALTSTACK => proc::sigaltstack(args[0], args[1], arch::stack_pointer(frame)),
         nr::RT_SIGRETURN => proc::rt_sigreturn(frame),
 
         // ---- misc -----------------------------------------------------

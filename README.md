@@ -327,7 +327,15 @@ loader bring up Alpine's userland.
 **Signals.** A handler installed with `rt_sigaction` is really entered: the
 kernel writes the same `rt_sigframe` Linux does onto the user stack, points the
 return address at the libc restorer, and `rt_sigreturn` puts the interrupted
-state back. Terminal signals are raised from the interrupt that receives the
+state back. A disposition that asked for `SA_ONSTACK` is entered on the stack
+`sigaltstack` named rather than on the interrupted one, and `sigaltstack` is
+answered rather than accepted and forgotten: a program that asks where its
+handler would run is told, and one that has named no stack is told that. A
+runtime that reads the answer back before deciding what to do needs both, and
+Go is one -- its scheduler interrupts a running thread with a signal, and the
+first thing its handler does is work out which stack it is standing on.
+
+Terminal signals are raised from the interrupt that receives the
 character, so `Ctrl-C` reaches a running job while the shell is blocked waiting
 for it. The shell puts each job in its own process group and hands it the
 terminal, so interrupting a job leaves the shell running.

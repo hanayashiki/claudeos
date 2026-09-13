@@ -22,7 +22,7 @@
 use super::task::VECTOR_BYTES;
 use super::trap::TrapFrame;
 use crate::abi::SysResult;
-use crate::signal::{SigAction, SA_NODEFER};
+use crate::signal::{SigAction, SA_NODEFER, SA_ONSTACK};
 use crate::task::Task;
 use crate::uaccess;
 
@@ -71,6 +71,13 @@ const FRAME_SIZE: usize = SC_RESERVED + SC_RESERVED_SIZE;
 /// something walking the stack from inside a handler can step over it.
 const RECORD_SIZE: usize = 16;
 
+/// The least an alternate stack may be and still be accepted, which is what
+/// Linux asks for on this machine. It is larger than x86-64's because the
+/// frame is: the vector registers go in a four-kilobyte area rather than at a
+/// fixed offset. The frame this file writes is smaller than it, so a stack
+/// that passes has room for one.
+pub const MIN_ALT_STACK: u64 = 5120;
+
 fn put64(buf: &mut [u8], offset: usize, value: u64) {
     buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
@@ -89,6 +96,26 @@ fn get32(buf: &[u8], offset: usize) -> u32 {
     let mut bytes = [0u8; 4];
     bytes.copy_from_slice(&buf[offset..offset + 4]);
     u32::from_le_bytes(bytes)
+}
+
+/// Take the alternate stack back from `uc_stack`, which is where the handler
+/// could have changed it. A handler that left the field alone puts back what
+/// was already there.
+fn restore_alt_stack(task: &Task, buf: &[u8], sp: u64) {
+    // A handler still standing on the stack cannot have it taken away or
+    // moved, so what the frame says is not acted on there.
+    if task.sig_stack.get().contains(sp) {
+        return;
+    }
+    let ss_sp = get64(buf, UC_STACK);
+    let ss_flags = get64(buf, UC_STACK + 8) as u32 as i32;
+    let ss_size = get64(buf, UC_STACK + 16);
+    let stack = if ss_flags & crate::abi::SS_DISABLE != 0 || ss_size < MIN_ALT_STACK {
+        crate::abi::SigAltStack::default()
+    } else {
+        crate::abi::SigAltStack { ss_sp, ss_flags: 0, _pad: 0, ss_size }
+    };
+    task.sig_stack.set(stack);
 }
 
 /// Build a signal frame on the user stack and redirect `frame` into
@@ -118,7 +145,14 @@ pub fn enter_signal_handler(
         return false;
     }
 
-    let sp = (frame.sp.saturating_sub((FRAME_SIZE + RECORD_SIZE) as u64)) & !0xFu64;
+    // A disposition that asked for its own stack gets it, unless a handler is
+    // already running on it -- nesting continues down the same stack rather
+    // than starting again at its top, which would write over the frame the
+    // outer handler is using.
+    let alt = task.sig_stack.get();
+    let on_alt = action.flags & SA_ONSTACK != 0 && alt.installed() && !alt.contains(frame.sp);
+    let below = if on_alt { alt.ss_sp + alt.ss_size } else { frame.sp };
+    let sp = (below.saturating_sub((FRAME_SIZE + RECORD_SIZE) as u64)) & !0xFu64;
 
     let mut buf = [0u8; WRITTEN_SIZE];
 
@@ -129,10 +163,12 @@ pub fn enter_signal_handler(
 
     put64(&mut buf, UC_FLAGS, 0);
     put64(&mut buf, UC_LINK, 0);
-    // uc_stack: no alternate stack is in use.
-    put64(&mut buf, UC_STACK, 0);
-    put64(&mut buf, UC_STACK + 8, 0);
-    put64(&mut buf, UC_STACK + 16, 0);
+    // uc_stack: the alternate stack as it stood when the handler was entered,
+    // which is what `rt_sigreturn` puts back and what a handler asking where
+    // it is reads.
+    put64(&mut buf, UC_STACK, alt.ss_sp);
+    put64(&mut buf, UC_STACK + 8, alt.flags_at(frame.sp) as u32 as u64);
+    put64(&mut buf, UC_STACK + 16, alt.ss_size);
     put64(&mut buf, UC_SIGMASK, task.signal_mask.get());
 
     put64(&mut buf, SC_FAULT_ADDRESS, frame.far);
@@ -206,6 +242,7 @@ pub fn leave_signal_handler(task: &Task, frame: &mut TrapFrame) -> SysResult {
     frame.spsr = get64(&buf, SC_PSTATE) & 0xF000_0000;
 
     task.signal_mask.set(get64(&buf, UC_SIGMASK));
+    restore_alt_stack(task, &buf, base);
 
     // Put the interrupted code's vector registers back, if the record saying
     // where they are is the one this kernel wrote.

@@ -73,6 +73,13 @@ pub fn fork(
     child.set_name(parent.name());
     child.umask.set(parent.umask.get());
     child.copy_actions_from(&parent);
+    // A fork's child has its own copy of the stack the parent named, so it
+    // keeps the naming. A thread shares the parent's memory, and two handlers
+    // running on one stack would write over each other, so it starts with
+    // none and installs its own.
+    if !share_vm {
+        child.sig_stack.set(parent.sig_stack.get());
+    }
     // The child carries on from the same instruction, so it starts on the
     // registers the parent is holding right now, thread pointer included
     // unless the caller named a new one.
@@ -702,6 +709,53 @@ pub fn rt_sigaction(signal: usize, act: u64, old: u64) -> SysResult {
             },
         );
     }
+    Ok(0)
+}
+
+/// `sigaltstack`: report the stack a handler would run on, and name a new one.
+///
+/// `sp` is where the program's stack pointer is now, which is what says
+/// whether it is running on the stack it is asking about: one that is in use
+/// may be reported but not replaced, because replacing it would leave the
+/// handler running on memory nothing accounts for any more.
+pub fn sigaltstack(new: u64, old: u64, sp: u64) -> SysResult {
+    let task = sched::current();
+    let current = task.sig_stack.get();
+    let on_it = current.contains(sp);
+
+    if old != 0 {
+        let reported = SigAltStack {
+            ss_sp: current.ss_sp,
+            ss_flags: current.flags_at(sp),
+            _pad: 0,
+            ss_size: current.ss_size,
+        };
+        uaccess::write_struct(old, &reported)?;
+    }
+    if new == 0 {
+        return Ok(0);
+    }
+    if on_it {
+        return Err(Errno::EPERM);
+    }
+
+    let asked: SigAltStack = uaccess::read_struct(new)?;
+    if asked.ss_flags & !(SS_ONSTACK | SS_DISABLE) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if asked.ss_flags & SS_DISABLE != 0 {
+        task.sig_stack.set(SigAltStack::default());
+        return Ok(0);
+    }
+    if asked.ss_size < arch::MIN_ALT_STACK {
+        return Err(Errno::ENOMEM);
+    }
+    task.sig_stack.set(SigAltStack {
+        ss_sp: asked.ss_sp,
+        ss_flags: 0,
+        _pad: 0,
+        ss_size: asked.ss_size,
+    });
     Ok(0)
 }
 

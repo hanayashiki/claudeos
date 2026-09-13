@@ -317,6 +317,50 @@ pub struct RLimit {
 
 pub const RLIM_INFINITY: u64 = u64::MAX;
 
+/// `stack_t`: the alternate stack a handler runs on when its disposition
+/// asked for one. Twenty-four bytes on both machines, the flags word padded
+/// out to the alignment the two pointers need.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SigAltStack {
+    pub ss_sp: u64,
+    pub ss_flags: i32,
+    /// What the compiler would leave between the flags and the size anyway.
+    /// It is named because the structure is written to user memory as a value
+    /// rather than as bytes, and a hole nothing assigns to is whatever the
+    /// kernel stack held there.
+    pub _pad: u32,
+    pub ss_size: u64,
+}
+
+impl SigAltStack {
+    /// Whether a stack has been installed at all. Taking it away is `ss_size`
+    /// going to zero, which is what `SS_DISABLE` asks for.
+    pub fn installed(&self) -> bool {
+        self.ss_size != 0
+    }
+
+    /// Whether `sp` is inside it.
+    pub fn contains(&self, sp: u64) -> bool {
+        self.installed() && sp >= self.ss_sp && sp < self.ss_sp + self.ss_size
+    }
+
+    /// What `sigaltstack` reports for the stack in place, given where the
+    /// program's stack pointer is now.
+    pub fn flags_at(&self, sp: u64) -> i32 {
+        if !self.installed() {
+            SS_DISABLE
+        } else if self.contains(sp) {
+            SS_ONSTACK
+        } else {
+            0
+        }
+    }
+}
+
+pub const SS_ONSTACK: i32 = 1;
+pub const SS_DISABLE: i32 = 2;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WinSize {
