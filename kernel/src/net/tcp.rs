@@ -23,21 +23,28 @@
 //! which copy it answers -- and a timeout doubles the timeout and leaves it
 //! doubled until a segment that went out once is acknowledged.
 //!
-//! What is not here, all of which only matters on a link that loses or
-//! reorders packets:
+//! A segment lost out of the middle of a stream is not waited out. Three
+//! acknowledgements naming the same byte mean the segments behind that one
+//! arrived, so it alone is sent again and the ones behind it are not. RFC
+//! 6582's partial acknowledgement handling covers a second loss inside the
+//! same window without leaving recovery. The congestion response goes with
+//! it: the threshold halves and the window comes down to it, because
+//! retransmitting quickly and sending just as much as before is worse on a
+//! congested link than doing neither.
 //!
-//!   * Loss recovery is the retransmission timer alone. There is no duplicate
-//!     acknowledgement count, no fast retransmit, no fast recovery, and no
-//!     selective acknowledgement, so one lost segment costs a whole timeout
-//!     and a go-back-N retransmission.
-//!   * Congestion control is slow start and the textbook congestion avoidance
-//!     increment, reset to one segment on every timeout. Without duplicate
-//!     acknowledgements there is nothing else it could react to.
-//!   * No Nagle, no delayed acknowledgement, no window scaling, no timestamps
-//!     and so no protection against wrapped sequence numbers.
+//! What is not here:
 //!
-//! On a quiet link -- which is what QEMU's user mode network is -- none of
-//! that shows. On a lossy one it would be slow rather than wrong.
+//!   * No selective acknowledgement. A lost segment is found by the
+//!     acknowledgements repeating, one loss per round trip, rather than by
+//!     the other end naming what it has; on a link that loses several
+//!     segments out of one window that is slower, and it is still correct.
+//!   * No window scaling, so the window is bounded at 64 KiB, which bounds
+//!     throughput on a link whose delay and bandwidth multiply out past that.
+//!   * No timestamps, and so no protection against wrapped sequence numbers,
+//!     and one round trip sample in flight at a time rather than one per
+//!     segment.
+//!   * No Nagle and no delayed acknowledgement: every segment is sent as soon
+//!     as there is a window for it and answered as soon as it arrives.
 
 use super::ip::{self, Ipv4Addr};
 use super::socket::{self, Endpoint, InetSocket, Protocol};
@@ -75,6 +82,11 @@ const INITIAL_RTO: u64 = 100;
 const MIN_RTO: u64 = 20;
 const MAX_RTO: u64 = 600;
 const MAX_RETRIES: u32 = 8;
+/// RFC 5681: acknowledgements naming the same byte that mean the segment for
+/// it was lost rather than that two arrived in the wrong order. Fewer would
+/// fire on ordinary reordering, which costs a retransmission that was never
+/// needed; more waits longer than the segments behind the gap take to arrive.
+const DUPLICATE_ACK_THRESHOLD: u32 = 3;
 const SYN_RETRIES: u32 = 5;
 /// Twice the maximum segment lifetime. A real stack waits sixty seconds; this
 /// waits ten, because nothing here runs long enough for a segment from an old
@@ -444,6 +456,19 @@ pub struct Tcb {
 
     congestion_window: u32,
     slow_start_threshold: u32,
+    /// Acknowledgements that named the byte the one before named.
+    duplicate_acks: u32,
+    /// While recovering from a loss the duplicate acknowledgements found:
+    /// the highest sequence number that had been sent when it was found.
+    /// RFC 6582's `recover`. Recovery ends when everything up to it has been
+    /// acknowledged, and a gap found before then belongs to the same loss
+    /// rather than to a new one.
+    recover: Option<u32>,
+    /// Segments sent again because three acknowledgements said the same
+    /// thing, and segments sent again because the clock ran out. Counted so
+    /// the suite can say which of the two recovered a loss.
+    pub fast_retransmits: u32,
+    pub timeouts: u32,
 
     pub backlog: usize,
     pub children: Vec<Arc<InetSocket>>,
@@ -489,6 +514,10 @@ impl Tcb {
             expire_at: 0,
             congestion_window: MSS as u32,
             slow_start_threshold: 64 * 1024,
+            duplicate_acks: 0,
+            recover: None,
+            fast_retransmits: 0,
+            timeouts: 0,
             backlog: 1,
             children: Vec::new(),
         }
@@ -594,6 +623,10 @@ impl Tcb {
 
     pub fn smoothed_round_trip(&self) -> u32 {
         self.srtt
+    }
+
+    pub fn slow_start_threshold(&self) -> u32 {
+        self.slow_start_threshold
     }
 
     fn arm_retransmit(&mut self) {
@@ -790,6 +823,55 @@ impl Tcb {
         }
     }
 
+    /// Send the first segment of what is still unacknowledged again,
+    /// without moving the point new data is sent from. This is the one
+    /// segment the duplicate acknowledgements say is missing; everything
+    /// behind it arrived, so sending that too would be sending it twice.
+    fn retransmit_head(&mut self) {
+        let n = self.pending.len().min(self.effective_mss());
+        if n == 0 {
+            // Nothing but a finish is outstanding.
+            match self.fin_sequence {
+                Some(sequence) if !self.fin_acknowledged => {
+                    self.send_segment(FIN | ACK, sequence, &[], false);
+                }
+                _ => return,
+            }
+        } else {
+            let chunk: Vec<u8> = self.pending.iter().take(n).copied().collect();
+            let flags = ACK | if n == self.pending.len() { PSH } else { 0 };
+            let sequence = self.send_unacknowledged;
+            self.send_segment(flags, sequence, &chunk, false);
+        }
+        // Karn: nothing sent twice is timed. RFC 6298 5.5: the timer starts
+        // over from the retransmission.
+        self.timed = None;
+        self.retransmit_at = crate::trap::ticks() + self.rto;
+    }
+
+    /// RFC 5681: three acknowledgements naming the same byte mean the segment
+    /// that byte is in went missing and the segments behind it arrived, which
+    /// is enough to send that one again now rather than when the clock says
+    /// so.
+    ///
+    /// The congestion response goes with it rather than being left out.
+    /// Duplicate acknowledgements mean segments were dropped somewhere, and a
+    /// machine that answers that by retransmitting quickly and sending just
+    /// as much as before is worse on a congested link than one that does
+    /// neither.
+    fn enter_recovery(&mut self) {
+        let flight = self.send_high.wrapping_sub(self.send_unacknowledged);
+        self.slow_start_threshold = (flight / 2).max(2 * MSS as u32);
+        self.recover = Some(self.send_high);
+        self.fast_retransmits += 1;
+        self.retransmit_head();
+        // Three segments have left the network since the missing one, which
+        // is what the three added here stand for.
+        self.congestion_window = self
+            .slow_start_threshold
+            .saturating_add(DUPLICATE_ACK_THRESHOLD * MSS as u32);
+    }
+
     // ---- input -----------------------------------------------------------
 
     /// RFC 793 section 3.9's first test: does this segment fall anywhere in
@@ -888,6 +970,16 @@ impl Tcb {
 
         let mut woke = false;
         let acknowledgement = segment.acknowledgement;
+        // RFC 5681's duplicate acknowledgement: it carries nothing, changes
+        // nothing, names the byte already named, and there is data
+        // outstanding for it to be about. Tested before the window this
+        // segment carries is taken, because an unchanged window is one of the
+        // things that makes it a duplicate.
+        let duplicate = segment.payload.is_empty()
+            && segment.flags & (SYN | FIN) == 0
+            && acknowledgement == self.send_unacknowledged
+            && seq_lt(self.send_unacknowledged, self.send_high)
+            && segment.window as u32 == self.send_window;
 
         if self.state == State::SynReceived {
             if seq_lt(self.send_unacknowledged, acknowledgement)
@@ -931,18 +1023,52 @@ impl Tcb {
                 self.send_next = self.send_unacknowledged;
             }
             self.retries = 0;
-            if self.congestion_window < self.slow_start_threshold {
-                self.congestion_window = self.congestion_window.saturating_add(MSS as u32);
-            } else {
-                let increment = (MSS * MSS) as u32 / self.congestion_window.max(1);
-                self.congestion_window = self.congestion_window.saturating_add(increment.max(1));
-            }
+            self.duplicate_acks = 0;
             self.retransmit_at = if self.send_unacknowledged == self.send_next {
                 0
             } else {
                 crate::trap::ticks() + self.rto
             };
+            match self.recover {
+                Some(recover) if seq_lt(acknowledgement, recover) => {
+                    // Only part of what was outstanding when the loss was
+                    // found: a second segment behind the first was lost too,
+                    // and this acknowledgement says which one. RFC 6582.
+                    self.congestion_window = self
+                        .congestion_window
+                        .saturating_sub(acked as u32)
+                        .saturating_add(MSS as u32)
+                        .max(MSS as u32);
+                    self.fast_retransmits += 1;
+                    self.retransmit_head();
+                }
+                Some(_) => {
+                    // Everything that was outstanding then has arrived: the
+                    // loss is behind us and the window comes back down to
+                    // what the loss set it to.
+                    self.recover = None;
+                    self.congestion_window = self.slow_start_threshold;
+                }
+                None if self.congestion_window < self.slow_start_threshold => {
+                    self.congestion_window = self.congestion_window.saturating_add(MSS as u32);
+                }
+                None => {
+                    let increment = (MSS * MSS) as u32 / self.congestion_window.max(1);
+                    self.congestion_window = self.congestion_window.saturating_add(increment.max(1));
+                }
+            }
             woke = true;
+        }
+
+        if duplicate {
+            self.duplicate_acks += 1;
+            if self.duplicate_acks == DUPLICATE_ACK_THRESHOLD && self.recover.is_none() {
+                self.enter_recovery();
+            } else if self.duplicate_acks > DUPLICATE_ACK_THRESHOLD {
+                // Each one past the third says one more segment has left the
+                // network, so there is room for one more to go in.
+                self.congestion_window = self.congestion_window.saturating_add(MSS as u32);
+            }
         }
 
         // The send window, taken from the most recent segment that carries a
@@ -1318,9 +1444,14 @@ impl Tcb {
         self.rto = (self.rto * 2).min(MAX_RTO);
         self.timed = None;
         self.retransmit_at = now + self.rto;
-        let flight = self.send_next.wrapping_sub(self.send_unacknowledged);
+        let flight = self.send_high.wrapping_sub(self.send_unacknowledged);
         self.slow_start_threshold = (flight / 2).max(2 * MSS as u32);
         self.congestion_window = MSS as u32;
+        // Whatever the duplicate acknowledgements were saying, the clock
+        // running out says more: start again from one segment.
+        self.recover = None;
+        self.duplicate_acks = 0;
+        self.timeouts += 1;
 
         match self.state {
             State::SynSent => self.send_segment(SYN, self.iss, &[], true),

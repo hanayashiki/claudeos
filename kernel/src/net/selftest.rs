@@ -285,6 +285,8 @@ pub fn run() -> bool {
     reassembly(&mut report, nic);
     crate::println!("net: the round trip, measured");
     round_trip_estimate(&mut report, nic);
+    crate::println!("net: a segment lost out of the middle of a stream");
+    fast_retransmit(&mut report, nic);
     crate::println!("net: a connection the program has closed");
     abandoned_connection(&mut report, nic);
     crate::println!("net: addresses this machine does not have");
@@ -1223,8 +1225,8 @@ fn lossy_link(report: &mut Report, nic: &'static FakeNic) {
     );
     report.check("with several segments lost on the way", peer.to_peer.lost >= 9);
     report.check(
-        "and no more waits on the clock than there were losses",
-        timeouts <= peer.to_peer.lost,
+        "and fewer waits on the clock than there were losses",
+        timeouts < peer.to_peer.lost,
     );
     peer.finish();
     socket::reset();
@@ -1851,6 +1853,71 @@ fn round_trip_estimate(report: &mut Report, nic: &'static FakeNic) {
     report.check(
         "a segment sent once brings the timeout back down",
         rto_of(&peer.socket) < backed_off,
+    );
+    peer.finish();
+    socket::reset();
+    nic.take();
+}
+
+fn fast_retransmits_of(socket: &Arc<InetSocket>) -> u32 {
+    match &*socket.inner.lock() {
+        Protocol::Tcp(tcb) => tcb.fast_retransmits,
+        Protocol::Udp(_) => 0,
+    }
+}
+
+fn timeouts_of(socket: &Arc<InetSocket>) -> u32 {
+    match &*socket.inner.lock() {
+        Protocol::Tcp(tcb) => tcb.timeouts,
+        Protocol::Udp(_) => 0,
+    }
+}
+
+fn slow_start_threshold_of(socket: &Arc<InetSocket>) -> u32 {
+    match &*socket.inner.lock() {
+        Protocol::Tcp(tcb) => tcb.slow_start_threshold(),
+        Protocol::Udp(_) => 0,
+    }
+}
+
+/// A segment lost out of the middle of a stream is sent again on the third
+/// acknowledgement that says the same thing, without waiting out a timeout.
+fn fast_retransmit(report: &mut Report, nic: &'static FakeNic) {
+    const SERVER_PORT: u16 = 8088;
+
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40800, 21_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    // Far enough into the stream that several segments are in flight behind
+    // the one that goes missing, which is what produces the repeated
+    // acknowledgements at all.
+    let mut fates = [Fate::Pass; 9];
+    fates[8] = Fate::Lose;
+    peer.to_peer.script(&fates);
+    let opened = slow_start_threshold_of(&peer.socket);
+    let body: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
+    let waits = transfer(&mut peer, &body);
+
+    report.check("the stream arrives whole", peer.stream == body);
+    report.check(
+        "after the other end said the same thing three times or more",
+        peer.repeated_acks >= 3,
+    );
+    report.check(
+        "the missing segment was sent again on that",
+        fast_retransmits_of(&peer.socket) >= 1,
+    );
+    report.check(
+        "and the clock was never waited out",
+        waits == 0 && timeouts_of(&peer.socket) == 0,
+    );
+    // A machine that retransmits quickly and sends just as much as before is
+    // worse on a congested link than one that does neither.
+    report.check(
+        "and the point it stops opening the window at came down with it",
+        slow_start_threshold_of(&peer.socket) < opened,
     );
     peer.finish();
     socket::reset();
