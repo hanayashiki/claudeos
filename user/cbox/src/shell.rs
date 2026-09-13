@@ -1011,6 +1011,10 @@ enum Flow {
     /// The foreground job was suspended. Whatever was going to run after it
     /// does not: the user is back at the prompt.
     Stopped,
+    /// The foreground job was killed by the interrupt key. Everything the
+    /// command was running inside -- a loop, a list, a function body -- gives
+    /// up with it, or the key would end one iteration and start the next.
+    Interrupted,
 }
 
 /// One pipeline the shell is keeping track of: either running in the
@@ -1059,6 +1063,10 @@ pub struct Shell {
     exit_trap: Option<String>,
     /// Set when expanding a word failed, so the command is not run.
     expansion_failed: bool,
+    /// Set when the interrupt key killed the foreground job. Read on the way
+    /// out of every block, because the paths that lose the flow -- a sourced
+    /// file, a command substitution -- have nothing else to report it with.
+    interrupted: bool,
     /// One frame per function call in progress, holding what each name
     /// declared `local` meant before the call.
     locals: Vec<Vec<(String, Option<String>)>>,
@@ -1094,6 +1102,7 @@ impl Shell {
             condition_depth: 0,
             exit_trap: None,
             expansion_failed: false,
+            interrupted: false,
             locals: Vec::new(),
         }
     }
@@ -1119,6 +1128,7 @@ impl Shell {
             condition_depth: 0,
             exit_trap: None,
             expansion_failed: false,
+            interrupted: false,
             locals: Vec::new(),
         }
     }
@@ -1170,6 +1180,9 @@ impl Shell {
 
         loop {
             self.reap_background();
+            // The interrupt that ended the last command is spent: being back
+            // here is what it asked for.
+            self.interrupted = false;
             let prompt = if pending.is_empty() { self.prompt() } else { "> ".to_string() };
             let completer = self.completer();
 
@@ -1305,6 +1318,9 @@ impl Shell {
             let flow = self.exec_node(node);
             if flow != Flow::Normal {
                 return flow;
+            }
+            if self.interrupted {
+                return Flow::Interrupted;
             }
         }
         Flow::Normal
@@ -1460,6 +1476,11 @@ impl Shell {
             self.expansion_failed = false;
             self.last_status = 1;
             return Flow::Normal;
+        }
+        // A command substitution that the interrupt key killed leaves nothing
+        // worth running the command with.
+        if self.interrupted {
+            return Flow::Interrupted;
         }
         if commands.is_empty() {
             return Flow::Normal;
@@ -1646,6 +1667,9 @@ impl Shell {
         if stopped {
             return Flow::Stopped;
         }
+        if self.interrupted {
+            return Flow::Interrupted;
+        }
         Flow::Normal
     }
 
@@ -1685,8 +1709,14 @@ impl Shell {
             self.next_job += 1;
             eprintln!("[{}]+  Stopped  {}", job.id, job.command);
             self.jobs.push(job);
-        } else if interrupted {
+        } else if interrupted && self.job_control {
+            // Only the shell that handed the job the terminal takes this for
+            // the key having been pressed. A script's shell is in the same
+            // group as its children, so the real key kills it outright, and a
+            // child that dies of SIGINT there is just a child that died: no
+            // "^C" was echoed to move off and nothing is abandoned.
             println!();
+            self.interrupted = true;
         }
         (status, stopped)
     }
@@ -2600,6 +2630,14 @@ impl Shell {
         };
         let pid = sys::fork();
         if pid == 0 {
+            // The keyboard signals are the interactive shell's to ignore.
+            // This subshell has to take them, or the key that was meant to
+            // abandon the command reaches only what the subshell is running.
+            if self.job_control {
+                for signum in [sys::SIGINT, sys::SIGQUIT] {
+                    sys::set_signal(signum, sys::SIG_DFL);
+                }
+            }
             sys::close(read_fd);
             sys::dup2(write_fd, sys::STDOUT);
             sys::close(write_fd);
@@ -2626,6 +2664,9 @@ impl Shell {
         sys::close(read_fd);
         let (_, status) = sys::wait4(pid as i32, 0);
         self.last_status = sys::exit_code_of(status);
+        if sys::signal_of(status) == Some(sys::SIGINT) && self.job_control {
+            self.interrupted = true;
+        }
 
         let mut captured = String::from_utf8_lossy(&collected).to_string();
         while captured.ends_with('\n') || captured.ends_with('\r') {

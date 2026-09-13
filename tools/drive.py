@@ -220,9 +220,9 @@ class TerminalConsole:
         os.close(slave)
 
     def recv(self):
-        if not select.select([self.master], [], [], 0.3)[0]:
-            return b""
         try:
+            if not select.select([self.master], [], [], 0.3)[0]:
+                return b""
             chunk = os.read(self.master, 4096)
         except OSError:
             return None
@@ -324,9 +324,11 @@ def main():
     while time.time() < deadline and console.process.poll() is None:
         time.sleep(0.2)
 
+    # Stop the reader before taking its console away, or a session that ran
+    # to the deadline ends on a read of a descriptor that has just been shut.
     stop.set()
-    console.close()
     thread.join(timeout=2)
+    console.close()
     if screen is not None:
         screen.close()
     return 0

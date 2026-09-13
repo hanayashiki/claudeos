@@ -330,6 +330,15 @@ behaves.
 IFS, and a reserved word is reserved only where a command can start, so `echo
 done` prints "done".
 
+The interrupt key abandons the whole command, not just the process that was
+running when it was pressed: a `while` or `for` loop, an enclosing list, a
+function body and a command substitution all give up with it and the prompt
+comes back with a status of 130. An interactive shell ignores the key itself,
+so what it has to go on is the wait status of the job it handed the terminal
+to. A script's shell is in the same process group as its children, so the key
+kills it outright, and a child that dies of `SIGINT` for its own reasons there
+does not end the script -- which is what bash and dash do.
+
 At the prompt it puts the terminal in raw mode and edits the line itself:
 arrow-key history, left/right cursor movement, Home/End/Delete,
 Ctrl-A/E/B/F/K/U/W/L, a `history` builtin, and tab completion of command names
@@ -391,8 +400,8 @@ failures.
   `scripts/run.sh` on a pseudo-terminal rather than over a socket. A socket
   hands the guest whatever byte is written to it, so it cannot say whether the
   terminal in front of QEMU would have kept `Ctrl-C` for the host; this one
-  interrupts a foreground `cat` and requires the prompt back and the next
-  command run.
+  interrupts a foreground `cat` and then a `while true` loop, and requires the
+  prompt back and the next command run each time.
 
 Every suite is an ordinary Linux program. Nothing in them is aware that they
 are not running on Linux.

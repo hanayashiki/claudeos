@@ -116,6 +116,8 @@ run_interrupt_key() {
       "until:claudeos shell" "wait:1" \
       "cat\n" "wait:1" "into-cat\n" "wait:1" "\x03" "wait:1.5" \
       "echo prompt-came-back\n" "wait:1.5" \
+      "while true; do sleep 1; done\n" "wait:2.5" "\x03" "wait:2" \
+      "echo loop-came-back\n" "wait:1.5" \
       "exit\n" "wait:4" 2>&1 | tr -d '\r')"
   echo "$output"
   echo
@@ -125,7 +127,10 @@ run_interrupt_key() {
   # is there only if the key reached the guest at all. "prompt-came-back" on a
   # line of its own is the shell running a command afterwards: the same text
   # echoed by a cat that was never interrupted keeps "echo " in front of it.
-  for expected in "^into-cat$" "\^C" "^prompt-came-back$" "session ended"; do
+  # "loop-came-back" says the key ended the whole loop rather than the `sleep`
+  # the loop happened to be in, which would start the next iteration instead.
+  for expected in "^into-cat$" "\^C" "^prompt-came-back$" "^loop-came-back$" \
+                  "session ended"; do
     if ! echo "$output" | grep -q "$expected"; then
       echo "   missing expected output: $expected"
       ok=0
