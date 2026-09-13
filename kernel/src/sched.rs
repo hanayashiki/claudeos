@@ -511,6 +511,10 @@ pub fn post_signal(task: &mut Task, signal: i32) -> Option<u32> {
         if task.state == State::Stopped {
             task.state = State::Runnable;
             task.wake_at = 0;
+            // A stop nobody has been told about yet has stopped being true.
+            // Left standing it is handed to whatever asks next, which is a
+            // suspension reported after the job is running again.
+            task.report_stop = false;
             task.report_continue = true;
             restarted = Some(task.ppid);
         }

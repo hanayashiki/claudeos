@@ -287,6 +287,45 @@ fn what_a_wait_does_with_signals(report: &mut Report) {
     );
 }
 
+/// A stop nobody asked to be told about has to stop being reportable once the
+/// job is running again, or the next wait that does ask is handed a suspension
+/// that has already ended.
+fn a_continued_job_has_no_stop_to_report(report: &mut Report) {
+    use crate::sys;
+
+    const SIGKILL: i32 = 9;
+    const SIGCONT: i32 = 18;
+    const SIGTSTP: i32 = 20;
+    const WNOHANG: u64 = 1;
+    const WUNTRACED: u64 = 2;
+    const WCONTINUED: u64 = 8;
+
+    let child = sys::fork();
+    if child == 0 {
+        loop {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let child = child as i32;
+
+    sys::kill(child, SIGTSTP);
+    std::thread::sleep(Duration::from_millis(150));
+    // This wait does not ask about stops, so it is told nothing.
+    let (idle, _) = sys::wait4(child, WNOHANG);
+    sys::kill(child, SIGCONT);
+    std::thread::sleep(Duration::from_millis(150));
+    // This one asks about both, and the job is running.
+    let (pid, status) = sys::wait4(child, WNOHANG | WUNTRACED | WCONTINUED);
+
+    sys::kill(child, SIGKILL);
+    let _ = sys::wait4(child, 0);
+    report.check(
+        "a continued job has no stop left to report",
+        idle == 0 && pid == child as i64 && sys::is_continued(status),
+        format!("first wait {}, then {} status {:#x}", idle, pid, status),
+    );
+}
+
 /// A wait for a negative value below minus one names a process group, which is
 /// how a shell waits for a job rather than for one process of it.
 fn waiting_on_a_process_group(report: &mut Report) {
@@ -977,6 +1016,7 @@ pub fn main(_args: &[String]) -> i32 {
     thread_of_a_child_is_not_a_child(&mut report);
     a_child_exit_reaches_a_blocked_parent(&mut report);
     what_a_wait_does_with_signals(&mut report);
+    a_continued_job_has_no_stop_to_report(&mut report);
     waiting_on_a_process_group(&mut report);
     a_child_finds_its_own_proc_entry(&mut report);
     a_fork_while_a_sibling_writes(&mut report);
