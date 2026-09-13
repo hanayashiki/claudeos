@@ -307,6 +307,13 @@ pub struct Tcb {
     pub iss: u32,
     pub send_unacknowledged: u32,
     pub send_next: u32,
+    /// The highest sequence number this end has ever sent. `send_next` goes
+    /// back to the first unacknowledged byte when the timer retransmits, so
+    /// it is not what says whether an acknowledgement names something that
+    /// was sent: an acknowledgement for what went out before the timer moved
+    /// the pointer back is perfectly ordinary, and rejecting it deadlocks the
+    /// connection until it times out altogether.
+    pub send_high: u32,
     pub send_window: u32,
     window_sequence: u32,
     window_ack: u32,
@@ -360,6 +367,7 @@ impl Tcb {
             iss: 0,
             send_unacknowledged: 0,
             send_next: 0,
+            send_high: 0,
             send_window: MSS as u32,
             window_sequence: 0,
             window_ack: 0,
@@ -436,6 +444,14 @@ impl Tcb {
         self.arm_retransmit();
     }
 
+    /// Note that everything up to `sequence` has now been put on the wire.
+    fn sent_through(&mut self, sequence: u32) {
+        self.send_next = sequence;
+        if seq_lt(self.send_high, sequence) {
+            self.send_high = sequence;
+        }
+    }
+
     fn arm_retransmit(&mut self) {
         if self.retransmit_at == 0 {
             self.retransmit_at = crate::trap::ticks() + self.rto;
@@ -449,12 +465,13 @@ impl Tcb {
         self.iss = initial_sequence(self.local, self.remote);
         self.send_unacknowledged = self.iss;
         self.send_next = self.iss;
+        self.send_high = self.iss;
         self.state = State::SynSent;
         self.congestion_window = MSS as u32;
         self.rto = INITIAL_RTO;
         self.retries = 0;
         self.send_segment(SYN, self.iss, &[], true);
-        self.send_next = self.iss.wrapping_add(1);
+        self.sent_through(self.iss.wrapping_add(1));
         self.arm_retransmit();
     }
 
@@ -470,7 +487,8 @@ impl Tcb {
         self.window_sequence = segment.sequence;
         self.iss = initial_sequence(self.local, self.remote);
         self.send_unacknowledged = self.iss;
-        self.send_next = self.iss.wrapping_add(1);
+        self.send_high = self.iss;
+        self.sent_through(self.iss.wrapping_add(1));
         self.window_ack = self.iss;
         self.state = State::SynReceived;
         self.congestion_window = MSS as u32;
@@ -602,13 +620,13 @@ impl Tcb {
                 let last = offset + n == self.pending.len();
                 let flags = ACK | if last { PSH } else { 0 };
                 self.send_segment(flags, sequence, &chunk, false);
-                self.send_next = sequence.wrapping_add(n as u32);
+                self.sent_through(sequence.wrapping_add(n as u32));
                 self.arm_retransmit();
             } else if self.fin_queued && self.fin_sequence.is_none() {
                 let sequence = self.send_next;
                 self.send_segment(FIN | ACK, sequence, &[], false);
                 self.fin_sequence = Some(sequence);
-                self.send_next = sequence.wrapping_add(1);
+                self.sent_through(sequence.wrapping_add(1));
                 self.arm_retransmit();
                 break;
             } else {
@@ -716,7 +734,7 @@ impl Tcb {
 
         if self.state == State::SynReceived {
             if seq_lt(self.send_unacknowledged, acknowledgement)
-                && seq_le(acknowledgement, self.send_next)
+                && seq_le(acknowledgement, self.send_high)
             {
                 self.state = State::Established;
                 self.retransmit_at = 0;
@@ -730,7 +748,7 @@ impl Tcb {
         }
 
         if seq_gt(acknowledgement, self.send_unacknowledged)
-            && seq_le(acknowledgement, self.send_next)
+            && seq_le(acknowledgement, self.send_high)
         {
             let mut acked = acknowledgement.wrapping_sub(self.send_unacknowledged) as usize;
             if let Some(fin_sequence) = self.fin_sequence {
@@ -742,6 +760,11 @@ impl Tcb {
             let drop_count = acked.min(self.pending.len());
             self.pending.drain(..drop_count);
             self.send_unacknowledged = acknowledgement;
+            if seq_lt(self.send_next, self.send_unacknowledged) {
+                // The timer moved the pointer back over bytes that turned out
+                // to have arrived. There is nothing there left to send again.
+                self.send_next = self.send_unacknowledged;
+            }
             self.retries = 0;
             self.rto = INITIAL_RTO;
             if self.congestion_window < self.slow_start_threshold {
@@ -994,7 +1017,7 @@ impl Tcb {
                     let byte = [self.pending[0]];
                     let sequence = self.send_next;
                     self.send_segment(ACK, sequence, &byte, false);
-                    self.send_next = sequence.wrapping_add(1);
+                    self.sent_through(sequence.wrapping_add(1));
                 } else {
                     self.output();
                 }

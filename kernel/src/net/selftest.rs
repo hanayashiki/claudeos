@@ -1123,6 +1123,36 @@ fn ack_number(frame: &[u8]) -> Option<u32> {
     Some(tcp::Segment::parse(datagram)?.acknowledgement)
 }
 
+/// Write a whole stream out through a socket, letting the peer answer each
+/// segment, and moving the clock on whenever nothing else can move. Returns
+/// how many times the clock was what moved it.
+fn transfer(peer: &mut Peer, body: &[u8]) -> usize {
+    let mut offset = 0;
+    let mut timeouts = 0;
+    for _ in 0..8192 {
+        while offset < body.len() {
+            match peer.socket.send(&body[offset..], None) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => offset += n,
+            }
+        }
+        if peer.pump() > 0 {
+            continue;
+        }
+        if offset >= body.len() && peer.stream.len() >= body.len() {
+            break;
+        }
+        // Nothing arrived and nothing can arrive: what is left is the clock.
+        let deadline = deadline_of(&peer.socket);
+        if deadline == u64::MAX {
+            break;
+        }
+        fire_timer(&peer.socket, deadline);
+        timeouts += 1;
+    }
+    timeouts
+}
+
 /// What the link can do that a real one cannot be asked for: deliver a
 /// segment twice, damage one, and lose a chosen one out of a long stream.
 fn lossy_link(report: &mut Report, nic: &'static FakeNic) {
@@ -1169,6 +1199,30 @@ fn lossy_link(report: &mut Report, nic: &'static FakeNic) {
     );
     peer.finish();
 
+    // ---- a long transfer over a link that loses segments ----
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40502, 13_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    // One in seven of what this stack sends, for as far ahead as the stream
+    // reaches, so several separate losses have to be recovered from.
+    let fates: Vec<Fate> = (0..96)
+        .map(|i| if i % 7 == 6 { Fate::Lose } else { Fate::Pass })
+        .collect();
+    peer.to_peer.script(&fates);
+    let body: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+    let timeouts = transfer(&mut peer, &body);
+    report.check(
+        "a transfer over a link that loses segments arrives whole",
+        peer.stream == body,
+    );
+    report.check("with several segments lost on the way", peer.to_peer.lost >= 9);
+    report.check(
+        "and no more waits on the clock than there were losses",
+        timeouts <= peer.to_peer.lost,
+    );
+    peer.finish();
     socket::reset();
     nic.take();
 }
