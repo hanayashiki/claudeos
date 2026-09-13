@@ -28,6 +28,8 @@ mod numbers {
     pub const SYS_WAIT4: u64 = 61;
     pub const SYS_RENAMEAT: u64 = 264;
     pub const SYS_EXIT_GROUP: u64 = 231;
+    pub const SYS_KILL: u64 = 62;
+    pub const SYS_NANOSLEEP: u64 = 35;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -42,6 +44,8 @@ mod numbers {
     pub const SYS_WAIT4: u64 = 260;
     pub const SYS_RENAMEAT: u64 = 38;
     pub const SYS_EXIT_GROUP: u64 = 94;
+    pub const SYS_KILL: u64 = 129;
+    pub const SYS_NANOSLEEP: u64 = 101;
 }
 
 use numbers::*;
@@ -201,6 +205,20 @@ pub fn read(fd: i32, buf: &mut [u8]) -> i64 {
             0,
         )
     }
+}
+
+/// Send a signal to a process by pid.
+pub fn kill(pid: i32, signal: i32) -> i64 {
+    unsafe { syscall(SYS_KILL, pid as i64 as u64, signal as i64 as u64, 0, 0, 0, 0) }
+}
+
+/// Sleep for `millis`, or until a signal arrives. A child that is only there
+/// to hold a share of its parent's pages waits here rather than spinning,
+/// because the two are the only things on the machine and a spin would take
+/// half of it.
+pub fn sleep_ms(millis: u64) -> i64 {
+    let spec = [millis / 1000, (millis % 1000) * 1_000_000];
+    unsafe { syscall(SYS_NANOSLEEP, spec.as_ptr() as u64, 0, 0, 0, 0, 0) }
 }
 
 pub fn close(fd: i32) -> i64 {

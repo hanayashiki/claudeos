@@ -396,7 +396,18 @@ impl Task {
     /// shared reference is what the validating path can hand over, and asking
     /// for an exclusive one there would mean a second one to a task the caller
     /// already holds.
-    pub fn handle_cow(&self, addr: u64) -> bool {
+    ///
+    /// The whole of it is one step. What the entry says, what it points at,
+    /// how many address spaces that frame is in and what finally goes in the
+    /// entry have to be one account of the page: a sibling thread that runs in
+    /// the middle of it is looking at the same entry, and what it does there
+    /// is decided by a state that only exists halfway through this. The token
+    /// is the proof that it cannot. On aarch64 a fault from user mode is
+    /// handled with interrupts in the state the faulting code was in, so a
+    /// program's own fault arrives here with them on, and `read`, `recvfrom`
+    /// and `mremap` reach here from a system call with them on whichever
+    /// machine it is.
+    pub fn handle_cow(&self, addr: u64, irq: NoInterrupts) -> bool {
         use crate::arch::paging::COW;
         let page = page_align_down(addr);
         let Some(flags) = self.space.flags_of(page) else {
@@ -435,12 +446,13 @@ impl Task {
                 crate::mm::PAGE_SIZE,
             );
         }
-        // Taking the old mapping away hands back the reference this table
-        // held on the shared frame; the copy takes its place.
-        let shared = self.space.unmap(page);
-        let mapped = self.space.map(page, copy, (flags & !COW) | WRITABLE).is_ok();
+        // The copy goes in over the shared page in one store, which hands back
+        // the reference this table held on the frame it was sharing. Dropping
+        // it is the release.
+        let shared = self.space.replace(page, copy, (flags & !COW) | WRITABLE, irq);
+        let replaced = shared.is_some();
         drop(shared);
-        mapped
+        replaced
     }
 
     /// Back `addr`'s page with memory if the heap or a region covers it.

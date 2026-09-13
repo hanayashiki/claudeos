@@ -10,11 +10,134 @@ use crate::sys;
 use crate::Report;
 
 pub fn run(report: &mut Report) {
+    pages_shared_by_a_fork_written_from_two_threads(report);
     exec_that_fails_keeps_the_memory_state(report);
     a_thread_left_unreaped_keeps_the_space(report);
     argument_blocks_larger_than_the_stack_is_mapped_with(report);
     addresses_outside_user_space_are_refused(report);
     a_hint_over_a_live_mapping_is_not_taken(report);
+}
+
+/// Pages a fork left shared, written from two threads of the same process at
+/// once.
+///
+/// Taking the private copy of a shared page reads the entry, copies the page
+/// and writes the entry back. While that was a call that took the old mapping
+/// away and a second one that put the new mapping in, the address had nothing
+/// at it in between. A sibling thread that touched it there did not find a
+/// page on its way back -- it found one that had never been touched, and was
+/// given a fresh page of zeroes over the top. The contents were gone, and the
+/// copy that was coming in was then refused for an address that was no longer
+/// free, which is EFAULT out of the system call or SIGSEGV in the program.
+///
+/// The two threads reach the copy by different routes on purpose. The read is
+/// a system call, which validates the buffer it is given with interrupts on
+/// whichever machine this is. The store is a fault from user mode, which on
+/// aarch64 is handled with interrupts in the state the faulting code was in
+/// and so also with them on. Either is a way in.
+///
+/// This is a smoke test. The window it looks for was a page copy wide, so
+/// catching it needs the timer to land inside one; what is shipped here is the
+/// two threads reaching the same pages while a child holds a share of them,
+/// and the contents surviving it.
+fn pages_shared_by_a_fork_written_from_two_threads(report: &mut Report) {
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Pages contended per round. Both threads sweep them in the same order,
+    /// so the one that is behind walks through whatever the one ahead is in
+    /// the middle of.
+    const PAGES: usize = 64;
+    const ROUNDS: usize = 40;
+    /// What every byte of every page holds. Not zero: a page of zeroes is what
+    /// an address with nothing at it is filled with, which is the thing being
+    /// looked for.
+    const MARKER: u8 = 0xA5;
+    const PAGE: usize = 4096;
+    const LEN: u64 = (PAGES * PAGE) as u64;
+    /// A file of nothing but the marker, so a one-byte read into a page writes
+    /// back the byte that is already there. The read is only here because it
+    /// is the way into the copy from a system call.
+    const SOURCE: &str = "/tmp/cow-marker";
+
+    let base = sys::mmap_anon(0, LEN);
+    if base <= 0 {
+        report.check("pages to share", false, format!("mmap returned {:#x}", base));
+        return;
+    }
+    let base = base as u64;
+
+    if std::fs::write(SOURCE, vec![MARKER; ROUNDS * PAGES + PAGE]).is_err() {
+        report.check("a file of the marker byte", false, String::new());
+        sys::munmap(base, LEN);
+        return;
+    }
+    let Ok(source) = std::fs::File::open(SOURCE) else {
+        report.check("a file of the marker byte", false, String::new());
+        sys::munmap(base, LEN);
+        return;
+    };
+    let fd = source.as_raw_fd();
+
+    let refused = AtomicUsize::new(0);
+    let mut damaged = 0usize;
+    let mut rounds = 0usize;
+
+    for _ in 0..ROUNDS {
+        unsafe { std::ptr::write_bytes(base as *mut u8, MARKER, LEN as usize) };
+
+        // The child exists to keep a second reference on every one of those
+        // pages, which is what makes the parent's first write to one a copy
+        // rather than a mark being cleared. It touches none of them: a touch
+        // here would take the copy on this side instead.
+        let child = sys::fork();
+        if child == 0 {
+            sys::sleep_ms(30_000);
+            sys::exit_group(0);
+        }
+        if child < 0 {
+            break;
+        }
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for page in 0..PAGES {
+                    let at = base + (page * PAGE) as u64 + 1;
+                    unsafe { std::ptr::write_volatile(at as *mut u8, MARKER) };
+                }
+            });
+            for page in 0..PAGES {
+                let at = base + (page * PAGE) as u64;
+                let slot = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, 1) };
+                if sys::read(fd, slot) != 1 {
+                    refused.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+
+        sys::kill(child as i32, 9);
+        sys::wait4(child as i32, 0);
+
+        let seen = unsafe { std::slice::from_raw_parts(base as *const u8, LEN as usize) };
+        damaged += seen.iter().filter(|byte| **byte != MARKER).count();
+        rounds += 1;
+    }
+
+    let refused = refused.load(Ordering::Relaxed);
+    report.check(
+        "pages a fork shared still hold what was written to them",
+        rounds == ROUNDS && damaged == 0,
+        format!("{} of {} rounds ran, {} bytes came back changed", rounds, ROUNDS, damaged),
+    );
+    report.check(
+        "and no read into one was refused",
+        refused == 0,
+        format!("{} of {} reads did not land", refused, rounds * PAGES),
+    );
+
+    drop(source);
+    let _ = std::fs::remove_file(SOURCE);
+    sys::munmap(base, LEN);
 }
 
 /// A hint names where a mapping should start, and the mapping is as long as it

@@ -47,8 +47,17 @@ pub fn validate_in(task: &Task, addr: u64, len: u64, write: bool) -> Result<(), 
                 // from the mark, so a shared page there reads back as writable
                 // while the hardware refuses the store; asking the permission
                 // alone would let the copy through and fault in the kernel.
+                //
+                // Taking the copy is one step from the entry it reads to the
+                // entry it writes, so it asks for interrupts to be off for the
+                // whole of it. Opening the section here rather than around the
+                // loop keeps it to one page: the caller may be validating a
+                // buffer megabytes long, and the pages it has not reached yet
+                // are no part of this.
                 if write && (flags & COW != 0 || flags & WRITABLE == 0) {
-                    if !task.handle_cow(page) {
+                    let copied =
+                        crate::sync::without_interrupts(|irq| task.handle_cow(page, irq));
+                    if !copied {
                         return Err(Errno::EFAULT);
                     }
                 }
