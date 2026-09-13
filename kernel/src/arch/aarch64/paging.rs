@@ -195,6 +195,13 @@ impl AddressSpace {
                 // The entry above it holds the table's reference from here
                 // on; `free_table` takes it back.
                 let new = frame::alloc_zeroed().ok_or(MapError::OutOfMemory)?.into_recorded();
+                // The walker reads these tables itself and may do so
+                // speculatively, so the zeroed table has to be visible before
+                // the descriptor naming it is. Without this the walker can
+                // reach the descriptor and read whatever the frame held
+                // before it was cleared. QEMU does not model this; a board
+                // does.
+                asm!("dsb ishst", options(nostack, preserves_flags));
                 *entry_ptr = new | PRESENT | PAGE_DESCRIPTOR;
                 table = new;
             } else {
