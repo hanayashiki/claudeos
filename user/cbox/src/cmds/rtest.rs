@@ -157,6 +157,30 @@ fn event_and_poll(report: &mut Report) {
     let _ = sys::close(event);
 }
 
+/// Numbers past the end of the table answer ENOSYS, which is how a program
+/// finds out that a call it would rather use is not there.
+///
+/// This kernel names every call on every machine and gives the ones a machine
+/// has no number for a placeholder at 0x10000 and up. Those numbers reach the
+/// kernel out of a register like any other, so they are what a probe walking
+/// upwards would run into, and answering them with the call they stand for
+/// would tell the probe that this machine has `open` at 0x10000.
+fn absent_numbers(report: &mut Report) {
+    const ENOSYS: i64 = -38;
+    let mut answered: Vec<(u64, i64)> = Vec::new();
+    for number in 0x1_0000u64..0x1_0020 {
+        let rc = crate::sys::probe(number);
+        if rc != ENOSYS {
+            answered.push((number, rc));
+        }
+    }
+    report.check(
+        "numbers past the table answer ENOSYS",
+        answered.is_empty(),
+        format!("{:?}", answered),
+    );
+}
+
 pub fn main(_args: &[String]) -> i32 {
     let mut report = Report { passed: 0, failed: 0 };
     println!("=== Rust standard library on claudeos ===");
@@ -405,6 +429,10 @@ pub fn main(_args: &[String]) -> i32 {
 
     let args: Vec<String> = std::env::args().collect();
     report.check("argv[0] present", !args.is_empty(), format!("{:?}", args));
+
+    println!();
+    println!("-- system call numbers --");
+    absent_numbers(&mut report);
 
     println!();
     println!("-- waiting on several things at once --");

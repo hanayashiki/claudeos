@@ -7,12 +7,13 @@
 //! replaced by an `at`-suffixed form by then: no `open`, only `openat`; no
 //! `stat`, only `fstatat`. Those names still have to exist, because the
 //! dispatcher is written once for every architecture, so they are given
-//! numbers above everything the hardware can deliver and are never matched.
+//! numbers above everything Linux numbers here.
 
 /// First of the numbers that mean "this call does not exist here". A program
-/// cannot ask for one: the dispatcher only ever sees what came out of a
-/// register, and nothing in the kernel synthesises a call.
-const ABSENT: u64 = 0x1_0000;
+/// can name one -- the number the dispatcher sees came out of a register, and
+/// a register holds any number -- so the dispatcher turns everything from here
+/// up away before it matches anything against the table.
+pub const ABSENT: u64 = 0x1_0000;
 
 pub const READ: u64 = 63;
 pub const WRITE: u64 = 64;

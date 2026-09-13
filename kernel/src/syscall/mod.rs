@@ -59,6 +59,16 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
 }
 
 fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
+    // A call the architecture's numbering has no number for is still named
+    // here, because the dispatcher is written once for every architecture, and
+    // it is given a placeholder above everything Linux numbers. The number
+    // matched below came out of a register, so a program can name a
+    // placeholder: matching one would run the call it stands for. Nothing is
+    // reported, because a number that names no call is not a call that is
+    // missing.
+    if number >= nr::ABSENT {
+        return Err(Errno::ENOSYS);
+    }
     match number {
         // ---- file I/O -------------------------------------------------
         nr::READ => file::read(args[0] as i32, args[1], args[2]),

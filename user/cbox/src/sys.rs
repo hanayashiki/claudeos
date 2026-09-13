@@ -195,6 +195,14 @@ unsafe fn syscall6(n: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> i6
     ret
 }
 
+/// Make the call `number` with no arguments, whatever number that is. This is
+/// for asking whether a call exists: a probe that walks the numbers is an
+/// ordinary thing for a program to do, and the answer for a number the kernel
+/// has no call at is ENOSYS.
+pub fn probe(number: u64) -> i64 {
+    unsafe { syscall3(number, 0, 0, 0) }
+}
+
 #[cfg(target_arch = "x86_64")]
 pub fn fork() -> i64 {
     unsafe { syscall0(SYS_FORK) }
