@@ -660,7 +660,11 @@ fn connection(report: &mut Report, nic: &FakeNic) {
                 server_iss + 1,
                 CLIENT_ISS + 1 + request.len() as u32,
                 tcp::PSH | tcp::ACK,
-                WINDOW,
+                // The right edge of the window has not moved since the
+                // handshake: the request that was read out of the socket
+                // freed 34 bytes, and the edge only moves when it can move
+                // by a whole segment.
+                WINDOW - request.len() as u16,
                 &[],
                 answer_body,
                 OUR_IP,
@@ -711,7 +715,7 @@ fn connection(report: &mut Report, nic: &FakeNic) {
                 server_next,
                 client_next,
                 tcp::FIN | tcp::ACK,
-                WINDOW,
+                WINDOW - request.len() as u16,
                 &[],
                 &[],
                 OUR_IP,
@@ -773,7 +777,7 @@ fn connection(report: &mut Report, nic: &FakeNic) {
                 server_next + 1,
                 client_next + 1,
                 tcp::ACK,
-                WINDOW,
+                WINDOW - request.len() as u16 - 1,
                 &[],
                 &[],
                 OUR_IP,
@@ -1125,8 +1129,14 @@ impl Peer {
 
 /// The number a segment this stack sent acknowledges.
 fn ack_number(frame: &[u8]) -> Option<u32> {
+    Some(ack_and_window(frame)?.0)
+}
+
+/// That, and the window it offers alongside it.
+fn ack_and_window(frame: &[u8]) -> Option<(u32, u16)> {
     let (_, datagram) = ip::parse(&frame[14..])?;
-    Some(tcp::Segment::parse(datagram)?.acknowledgement)
+    let parsed = tcp::Segment::parse(datagram)?;
+    Some((parsed.acknowledgement, parsed.window))
 }
 
 /// Write a whole stream out through a socket, letting the peer answer each
@@ -1918,6 +1928,52 @@ fn fast_retransmit(report: &mut Report, nic: &'static FakeNic) {
     report.check(
         "and the point it stops opening the window at came down with it",
         slow_start_threshold_of(&peer.socket) < opened,
+    );
+    peer.finish();
+
+    // ---- what the other end tests before it believes a repeat ----
+    //
+    // The other end counts an acknowledgement as a repeat only if the window
+    // it offers has not changed; one that has changed is a window update. A
+    // window that moved every time the program read a byte, in between the
+    // repeats, left the other end waiting out its own timeout for every
+    // segment it lost.
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40801, 22_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    let block = [0x33u8; 1460];
+    for _ in 0..3 {
+        peer.write(&block);
+    }
+    nic.take();
+    let hole = peer.send_next;
+    peer.send_next = peer.send_next.wrapping_add(block.len() as u32);
+    let mut repeats: Vec<(u32, u16)> = Vec::new();
+    for i in 0..4u32 {
+        peer.send(
+            hole.wrapping_add((i + 1) * block.len() as u32),
+            tcp::PSH | tcp::ACK,
+            &block,
+        );
+        // The program takes some of what arrived before the gap, which is
+        // what used to move the window between one repeat and the next.
+        let mut buf = [0u8; 1024];
+        let _ = peer.socket.receive_into(&mut buf, false);
+        for frame in nic.take() {
+            if let Some(pair) = ack_and_window(&frame) {
+                repeats.push(pair);
+            }
+        }
+    }
+    report.check(
+        "an acknowledgement repeated while a gap waits names the same byte",
+        repeats.len() >= 4 && repeats.iter().all(|(ack, _)| *ack == hole),
+    );
+    report.check(
+        "and offers the same window, which is what makes it count as a repeat",
+        repeats.windows(2).all(|pair| pair[0].1 == pair[1].1),
     );
     peer.finish();
     socket::reset();

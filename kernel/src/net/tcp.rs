@@ -393,6 +393,9 @@ pub struct Tcb {
 
     pub irs: u32,
     pub receive_next: u32,
+    /// The right edge of the window this end has offered: the first sequence
+    /// number it has not promised room for.
+    receive_high: u32,
     /// Runs of bytes that arrived before the bytes in front of them, in order
     /// and with the ones that touch joined. Acknowledging only what is
     /// contiguous is what tells the other end which segment to send again;
@@ -490,6 +493,7 @@ impl Tcb {
             window_ack: 0,
             irs: 0,
             receive_next: 0,
+            receive_high: 0,
             out_of_order: Vec::new(),
             held: 0,
             held_fin: None,
@@ -537,11 +541,52 @@ impl Tcb {
         }
     }
 
-    /// How much more this end is prepared to receive.
+    /// How much more this end has said it is prepared to receive: the right
+    /// edge it last offered, less what it has taken since.
     fn advertised_window(&self) -> u16 {
-        RECEIVE_WINDOW
-            .saturating_sub(self.received.len())
-            .min(u16::MAX as usize) as u16
+        if seq_le(self.receive_high, self.receive_next) {
+            return 0;
+        }
+        self.receive_high
+            .wrapping_sub(self.receive_next)
+            .min(u16::MAX as u32) as u16
+    }
+
+    /// Move the right edge of the window forward.
+    ///
+    /// It never moves left, and it only moves right by a whole segment or
+    /// more, which is RFC 1122 4.2.3.3's rule against offering the other end
+    /// room a byte at a time.
+    ///
+    /// `advanced` says whether the byte wanted next has moved since the last
+    /// acknowledgement went out. When it has not -- which is every
+    /// acknowledgement repeated while a gap is waiting to be filled -- the
+    /// edge is left alone even if there is room to move it, so every one of
+    /// those acknowledgements carries the same window. The other end tests
+    /// exactly that: an acknowledgement whose window has changed is a window
+    /// update rather than a repeat, and does not count towards the three that
+    /// make it send the missing segment again. A window that moved with the
+    /// reader draining the buffer, in between the repeats, left the other end
+    /// waiting out its own timeout for every lost segment.
+    ///
+    /// A window that has closed is the exception: it has to be able to open
+    /// again whether the byte wanted next moved or not, or the other end
+    /// waits for room that is already there.
+    fn open_window(&mut self, advanced: bool) {
+        if seq_lt(self.receive_high, self.receive_next) {
+            self.receive_high = self.receive_next;
+        }
+        let free = RECEIVE_WINDOW.saturating_sub(self.received.len()) as u32;
+        let wanted = self.receive_next.wrapping_add(free);
+        let step = (MSS as u32).min((RECEIVE_WINDOW / 2) as u32);
+        if !seq_gt(wanted, self.receive_high)
+            || wanted.wrapping_sub(self.receive_high) < step
+        {
+            return;
+        }
+        if advanced || self.advertised_window() < step as u16 {
+            self.receive_high = wanted;
+        }
     }
 
     fn send_segment(&mut self, flags: u8, sequence: u32, payload: &[u8], with_mss: bool) {
@@ -639,6 +684,7 @@ impl Tcb {
 
     /// Start an active open: send the first connection request.
     pub fn open(&mut self, _passive: bool) {
+        self.receive_high = self.receive_next.wrapping_add(RECEIVE_WINDOW as u32);
         self.iss = initial_sequence(self.local, self.remote);
         self.send_unacknowledged = self.iss;
         self.send_next = self.iss;
@@ -658,6 +704,7 @@ impl Tcb {
     fn accept_open(&mut self, segment: &Segment) {
         self.irs = segment.sequence;
         self.receive_next = segment.sequence.wrapping_add(1);
+        self.receive_high = self.receive_next.wrapping_add(RECEIVE_WINDOW as u32);
         if let Some(mss) = segment.mss {
             self.peer_mss = (mss as usize).clamp(MIN_MSS, MSS);
         }
@@ -701,7 +748,6 @@ impl Tcb {
 
     pub fn read(&mut self, buf: &mut [u8], peek: bool) -> Result<usize, Errno> {
         if !self.received.is_empty() {
-            let free_before = RECEIVE_WINDOW.saturating_sub(self.received.len());
             let n = buf.len().min(self.received.len());
             for (i, slot) in buf[..n].iter_mut().enumerate() {
                 *slot = self.received[i];
@@ -711,11 +757,12 @@ impl Tcb {
                 // A window that was closed and is now open again has to be
                 // advertised, or the other end waits for a segment that only
                 // this acknowledgement can carry.
-                let free_after = RECEIVE_WINDOW.saturating_sub(self.received.len());
-                if free_before < self.effective_mss() && free_after >= self.effective_mss() {
-                    if self.state.is_synchronised() {
-                        self.acknowledge();
-                    }
+                let offered_before = self.advertised_window();
+                self.open_window(false);
+                if offered_before < self.advertised_window()
+                    && self.state.is_synchronised()
+                {
+                    self.acknowledge();
                 }
             }
             return Ok(n);
@@ -969,6 +1016,7 @@ impl Tcb {
         }
 
         let mut woke = false;
+        let wanted_before = self.receive_next;
         let acknowledgement = segment.acknowledgement;
         // RFC 5681's duplicate acknowledgement: it carries nothing, changes
         // nothing, names the byte already named, and there is data
@@ -1155,6 +1203,7 @@ impl Tcb {
         }
 
         if need_ack && self.state != State::Closed {
+            self.open_window(self.receive_next != wanted_before);
             self.acknowledge();
         }
         self.output();
@@ -1182,6 +1231,7 @@ impl Tcb {
         }
         self.irs = segment.sequence;
         self.receive_next = segment.sequence.wrapping_add(1);
+        self.receive_high = self.receive_next.wrapping_add(RECEIVE_WINDOW as u32);
         if let Some(mss) = segment.mss {
             self.peer_mss = (mss as usize).clamp(MIN_MSS, MSS);
         }
