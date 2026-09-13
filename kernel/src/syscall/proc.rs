@@ -26,10 +26,10 @@ pub fn fork(
     // or it is held by nobody: the tables under it, and the references its
     // entries took on the parent's frames, would stay taken for good.
     let space = if share_vm {
-        parent.space
+        parent.space()
     } else {
         let space = AddressSpace::new_user().ok_or(Errno::ENOMEM)?;
-        if space.clone_user_from(&parent.space).is_err() {
+        if space.clone_user_from(&parent.space()).is_err() {
             space.destroy();
             return Err(Errno::ENOMEM);
         }
@@ -44,10 +44,10 @@ pub fn fork(
     };
     if share_vm {
         // Threads must see each other's mappings, so they share one record.
-        child.mm = parent.mm.clone();
+        child.share_space_of(&parent);
     } else {
-        let source = parent.mm.lock();
-        let mut target = child.mm.lock();
+        let source = parent.mm().lock();
+        let mut target = child.mm().lock();
         target.vmas = source.vmas.clone();
         target.brk_start = source.brk_start;
         target.brk = source.brk;
@@ -187,7 +187,7 @@ pub fn exec_into_current(
 
     elf::validate(&node.inner.lock().data)?;
 
-    let old_space = sched::current().space;
+    let old_space = sched::current().space();
     let new_space = AddressSpace::new_user().ok_or(Errno::ENOMEM)?;
 
     // Everything below runs against the new address space; the kernel half is
@@ -204,7 +204,7 @@ pub fn exec_into_current(
     // tables it describes are still there and the task goes back to running on
     // them if it does not.
     let mut task = sched::current();
-    let old_mm = alloc::sync::Arc::clone(&task.mm);
+    let old_mm = alloc::sync::Arc::clone(task.mm());
     let new_mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
     crate::sync::without_interrupts(|irq| task.run_on_space(new_space, new_mm, irq));
 

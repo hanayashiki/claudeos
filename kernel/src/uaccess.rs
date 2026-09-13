@@ -35,7 +35,7 @@ pub fn validate_in(task: &Task, addr: u64, len: u64, write: bool) -> Result<(), 
 
     let mut page = page_align_down(addr);
     while page < end {
-        match task.space.flags_of(page) {
+        match task.space().flags_of(page) {
             Some(flags) => {
                 // A page shared after a fork is read-only until someone writes
                 // to it. The kernel writing on the task's behalf counts, so
@@ -68,7 +68,7 @@ pub fn validate_in(task: &Task, addr: u64, len: u64, write: bool) -> Result<(), 
 }
 
 fn writable(task: &Task, page: u64) -> bool {
-    matches!(task.space.flags_of(page), Some(flags) if flags & WRITABLE != 0)
+    matches!(task.space().flags_of(page), Some(flags) if flags & WRITABLE != 0)
 }
 
 pub fn read_bytes(addr: u64, buf: &mut [u8]) -> Result<(), Errno> {

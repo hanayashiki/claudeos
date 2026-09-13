@@ -124,9 +124,12 @@ pub struct Task {
     kstack: *mut u8,
     pub kstack_top: u64,
 
-    pub space: AddressSpace,
+    /// The page tables the task runs on, and the record of what is in them.
+    /// Private for the same reason the scheduling state is: the two have to
+    /// change together, and `run_on_space` is where that happens.
+    space: AddressSpace,
     /// Shared with every thread running in the same address space.
-    pub mm: Arc<Spinlock<MemState>>,
+    mm: Arc<Spinlock<MemState>>,
     /// Shared with every task that cloned with `CLONE_FILES`.
     pub fds: FdTable,
     /// Shared with every task that cloned with `CLONE_FS`, so that a directory
@@ -505,17 +508,6 @@ impl Task {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // What the scheduler may do with this task
-    // -----------------------------------------------------------------------
-    //
-    // Every transition below is one step with two halves: the task stops being
-    // runnable and something is told about it, or it becomes runnable and the
-    // reason it was waiting is cleared. Each takes the held process table,
-    // which is what proves interrupts are off for the whole of it and is also
-    // where the other task each one has to reach is found. A tick landing
-    // between the halves is what the six defects this replaces all were.
-
     pub fn state(&self) -> State {
         self.state
     }
@@ -524,6 +516,40 @@ impl Task {
     pub fn wake_at(&self) -> u64 {
         self.wake_at
     }
+
+    /// The page tables the task runs on.
+    pub fn space(&self) -> AddressSpace {
+        self.space
+    }
+
+    /// The record of what is in them, shared with this task's threads.
+    pub fn mm(&self) -> &Arc<Spinlock<MemState>> {
+        &self.mm
+    }
+
+    /// Run in the address space `other` runs in, sharing its region list.
+    ///
+    /// Only for a task that has not been admitted to the scheduler yet, which
+    /// is why it asks for no proof of anything: nothing can see this task to
+    /// be confused by a half-done change. A task that is already running
+    /// changes address space through `run_on_space`.
+    pub fn share_space_of(&mut self, other: &Task) {
+        self.space = other.space;
+        self.mm = other.mm.clone();
+    }
+
+    // -----------------------------------------------------------------------
+    // Transitions
+    // -----------------------------------------------------------------------
+    //
+    // Each of these is one step with two halves: the task stops being runnable
+    // and something is told about it, or it becomes runnable and the reason it
+    // was waiting is cleared, or the record of the address space moves and the
+    // register follows it. A tick landing between the halves is what the six
+    // defects these replace all were, so each asks for proof that interrupts
+    // are off for the whole of it. The three that have to reach a second task
+    // take the process table, held, which is that proof and is also where the
+    // other task is found.
 
     /// Park the task until `wake_at` ticks, or until something wakes it. Zero
     /// means no deadline: only a wake-up ends it.

@@ -52,7 +52,7 @@ pub fn brk(request: u64) -> SysResult {
         // back the reference the entry held, and dropping it is the release.
         let mut page = new_brk;
         while page < current_brk {
-            drop(task.space.unmap(page));
+            drop(task.space().unmap(page));
             page += PAGE_SIZE_U64;
         }
     }
@@ -114,7 +114,7 @@ pub fn mmap(
         // File-backed pages are populated up front from the file contents.
         let mut page = base;
         while page < base + len {
-            task.space
+            task.space()
                 .map_new(page, PRESENT | WRITABLE | USER)
                 .map_err(|_| Errno::ENOMEM)?;
             page += PAGE_SIZE_U64;
@@ -128,7 +128,7 @@ pub fn mmap(
         let bits = prot_to_flags(prot);
         let mut page = base;
         while page < base + len {
-            task.space.set_flags(page, bits);
+            task.space().set_flags(page, bits);
             page += PAGE_SIZE_U64;
         }
     }
@@ -148,7 +148,7 @@ fn unmap_range(addr: u64, len: u64) {
     let end = page_align_up(addr + len);
     let mut page = start;
     while page < end {
-        drop(task.space.unmap(page));
+        drop(task.space().unmap(page));
         page += PAGE_SIZE_U64;
     }
     task.remove_vma_range(start, end);
@@ -177,13 +177,13 @@ pub fn mprotect(addr: u64, length: u64, prot: u64) -> SysResult {
         // protection when they fault in. A page still shared after a fork
         // keeps its copy-on-write mark and stays read-only whatever is asked
         // for: the copy happens when it is written to, as before.
-        if let Some(existing) = task.space.flags_of(page) {
+        if let Some(existing) = task.space().flags_of(page) {
             let bits = if existing & crate::arch::paging::COW != 0 {
                 (bits & !WRITABLE) | crate::arch::paging::COW
             } else {
                 bits
             };
-            task.space.set_flags(page, bits);
+            task.space().set_flags(page, bits);
         }
         page += PAGE_SIZE_U64;
     }

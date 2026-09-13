@@ -18,7 +18,7 @@ pub struct Key {
 }
 
 pub fn futex_key(address: u64) -> Key {
-    Key { space: sched::current().space.id(), address }
+    Key { space: sched::current().space().id(), address }
 }
 
 struct Waiter {

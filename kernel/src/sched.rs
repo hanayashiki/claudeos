@@ -204,7 +204,7 @@ pub fn current_pgid() -> u32 {
 /// it. A caller that is about to stop naming the space asks after it has
 /// stopped.
 pub fn space_in_use(space: arch::paging::AddressSpace) -> bool {
-    TASKS.lock().iter().any(|t| t.get().space == space)
+    TASKS.lock().iter().any(|t| t.get().space() == space)
 }
 
 fn pick_next() -> Option<*mut Task> {
@@ -270,8 +270,8 @@ unsafe fn switch_to(next: *mut Task) {
     arch::set_kernel_entry_stack(next_task.kstack_top);
     arch::set_current_task(next as u64);
 
-    if next_task.space != prev_task.space {
-        next_task.space.switch_to();
+    if next_task.space() != prev_task.space() {
+        next_task.space().switch_to();
     }
 
     CURRENT = next;
@@ -435,9 +435,9 @@ pub fn exit_current(status: i32) -> ! {
 
         // Threads share an address space and its region list; only the last
         // thread out may tear either of them down.
-        let last_thread = alloc::sync::Arc::strong_count(&task.mm) == 1;
+        let last_thread = alloc::sync::Arc::strong_count(task.mm()) == 1;
         if last_thread {
-            task.space.free_user_memory();
+            task.space().free_user_memory();
             task.clear_vmas();
         }
         let ppid = task.ppid;
@@ -786,8 +786,8 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
         let mut task = Box::from_raw(ptr);
         // The task being reaped is already out of the table, so this asks
         // whether anything else still names the address space it ran in.
-        if !space_in_use(task.space) {
-            task.space.destroy();
+        if !space_in_use(task.space()) {
+            task.space().destroy();
         }
         task.free_kernel_stack();
         task.mark_dead();
@@ -827,8 +827,8 @@ pub fn reap_dead_threads() {
             crate::fs::procfs::remove_process(task.pid);
             // Out of the table already, so this asks whether anything else --
             // the process, or another of its threads -- still names the space.
-            if !space_in_use(task.space) {
-                task.space.destroy();
+            if !space_in_use(task.space()) {
+                task.space().destroy();
             }
             task.free_kernel_stack();
             task.mark_dead();
