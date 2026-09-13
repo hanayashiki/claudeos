@@ -13,8 +13,13 @@ use crate::abi::{SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-/// Whether the message below has been printed already.
+/// Whether the message about an interrupt this interface may not claim has
+/// been printed already.
 static SAID_NOT_OURS: AtomicBool = AtomicBool::new(false);
+
+/// Whether the message about a line past the end of the handler table has been
+/// printed already.
+static SAID_NO_HANDLER: AtomicBool = AtomicBool::new(false);
 
 /// What an exception entry saves, in the order `vectors.s` writes it.
 #[repr(C)]
@@ -254,9 +259,41 @@ pub fn mask_irq(irq: u8) {
     gic::mask(irq);
 }
 
-/// Tell the controller the handler for `irq` is finished.
-pub fn end_of_interrupt(irq: u8) {
-    gic::end_of_interrupt(irq);
+/// The claim the interrupt now being handled holds, until whoever ends it
+/// takes it from here.
+///
+/// The end-of-interrupt belongs in the handler the line dispatches to. It has
+/// to come after the device is cleared, or a level-triggered line asserts
+/// again as soon as the handler returns; and it has to come before the handler
+/// reschedules, because the running priority stays raised across a context
+/// switch and nothing of that priority or lower -- the timer among them --
+/// would be delivered for as long as the other task ran. A handler is the
+/// portable half's and takes a trap frame and nothing else, so the claim is
+/// left here for `end_of_interrupt` to take.
+///
+/// Read and written with interrupts masked. A handler that reschedules leaves
+/// this entry suspended while another one runs on its own kernel stack, which
+/// is why `interrupt` below puts back what it found rather than clearing the
+/// slot.
+static mut OUTSTANDING: Option<gic::Claimed> = None;
+
+/// Put `claim` in the slot and give back what was there.
+fn swap_outstanding(claim: Option<gic::Claimed>) -> Option<gic::Claimed> {
+    unsafe { core::mem::replace(&mut *core::ptr::addr_of_mut!(OUTSTANDING), claim) }
+}
+
+/// Tell the controller the handler for the interrupt being serviced is
+/// finished.
+///
+/// The line ended is the one the acknowledge handed out rather than the one
+/// named here; they are the same number for every line that has a handler, and
+/// the controller accepts no other. A call with nothing outstanding does
+/// nothing, so a handler called any other way than from an interrupt cannot
+/// drop the running priority of one that is still being serviced.
+pub fn end_of_interrupt(_irq: u8) {
+    if let Some(claim) = swap_outstanding(None) {
+        claim.end();
+    }
 }
 
 /// Where every vector slot arrives.
@@ -266,7 +303,9 @@ pub extern "C" fn exception_entry(frame: &mut TrapFrame) {
     // so the kind is the slot within its group of four.
     match frame.slot & 3 {
         0 => synchronous(frame),
-        1 => interrupt(frame),
+        1 => {
+            interrupt(frame);
+        }
         2 => fast_interrupt(frame),
         _ => {
             crate::println!("[trap] system error at {:#x} esr {:#x}", frame.elr, frame.esr);
@@ -358,31 +397,50 @@ fn handle_synchronous(frame: &mut TrapFrame) {
     dispatch(frame);
 }
 
-fn interrupt(frame: &mut TrapFrame) {
-    let line = gic::acknowledge();
-    // Nothing to claim, or a line past the end of the handler table. Either
-    // way there is nothing to end, because a number in that range was never a
-    // claim in the first place.
-    if line >= gic::NOT_A_LINE || line >= IRQ_COUNT as u32 {
-        // One of those numbers means there was an interrupt and this
-        // interface was not allowed to take it. Nothing cleared the device
-        // and nothing can end what was never claimed, so a level-triggered
-        // line arrives again as soon as this returns and the machine makes no
-        // further progress. Said once: saying it every time is the same
-        // livelock with output.
-        if line == gic::NOT_OURS && !SAID_NOT_OURS.swap(true, Ordering::Relaxed) {
-            crate::println!(
-                "[gic] an interrupt arrived that this interface may not claim; \
-                 it cannot be ended and will arrive again"
-            );
+fn interrupt(frame: &mut TrapFrame) -> gic::Ended {
+    let claim = match gic::acknowledge() {
+        gic::Acknowledged::Line(claim) => claim,
+        // There was nothing pending by the time the interface was read.
+        gic::Acknowledged::Spurious(ended) => return ended,
+        gic::Acknowledged::NotOurs(ended) => {
+            // Nothing cleared the device and nothing can end what was never
+            // claimed, so a level-triggered line arrives again as soon as this
+            // returns and the machine makes no further progress. Said once:
+            // saying it every time is the same livelock with output.
+            if !SAID_NOT_OURS.swap(true, Ordering::Relaxed) {
+                crate::println!(
+                    "[gic] an interrupt arrived that this interface may not claim; \
+                     it cannot be ended and will arrive again"
+                );
+            }
+            return ended;
         }
-        return;
+    };
+    let line = claim.line();
+    // A line the controller implements and the handler table has no room for.
+    // This chip reports 256 lines and the table holds 192, so the controller
+    // can hand out a number in between: the Ethernet controller's is 189, one
+    // below the table's size. The claim is a real one, so it is ended here --
+    // returning without ending it leaves the running priority at this line's
+    // and no interrupt of that priority or lower, timer and console included,
+    // is ever delivered again. Nothing will clear the device either, so the
+    // line is stopped at the distributor as well, or it would simply be
+    // delivered again.
+    if line >= IRQ_COUNT as u32 {
+        if !SAID_NO_HANDLER.swap(true, Ordering::Relaxed) {
+            crate::println!("[gic] line {} is past the handler table; masking it", line);
+        }
+        return claim.mask_and_end();
     }
     if line == TIMER_IRQ as u32 {
         rearm_timer();
     }
     frame.vector = irq_vector(line as u8) as u64;
+    // The handler takes the claim through `end_of_interrupt` and ends it
+    // there. Whatever it leaves is ended here.
+    let outer = swap_outstanding(Some(claim));
     dispatch(frame);
+    gic::end_outstanding(swap_outstanding(outer))
 }
 
 fn dispatch(frame: &mut TrapFrame) {
