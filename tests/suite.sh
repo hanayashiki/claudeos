@@ -531,6 +531,9 @@ check "one long line has none"        "0"   "$(wc -l < /tmp/by/long)"
 check "an invalid encoding is bytes"  "12"  "$(wc -c < /tmp/by/bad)"
 check "grep matches in a binary file" "0"   "$(grep -q abc /tmp/by/all; echo $?)"
 check "and says which lines"          "2"   "$(grep -c . /tmp/by/all)"
+# `.` is a byte here, so it matches whatever the line is made of. busybox hands
+# its pattern to the regex library it was built against and the two in this
+# image disagree about an invalid sequence, so this one is not compared below.
 check "grep over an invalid encoding" "1"   "$(grep -c . /tmp/by/bad)"
 check "a zero byte survives cut"      "4"   "$(cut -d: -f1 /tmp/by/zero | wc -c)"
 check "a zero byte survives tr"       "7"   "$(tr -d ':' < /tmp/by/zero | wc -c)"
@@ -539,7 +542,8 @@ check "head keeps one too"            "3"   "$(head -n 9 /tmp/by/nonl | wc -c)"
 check "tail keeps one too"            "3"   "$(tail -n 9 /tmp/by/nonl | wc -c)"
 # busybox's cat -n reads lines and writes them back with an end, so it puts a
 # newline after a last line that had not got one. Ours writes what it was
-# given, which is what GNU cat does, so this one is not compared below.
+# given, which is what GNU cat does; the comparison below uses a file that does
+# end in a newline, where the two agree.
 check "cat -n adds no line end"       "1"   "$(cat -n /tmp/by/nonl | wc -l)"
 # The shell holds its words as text, so a byte in a script that does not decode
 # does not reach the command it is an argument to intact. What it must not do
@@ -547,6 +551,11 @@ check "cat -n adds no line end"       "1"   "$(cat -n /tmp/by/nonl | wc -l)"
 # than comparing what they printed.
 printf 'echo one\necho t\355\240\200wo\necho three\n' > /tmp/by/script.sh
 check "a script that does not decode"  "3"  "$(sh /tmp/by/script.sh | wc -l)"
+# rev reverses bytes. Whether busybox does depends on whether it was built with
+# unicode support, and the two fetched for the two machines differ, so the
+# comparison below uses a line of digits and the byte case is checked here.
+check "rev reverses bytes"            "B"   "$(printf 'A\377B\n' | rev | cut -c1)"
+check "and keeps the one between"     "2"   "$(printf 'A\377B\n' | rev | tr -d 'AB' | wc -c)"
 
 if [ -x /bin/busybox ]; then
   # The same input through the upstream busybox in this image, whose answer is
@@ -571,7 +580,6 @@ if [ -x /bin/busybox ]; then
   # busybox holds a line as a C string, so a zero byte in one truncates what it
   # writes back, and there is nothing to be gained by matching that.
   pair "grep prints its line" 'grep . /tmp/by/high'     'busybox grep . /tmp/by/high'
-  pair "grep an invalid one"  'grep . /tmp/by/bad'      'busybox grep . /tmp/by/bad'
   pair "grep -o"              'grep -o abc /tmp/by/high' 'busybox grep -o abc /tmp/by/high'
   pair "sed substitutes"      'sed s/abc/ABC/ /tmp/by/high' 'busybox sed s/abc/ABC/ /tmp/by/high'
   pair "sed keeps the rest"   'sed s/a/A/ /tmp/by/nonl' 'busybox sed s/a/A/ /tmp/by/nonl'
@@ -581,7 +589,6 @@ if [ -x /bin/busybox ]; then
   pair "uniq"                 'uniq /tmp/by/high'       'busybox uniq /tmp/by/high'
   pair "cut -c"               'cut -c1-5 /tmp/by/high'  'busybox cut -c1-5 /tmp/by/high'
   pair "cut -f"               'cut -d: -f1 /tmp/by/high' 'busybox cut -d: -f1 /tmp/by/high'
-  pair "rev"                  'rev /tmp/by/high'        'busybox rev /tmp/by/high'
   pair "rev a long line"      'rev /tmp/by/long'        'busybox rev /tmp/by/long'
   check "wc -c"               "$(busybox wc -c < /tmp/by/all)"  "$(wc -c < /tmp/by/all)"
   check "wc -l"               "$(busybox wc -l < /tmp/by/all)"  "$(wc -l < /tmp/by/all)"
