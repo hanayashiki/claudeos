@@ -5,7 +5,7 @@
 //! allocated here, so the kernel never takes a page fault on a user pointer.
 
 use crate::abi::Errno;
-use crate::arch::paging::{is_user_addr, WRITABLE};
+use crate::arch::paging::{is_user_addr, COW, WRITABLE};
 use crate::mm::{page_align_down, PAGE_SIZE_U64};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -25,11 +25,17 @@ pub fn validate(addr: u64, len: u64, write: bool) -> Result<(), Errno> {
     while page < end {
         match task.space.flags_of(page) {
             Some(flags) => {
-                if write && flags & WRITABLE == 0 {
-                    // A page shared after a fork is read-only until someone
-                    // writes to it. The kernel writing on the task's behalf
-                    // counts, so take the private copy here rather than
-                    // reporting a bad address.
+                // A page shared after a fork is read-only until someone writes
+                // to it. The kernel writing on the task's behalf counts, so
+                // take the private copy here rather than reporting a bad
+                // address.
+                //
+                // The mark decides, not the write permission. aarch64 keeps
+                // the permission the caller asked for and derives read-only
+                // from the mark, so a shared page there reads back as writable
+                // while the hardware refuses the store; asking the permission
+                // alone would let the copy through and fault in the kernel.
+                if write && (flags & COW != 0 || flags & WRITABLE == 0) {
                     if !task.handle_cow(page) {
                         return Err(Errno::EFAULT);
                     }
