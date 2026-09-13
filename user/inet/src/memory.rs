@@ -160,9 +160,10 @@ fn free_kib() -> Option<u64> {
 /// a thread that has exited and has not been reaped, then replace this image
 /// while it is still there.
 ///
-/// The thread's task belongs to whoever started this process, not to this one,
-/// so nothing here can reap it and it is still on the machine, naming the
-/// address space this exec is about to leave, when the exec happens.
+/// No wait reports a thread, so nothing reaps this one. It is still on the
+/// machine, naming the address space this exec is about to leave, when the exec
+/// happens; the kernel lets go of it the next time this process makes a task or
+/// ends one.
 pub fn leave_a_thread_and_exec() -> ! {
     let handle = std::thread::spawn(|| {});
     let _ = handle.join();
@@ -174,7 +175,7 @@ pub fn leave_a_thread_and_exec() -> ! {
     sys::exit_group(1);
 }
 
-/// One process through that sequence, and both of the tasks it leaves reaped.
+/// One process through that sequence, reaped.
 fn round() -> bool {
     let pid = sys::fork();
     if pid == 0 {
@@ -184,13 +185,10 @@ fn round() -> bool {
     if pid < 0 {
         return false;
     }
-    // Named, not "whichever is ready": the thread is a child of this process
-    // too and becomes reapable first, and reaping it before the exec would
-    // take away the very thing the exec has to trip over.
-    if sys::wait4(pid as i32, 0).0 < 0 {
-        return false;
-    }
-    sys::wait4(-1, 0).0 >= 0
+    // Only the process is waited for. A thread is not a child of anything: no
+    // wait reports it, and the kernel takes its task away itself once the
+    // process it belonged to is finished with the address space.
+    sys::wait4(pid as i32, 0).0 >= 0
 }
 
 /// A task that has exited and has not been reaped still names the address
