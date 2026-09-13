@@ -442,9 +442,12 @@ pub fn kill(pid: i64, signal: i32) -> SysResult {
     if !delivered {
         return Err(Errno::ESRCH);
     }
-    if !probe {
-        sched::check_signals();
-    }
+    // A signal sent to this task is not acted on here. The entry path does that
+    // once this call's result has been stored, and doing it first means the
+    // result is stored over the frame a handler was about to be entered on:
+    // on aarch64 the register a syscall returns in is the one a handler takes
+    // its signal number in, so the handler was entered with the result in place
+    // of the signal and this call returned whatever its first argument was.
     Ok(0)
 }
 

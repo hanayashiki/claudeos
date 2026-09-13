@@ -514,11 +514,14 @@ fn a_signal_frame_on_a_shared_page(report: &mut Report) {
         // Straight to the kernel rather than through libc's `raise`: this task
         // was made by a bare fork, so the thread id libc remembers is still the
         // parent's and the signal would go there.
-        sys::kill(sys::getpid() as i32, SIGUSR2);
+        // The result of this call is stored over the frame a handler is
+        // entered on, so a signal sent to oneself has to come back as zero for
+        // the handler to be given the right number.
+        let sent = sys::kill(sys::getpid() as i32, SIGUSR2);
         // The handler runs on the way out, and execution has to carry on from
         // where it left off afterwards.
         let ran = SIGNAL_TOTAL.load(Ordering::SeqCst) - before == SIGUSR2 as usize;
-        sys::exit_group(if ran { 0 } else { 1 });
+        sys::exit_group(if ran && sent == 0 { 0 } else { 1 });
     }
     let (pid, status) = sys::wait4(child as i32, 0);
     report.check(
