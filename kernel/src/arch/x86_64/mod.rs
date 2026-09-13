@@ -175,14 +175,20 @@ pub fn interrupts_enabled() -> bool {
     flags & (1 << 9) != 0
 }
 
+// Deliberately not `nomem`. These two instructions touch no memory themselves,
+// but every critical section in the kernel is built on them, and the point of
+// such a section is that a store lands before interrupts come back on.
+// Asserting `nomem` tells the compiler the asm reads and writes nothing, which
+// lets it move loads and stores across it. Leaving it off makes the asm a
+// barrier the compiler will not reorder memory operations past.
 #[inline]
 pub fn disable_interrupts() {
-    unsafe { asm!("cli", options(nomem, nostack)) };
+    unsafe { asm!("cli", options(nostack, preserves_flags)) };
 }
 
 #[inline]
 pub fn enable_interrupts() {
-    unsafe { asm!("sti", options(nomem, nostack)) };
+    unsafe { asm!("sti", options(nostack, preserves_flags)) };
 }
 
 // ---------------------------------------------------------------------------
