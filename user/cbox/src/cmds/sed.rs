@@ -440,18 +440,45 @@ fn edit(commands: &mut [Command], data: &[u8], quiet: bool) -> Vec<u8> {
         super::lines(data).iter().map(|line| super::without_newline(line)).collect();
     let terminated = data.last() == Some(&b'\n');
     let mut out = Vec::new();
-    run(commands, &lines, quiet, &mut out);
-    if !terminated && out.last() == Some(&b'\n') {
-        out.pop();
-    }
+    run(commands, &lines, quiet, terminated, &mut out);
     out
 }
 
-fn run(commands: &mut [Command], lines: &[&[u8]], quiet: bool, out: &mut Vec<u8>) {
+/// Write one piece of output, supplying the newline the piece before it was
+/// owed.
+///
+/// A pattern space that came from a last line with no newline after it is
+/// written without one, but anything printed afterwards has to be separated
+/// from it, so the newline is owed rather than dropped. That leaves the
+/// missing newline at the end of the output and nowhere else, whether the
+/// line that was missing one was printed once, printed twice, or deleted.
+fn emit(out: &mut Vec<u8>, owed: &mut bool, body: &[u8], ends: bool) {
+    if *owed {
+        out.push(b'\n');
+        *owed = false;
+    }
+    out.extend_from_slice(body);
+    if ends {
+        out.push(b'\n');
+    } else {
+        *owed = true;
+    }
+}
+
+fn run(
+    commands: &mut [Command],
+    lines: &[&[u8]],
+    quiet: bool,
+    terminated: bool,
+    out: &mut Vec<u8>,
+) {
     let total = lines.len();
+    let mut owed = false;
     for (index, line) in lines.iter().enumerate() {
         let number = index + 1;
         let last = number == total;
+        // Whether a pattern space printed in this cycle ends in a newline.
+        let ends = !last || terminated;
         let mut space = line.to_vec();
         let mut deleted = false;
         let mut quit = false;
@@ -465,13 +492,11 @@ fn run(commands: &mut [Command], lines: &[&[u8]], quiet: bool, out: &mut Vec<u8>
                     let (new, changed) = substitute(&space, regex, replacement, *global, *which);
                     space = new;
                     if changed && *print {
-                        out.extend_from_slice(&space);
-                        out.push(b'\n');
+                        emit(out, &mut owed, &space, ends);
                     }
                 }
                 Action::Print => {
-                    out.extend_from_slice(&space);
-                    out.push(b'\n');
+                    emit(out, &mut owed, &space, ends);
                 }
                 Action::Delete => {
                     deleted = true;
@@ -482,8 +507,7 @@ fn run(commands: &mut [Command], lines: &[&[u8]], quiet: bool, out: &mut Vec<u8>
                     break;
                 }
                 Action::LineNumber => {
-                    out.extend_from_slice(number.to_string().as_bytes());
-                    out.push(b'\n');
+                    emit(out, &mut owed, number.to_string().as_bytes(), true);
                 }
                 Action::Transliterate { from, to } => {
                     for byte in space.iter_mut() {
@@ -496,8 +520,7 @@ fn run(commands: &mut [Command], lines: &[&[u8]], quiet: bool, out: &mut Vec<u8>
         }
 
         if !deleted && !quiet {
-            out.extend_from_slice(&space);
-            out.push(b'\n');
+            emit(out, &mut owed, &space, ends);
         }
         if quit {
             break;

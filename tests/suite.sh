@@ -538,6 +538,11 @@ check "grep over an invalid encoding" "1"   "$(grep -c . /tmp/by/bad)"
 check "a zero byte survives cut"      "4"   "$(cut -d: -f1 /tmp/by/zero | wc -c)"
 check "a zero byte survives tr"       "7"   "$(tr -d ':' < /tmp/by/zero | wc -c)"
 check "sed keeps a missing newline"   "3"   "$(sed 's/a/A/' /tmp/by/nonl | wc -c)"
+# The newline is missing from the end of the output, not from wherever the line
+# that had not got one would have been: deleting that line leaves the line
+# before it ended as it was, and printing it twice puts a newline between.
+check "sed deletes the line with none" "2"  "$(sed '2d' /tmp/by/nonl | wc -c)"
+check "sed prints it twice"           "7"   "$(sed -n 'p;p' /tmp/by/nonl | wc -c)"
 check "head keeps one too"            "3"   "$(head -n 9 /tmp/by/nonl | wc -c)"
 check "tail keeps one too"            "3"   "$(tail -n 9 /tmp/by/nonl | wc -c)"
 # busybox's cat -n reads lines and writes them back with an end, so it puts a
@@ -583,6 +588,7 @@ if [ -x /bin/busybox ]; then
   pair "grep -o"              'grep -o abc /tmp/by/high' 'busybox grep -o abc /tmp/by/high'
   pair "sed substitutes"      'sed s/abc/ABC/ /tmp/by/high' 'busybox sed s/abc/ABC/ /tmp/by/high'
   pair "sed keeps the rest"   'sed s/a/A/ /tmp/by/nonl' 'busybox sed s/a/A/ /tmp/by/nonl'
+  pair "sed deletes a line"   'sed 2d /tmp/by/nonl'     'busybox sed 2d /tmp/by/nonl'
   pair "tr translates"        'tr a-z A-Z < /tmp/by/high' 'busybox tr a-z A-Z < /tmp/by/high'
   pair "tr deletes"           'tr -d "\0" < /tmp/by/all' 'busybox tr -d "\0" < /tmp/by/all'
   pair "sort"                 'sort /tmp/by/high'       'busybox sort /tmp/by/high'
