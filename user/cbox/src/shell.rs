@@ -1152,9 +1152,15 @@ impl Shell {
         if args.len() >= 2 && !args[1].starts_with('-') {
             self.script_name = args[1].clone();
             self.positional = args[2..].to_vec();
-            match std::fs::read_to_string(&args[1]) {
-                Ok(text) => {
-                    self.run_text(&text);
+            // A script is read as bytes. Refusing to run the file at all
+            // because one byte in it does not decode is a worse answer than
+            // running it, and it is the answer `read_to_string` gives. The
+            // shell holds its words as text, so a byte like that still does
+            // not reach a command intact; what this settles is that the rest
+            // of the script runs.
+            match std::fs::read(&args[1]) {
+                Ok(data) => {
+                    self.run_text(&String::from_utf8_lossy(&data));
                     return self.exit_code.unwrap_or(self.last_status);
                 }
                 Err(err) => {
@@ -2168,9 +2174,11 @@ impl Shell {
                 0
             }
             "." | "source" => match argv.get(1) {
-                Some(path) => match std::fs::read_to_string(path) {
-                    Ok(text) => {
-                        self.run_text(&text);
+                // Bytes, for the reason a script named on the command line is
+                // read as bytes: a file that does not decode still runs.
+                Some(path) => match std::fs::read(path) {
+                    Ok(data) => {
+                        self.run_text(&String::from_utf8_lossy(&data));
                         self.last_status
                     }
                     Err(err) => {

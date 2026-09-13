@@ -541,6 +541,12 @@ check "tail keeps one too"            "3"   "$(tail -n 9 /tmp/by/nonl | wc -c)"
 # newline after a last line that had not got one. Ours writes what it was
 # given, which is what GNU cat does, so this one is not compared below.
 check "cat -n adds no line end"       "1"   "$(cat -n /tmp/by/nonl | wc -l)"
+# The shell holds its words as text, so a byte in a script that does not decode
+# does not reach the command it is an argument to intact. What it must not do
+# is refuse to run the file, which is why this counts the lines that ran rather
+# than comparing what they printed.
+printf 'echo one\necho t\355\240\200wo\necho three\n' > /tmp/by/script.sh
+check "a script that does not decode"  "3"  "$(sh /tmp/by/script.sh | wc -l)"
 
 if [ -x /bin/busybox ]; then
   # The same input through the upstream busybox in this image, whose answer is
