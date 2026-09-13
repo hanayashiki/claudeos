@@ -21,6 +21,18 @@ pub const VECTOR_SYSCALL: u64 = 0x100;
 /// pointer, and the address to carry on at.
 const SWITCH_FRAME_WORDS: u64 = 12;
 
+/// Bytes those take. `switch.s` is given this rather than carrying a number of
+/// its own, and it addresses the pair holding the frame pointer and the return
+/// address as the last sixteen bytes of it, which is where `prepare_kernel_entry`
+/// puts the address a new task starts at.
+pub(super) const SWITCH_FRAME_SIZE: usize = SWITCH_FRAME_WORDS as usize * 8;
+
+const _: () = {
+    // Six `stp` pairs, and `sub sp, sp, #size` wants the stack sixteen-byte
+    // aligned.
+    assert!(SWITCH_FRAME_SIZE == 6 * 16);
+};
+
 /// The thirty-two vector registers and the two words that control them.
 ///
 /// The kernel is built without access to these, so everything in them between
@@ -212,7 +224,7 @@ pub fn trap_frame_at(kstack_top: u64) -> *mut TrapFrame {
 pub fn prepare_kernel_entry(kstack_top: u64, entry: u64) -> u64 {
     // Leave the trap frame area untouched and build the switch frame below it.
     let base = kstack_top - TRAP_FRAME_SIZE as u64;
-    let frame = (base - SWITCH_FRAME_WORDS * 8) as *mut u64;
+    let frame = (base - SWITCH_FRAME_SIZE as u64) as *mut u64;
     unsafe {
         for slot in 0..SWITCH_FRAME_WORDS {
             *frame.add(slot as usize) = 0;

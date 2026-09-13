@@ -8,19 +8,34 @@ pub mod pit;
 
 use core::arch::asm;
 
-/// Per-CPU scratch area reached through GS. The field offsets are relied on by
-/// the syscall entry stub in syscall.s.
+/// Per-CPU scratch area reached through GS. The syscall entry stub reaches the
+/// first two fields through that segment, and is given their offsets rather
+/// than carrying numbers of its own: a field added above `kernel_rsp` would
+/// otherwise leave the stub loading its kernel stack pointer out of whatever
+/// took that slot.
 #[repr(C)]
 pub struct PerCpu {
-    /// +0: kernel stack top to install on entry from user mode.
+    /// Kernel stack top to install on entry from user mode.
     pub kernel_rsp: u64,
-    /// +8: scratch slot holding the user's RSP across the entry sequence.
+    /// Scratch slot holding the user's RSP across the entry sequence.
     pub user_rsp: u64,
-    /// +16: currently running task.
+    /// Currently running task.
     pub current: u64,
-    /// +24: nesting depth of kernel entries, for debugging.
+    /// Nesting depth of kernel entries, for debugging.
     pub depth: u64,
 }
+
+/// The offsets `syscall_entry.s` addresses the block above by.
+pub(super) const OFF_KERNEL_RSP: usize = core::mem::offset_of!(PerCpu, kernel_rsp);
+pub(super) const OFF_USER_RSP: usize = core::mem::offset_of!(PerCpu, user_rsp);
+
+const _: () = {
+    // The stub addresses these as displacements from the segment base, so
+    // both have to stay inside the block the base points at.
+    assert!(OFF_KERNEL_RSP + 8 <= core::mem::size_of::<PerCpu>());
+    assert!(OFF_USER_RSP + 8 <= core::mem::size_of::<PerCpu>());
+    assert!(OFF_KERNEL_RSP != OFF_USER_RSP);
+};
 
 static mut PER_CPU: PerCpu = PerCpu { kernel_rsp: 0, user_rsp: 0, current: 0, depth: 0 };
 

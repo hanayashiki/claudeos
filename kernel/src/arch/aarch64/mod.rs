@@ -23,8 +23,19 @@ pub mod nr;
 pub mod paging;
 
 global_asm!(include_str!("boot.s"));
-global_asm!(include_str!("vectors.s"));
-global_asm!(include_str!("switch.s"));
+// The entry and exit paths address the trap frame by the offsets the structure
+// in trap.rs actually has, rather than by numbers written out beside it.
+global_asm!(
+    include_str!("vectors.s"),
+    FRAME_SIZE = const trap::FRAME_SIZE,
+    OFF_X = const trap::OFF_X,
+    OFF_X30 = const trap::OFF_X30,
+    OFF_ELR = const trap::OFF_ELR,
+    OFF_ESR = const trap::OFF_ESR,
+    OFF_VECTOR = const trap::OFF_VECTOR,
+    OFF_SLOT = const trap::OFF_SLOT,
+);
+global_asm!(include_str!("switch.s"), FRAME_SIZE = const task::SWITCH_FRAME_SIZE);
 
 // Some of these name a part of the interface without being called from the
 // portable half today; they are listed here because this file is the contract.

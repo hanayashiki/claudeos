@@ -40,6 +40,36 @@ pub struct TrapFrame {
     pub slot: u64,
 }
 
+/// What `vectors.s` is given for this structure. Every offset the entry and
+/// exit paths name comes from here rather than being written out there, so a
+/// field that moves takes the instruction that saves it with it. What is left
+/// for the assertions below is what a constant cannot carry: that the fields a
+/// single `stp` writes as a pair lie next to each other, in that order, and
+/// that the frame keeps the stack sixteen-byte aligned.
+pub(super) const FRAME_SIZE: usize = core::mem::size_of::<TrapFrame>();
+pub(super) const OFF_X: usize = core::mem::offset_of!(TrapFrame, x);
+pub(super) const OFF_X30: usize = OFF_X + 30 * 8;
+pub(super) const OFF_ELR: usize = core::mem::offset_of!(TrapFrame, elr);
+pub(super) const OFF_ESR: usize = core::mem::offset_of!(TrapFrame, esr);
+pub(super) const OFF_VECTOR: usize = core::mem::offset_of!(TrapFrame, vector);
+pub(super) const OFF_SLOT: usize = core::mem::offset_of!(TrapFrame, slot);
+
+const _: () = {
+    // The general registers are addressed as fifteen consecutive pairs from
+    // the base of the frame.
+    assert!(OFF_X == 0);
+    assert!(core::mem::size_of::<[u64; 31]>() == 31 * 8);
+    // `stp x30, x21` writes x[30] and then the stack pointer of the level
+    // below; `stp x22, x23` writes ELR and then SPSR, and then ESR and FAR.
+    assert!(core::mem::offset_of!(TrapFrame, sp) == OFF_X30 + 8);
+    assert!(core::mem::offset_of!(TrapFrame, spsr) == OFF_ELR + 8);
+    assert!(core::mem::offset_of!(TrapFrame, far) == OFF_ESR + 8);
+    // Nothing else may sit between the frame's end and the last field, because
+    // an exception from EL1 records the stack pointer as the frame's end.
+    assert!(FRAME_SIZE == OFF_SLOT + 8);
+    assert!(FRAME_SIZE % 16 == 0);
+};
+
 impl TrapFrame {
     /// True when the exception came from a program rather than the kernel.
     /// Mode zero in the saved processor state is EL0.

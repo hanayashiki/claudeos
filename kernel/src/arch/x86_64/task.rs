@@ -14,8 +14,14 @@ extern "C" {
 pub const TRAP_FRAME_SIZE: usize = core::mem::size_of::<TrapFrame>();
 
 /// The vector recorded in a frame that did not come from an interrupt. The
-/// `syscall` entry stub writes the same value.
+/// `syscall` entry stub is given this to write.
 pub const VECTOR_SYSCALL: u64 = 0x100;
+
+/// How many words `switch.s` leaves on the stack of a task it switched away
+/// from: the seven it pushes, and the address it will return to. `switch.s`
+/// builds that frame with pushes rather than offsets, so this is the only
+/// number the two halves share, and it is checked there.
+pub(super) const SWITCH_FRAME_WORDS: usize = 8;
 
 /// The x87, MMX and SSE register file, as `fxsave` lays it out.
 ///
@@ -150,7 +156,7 @@ pub fn trap_frame_at(kstack_top: u64) -> *mut TrapFrame {
 pub fn prepare_kernel_entry(kstack_top: u64, entry: u64) -> u64 {
     // Leave the trap frame area untouched and build the switch frame below it.
     let base = kstack_top - TRAP_FRAME_SIZE as u64;
-    let frame = (base - 8 * 8) as *mut u64;
+    let frame = (base - (SWITCH_FRAME_WORDS * 8) as u64) as *mut u64;
     unsafe {
         // Mirrors what switch_context pops: rflags, r15, r14, r13, r12,
         // rbx, rbp, then the address it returns to.
@@ -161,7 +167,7 @@ pub fn prepare_kernel_entry(kstack_top: u64, entry: u64) -> u64 {
         *frame.add(4) = 0; // r12
         *frame.add(5) = 0; // rbx
         *frame.add(6) = 0; // rbp
-        *frame.add(7) = entry;
+        *frame.add(SWITCH_FRAME_WORDS - 1) = entry;
     }
     frame as u64
 }

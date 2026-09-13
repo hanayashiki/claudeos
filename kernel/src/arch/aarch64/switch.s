@@ -6,17 +6,20 @@
  * stack, records the stack pointer, then resumes the incoming task from the
  * mirror-image frame on its stack. The processor state is not saved: it is
  * the caller's business, and both sides run with interrupts off.
+ *
+ * The size of the frame comes in as a constant from task.rs, which lays the
+ * same frame out by hand for a task that has never run.
  */
 .section .text, "ax"
 .global switch_context
 switch_context:
-    sub  sp, sp, #96
+    sub  sp, sp, #{FRAME_SIZE}
     stp  x19, x20, [sp, #0]
     stp  x21, x22, [sp, #16]
     stp  x23, x24, [sp, #32]
     stp  x25, x26, [sp, #48]
     stp  x27, x28, [sp, #64]
-    stp  x29, x30, [sp, #80]
+    stp  x29, x30, [sp, #({FRAME_SIZE} - 16)]
     mov  x9, sp
     str  x9, [x0]
     mov  sp, x1
@@ -25,6 +28,6 @@ switch_context:
     ldp  x23, x24, [sp, #32]
     ldp  x25, x26, [sp, #48]
     ldp  x27, x28, [sp, #64]
-    ldp  x29, x30, [sp, #80]
-    add  sp, sp, #96
+    ldp  x29, x30, [sp, #({FRAME_SIZE} - 16)]
+    add  sp, sp, #{FRAME_SIZE}
     ret

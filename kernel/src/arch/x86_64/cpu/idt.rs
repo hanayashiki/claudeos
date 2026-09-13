@@ -39,6 +39,58 @@ impl TrapFrame {
     }
 }
 
+/// What the two entry paths are given for this structure. `syscall_entry.s`
+/// builds the frame field by field and `interrupts.s` reads the saved code
+/// selector out of it to decide whether to swap GS; both take these rather
+/// than carrying numbers of their own.
+pub const FRAME_SIZE: usize = core::mem::size_of::<TrapFrame>();
+
+macro_rules! frame_offsets {
+    ($($name:ident => $field:ident),* $(,)?) => {
+        $(pub const $name: usize = core::mem::offset_of!(TrapFrame, $field);)*
+
+        const _: () = {
+            // Both paths push and pop the general registers as one run and
+            // name no offset for any of them, and the `addq` that follows
+            // steps from the last of them to what the CPU pushed. So the
+            // order matters as much as the offsets do: every field lies one
+            // word after the one before it, and nothing follows the last.
+            let offsets = [$($name),*];
+            let mut i = 0;
+            while i < offsets.len() {
+                assert!(offsets[i] == i * 8);
+                i += 1;
+            }
+            assert!(FRAME_SIZE == offsets.len() * 8);
+        };
+    };
+}
+
+frame_offsets! {
+    OFF_RAX => rax,
+    OFF_RBX => rbx,
+    OFF_RCX => rcx,
+    OFF_RDX => rdx,
+    OFF_RSI => rsi,
+    OFF_RDI => rdi,
+    OFF_RBP => rbp,
+    OFF_R8 => r8,
+    OFF_R9 => r9,
+    OFF_R10 => r10,
+    OFF_R11 => r11,
+    OFF_R12 => r12,
+    OFF_R13 => r13,
+    OFF_R14 => r14,
+    OFF_R15 => r15,
+    OFF_VECTOR => vector,
+    OFF_ERROR_CODE => error_code,
+    OFF_RIP => rip,
+    OFF_CS => cs,
+    OFF_RFLAGS => rflags,
+    OFF_RSP => rsp,
+    OFF_SS => ss,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct IdtEntry {
