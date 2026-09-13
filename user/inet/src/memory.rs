@@ -11,6 +11,96 @@ use crate::Report;
 
 pub fn run(report: &mut Report) {
     exec_that_fails_keeps_the_memory_state(report);
+    a_thread_left_unreaped_keeps_the_space(report);
+}
+
+/// How much memory the machine says is unspoken for, in kibibytes.
+fn free_kib() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemFree:") {
+            return rest.trim().trim_end_matches("kB").trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// The half of the check below that runs in a process of its own: leave behind
+/// a thread that has exited and has not been reaped, then replace this image
+/// while it is still there.
+///
+/// The thread's task belongs to whoever started this process, not to this one,
+/// so nothing here can reap it and it is still on the machine, naming the
+/// address space this exec is about to leave, when the exec happens.
+pub fn leave_a_thread_and_exec() -> ! {
+    let handle = std::thread::spawn(|| {});
+    let _ = handle.join();
+    // A join returns once the thread's tid has been cleared, which is a moment
+    // before its task reaches its final state. The exec has to come after
+    // that, or there is no unreaped thread for it to trip over.
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    sys::execve("/bin/true", &["true"]);
+    sys::exit_group(1);
+}
+
+/// One process through that sequence, and both of the tasks it leaves reaped.
+fn round() -> bool {
+    let pid = sys::fork();
+    if pid == 0 {
+        sys::execve("/bin/inet", &["inet", "leave-a-thread"]);
+        sys::exit_group(1);
+    }
+    if pid < 0 {
+        return false;
+    }
+    // Named, not "whichever is ready": the thread is a child of this process
+    // too and becomes reapable first, and reaping it before the exec would
+    // take away the very thing the exec has to trip over.
+    if sys::wait4(pid as i32, 0).0 < 0 {
+        return false;
+    }
+    sys::wait4(-1, 0).0 >= 0
+}
+
+/// A task that has exited and has not been reaped still names the address
+/// space it ran in, so an exec by one of its siblings must not hand that space
+/// back. Handing it back twice shows up as the machine claiming more free
+/// memory than it has, because the second release takes a frame that has since
+/// been given to something else.
+fn a_thread_left_unreaped_keeps_the_space(report: &mut Report) {
+    const WARM_UP: usize = 3;
+    const ROUNDS: usize = 40;
+    // The kernel heap takes frames as it grows and does not give them back, so
+    // a few kilobytes of drift is ordinary. A frame released twice a round is
+    // many times that.
+    const SLACK: i64 = 64;
+
+    for _ in 0..WARM_UP {
+        if !round() {
+            report.check("a process to leave a thread in", false, String::new());
+            return;
+        }
+    }
+    let Some(before) = free_kib() else {
+        report.check("free memory is reported", false, String::new());
+        return;
+    };
+    for _ in 0..ROUNDS {
+        if !round() {
+            report.check("a process to leave a thread in", false, String::new());
+            return;
+        }
+    }
+    let Some(after) = free_kib() else {
+        report.check("free memory is reported", false, String::new());
+        return;
+    };
+    let drift = after as i64 - before as i64;
+    report.check(
+        "a process execs with a thread unreaped and its memory is given back once",
+        drift.abs() <= SLACK,
+        format!("free memory moved by {} kB over {} rounds", drift, ROUNDS),
+    );
 }
 
 /// An executable that passes every check made before the old address space is
@@ -75,7 +165,7 @@ fn exec_that_fails_keeps_the_memory_state(report: &mut Report) {
         // Nothing below allocates: after a failed exec the heap is exactly
         // what is in doubt.
         let before = sys::brk(0);
-        let refused = sys::execve(PATH) < 0;
+        let refused = sys::execve(PATH, &[PATH]) < 0;
         let after = sys::brk(0);
         let mut code = 0;
         if refused {

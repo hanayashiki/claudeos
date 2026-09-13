@@ -43,6 +43,8 @@ fn main() {
             let count: usize = args.get(3).and_then(|c| c.parse().ok()).unwrap_or(usize::MAX);
             serve(port, count);
         }
+        // Started by the memory checks, in a process of its own.
+        Some("leave-a-thread") => memory::leave_a_thread_and_exec(),
         _ => test(),
     }
 }

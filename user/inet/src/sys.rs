@@ -100,19 +100,26 @@ pub fn fork() -> i64 {
     unsafe { syscall(SYS_CLONE, SIGCHLD, 0, 0, 0, 0, 0) }
 }
 
-/// Replace this program with the one at `path`, which is given as its own
-/// only argument and no environment. Only returns if it could not be done.
-pub fn execve(path: &str) -> i64 {
-    let mut name = Vec::with_capacity(path.len() + 1);
-    name.extend_from_slice(path.as_bytes());
-    name.push(0);
-    let argv = [name.as_ptr() as u64, 0u64];
+fn cstr(value: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len() + 1);
+    out.extend_from_slice(value.as_bytes());
+    out.push(0);
+    out
+}
+
+/// Replace this program with the one at `path`, run with `argv` and an empty
+/// environment. Only returns if it could not be done.
+pub fn execve(path: &str, argv: &[&str]) -> i64 {
+    let name = cstr(path);
+    let args: Vec<Vec<u8>> = argv.iter().map(|a| cstr(a)).collect();
+    let mut pointers: Vec<u64> = args.iter().map(|a| a.as_ptr() as u64).collect();
+    pointers.push(0);
     let envp = [0u64];
     unsafe {
         syscall(
             SYS_EXECVE,
             name.as_ptr() as u64,
-            argv.as_ptr() as u64,
+            pointers.as_ptr() as u64,
             envp.as_ptr() as u64,
             0,
             0,
