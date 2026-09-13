@@ -457,15 +457,12 @@ impl AddressSpace {
     /// copy-on-write, so a fork costs a page table walk rather than a copy of
     /// the whole address space; the copy happens per page, only if written to.
     ///
-    /// A walk that stops partway has still taken write permission away from
-    /// every page it reached, so the flush belongs to both outcomes and is
-    /// done here where neither can get past it. What this address space has
-    /// collected by then is the caller's to release.
+    /// Each page is invalidated where its permission changes, so a walk that
+    /// stops partway leaves nothing behind that a flush here would have to
+    /// clean up. What this address space has collected by then is the
+    /// caller's to release.
     pub fn clone_user_from(&self, src: &AddressSpace) -> Result<(), MapError> {
-        let result = unsafe { self.share_user_tables(src) };
-        // The parent's write permissions just changed underneath it.
-        flush_tlb_all();
-        result
+        unsafe { self.share_user_tables(src) }
     }
 
     unsafe fn share_user_tables(&self, src: &AddressSpace) -> Result<(), MapError> {
@@ -505,8 +502,16 @@ impl AddressSpace {
                         let shared = if flags & WRITABLE != 0 {
                             let shared = (flags & !WRITABLE) | COW;
                             // The parent loses write access too, or it
-                            // would change pages the child can see.
+                            // would change pages the child can see. The walk
+                            // runs on the parent's tables, so the translation
+                            // this contradicts is in the processor's cache of
+                            // them right now: a sibling's store goes through
+                            // it, into a page the child is about to share,
+                            // until it is thrown away. That is why the
+                            // invalidation is here and not at the end of the
+                            // walk.
                             Entry::new(phys | shared).store(pt.add(l));
+                            flush_tlb(virt);
                             shared
                         } else {
                             flags

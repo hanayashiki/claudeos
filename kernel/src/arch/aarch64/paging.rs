@@ -531,15 +531,12 @@ impl AddressSpace {
     /// Give this address space the same user mappings `src` has, shared and
     /// read-only so that the first write to either copy makes its own frame.
     ///
-    /// A walk that stops partway has still taken write permission away from
-    /// every page it reached, so the flush belongs to both outcomes and is
-    /// done here where neither can get past it. What this address space has
-    /// collected by then is the caller's to release.
+    /// Each page is invalidated where its permission changes, so a walk that
+    /// stops partway leaves nothing behind that a flush here would have to
+    /// clean up. What this address space has collected by then is the
+    /// caller's to release.
     pub fn clone_user_from(&self, src: &AddressSpace) -> Result<(), MapError> {
-        let result = unsafe { self.share_user_tables(src) };
-        // The parent's write permissions just changed underneath it.
-        flush_tlb_all();
-        result
+        unsafe { self.share_user_tables(src) }
     }
 
     unsafe fn share_user_tables(&self, src: &AddressSpace) -> Result<(), MapError> {
@@ -604,7 +601,13 @@ unsafe fn clone_table(
                 flags |= COW;
                 // The page the parent is still running on has to lose write
                 // permission too, or its writes would be seen by the child.
+                // The walk runs on the parent's tables, so the translation
+                // this contradicts is in the processor's cache of them right
+                // now: a sibling's store goes through it, into a page the
+                // child is about to share, until it is thrown away. That is
+                // why the invalidation is here and not at the end of the walk.
                 encode(entry.addr(), flags).store(entry_ptr);
+                flush_tlb(virt);
             }
             let shared = frame::share_recorded(entry.addr());
             dst.map(virt, shared, flags)?;
