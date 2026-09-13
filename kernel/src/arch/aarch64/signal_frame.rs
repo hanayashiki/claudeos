@@ -102,7 +102,19 @@ pub fn enter_signal_handler(
 ) -> bool {
     // There is no code in this kernel's address space a handler could return
     // through, so a program that registered no restorer has nowhere to go.
+    // Linux on this machine maps a page of its own holding the two
+    // instructions and does not look at the field at all, which is why a
+    // program built for it need not fill the field in; this kernel maps no
+    // such page. Say so rather than kill the task without a word, because
+    // what it looks like from outside is a program that took a fault it never
+    // executed an instruction for.
     if action.restorer == 0 {
+        crate::println!(
+            "[signal] pid={} registered no restorer for signal {}, \
+             and this machine has no trampoline of its own to return through",
+            crate::sched::current().pid,
+            signal
+        );
         return false;
     }
 
