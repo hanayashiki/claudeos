@@ -20,6 +20,8 @@ else
 fi
 
 status=0
+# Suites that did not run at all. A skip is not a pass, so the summary says so.
+skipped=0
 
 banner() {
   echo "=============================================================="
@@ -117,19 +119,24 @@ if [ -x "$BUSYBOX" ]; then
   run_suite "upstream busybox" "/root/busybox.sh" 300
 else
   echo ">> upstream busybox: skipped (run ARCH=$ARCH scripts/fetch-busybox.sh)"
+  skipped=$((skipped + 1))
   echo
 fi
 if [ -f "$ALPINE" ]; then
   run_suite "alpine linux userland" "init=/bin/sh /root/alpine.sh" 300 "$ALPINE"
 else
   echo ">> alpine linux userland: skipped (run ARCH=$ARCH scripts/fetch-alpine.sh)"
+  skipped=$((skipped + 1))
   echo
 fi
 run_interactive
 
-if [ $status -eq 0 ]; then
-  echo "all suites passed"
-else
+if [ $status -ne 0 ]; then
   echo "some suites failed"
+elif [ $skipped -gt 0 ]; then
+  # Saying "all passed" here would be untrue: a skipped suite tested nothing.
+  echo "the suites that ran passed, but $skipped did not run"
+else
+  echo "all suites passed"
 fi
 exit $status
