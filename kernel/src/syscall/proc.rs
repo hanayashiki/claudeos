@@ -59,10 +59,23 @@ pub fn fork(
     child.ppid = if is_thread { parent.ppid } else { parent.pid };
     child.tgid = if is_thread { parent.tgid } else { child_pid };
     child.pgid = parent.pgid;
-    child.cwd = parent.cwd.clone();
+    // Two more things a thread shares with the task that started it. Without
+    // these a descriptor one thread opens is a descriptor the others do not
+    // have, and a directory one changes into is one the others do not resolve
+    // against. A fork takes a copy of each instead, which is what makes the
+    // two processes independent from that point on.
+    child.cwd = if flags & CLONE_FS != 0 {
+        parent.cwd.clone()
+    } else {
+        alloc::sync::Arc::new(crate::sync::Spinlock::new(parent.cwd()))
+    };
+    child.fds = if flags & CLONE_FILES != 0 {
+        parent.fds.share()
+    } else {
+        parent.fds.clone_table()
+    };
     child.exe_path = parent.exe_path.clone();
     child.name = parent.name.clone();
-    child.fds = parent.fds.clone_table();
     child.umask = parent.umask;
     child.signal_actions = parent.signal_actions;
     // The child carries on from the same instruction, so it starts on the

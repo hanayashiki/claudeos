@@ -23,7 +23,7 @@ pub fn resolve_str(dirfd: i64, path: &str) -> Result<String, Errno> {
         return Ok(fs::normalize("/", path));
     }
     if dirfd == AT_FDCWD {
-        let cwd = sched::current().cwd.clone();
+        let cwd = sched::current().cwd();
         return Ok(fs::normalize(&cwd, path));
     }
     let file = sched::current().fds.get(dirfd as i32)?;
@@ -62,7 +62,7 @@ fn procfs_override_for(path: &str, for_link: bool) -> Option<String> {
     if let Some(entry) = effective.strip_prefix(&own_prefix) {
         match entry {
             "exe" => return Some(task.exe_path.clone()),
-            "cwd" => return Some(task.cwd.clone()),
+            "cwd" => return Some(task.cwd()),
             _ => {}
         }
         if let Some(number) = entry.strip_prefix("fd/") {
@@ -240,7 +240,7 @@ pub fn close(fd: i32) -> SysResult {
 }
 
 pub fn close_range(first: u32, last: u32) -> SysResult {
-    let table = &mut sched::current().fds;
+    let table = sched::current().fds.share();
     for fd in first..=last.min(fs::MAX_FDS as u32 - 1) {
         let _ = table.close(fd as i32);
     }
@@ -374,7 +374,7 @@ pub fn getdents64(fd: i32, out: u64, len: usize) -> SysResult {
 }
 
 pub fn getcwd(out: u64, len: usize) -> SysResult {
-    let cwd = sched::current().cwd.clone();
+    let cwd = sched::current().cwd();
     let bytes = cwd.as_bytes();
     if bytes.len() + 1 > len {
         return Err(Errno::ERANGE);
@@ -391,7 +391,7 @@ pub fn chdir(path_addr: u64) -> SysResult {
     if !node.is_dir() {
         return Err(Errno::ENOTDIR);
     }
-    sched::current().cwd = path;
+    sched::current().set_cwd(path);
     Ok(0)
 }
 
@@ -401,7 +401,7 @@ pub fn fchdir(fd: i32) -> SysResult {
     if !node.is_dir() {
         return Err(Errno::ENOTDIR);
     }
-    sched::current().cwd = file.path.clone();
+    sched::current().set_cwd(file.path.clone());
     Ok(0)
 }
 
@@ -535,7 +535,7 @@ pub fn dup2(old: i32, new: i32, flags: u32) -> SysResult {
     if new < 0 || new as usize >= fs::MAX_FDS {
         return Err(Errno::EBADF);
     }
-    let table = &mut sched::current().fds;
+    let table = sched::current().fds.share();
     let _ = table.close(new);
     table.insert_at(new as usize, file, flags & O_CLOEXEC != 0);
     Ok(new as u64)
@@ -544,7 +544,7 @@ pub fn dup2(old: i32, new: i32, flags: u32) -> SysResult {
 pub fn pipe2(out: u64, flags: u32) -> SysResult {
     let (read_end, write_end) = pipe::create_pair(flags & !O_CLOEXEC);
     let cloexec = flags & O_CLOEXEC != 0;
-    let table = &mut sched::current().fds;
+    let table = sched::current().fds.share();
     let read_fd = table.alloc(read_end, cloexec)?;
     let write_fd = match table.alloc(write_end, cloexec) {
         Ok(fd) => fd,
@@ -562,20 +562,17 @@ pub fn fcntl(fd: i32, cmd: u32, arg: u64) -> SysResult {
     let file = sched::current().fds.get(fd)?;
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            let table = &mut sched::current().fds;
-            let new = table.alloc_at_least(arg as usize, file, cmd == F_DUPFD_CLOEXEC)?;
+            let new = sched::current()
+                .fds
+                .alloc_at_least(arg as usize, file, cmd == F_DUPFD_CLOEXEC)?;
             Ok(new as u64)
         }
         F_GETFD => {
-            let table = &sched::current().fds;
-            let set = table.cloexec.get(fd as usize).copied().unwrap_or(false);
+            let set = sched::current().fds.is_cloexec(fd);
             Ok(if set { FD_CLOEXEC as u64 } else { 0 })
         }
         F_SETFD => {
-            let table = &mut sched::current().fds;
-            if (fd as usize) < table.cloexec.len() {
-                table.cloexec[fd as usize] = arg as u32 & FD_CLOEXEC != 0;
-            }
+            sched::current().fds.set_cloexec(fd, arg as u32 & FD_CLOEXEC != 0);
             Ok(0)
         }
         F_GETFL => Ok(file.flags() as u64),
@@ -624,10 +621,7 @@ pub fn ioctl(fd: i32, request: u64, arg: u64) -> SysResult {
             return Ok(0);
         }
         FIOCLEX | FIONCLEX => {
-            let table = &mut sched::current().fds;
-            if (fd as usize) < table.cloexec.len() {
-                table.cloexec[fd as usize] = request == FIOCLEX;
-            }
+            sched::current().fds.set_cloexec(fd, request == FIOCLEX);
             return Ok(0);
         }
         _ => {}

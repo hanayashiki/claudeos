@@ -120,8 +120,11 @@ pub struct Task {
     pub space: AddressSpace,
     /// Shared with every thread running in the same address space.
     pub mm: Arc<Spinlock<MemState>>,
+    /// Shared with every task that cloned with `CLONE_FILES`.
     pub fds: FdTable,
-    pub cwd: String,
+    /// Shared with every task that cloned with `CLONE_FS`, so that a directory
+    /// one thread changes into is the one its siblings resolve against.
+    pub cwd: Arc<Spinlock<String>>,
     pub name: String,
     /// Path of the running executable, reported through /proc/self/exe.
     pub exe_path: String,
@@ -199,7 +202,7 @@ impl Task {
             space,
             mm: Arc::new(Spinlock::new(MemState::new())),
             fds: FdTable::new(),
-            cwd: String::from("/"),
+            cwd: Arc::new(Spinlock::new(String::from("/"))),
             name: name.to_string(),
             exe_path: String::new(),
             exit_code: 0,
@@ -234,6 +237,14 @@ impl Task {
     /// lands in `entry`.
     pub fn prepare_kernel_frame(&mut self, entry: u64) {
         self.kernel_sp = arch::prepare_kernel_entry(self.kstack_top, entry);
+    }
+
+    pub fn cwd(&self) -> String {
+        self.cwd.lock().clone()
+    }
+
+    pub fn set_cwd(&self, path: String) {
+        *self.cwd.lock() = path;
     }
 
     pub fn brk_start(&self) -> u64 {

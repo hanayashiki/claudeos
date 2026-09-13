@@ -333,8 +333,11 @@ pub fn exit_current(status: i32) -> ! {
             let _ = crate::uaccess::write_u32(address, 0);
             crate::futex::wake(crate::futex::futex_key(address), u32::MAX);
         }
-        task.fds.entries.clear();
-        task.fds.cloexec.clear();
+        // Under CLONE_FILES the table belongs to the whole process, so only
+        // the last task holding it may empty it here.
+        if task.fds.is_last_reference() {
+            task.fds.clear();
+        }
 
         // Threads share an address space and its region list; only the last
         // thread out may tear either of them down.

@@ -13,6 +13,7 @@
 
 mod memory;
 mod sys;
+mod threads;
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -68,6 +69,8 @@ fn test() {
     http(&mut report);
     println!("-- memory management --");
     memory::run(&mut report);
+    println!("-- what threads share --");
+    threads::run(&mut report);
 
     println!();
     println!("=== {} passed, {} failed ===", report.passed, report.failed);

@@ -1,6 +1,6 @@
 //! Raw Linux system calls.
 //!
-//! The memory checks need calls the standard library does not expose at all --
+//! The checks here need calls the standard library does not expose at all --
 //! `brk`, `mmap` with an address of its choosing, `execve` -- and they need
 //! `fork` and `wait4` rather than the process plumbing `std::process` wraps
 //! around them, because what is being watched is which task reaps which.
@@ -11,7 +11,6 @@ pub const PROT_READ: u64 = 1;
 pub const PROT_WRITE: u64 = 2;
 pub const MAP_PRIVATE: u64 = 0x02;
 pub const MAP_ANONYMOUS: u64 = 0x20;
-pub const WNOHANG: u64 = 1;
 
 // The call numbers and the instruction that makes the call are the machine's
 // own. x86-64 keeps its historical table; aarch64 uses the asm-generic one,
@@ -19,6 +18,8 @@ pub const WNOHANG: u64 = 1;
 // exit stands in for it.
 #[cfg(target_arch = "x86_64")]
 mod numbers {
+    pub const SYS_READ: u64 = 0;
+    pub const SYS_CLOSE: u64 = 3;
     pub const SYS_MMAP: u64 = 9;
     pub const SYS_MUNMAP: u64 = 11;
     pub const SYS_BRK: u64 = 12;
@@ -30,6 +31,8 @@ mod numbers {
 
 #[cfg(target_arch = "aarch64")]
 mod numbers {
+    pub const SYS_READ: u64 = 63;
+    pub const SYS_CLOSE: u64 = 57;
     pub const SYS_MMAP: u64 = 222;
     pub const SYS_MUNMAP: u64 = 215;
     pub const SYS_BRK: u64 = 214;
@@ -161,6 +164,24 @@ pub fn wait4(pid: i32, options: u64) -> (i64, i32) {
         )
     };
     (rc, (status >> 8) & 0xFF)
+}
+
+pub fn read(fd: i32, buf: &mut [u8]) -> i64 {
+    unsafe {
+        syscall(
+            SYS_READ,
+            fd as i64 as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+pub fn close(fd: i32) -> i64 {
+    unsafe { syscall(SYS_CLOSE, fd as i64 as u64, 0, 0, 0, 0, 0) }
 }
 
 pub fn exit_group(code: i32) -> ! {
