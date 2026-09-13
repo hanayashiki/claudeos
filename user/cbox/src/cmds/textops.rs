@@ -346,7 +346,7 @@ pub fn grep(args: &[String]) -> i32 {
         let mut count = 0;
         for (index, line) in text.lines().enumerate() {
             let haystack = if ignore_case { line.to_lowercase() } else { line.to_string() };
-            let hit = matcher.is_match(&haystack);
+            let hit = matcher.is_match(haystack.as_bytes());
             if hit == invert {
                 continue;
             }
@@ -362,12 +362,13 @@ pub fn grep(args: &[String]) -> i32 {
             // -o prints what matched rather than the line it was found on,
             // once per match.
             if only_matching {
-                let chars: Vec<char> = haystack.chars().collect();
-                let original: Vec<char> = line.chars().collect();
+                let hay = haystack.as_bytes();
+                let original = line.as_bytes();
                 let mut at = 0usize;
-                while let Some((start, end)) = matcher.find(&chars, at) {
+                while let Some((start, end)) = matcher.find(hay, at) {
                     if end > start {
-                        let piece: String = original[start..end.min(original.len())].iter().collect();
+                        let piece = &original[start..end.min(original.len())];
+                        let piece = String::from_utf8_lossy(piece);
                         if number {
                             println!("{}{}:{}", prefix, index + 1, piece);
                         } else {
@@ -375,7 +376,7 @@ pub fn grep(args: &[String]) -> i32 {
                         }
                     }
                     at = if end > start { end } else { start + 1 };
-                    if at > chars.len() {
+                    if at > hay.len() {
                         break;
                     }
                 }

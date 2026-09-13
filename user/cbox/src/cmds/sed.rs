@@ -2,9 +2,14 @@
 //!
 //! Addresses select lines, commands act on them, and the pattern space is
 //! printed at the end of the cycle unless -n said not to.
+//!
+//! The pattern space holds bytes. A file handed to sed is not always text,
+//! and one that is not still has lines in it that a script can select and
+//! substitute in; refusing it, or replacing the bytes that do not decode,
+//! would lose what the file said.
 
 use crate::regex::Regex;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 
 enum Address {
     /// Every line.
@@ -15,7 +20,7 @@ enum Address {
 }
 
 impl Address {
-    fn matches(&self, number: usize, last: bool, line: &str) -> bool {
+    fn matches(&self, number: usize, last: bool, line: &[u8]) -> bool {
         match self {
             Address::Always => true,
             Address::Line(want) => number == *want,
@@ -33,7 +38,7 @@ enum Action {
     Quit,
     LineNumber,
     /// y/abc/xyz/
-    Transliterate { from: Vec<char>, to: Vec<char> },
+    Transliterate { from: Vec<u8>, to: Vec<u8> },
 }
 
 struct Command {
@@ -47,7 +52,7 @@ struct Command {
 }
 
 impl Command {
-    fn selects(&mut self, number: usize, last: bool, line: &str) -> bool {
+    fn selects(&mut self, number: usize, last: bool, line: &[u8]) -> bool {
         let chosen = match &self.end {
             None => self.start.matches(number, last, line),
             Some(end) => {
@@ -59,7 +64,7 @@ impl Command {
                     }
                     true
                 } else if self.start.matches(number, last, line) {
-                    self.active = !end.matches(number + 1, false, "");
+                    self.active = !end.matches(number + 1, false, b"");
                     true
                 } else {
                     false
@@ -222,10 +227,10 @@ fn parse_script(script: &str, extended: bool) -> Result<Vec<Command>, String> {
                     .ok_or("unterminated y command")?;
                 let to = parse_until(&chars, &mut position, delimiter)
                     .ok_or("unterminated y command")?;
-                if from.chars().count() != to.chars().count() {
+                if from.len() != to.len() {
                     return Err("y needs two sets of the same length".into());
                 }
-                Action::Transliterate { from: from.chars().collect(), to: to.chars().collect() }
+                Action::Transliterate { from: from.into_bytes(), to: to.into_bytes() }
             }
             'p' => Action::Print,
             'd' => Action::Delete,
@@ -248,28 +253,28 @@ fn parse_script(script: &str, extended: bool) -> Result<Vec<Command>, String> {
 /// groups the pattern captured.
 fn expand(
     replacement: &str,
-    matched: &str,
-    text: &[char],
+    matched: &[u8],
+    text: &[u8],
     caps: &crate::regex::Captures,
-) -> String {
-    let mut out = String::new();
-    let mut chars = replacement.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '&' => out.push_str(matched),
-            '\\' => match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('&') => out.push('&'),
-                Some('\\') => out.push('\\'),
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut bytes = replacement.bytes();
+    while let Some(b) = bytes.next() {
+        match b {
+            b'&' => out.extend_from_slice(matched),
+            b'\\' => match bytes.next() {
+                Some(b'n') => out.push(b'\n'),
+                Some(b't') => out.push(b'\t'),
+                Some(b'&') => out.push(b'&'),
+                Some(b'\\') => out.push(b'\\'),
                 Some(digit) if digit.is_ascii_digit() => {
-                    let index = digit.to_digit(10).unwrap_or(0) as usize;
+                    let index = (digit - b'0') as usize;
                     if let Some(Some((start, end))) = caps.get(index) {
-                        out.extend(text[*start..*end].iter());
+                        out.extend_from_slice(&text[*start..*end]);
                     }
                 }
                 Some(other) => out.push(other),
-                None => out.push('\\'),
+                None => out.push(b'\\'),
             },
             other => out.push(other),
         }
@@ -278,38 +283,36 @@ fn expand(
 }
 
 fn substitute(
-    line: &str,
+    line: &[u8],
     regex: &Regex,
     replacement: &str,
     global: bool,
     which: usize,
-) -> (String, bool) {
-    let chars: Vec<char> = line.chars().collect();
-    let mut out = String::new();
+) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
     let mut cursor = 0usize;
     let mut seen = 0usize;
     let mut changed = false;
     let mut caps = crate::regex::Captures::new();
 
-    while cursor <= chars.len() {
-        let (start, end) = match regex.find_captures(&chars, cursor, &mut caps) {
+    while cursor <= line.len() {
+        let (start, end) = match regex.find_captures(line, cursor, &mut caps) {
             Some(span) => span,
             None => break,
         };
         seen += 1;
         let take = seen >= which && (global || seen == which);
-        out.extend(chars[cursor..start].iter());
-        let matched: String = chars[start..end].iter().collect();
+        out.extend_from_slice(&line[cursor..start]);
         if take {
-            out.push_str(&expand(replacement, &matched, &chars, &caps));
+            out.extend_from_slice(&expand(replacement, &line[start..end], line, &caps));
             changed = true;
         } else {
-            out.push_str(&matched);
+            out.extend_from_slice(&line[start..end]);
         }
         if end == start {
             // An empty match would not advance on its own.
-            if start < chars.len() {
-                out.push(chars[start]);
+            if start < line.len() {
+                out.push(line[start]);
             }
             cursor = start + 1;
         } else {
@@ -319,8 +322,8 @@ fn substitute(
             break;
         }
     }
-    if cursor < chars.len() {
-        out.extend(chars[cursor..].iter());
+    if cursor < line.len() {
+        out.extend_from_slice(&line[cursor..]);
     }
     (out, changed)
 }
@@ -387,53 +390,69 @@ pub fn main(args: &[String]) -> i32 {
             eprintln!("sed: -i needs a file");
             return 2;
         }
-        let stdin = std::io::stdin();
-        let lines: Vec<String> = BufReader::new(stdin.lock())
-            .lines()
-            .map_while(Result::ok)
-            .collect();
-        let mut out = String::new();
-        run(&mut commands, &lines, quiet, &mut out);
-        print!("{}", out);
-        let _ = std::io::stdout().flush();
+        let mut data = Vec::new();
+        if std::io::stdin().read_to_end(&mut data).is_err() {
+            eprintln!("sed: -: cannot read input");
+            return 1;
+        }
+        let out = edit(&mut commands, &data, quiet);
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        let _ = handle.write_all(&out);
+        let _ = handle.flush();
         return 0;
     }
 
     let mut status = 0;
     for path in &files {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
+        let data = match std::fs::read(path) {
+            Ok(data) => data,
             Err(err) => {
                 eprintln!("sed: {}: {}", path, err);
                 status = 1;
                 continue;
             }
         };
-        let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
-        let mut out = String::new();
         for command in commands.iter_mut() {
             command.active = false;
         }
-        run(&mut commands, &lines, quiet, &mut out);
+        let out = edit(&mut commands, &data, quiet);
         if in_place {
-            if let Err(err) = std::fs::write(path, out.as_bytes()) {
+            if let Err(err) = std::fs::write(path, &out) {
                 eprintln!("sed: {}: {}", path, err);
                 status = 1;
             }
         } else {
-            print!("{}", out);
+            let stdout = std::io::stdout();
+            let _ = stdout.lock().write_all(&out);
         }
     }
     let _ = std::io::stdout().flush();
     status
 }
 
-fn run(commands: &mut [Command], lines: &[String], quiet: bool, out: &mut String) {
+/// Run the script over one input. The last line of a file that does not end
+/// in a newline has not got one to print either, so a run over such a file
+/// gives back a file of the same shape rather than one with a line ending
+/// sed invented.
+fn edit(commands: &mut [Command], data: &[u8], quiet: bool) -> Vec<u8> {
+    let lines: Vec<&[u8]> =
+        super::lines(data).iter().map(|line| super::without_newline(line)).collect();
+    let terminated = data.last() == Some(&b'\n');
+    let mut out = Vec::new();
+    run(commands, &lines, quiet, &mut out);
+    if !terminated && out.last() == Some(&b'\n') {
+        out.pop();
+    }
+    out
+}
+
+fn run(commands: &mut [Command], lines: &[&[u8]], quiet: bool, out: &mut Vec<u8>) {
     let total = lines.len();
     for (index, line) in lines.iter().enumerate() {
         let number = index + 1;
         let last = number == total;
-        let mut space = line.clone();
+        let mut space = line.to_vec();
         let mut deleted = false;
         let mut quit = false;
 
@@ -446,13 +465,13 @@ fn run(commands: &mut [Command], lines: &[String], quiet: bool, out: &mut String
                     let (new, changed) = substitute(&space, regex, replacement, *global, *which);
                     space = new;
                     if changed && *print {
-                        out.push_str(&space);
-                        out.push('\n');
+                        out.extend_from_slice(&space);
+                        out.push(b'\n');
                     }
                 }
                 Action::Print => {
-                    out.push_str(&space);
-                    out.push('\n');
+                    out.extend_from_slice(&space);
+                    out.push(b'\n');
                 }
                 Action::Delete => {
                     deleted = true;
@@ -463,24 +482,22 @@ fn run(commands: &mut [Command], lines: &[String], quiet: bool, out: &mut String
                     break;
                 }
                 Action::LineNumber => {
-                    out.push_str(&number.to_string());
-                    out.push('\n');
+                    out.extend_from_slice(number.to_string().as_bytes());
+                    out.push(b'\n');
                 }
                 Action::Transliterate { from, to } => {
-                    space = space
-                        .chars()
-                        .map(|c| match from.iter().position(|f| *f == c) {
-                            Some(at) => to[at],
-                            None => c,
-                        })
-                        .collect();
+                    for byte in space.iter_mut() {
+                        if let Some(at) = from.iter().position(|f| f == byte) {
+                            *byte = to[at];
+                        }
+                    }
                 }
             }
         }
 
         if !deleted && !quiet {
-            out.push_str(&space);
-            out.push('\n');
+            out.extend_from_slice(&space);
+            out.push(b'\n');
         }
         if quit {
             break;

@@ -111,6 +111,32 @@ pub fn split_flags(args: &[String]) -> (String, Vec<String>) {
     (flags, operands)
 }
 
+/// The lines of `data`, each one keeping the newline that ended it. The last
+/// line has none when the input did not end in one, which is how a tool that
+/// copies lines through knows not to add a newline the input had not got.
+pub fn lines(data: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (index, byte) in data.iter().enumerate() {
+        if *byte == b'\n' {
+            out.push(&data[start..=index]);
+            start = index + 1;
+        }
+    }
+    if start < data.len() {
+        out.push(&data[start..]);
+    }
+    out
+}
+
+/// A line without the newline that ended it, if it had one.
+pub fn without_newline(line: &[u8]) -> &[u8] {
+    match line.strip_suffix(b"\n") {
+        Some(rest) => rest,
+        None => line,
+    }
+}
+
 /// Read every named file, or standard input when there are none.
 pub fn read_inputs(program: &str, paths: &[String]) -> (Vec<(String, String)>, i32) {
     use std::io::Read;
