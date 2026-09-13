@@ -19,7 +19,9 @@ pub const MAP_ANONYMOUS: u64 = 0x20;
 #[cfg(target_arch = "x86_64")]
 mod numbers {
     pub const SYS_READ: u64 = 0;
+    pub const SYS_WRITE: u64 = 1;
     pub const SYS_CLOSE: u64 = 3;
+    pub const SYS_OPENAT: u64 = 257;
     pub const SYS_MMAP: u64 = 9;
     pub const SYS_MUNMAP: u64 = 11;
     pub const SYS_BRK: u64 = 12;
@@ -35,7 +37,9 @@ mod numbers {
 #[cfg(target_arch = "aarch64")]
 mod numbers {
     pub const SYS_READ: u64 = 63;
+    pub const SYS_WRITE: u64 = 64;
     pub const SYS_CLOSE: u64 = 57;
+    pub const SYS_OPENAT: u64 = 56;
     pub const SYS_MMAP: u64 = 222;
     pub const SYS_MUNMAP: u64 = 215;
     pub const SYS_BRK: u64 = 214;
@@ -205,6 +209,24 @@ pub fn read(fd: i32, buf: &mut [u8]) -> i64 {
             0,
         )
     }
+}
+
+/// Write from an address the caller names rather than from a slice, so the
+/// buffer can be one a sibling thread is taking away underneath it.
+pub fn write_raw(fd: i32, addr: u64, len: u64) -> i64 {
+    unsafe { syscall(SYS_WRITE, fd as i64 as u64, addr, len, 0, 0, 0) }
+}
+
+/// Open the path at `addr`, for the same reason. `openat` on both machines:
+/// the aarch64 table has no plain `open`.
+pub fn open_raw(addr: u64, flags: u64) -> i64 {
+    const AT_FDCWD: i64 = -100;
+    unsafe { syscall(SYS_OPENAT, AT_FDCWD as u64, addr, flags, 0, 0, 0) }
+}
+
+pub fn open(path: &str, flags: u64) -> i64 {
+    let path = cstr(path);
+    open_raw(path.as_ptr() as u64, flags)
 }
 
 /// Send a signal to a process by pid.

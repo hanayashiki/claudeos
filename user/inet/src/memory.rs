@@ -12,6 +12,7 @@ use crate::Report;
 pub fn run(report: &mut Report) {
     pages_shared_by_a_fork_written_from_two_threads(report);
     pages_a_fork_shared_are_out_of_the_parents_reach(report);
+    a_user_buffer_unmapped_while_the_kernel_reads_it(report);
     exec_that_fails_keeps_the_memory_state(report);
     a_thread_left_unreaped_keeps_the_space(report);
     argument_blocks_larger_than_the_stack_is_mapped_with(report);
@@ -238,6 +239,77 @@ fn pages_a_fork_shared_are_out_of_the_parents_reach(report: &mut Report) {
         format!("{} of {} rounds ran, the child's memory moved under it in {}", rounds, ROUNDS, moved),
     );
     sys::munmap(base, LEN);
+}
+
+/// A user pointer the kernel is about to read through is checked first, and a
+/// sibling thread can take the mapping away between the check and the read.
+/// The read is then a kernel access to a page that is not present, which is
+/// fatal to the machine rather than to the program.
+///
+/// Two ways in: a `write`, where the kernel copies the buffer out of user
+/// memory, and an `openat`, where it reads a path out of it. Both must come
+/// back as a result or as a bad address, and the machine has to still be here
+/// afterwards to say so.
+///
+/// A smoke test, for the same reason as above.
+fn a_user_buffer_unmapped_while_the_kernel_reads_it(report: &mut Report) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const PAGES: usize = 4;
+    const PAGE: usize = 4096;
+    const LEN: u64 = (PAGES * PAGE) as u64;
+    const ROUNDS: usize = 3000;
+    const EFAULT: i64 = -14;
+
+    let sink = sys::open("/dev/null", 1);
+    if sink < 0 {
+        report.check("somewhere to write to", false, format!("open returned {}", sink));
+        return;
+    }
+    let base = sys::mmap_anon(0, LEN);
+    if base <= 0 {
+        report.check("a buffer to pull away", false, format!("mmap returned {:#x}", base));
+        sys::close(sink as i32);
+        return;
+    }
+    let base = base as u64;
+
+    let stop = AtomicBool::new(false);
+    let odd = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                sys::munmap(base, LEN);
+                sys::mmap_fixed(base, LEN);
+            }
+        });
+
+        for _ in 0..ROUNDS {
+            let wrote = sys::write_raw(sink as i32, base, LEN);
+            if wrote != LEN as i64 && wrote != EFAULT {
+                odd.fetch_add(1, Ordering::Relaxed);
+            }
+            // The path is whatever is at that address, which after a remap is
+            // a page of zeroes and so the empty name. What matters is the
+            // route: the kernel reads the string through the pointer it was
+            // given.
+            let opened = sys::open_raw(base, 0);
+            if opened >= 0 {
+                sys::close(opened as i32);
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+    });
+
+    let odd = odd.load(Ordering::Relaxed);
+    report.check(
+        "a buffer unmapped under a system call reading it does not fault the kernel",
+        odd == 0,
+        format!("{} of {} writes came back as neither the length nor a bad address", odd, ROUNDS),
+    );
+    sys::munmap(base, LEN);
+    sys::close(sink as i32);
 }
 
 /// A hint names where a mapping should start, and the mapping is as long as it
