@@ -17,9 +17,13 @@ static FOREGROUND_PGID: Spinlock<u32> = Spinlock::new(0);
 /// The task the CPU is running, as a guard rather than a reference.
 ///
 /// Which task that is changes at every context switch, so handing out a
-/// `&'static mut Task` says something that is not true: the borrow would
-/// outlive the state it describes. The guard reads the current task on each
-/// use and cannot be stored anywhere with a longer life.
+/// `&'static Task` says something that is not true: the borrow would outlive
+/// the state it describes. The guard reads the current task on each use and
+/// cannot be stored anywhere with a longer life.
+///
+/// It hands out a shared reference and nothing else, which is what makes
+/// holding two of these, or one of these alongside a task the table handed
+/// out, mean nothing. A task changes its own fields through them.
 pub struct Current(());
 
 impl core::ops::Deref for Current {
@@ -29,15 +33,6 @@ impl core::ops::Deref for Current {
         unsafe {
             debug_assert!(!CURRENT.is_null());
             &*CURRENT
-        }
-    }
-}
-
-impl core::ops::DerefMut for Current {
-    fn deref_mut(&mut self) -> &mut Task {
-        unsafe {
-            debug_assert!(!CURRENT.is_null());
-            &mut *CURRENT
         }
     }
 }
@@ -74,11 +69,15 @@ impl<'a> Held<'a> {
         self.irq
     }
 
-    pub fn find(&self, pid: u32) -> Option<&'static mut Task> {
+    /// The task with `pid`, borrowed from the hold. Two of these at once name
+    /// two entries in one table and say nothing about each other, which is why
+    /// asking for the caller's own pid is an ordinary thing to do rather than
+    /// a second route to something it already has.
+    pub fn find(&self, pid: u32) -> Option<&'a Task> {
         self.tasks.iter().find(|t| t.get().pid == pid).map(|t| t.get())
     }
 
-    pub fn for_each(&self, mut f: impl FnMut(&'static mut Task)) {
+    pub fn for_each(&self, mut f: impl FnMut(&'a Task)) {
         for entry in self.tasks {
             f(entry.get());
         }
@@ -142,16 +141,6 @@ fn admit(task: Box<Task>, _irq: NoInterrupts) {
     TASKS.lock().push(TaskPtr(Box::into_raw(task)));
 }
 
-/// Look up a task and hand the reference out. The table is unlocked again
-/// before this returns, so the reference is only good for as long as nothing
-/// can reap the task: a field or two read or written with interrupts still off,
-/// or inside a block that holds them off itself. Anything longer takes the
-/// table with it through `with_task`.
-pub fn find(pid: u32) -> Option<&'static mut Task> {
-    let tasks = TASKS.lock();
-    tasks.iter().find(|t| t.get().pid == pid).map(|t| t.get())
-}
-
 /// Run `f` on the task with `pid`, with the table held for as long as it runs.
 ///
 /// A reader that walks a task -- every page of every region, every descriptor
@@ -181,7 +170,7 @@ pub fn task_count() -> usize {
 /// Run `f` on every task, with the table held for as long as it runs. The
 /// closure is handed the hold alongside each task, because a state change it
 /// makes may have to reach that task's parent, which is in the same table.
-pub fn for_each<F: FnMut(&'static mut Task, &Held)>(mut f: F) {
+pub fn for_each<F: FnMut(&Task, &Held)>(mut f: F) {
     with_tasks(|table| table.for_each(|task| f(task, table)));
 }
 
@@ -243,7 +232,7 @@ fn pick_next() -> Option<*mut Task> {
         }
     }
 
-    let current = unsafe { &mut *cur };
+    let current = unsafe { &*cur };
     if cur != idle && current.state() == State::Runnable {
         return None;
     }
@@ -258,8 +247,11 @@ unsafe fn switch_to(next: *mut Task) {
     if prev == next {
         return;
     }
-    let prev_task = &mut *prev;
-    let next_task = &mut *next;
+    // Shared references, because this runs from the timer: whatever was
+    // interrupted is holding one on the task it was running, and an exclusive
+    // one taken here would be a second reference to that same task.
+    let prev_task = &*prev;
+    let next_task = &*next;
 
     // The registers the trap frame does not hold, the thread pointer and the
     // floating point and vector file among them, are carried across by hand.
@@ -516,7 +508,7 @@ pub fn raise_on_current(signal: i32) {
 /// taken yet, and a stop discards a continue the same way. Restarting is what
 /// the parent has to be told about, and the table is held here, which is where
 /// the parent is found.
-pub fn post_signal(task: &mut Task, signal: i32, table: &Held) {
+pub fn post_signal(task: &Task, signal: i32, table: &Held) {
     const STOPS: u64 = (1 << (SIGSTOP as u64 & 63))
         | (1 << (SIGTSTP as u64 & 63))
         | (1 << (SIGTTIN as u64 & 63))
@@ -730,7 +722,7 @@ pub fn check_signals() {
         if action.flags & crate::signal::SA_RESETHAND != 0 {
             task.set_action(signal as usize, crate::signal::SigAction::default());
         }
-        if !crate::signal::deliver(&mut current(), signal, &action, frame) {
+        if !crate::signal::deliver(&task, signal, &action, frame) {
             exit_current(SIGSEGV & 0x7F);
         }
         return;

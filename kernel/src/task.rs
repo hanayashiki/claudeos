@@ -4,6 +4,11 @@
 //! current task is reached through a raw pointer rather than a lock that a
 //! blocking syscall would have to hold across a context switch. What keeps a
 //! change to a task whole is the interrupt mask, not a lock on the task.
+//!
+//! A task that is in the table is reachable from two directions at once: the
+//! task itself has the running-task guard, and anything holding the table can
+//! look it up by pid. Neither direction hands out an exclusive reference, for
+//! the reason set out on `Task` below.
 
 use crate::abi::*;
 use crate::arch::paging::{
@@ -110,14 +115,20 @@ impl MemState {
 
 /// A task control block.
 ///
-/// Everything a task changes after it is in the process table sits in a cell,
-/// so that changing it asks for a shared reference rather than an exclusive
-/// one. That is not what makes the change whole: a single processor with
-/// interrupts masked is, and a cell's load-modify-store is the same
-/// instructions the plain field was.
+/// Everything a task changes after it is in the process table sits in a cell.
+/// That is not to make the changes atomic -- a single processor with interrupts
+/// masked is what does that, and a cell's load-modify-store is the same
+/// instructions the plain field was -- but so that changing it asks for a
+/// shared reference. A task in the table is reachable by two routes at once,
+/// through the running-task guard and through the table, and an exclusive
+/// reference from either would be an exclusive reference to something the other
+/// route hands out as well. With nothing to mutate through, the two references
+/// cannot be written down.
 ///
 /// The fields that are not in cells are the ones fixed before the task is
-/// admitted, while it is a box one caller owns and nothing else can reach.
+/// admitted. Until `sched::register` takes the box, the task is owned by one
+/// caller and reachable from nowhere else, which is the one place an exclusive
+/// reference to it is the truth.
 pub struct Task {
     pub pid: u32,
     pub tgid: u32,
@@ -1092,8 +1103,11 @@ pub struct TaskPtr(pub *mut Task);
 unsafe impl Send for TaskPtr {}
 
 impl TaskPtr {
-    pub fn get(&self) -> &'static mut Task {
-        unsafe { &mut *self.0 }
+    /// The task, borrowed for as long as the entry that names it. The entry is
+    /// in the process table, so what the borrow comes from is a hold on the
+    /// table, and the reference cannot outlive it.
+    pub fn get(&self) -> &Task {
+        unsafe { &*self.0 }
     }
 }
 
