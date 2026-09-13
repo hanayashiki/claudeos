@@ -2,7 +2,7 @@
 //! kernel: threads, synchronisation, subprocesses, files and large heaps.
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{IoSlice, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -157,6 +157,83 @@ fn event_and_poll(report: &mut Report) {
     let _ = sys::close(event);
 }
 
+/// The timer has to keep arriving while another task is inside a long system
+/// call. A sleep's deadline is counted in timer ticks, and a tick that finds
+/// interrupts masked is delivered late rather than twice, so a call that runs
+/// masked from entry to return costs its own length out of every sleep and
+/// every timeout in the system that spans it.
+fn timer_under_load(report: &mut Report) {
+    const ROUNDS: usize = 12;
+    // Each sleep spans several of the writes below, so what is measured is
+    // the delay they add over a stretch of time rather than whichever part of
+    // one of them a shorter sleep happened to overlap.
+    const NAP: Duration = Duration::from_millis(100);
+    // Each write copies 32 MiB, which is more than two ticks' worth, so with
+    // the timer held off a sleep of ten ticks takes more than twice as long as
+    // it asked for: measured, 120 ms late against 0 to 8 ms when the timer
+    // gets through. The bound sits between the two in the same ratio, a
+    // quarter of the one and four times the other, because the milliseconds
+    // on the working side are not all the kernel's: the emulator has a host
+    // scheduler above it, and the kernel heap still maps the pages it grows by
+    // with the heap locked.
+    const BOUND: Duration = Duration::from_millis(30);
+
+    // Two of these in one call: a system call is what has to stay
+    // interruptible, and the kernel copies each piece separately, so this is
+    // one call that copies twice as much rather than two calls.
+    let block = vec![0u8; 16 << 20];
+    let mut sink = match std::fs::OpenOptions::new().write(true).open("/dev/null") {
+        Ok(sink) => sink,
+        Err(err) => {
+            report.check("/dev/null opens for writing", false, format!("{}", err));
+            return;
+        }
+    };
+    // The kernel copies a write into a buffer of its own, and the first one
+    // this large grows the kernel heap, which maps the new pages with the
+    // heap locked and so with interrupts off. That is a one-off and is not
+    // what is being measured here, so pay it before the clock starts.
+    let _ = sink.write_vectored(&[IoSlice::new(&block), IoSlice::new(&block)]);
+
+    let stop = Arc::new(AtomicUsize::new(0));
+    let running = Arc::clone(&stop);
+    let load = std::thread::spawn(move || {
+        while running.load(Ordering::Relaxed) == 0 {
+            let _ = sink.write_vectored(&[IoSlice::new(&block), IoSlice::new(&block)]);
+        }
+    });
+
+    let mut late = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let started = Instant::now();
+        std::thread::sleep(NAP);
+        late.push(started.elapsed().saturating_sub(NAP));
+    }
+    stop.store(1, Ordering::Relaxed);
+    let _ = load.join();
+
+    late.sort();
+    // The middle round decides rather than the mean: an emulator is at the
+    // mercy of the host's own scheduler, and one stalled round should not
+    // read as a kernel that holds interrupts off. What this catches is
+    // systematic -- with the timer held off every sleep here is late -- so it
+    // is in the middle of the distribution and not only in its tail.
+    let median = late[ROUNDS / 2];
+    let mean = late.iter().sum::<Duration>() / ROUNDS as u32;
+    let measured = format!(
+        "median {} us late, mean {} us, worst {} us",
+        median.as_micros(),
+        mean.as_micros(),
+        late[ROUNDS - 1].as_micros()
+    );
+    println!("      {} sleeps of {} ms: {}", ROUNDS, NAP.as_millis(), measured);
+    report.check(
+        "a sleep wakes on time while another task is in a long call",
+        median < BOUND,
+        measured,
+    );
+}
+
 pub fn main(_args: &[String]) -> i32 {
     let mut report = Report { passed: 0, failed: 0 };
     println!("=== Rust standard library on claudeos ===");
@@ -247,6 +324,10 @@ pub fn main(_args: &[String]) -> i32 {
         slept >= Duration::from_millis(90),
         format!("{:?}", slept),
     );
+
+    println!();
+    println!("-- the clock under load --");
+    timer_under_load(&mut report);
 
     println!();
     println!("-- files --");

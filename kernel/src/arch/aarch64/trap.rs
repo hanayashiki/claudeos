@@ -42,7 +42,16 @@ impl TrapFrame {
     pub fn from_user(&self) -> bool {
         self.spsr & 0xF == 0
     }
+
+    /// True when interrupts were enabled in the code this exception
+    /// interrupted. The bit is a mask, so it is set when they were off.
+    fn interrupts_were_enabled(&self) -> bool {
+        self.spsr & SPSR_I == 0
+    }
 }
+
+/// The interrupt mask in a saved processor state.
+const SPSR_I: u64 = 1 << 7;
 
 /// Vectors 0..EXCEPTION_COUNT are the exception classes the syndrome register
 /// reports, of which there are as many as six bits can hold.
@@ -189,7 +198,36 @@ pub extern "C" fn exception_entry(frame: &mut TrapFrame) {
     }
 }
 
+/// A synchronous exception, run with interrupts in the state the code that
+/// took it was in.
+///
+/// The hardware sets all four masks on entry to EL1 and nothing below needs
+/// them: the frame is complete before this is reached, and every lock the
+/// handlers take masks for itself and puts back what it found. Left masked,
+/// a system call that never blocks runs that way from entry to return, so the
+/// timer does not tick for as long as the longest call takes: a 16 MiB copy
+/// here, and on a board whose console is driven a character at a time, a
+/// third of a second for a 4 KiB write. Sleeps and poll deadlines stretch by
+/// that much, typed input is dropped, and a receive ring overruns.
+///
+/// The saved state decides rather than a blanket enable, so a fault taken
+/// inside a kernel critical section is handled as masked as the code that
+/// faulted was.
 fn synchronous(frame: &mut TrapFrame) {
+    let unmask = frame.interrupts_were_enabled();
+    if unmask {
+        super::enable_interrupts();
+    }
+    handle_synchronous(frame);
+    // The return path masks everything again before it touches ELR and SPSR,
+    // but this is not the only way out of here: a handler can switch away and
+    // come back, and what it comes back to must be what it left.
+    if unmask {
+        super::disable_interrupts();
+    }
+}
+
+fn handle_synchronous(frame: &mut TrapFrame) {
     let class = frame.esr >> 26;
     if class == EC_SVC {
         frame.vector = super::task::VECTOR_SYSCALL;
