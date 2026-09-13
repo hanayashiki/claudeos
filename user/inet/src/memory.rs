@@ -11,6 +11,9 @@ use crate::Report;
 
 pub fn run(report: &mut Report) {
     pages_shared_by_a_fork_written_from_two_threads(report);
+    pages_a_fork_shared_are_out_of_the_parents_reach(report);
+    a_user_buffer_unmapped_while_the_kernel_reads_it(report);
+    a_page_two_threads_reach_at_once(report);
     exec_that_fails_keeps_the_memory_state(report);
     a_thread_left_unreaped_keeps_the_space(report);
     argument_blocks_larger_than_the_stack_is_mapped_with(report);
@@ -138,6 +141,243 @@ fn pages_shared_by_a_fork_written_from_two_threads(report: &mut Report) {
     drop(source);
     let _ = std::fs::remove_file(SOURCE);
     sys::munmap(base, LEN);
+}
+
+/// A fork is a snapshot: once it has shared a page with the child, nothing the
+/// parent does may reach that page again.
+///
+/// Sharing one took the parent's write permission away and then took the
+/// child's reference on the frame, with a window between them. A sibling
+/// thread that faulted on the page in that window read a reference count of
+/// one, took the last-owner path, and cleared the mark, so the parent kept
+/// write access to a frame the child was about to share. Both processes then
+/// had a writable mapping of one page.
+///
+/// What the child watches for is its own memory moving under it: it reads
+/// every page, sleeps while the sibling keeps writing, and reads them again.
+/// A page that changed is one the parent still reaches.
+///
+/// This is a smoke test. The window was between two calls, so catching it
+/// needs the timer to land inside one; the proof was a widened window.
+fn pages_a_fork_shared_are_out_of_the_parents_reach(report: &mut Report) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const PAGES: usize = 64;
+    const ROUNDS: usize = 40;
+    const PAGE: usize = 4096;
+    const LEN: u64 = (PAGES * PAGE) as u64;
+    /// How long the child leaves the sibling writing before it looks again.
+    const WATCH_MS: u64 = 30;
+
+    let base = sys::mmap_anon(0, LEN);
+    if base <= 0 {
+        report.check("pages to fork over", false, format!("mmap returned {:#x}", base));
+        return;
+    }
+    let base = base as u64;
+    // Every page present and writable in this thread before the first fork, so
+    // the walk has write permission to take away from each of them.
+    unsafe { std::ptr::write_bytes(base as *mut u8, 0, LEN as usize) };
+
+    let stop = AtomicBool::new(false);
+    let mut rounds = 0usize;
+    let mut moved = 0usize;
+
+    std::thread::scope(|scope| {
+        // A rising number, so a write that lands in a page the child holds
+        // shows up as a different value rather than the same one again.
+        scope.spawn(|| {
+            let mut count: u32 = 1;
+            while !stop.load(Ordering::Relaxed) {
+                for page in 0..PAGES {
+                    let at = base + (page * PAGE) as u64;
+                    unsafe { std::ptr::write_volatile(at as *mut u32, count) };
+                }
+                count = count.wrapping_add(1);
+            }
+        });
+
+        for _ in 0..ROUNDS {
+            let child = sys::fork();
+            if child == 0 {
+                // Nothing here allocates or takes a lock: this is a fork out
+                // of a program with a thread running in it, and the only
+                // things the child may rely on are its own stack and the
+                // system calls it makes itself.
+                let mut first = [0u32; PAGES];
+                for (page, slot) in first.iter_mut().enumerate() {
+                    let at = base + (page * PAGE) as u64;
+                    *slot = unsafe { std::ptr::read_volatile(at as *const u32) };
+                }
+                sys::sleep_ms(WATCH_MS);
+                let mut changed = 0;
+                for (page, slot) in first.iter().enumerate() {
+                    let at = base + (page * PAGE) as u64;
+                    if unsafe { std::ptr::read_volatile(at as *const u32) } != *slot {
+                        changed += 1;
+                    }
+                }
+                sys::exit_group(i32::from(changed != 0));
+            }
+            if child < 0 {
+                break;
+            }
+            let (pid, code) = sys::wait4(child as i32, 0);
+            if pid < 0 {
+                break;
+            }
+            if code != 0 {
+                moved += 1;
+            }
+            rounds += 1;
+        }
+        stop.store(true, Ordering::Relaxed);
+    });
+
+    report.check(
+        "a page a fork shared is beyond the parent's reach afterwards",
+        rounds == ROUNDS && moved == 0,
+        format!("{} of {} rounds ran, the child's memory moved under it in {}", rounds, ROUNDS, moved),
+    );
+    sys::munmap(base, LEN);
+}
+
+/// A user pointer the kernel is about to read through is checked first, and a
+/// sibling thread can take the mapping away between the check and the read.
+/// The read is then a kernel access to a page that is not present, which is
+/// fatal to the machine rather than to the program.
+///
+/// Two ways in: a `write`, where the kernel copies the buffer out of user
+/// memory, and an `openat`, where it reads a path out of it. Both must come
+/// back as a result or as a bad address, and the machine has to still be here
+/// afterwards to say so.
+///
+/// A smoke test, for the same reason as above.
+fn a_user_buffer_unmapped_while_the_kernel_reads_it(report: &mut Report) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const PAGES: usize = 4;
+    const PAGE: usize = 4096;
+    const LEN: u64 = (PAGES * PAGE) as u64;
+    const ROUNDS: usize = 3000;
+    const EFAULT: i64 = -14;
+
+    let sink = sys::open("/dev/null", 1);
+    if sink < 0 {
+        report.check("somewhere to write to", false, format!("open returned {}", sink));
+        return;
+    }
+    let base = sys::mmap_anon(0, LEN);
+    if base <= 0 {
+        report.check("a buffer to pull away", false, format!("mmap returned {:#x}", base));
+        sys::close(sink as i32);
+        return;
+    }
+    let base = base as u64;
+
+    let stop = AtomicBool::new(false);
+    let odd = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                sys::munmap(base, LEN);
+                sys::mmap_fixed(base, LEN);
+            }
+        });
+
+        for _ in 0..ROUNDS {
+            let wrote = sys::write_raw(sink as i32, base, LEN);
+            if wrote != LEN as i64 && wrote != EFAULT {
+                odd.fetch_add(1, Ordering::Relaxed);
+            }
+            // The path is whatever is at that address, which after a remap is
+            // a page of zeroes and so the empty name. What matters is the
+            // route: the kernel reads the string through the pointer it was
+            // given.
+            let opened = sys::open_raw(base, 0);
+            if opened >= 0 {
+                sys::close(opened as i32);
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+    });
+
+    let odd = odd.load(Ordering::Relaxed);
+    report.check(
+        "a buffer unmapped under a system call reading it does not fault the kernel",
+        odd == 0,
+        format!("{} of {} writes came back as neither the length nor a bad address", odd, ROUNDS),
+    );
+    sys::munmap(base, LEN);
+    sys::close(sink as i32);
+}
+
+/// How much of the program's own read-only data this check reaches into. A page
+/// of it is untouched until the check asks for it, because nothing else reads
+/// it, and it is file-backed, so the first touch is a page filled from the
+/// executable.
+const COLD_PAGES: usize = 48;
+const COLD_PAGE: usize = 4096;
+
+/// Every byte non-zero, so a read that comes back zero is a read of a page
+/// whose contents are not there yet rather than a read of the file's bytes.
+static COLD: [u8; COLD_PAGES * COLD_PAGE] = {
+    let mut out = [0u8; COLD_PAGES * COLD_PAGE];
+    let mut i = 0;
+    while i < COLD_PAGES * COLD_PAGE {
+        out[i] = (i % 251) as u8 + 1;
+        i += 1;
+    }
+    out
+};
+
+/// Two threads reaching one untouched page at the same moment.
+///
+/// Filling a page from the file mapped it first, read the contents into it
+/// through that mapping, and gave it the segment's protection afterwards, so
+/// between the first and the last it was reachable by a sibling holding the
+/// zeroes of a fresh frame. And the handler read a page a sibling had already
+/// put in as a fault it could not repair, which killed the task with a
+/// segmentation fault at an address that is mapped.
+///
+/// A smoke test: one processor runs one of the two threads at a time, so they
+/// only overlap if the timer lands inside the handler. The proof was a widened
+/// window, where both of these were every page rather than none.
+fn a_page_two_threads_reach_at_once(report: &mut Report) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+
+    let blank = AtomicUsize::new(0);
+    let barrier = Barrier::new(2);
+    // Through an opaque pointer, so the read below is a load from the page and
+    // not a constant the compiler read out of the program at build time.
+    let base = std::hint::black_box(COLD.as_ptr()) as usize;
+
+    let sweep = |base: usize, barrier: &Barrier, blank: &AtomicUsize| {
+        for page in 0..COLD_PAGES {
+            // Both threads are let go at the same point, so the one that
+            // faults second walks into whatever the first is in the middle of.
+            barrier.wait();
+            let byte =
+                unsafe { std::ptr::read_volatile((base + page * COLD_PAGE) as *const u8) };
+            if byte == 0 {
+                blank.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    };
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| sweep(base, &barrier, &blank));
+        sweep(base, &barrier, &blank);
+    });
+
+    let blank = blank.load(Ordering::Relaxed);
+    report.check(
+        "a page two threads reach at once holds what the file put in it",
+        blank == 0,
+        format!("{} of {} reads came back zero", blank, COLD_PAGES * 2),
+    );
 }
 
 /// A hint names where a mapping should start, and the mapping is as long as it

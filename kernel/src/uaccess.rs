@@ -3,6 +3,10 @@
 //! Every access is validated first: the range must be canonical user memory,
 //! and any page that a region covers but has not been faulted in yet is
 //! allocated here, so the kernel never takes a page fault on a user pointer.
+//! The check and the access that follows it are one block with interrupts off,
+//! a page at a time, because a sibling thread on the same address space can
+//! unmap what was just checked or take its write permission away, and the
+//! access is then a kernel fault on a page the check said was there.
 //!
 //! Each call comes in two forms. The plain one is for a caller that holds no
 //! reference to the running task and reads it back out of the scheduler; the
@@ -84,9 +88,36 @@ pub fn read_bytes(addr: u64, buf: &mut [u8]) -> Result<(), Errno> {
     read_bytes_in(&crate::sched::current(), addr, buf)
 }
 
+/// Copy out of user memory a page at a time, checking each page and reading it
+/// with nothing else able to run in between.
+///
+/// A sibling thread that unmaps the buffer between the check and the read
+/// leaves the kernel reading a page that is not present, which faults in the
+/// kernel and is fatal to the machine rather than to the program. Checking and
+/// copying under the same block closes that, and a page at a time is what
+/// keeps the block from being as long as whatever buffer the program passed.
+///
+/// A range that goes bad partway is a bad address with the pages before it
+/// already copied, which is what the write side does as well.
 pub fn read_bytes_in(task: &Task, addr: u64, buf: &mut [u8]) -> Result<(), Errno> {
-    validate_in(task, addr, buf.len() as u64, false)?;
-    unsafe { core::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), buf.len()) };
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let end = addr.checked_add(buf.len() as u64).ok_or(Errno::EFAULT)?;
+    let mut at = addr;
+    while at < end {
+        let chunk_end = (page_align_down(at) + PAGE_SIZE_U64).min(end);
+        let from = (at - addr) as usize;
+        let len = (chunk_end - at) as usize;
+        crate::sync::without_interrupts(|_irq| -> Result<(), Errno> {
+            validate_in(task, at, len as u64, false)?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(at as *const u8, buf.as_mut_ptr().add(from), len)
+            };
+            Ok(())
+        })?;
+        at = chunk_end;
+    }
     Ok(())
 }
 
@@ -159,8 +190,12 @@ pub fn write_u32_in(task: &Task, addr: u64, value: u32) -> Result<(), Errno> {
 
 pub fn read_struct<T: Copy>(addr: u64) -> Result<T, Errno> {
     let size = core::mem::size_of::<T>();
-    validate(addr, size as u64, false)?;
-    Ok(unsafe { core::ptr::read_unaligned(addr as *const T) })
+    let task = crate::sched::current();
+    // Checked and read together, for the same reason `read_bytes_in` is.
+    crate::sync::without_interrupts(|_irq| -> Result<T, Errno> {
+        validate_in(&task, addr, size as u64, false)?;
+        Ok(unsafe { core::ptr::read_unaligned(addr as *const T) })
+    })
 }
 
 pub fn write_struct<T: Copy>(addr: u64, value: &T) -> Result<(), Errno> {
@@ -175,24 +210,40 @@ pub fn write_struct<T: Copy>(addr: u64, value: &T) -> Result<(), Errno> {
 }
 
 /// Read a NUL-terminated string, at most `max` bytes long.
+///
+/// The string is copied in pieces and the NUL looked for afterwards, because a
+/// scan that pushed a byte at a time would be growing a vector inside the
+/// block, and the heap it grows into maps pages. A piece stops at the end of
+/// the page, so a string near the end of a mapping does not require the next
+/// page to exist, and at `CHUNK` bytes, so the usual short path costs one
+/// small allocation rather than a page of copying.
 pub fn read_cstr(addr: u64, max: usize) -> Result<String, Errno> {
-    let mut out = Vec::new();
+    const CHUNK: u64 = 256;
+    let task = crate::sched::current();
+    let mut out: Vec<u8> = Vec::new();
     let mut cursor = addr;
     loop {
         if out.len() >= max {
             return Err(Errno::ENAMETOOLONG);
         }
-        // Validate a page at a time so a string near the end of a mapping
-        // does not require the next page to exist.
-        let chunk_end = (page_align_down(cursor) + PAGE_SIZE_U64).min(addr + max as u64);
-        validate(cursor, chunk_end - cursor, false)?;
-        while cursor < chunk_end {
-            let byte = unsafe { *(cursor as *const u8) };
-            cursor += 1;
-            if byte == 0 {
-                return String::from_utf8(out).map_err(|_| Errno::EINVAL);
-            }
-            out.push(byte);
+        let chunk_end = (page_align_down(cursor) + PAGE_SIZE_U64)
+            .min(addr + max as u64)
+            .min(cursor + CHUNK);
+        let len = (chunk_end - cursor) as usize;
+        let start = out.len();
+        // The room for the piece is taken before interrupts go off, for the
+        // reason above.
+        out.reserve(len);
+        crate::sync::without_interrupts(|_irq| -> Result<(), Errno> {
+            validate_in(&task, cursor, len as u64, false)?;
+            let chunk = unsafe { core::slice::from_raw_parts(cursor as *const u8, len) };
+            out.extend_from_slice(chunk);
+            Ok(())
+        })?;
+        cursor = chunk_end;
+        if let Some(at) = out[start..].iter().position(|byte| *byte == 0) {
+            out.truncate(start + at);
+            return String::from_utf8(out).map_err(|_| Errno::EINVAL);
         }
     }
 }

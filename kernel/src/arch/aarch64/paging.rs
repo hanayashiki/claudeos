@@ -222,6 +222,41 @@ pub enum MapError {
     AlreadyMapped,
 }
 
+/// A page on its way in: a frame the allocator has just handed over, zeroed,
+/// and mapped nowhere yet.
+///
+/// This is the only thing `publish` takes, and it consumes it. A caller with
+/// contents to put in a page therefore puts them in here, through the direct
+/// map, while the page is somewhere no program can reach; once it is published
+/// there is nothing left to write through. The other order -- map the page
+/// wide enough to write through, write, then narrow it to what it should have
+/// been -- has no spelling, and it is the order that leaves a page a sibling
+/// thread can read blank, or run, before it holds anything.
+///
+/// Only the allocator makes one, so this is not a way to move a frame that
+/// another mapping is holding: taking a mapping away and putting the same
+/// frame back somewhere else still cannot be written.
+pub struct FreshPage(Frame);
+
+impl FreshPage {
+    /// A zeroed frame, or `None` when there is none to be had.
+    pub fn new() -> Option<FreshPage> {
+        frame::alloc_zeroed().map(FreshPage)
+    }
+
+    /// The page's bytes, through the direct map. The address is also what a
+    /// cache maintenance operation on these bytes has to name, since it is the
+    /// one they were written through.
+    pub fn bytes(&mut self) -> &mut [u8] {
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                phys_to_virt(self.0.addr()) as *mut u8,
+                PAGE_SIZE_U64 as usize,
+            )
+        }
+    }
+}
+
 /// A translation table hierarchy, identified by the physical address of its
 /// top-level table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,12 +361,29 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Map a fresh zeroed frame at `virt`, giving back its physical address.
-    pub fn map_new(&self, virt: u64, flags: u64) -> Result<u64, MapError> {
-        let frame = frame::alloc_zeroed().ok_or(MapError::OutOfMemory)?;
+    /// Put `page` in at `virt` with `flags`, giving back where it is. The entry
+    /// holds the page's reference from here on, and `unmap` or teardown gives
+    /// it back.
+    ///
+    /// The one way a page with contents in it becomes reachable. It takes the
+    /// page by value, so what goes in was finished beforehand: there is no
+    /// moment when the address has something at it that is not what it is going
+    /// to hold, and none when it is reachable with permissions it is not going
+    /// to keep.
+    ///
+    /// The store that writes the entry carries the ordering, so nothing has to
+    /// order the contents against it by hand.
+    pub fn publish(&self, virt: u64, page: FreshPage, flags: u64) -> Result<u64, MapError> {
+        let frame = page.0;
         let phys = frame.addr();
         self.map(virt, frame, flags)?;
         Ok(phys)
+    }
+
+    /// Map a page whose finished contents are zero, which a fresh frame already
+    /// is: the heap, and anonymous memory.
+    pub fn map_new(&self, virt: u64, flags: u64) -> Result<u64, MapError> {
+        self.publish(virt, FreshPage::new().ok_or(MapError::OutOfMemory)?, flags)
     }
 
     /// Print the walk of `virt` through this hierarchy, descriptor by
@@ -431,7 +483,9 @@ impl AddressSpace {
         Some(unsafe { Frame::from_recorded(old) })
     }
 
-    /// Take the mapping away, handing back the reference it held.
+    /// Take the mapping at `virt` away, handing back the reference the
+    /// descriptor held. Dropping the result releases the frame.
+    #[must_use = "dropping the frame is what releases it"]
     pub fn unmap(&self, virt: u64) -> Option<Frame> {
         let frame = unsafe {
             let entry = self.entry_for(virt, false).ok()?;
@@ -531,15 +585,64 @@ impl AddressSpace {
     /// Give this address space the same user mappings `src` has, shared and
     /// read-only so that the first write to either copy makes its own frame.
     ///
-    /// A walk that stops partway has still taken write permission away from
-    /// every page it reached, so the flush belongs to both outcomes and is
-    /// done here where neither can get past it. What this address space has
-    /// collected by then is the caller's to release.
+    /// Each page is invalidated where its permission changes, so a walk that
+    /// stops partway leaves nothing behind that a flush here would have to
+    /// clean up. What this address space has collected by then is the
+    /// caller's to release.
     pub fn clone_user_from(&self, src: &AddressSpace) -> Result<(), MapError> {
-        let result = unsafe { self.share_user_tables(src) };
-        // The parent's write permissions just changed underneath it.
-        flush_tlb_all();
-        result
+        unsafe { self.share_user_tables(src) }
+    }
+
+    /// Share the page `at` names with this address space at `virt`, leaving
+    /// both sides copy-on-write when it was writable.
+    ///
+    /// One call, because the two halves are one account of the page. Taking
+    /// the parent's write permission away and then taking the child's
+    /// reference on the frame were two calls with a window between them, and
+    /// the second takes the allocator's lock, which unmasks interrupts on the
+    /// way out. A sibling thread that faulted on the page there read a
+    /// reference count of one, took the last-owner path and cleared the mark,
+    /// so the parent kept write access to a frame the child was about to
+    /// share. Two processes then had a writable mapping of one page and
+    /// neither knew. A fault from user mode is handled on this machine with
+    /// interrupts in the state the faulting code was in, so the sibling needs
+    /// nothing unusual to get in.
+    ///
+    /// The token is what says nothing runs between the two halves. It could
+    /// not say that while they were separate calls: each is legitimate alone,
+    /// and a token proves a section exists rather than that two calls are
+    /// inside one. The walk opens the section around one page rather than
+    /// around itself, because it is tens of thousands of pages long.
+    ///
+    /// The reference for the child is taken first, so the count is never
+    /// lower than the number of mappings that are going to hold it.
+    unsafe fn share_page(
+        &self,
+        virt: u64,
+        at: *mut Entry,
+        _irq: NoInterrupts,
+    ) -> Result<(), MapError> {
+        let entry = *at;
+        if !entry.is_present() {
+            // Gone between the walk reading the entry and this section
+            // opening, so there is nothing here to share.
+            return Ok(());
+        }
+        let phys = entry.addr();
+        let shared = frame::share_recorded(phys);
+        let mut flags = entry.flags();
+        if flags & WRITABLE != 0 {
+            flags |= COW;
+            // The page the parent is still running on has to lose write
+            // permission too, or its writes would be seen by the child. The
+            // walk runs on the parent's tables, so the translation this
+            // contradicts is in the processor's cache of them right now, and a
+            // sibling's store would go through it into the page the child is
+            // about to share until it is thrown away.
+            encode(phys, flags).store(at);
+            flush_tlb(virt);
+        }
+        self.map(virt, shared, flags)
     }
 
     unsafe fn share_user_tables(&self, src: &AddressSpace) -> Result<(), MapError> {
@@ -599,15 +702,7 @@ unsafe fn clone_table(
         }
         let virt = base | (i as u64) << (12 + 9 * (level - 1));
         if level == 1 {
-            let mut flags = entry.flags();
-            if flags & WRITABLE != 0 {
-                flags |= COW;
-                // The page the parent is still running on has to lose write
-                // permission too, or its writes would be seen by the child.
-                encode(entry.addr(), flags).store(entry_ptr);
-            }
-            let shared = frame::share_recorded(entry.addr());
-            dst.map(virt, shared, flags)?;
+            crate::sync::without_interrupts(|irq| dst.share_page(virt, entry_ptr, irq))?;
         } else {
             clone_table(dst, src, entry.addr(), virt, level - 1)?;
         }
