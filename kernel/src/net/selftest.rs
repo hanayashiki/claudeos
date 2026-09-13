@@ -773,6 +773,13 @@ fn connection(report: &mut Report, nic: &FakeNic) {
     nic.take();
 }
 
+fn queued_bytes_of(socket: &Arc<InetSocket>) -> usize {
+    match &*socket.inner.lock() {
+        Protocol::Udp(state) => state.queued_bytes(),
+        Protocol::Tcp(_) => 0,
+    }
+}
+
 fn state_of(socket: &Arc<InetSocket>) -> tcp::State {
     match &*socket.inner.lock() {
         Protocol::Tcp(tcb) => tcb.state,
@@ -1429,6 +1436,34 @@ fn datagrams(report: &mut Report, nic: &FakeNic) {
         &udp_datagram(REMOTE_PORT, 7778, b"nobody", PEER_IP, OUR_IP),
     );
     report.check("a datagram for nobody is dropped", nic.take().is_empty());
+
+    // Shutting the read side down throws away what is queued, and the count
+    // of queued bytes has to go with it or the socket believes it is holding
+    // datagrams that are not there.
+    for text in [b"first datagram".as_slice(), b"second datagram".as_slice()] {
+        deliver_ip(
+            ip::PROTO_UDP,
+            &udp_datagram(REMOTE_PORT, LOCAL_PORT, text, PEER_IP, OUR_IP),
+        );
+    }
+    let held = queued_bytes_of(&socket);
+    if socket.shutdown(true, false).is_err() {
+        report.check("the read side can be shut down", false);
+        return;
+    }
+    report.check("what was queued is accounted for", held == 29);
+    report.check("and shutting the read side down gives it back", queued_bytes_of(&socket) == 0);
+    match socket.receive_into(&mut buf, false) {
+        Ok((n, _)) => report.check("a receive afterwards reports the end", n == 0),
+        Err(_) => report.check("a receive afterwards reports the end", false),
+    }
+    // What arrives next is the only thing held, rather than the last of a
+    // queue the socket thinks is still full.
+    deliver_ip(
+        ip::PROTO_UDP,
+        &udp_datagram(REMOTE_PORT, LOCAL_PORT, b"later", PEER_IP, OUR_IP),
+    );
+    report.check("and the room is there for what comes next", queued_bytes_of(&socket) == 5);
 
     socket::close(&socket);
 }

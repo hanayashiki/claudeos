@@ -19,6 +19,7 @@ pub struct UdpState {
     pub remote: Option<Endpoint>,
     pub bound: bool,
     pub write_shutdown: bool,
+    pub read_shutdown: bool,
     pub error: Option<Errno>,
     pub queue: VecDeque<(Endpoint, Vec<u8>)>,
     queued_bytes: usize,
@@ -31,10 +32,23 @@ impl UdpState {
             remote: None,
             bound: false,
             write_shutdown: false,
+            read_shutdown: false,
             error: None,
             queue: VecDeque::new(),
             queued_bytes: 0,
         }
+    }
+
+    pub fn queued_bytes(&self) -> usize {
+        self.queued_bytes
+    }
+
+    /// Nothing will be read from this socket again: what is queued is thrown
+    /// away, and the room it took with it.
+    pub fn shutdown_read(&mut self) {
+        self.queue.clear();
+        self.queued_bytes = 0;
+        self.read_shutdown = true;
     }
 
     pub fn enqueue(&mut self, from: Endpoint, data: &[u8]) {
@@ -52,6 +66,11 @@ impl UdpState {
     /// is discarded, which is what a datagram socket does.
     pub fn receive(&mut self, buf: &mut [u8], peek: bool) -> Result<(usize, Endpoint), Errno> {
         let Some((from, data)) = self.queue.front() else {
+            if self.read_shutdown {
+                // Linux reports the end here rather than waiting for a
+                // datagram that nobody would be able to read.
+                return Ok((0, Endpoint::UNSPECIFIED));
+            }
             return Err(Errno::EAGAIN);
         };
         let n = buf.len().min(data.len());

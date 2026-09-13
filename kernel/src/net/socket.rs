@@ -116,7 +116,8 @@ impl InetSocket {
                     || tcb.error.is_some()
                     || tcb.state == tcp::State::Closed
             }
-            Protocol::Udp(state) => !state.queue.is_empty(),
+            // A read side that is shut reports the end rather than waiting.
+            Protocol::Udp(state) => !state.queue.is_empty() || state.read_shutdown,
         }
     }
 
@@ -442,7 +443,7 @@ impl InetSocket {
             }
             Protocol::Udp(state) => {
                 if read {
-                    state.queue.clear();
+                    state.shutdown_read();
                 }
                 if write {
                     state.write_shutdown = true;
