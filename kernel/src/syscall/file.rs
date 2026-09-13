@@ -674,7 +674,7 @@ pub fn ioctl(fd: i32, request: u64, arg: u64) -> SysResult {
 /// Descriptors an epoll set or a poll call can wait on.
 pub fn ready_to_write(file: &Arc<OpenFile>) -> bool {
     match &file.backing {
-        FileBacking::Pipe(pipe, is_write) => !*is_write || pipe.writable_now(),
+        FileBacking::Pipe(pipe, end) => !end.writes() || pipe.writable_now(),
         FileBacking::Socket(socket) => socket.tx.writable_now(),
         FileBacking::Inet(handle) => handle.socket.writable(),
         _ => true,
@@ -687,8 +687,8 @@ pub fn ready_to_read(file: &Arc<OpenFile>) -> bool {
         FileBacking::Socket(socket) => socket.readable(),
         FileBacking::Inet(handle) => handle.socket.readable(),
         FileBacking::Epoll(_) => false,
-        FileBacking::Pipe(pipe, is_write) => {
-            if *is_write {
+        FileBacking::Pipe(pipe, end) => {
+            if !end.reads() {
                 true
             } else {
                 pipe.available() > 0 || pipe.writers.load(core::sync::atomic::Ordering::Acquire) == 0
@@ -1060,12 +1060,12 @@ pub fn epoll_wait(epfd: i32, events_addr: u64, max: i32, timeout_ms: i64) -> Sys
         if events & EPOLLOUT != 0 && file.writable() && ready_to_write(file) {
             ready |= EPOLLOUT;
         }
-        if let FileBacking::Pipe(pipe, is_write) = &file.backing {
-            let gone = if *is_write {
-                pipe.readers.load(core::sync::atomic::Ordering::Acquire) == 0
-            } else {
-                pipe.writers.load(core::sync::atomic::Ordering::Acquire) == 0
-            };
+        if let FileBacking::Pipe(pipe, end) = &file.backing {
+            // An end that holds both sides keeps either count from reaching
+            // zero, so it never hangs up on itself.
+            let readers = pipe.readers.load(core::sync::atomic::Ordering::Acquire);
+            let writers = pipe.writers.load(core::sync::atomic::Ordering::Acquire);
+            let gone = (end.reads() && writers == 0) || (end.writes() && readers == 0);
             if gone {
                 ready |= EPOLLHUP;
             }

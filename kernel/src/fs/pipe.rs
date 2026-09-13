@@ -7,6 +7,29 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const PIPE_CAPACITY: usize = 64 * 1024;
 
+/// Which ends of a pipe one descriptor holds.
+///
+/// A FIFO opened O_RDWR holds both at once: it may be written and read, and
+/// closing it has to give back a reader and a writer. A single "is this the
+/// write end" flag cannot say that, and a descriptor it called a read end
+/// refused writes and never reached end of file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PipeEnd {
+    Read,
+    Write,
+    Both,
+}
+
+impl PipeEnd {
+    pub fn reads(self) -> bool {
+        matches!(self, PipeEnd::Read | PipeEnd::Both)
+    }
+
+    pub fn writes(self) -> bool {
+        matches!(self, PipeEnd::Write | PipeEnd::Both)
+    }
+}
+
 struct Buffer {
     data: alloc::vec::Vec<u8>,
     head: usize,
@@ -166,44 +189,45 @@ fn fifo_for(ino: u64) -> Arc<Pipe> {
 pub fn open_fifo(ino: u64, flags: u32, path: &str) -> Result<Arc<super::OpenFile>, Errno> {
     use crate::abi::{O_ACCMODE, O_NONBLOCK, O_RDWR, O_WRONLY};
     let pipe = fifo_for(ino);
-    let access = flags & O_ACCMODE;
-    let writing = access == O_WRONLY;
-    let both = access == O_RDWR;
+    let end = match flags & O_ACCMODE {
+        O_WRONLY => PipeEnd::Write,
+        O_RDWR => PipeEnd::Both,
+        _ => PipeEnd::Read,
+    };
 
     // Read the other side's open count before joining, so an open that
     // happens from here on is seen as a change even if it has finished by the
     // time this one looks.
-    let seen = if writing {
+    let seen = if end == PipeEnd::Write {
         pipe.reader_opens.load(Ordering::Acquire)
     } else {
         pipe.writer_opens.load(Ordering::Acquire)
     };
 
-    if writing {
-        if flags & O_NONBLOCK != 0 && pipe.readers.load(Ordering::Acquire) == 0 {
-            return Err(Errno::ENXIO);
-        }
-        pipe.writers.fetch_add(1, Ordering::AcqRel);
-        pipe.writer_opens.fetch_add(1, Ordering::AcqRel);
-    } else {
+    let nonblock = flags & O_NONBLOCK != 0;
+    if end == PipeEnd::Write && nonblock && pipe.readers.load(Ordering::Acquire) == 0 {
+        return Err(Errno::ENXIO);
+    }
+    if end.reads() {
         pipe.readers.fetch_add(1, Ordering::AcqRel);
         pipe.reader_opens.fetch_add(1, Ordering::AcqRel);
-        if both {
-            pipe.writers.fetch_add(1, Ordering::AcqRel);
-            pipe.writer_opens.fetch_add(1, Ordering::AcqRel);
-        }
+    }
+    if end.writes() {
+        pipe.writers.fetch_add(1, Ordering::AcqRel);
+        pipe.writer_opens.fetch_add(1, Ordering::AcqRel);
     }
     // The end that just arrived may be the one the other side was waiting for.
     pipe.wake();
 
     let file = Arc::new(super::OpenFile {
-        backing: super::FileBacking::Pipe(pipe.clone(), writing),
+        backing: super::FileBacking::Pipe(pipe.clone(), end),
         offset: Spinlock::new(0),
         flags: Spinlock::new(flags),
         path: alloc::string::String::from(path),
     });
 
-    if !both && flags & O_NONBLOCK == 0 {
+    if end != PipeEnd::Both && !nonblock {
+        let writing = end == PipeEnd::Write;
         let want = if writing { &pipe.readers } else { &pipe.writers };
         let opens = if writing { &pipe.reader_opens } else { &pipe.writer_opens };
         let queue = if writing { &pipe.not_full } else { &pipe.not_empty };
@@ -231,13 +255,13 @@ pub fn create_pair(flags: u32) -> (Arc<super::OpenFile>, Arc<super::OpenFile>) {
     pipe.writers.store(1, Ordering::Release);
 
     let read_end = Arc::new(OpenFile {
-        backing: FileBacking::Pipe(pipe.clone(), false),
+        backing: FileBacking::Pipe(pipe.clone(), PipeEnd::Read),
         offset: Spinlock::new(0),
         flags: Spinlock::new(flags),
         path: alloc::string::String::from("pipe:"),
     });
     let write_end = Arc::new(OpenFile {
-        backing: FileBacking::Pipe(pipe, true),
+        backing: FileBacking::Pipe(pipe, PipeEnd::Write),
         offset: Spinlock::new(0),
         flags: Spinlock::new(flags),
         path: alloc::string::String::from("pipe:"),
@@ -248,9 +272,13 @@ pub fn create_pair(flags: u32) -> (Arc<super::OpenFile>, Arc<super::OpenFile>) {
 impl Drop for super::OpenFile {
     fn drop(&mut self) {
         match &self.backing {
-            super::FileBacking::Pipe(pipe, is_write) => {
-                let counter = if *is_write { &pipe.writers } else { &pipe.readers };
-                counter.fetch_sub(1, Ordering::AcqRel);
+            super::FileBacking::Pipe(pipe, end) => {
+                if end.reads() {
+                    pipe.readers.fetch_sub(1, Ordering::AcqRel);
+                }
+                if end.writes() {
+                    pipe.writers.fetch_sub(1, Ordering::AcqRel);
+                }
                 // The other end has to notice that this one is gone.
                 pipe.wake();
             }
