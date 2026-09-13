@@ -26,6 +26,7 @@ mod numbers {
     pub const SYS_FORK: u64 = 57;
     pub const SYS_EXECVE: u64 = 59;
     pub const SYS_WAIT4: u64 = 61;
+    pub const SYS_RENAMEAT: u64 = 264;
     pub const SYS_EXIT_GROUP: u64 = 231;
 }
 
@@ -39,6 +40,7 @@ mod numbers {
     pub const SYS_CLONE: u64 = 220;
     pub const SYS_EXECVE: u64 = 221;
     pub const SYS_WAIT4: u64 = 260;
+    pub const SYS_RENAMEAT: u64 = 38;
     pub const SYS_EXIT_GROUP: u64 = 94;
 }
 
@@ -164,6 +166,27 @@ pub fn wait4(pid: i32, options: u64) -> (i64, i32) {
         )
     };
     (rc, (status >> 8) & 0xFF)
+}
+
+/// Give `from` the name `to`, and give back the negated errno on failure
+/// rather than the standard library's error type, since which errno it is is
+/// what the checks are about. This is `renameat` because the aarch64 table has
+/// no plain `rename`.
+pub fn rename(from: &str, to: &str) -> i64 {
+    const AT_FDCWD: i64 = -100;
+    let from = cstr(from);
+    let to = cstr(to);
+    unsafe {
+        syscall(
+            SYS_RENAMEAT,
+            AT_FDCWD as u64,
+            from.as_ptr() as u64,
+            AT_FDCWD as u64,
+            to.as_ptr() as u64,
+            0,
+            0,
+        )
+    }
 }
 
 pub fn read(fd: i32, buf: &mut [u8]) -> i64 {

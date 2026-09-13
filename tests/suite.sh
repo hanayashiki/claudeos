@@ -285,6 +285,25 @@ check "same inode"           "0"        "$(test $(stat -c %i /tmp/lk/a) -eq $(st
 rm /tmp/lk/b
 check "unlink drops a name"  "1"        "$(stat -c %h /tmp/lk/a)"
 check "the file is still there" "changed" "$(cat /tmp/lk/a)"
+
+# Renaming a name onto itself, and a directory into its own subtree. Both are
+# one lookup and two directory edits, and neither has an answer that involves
+# the file disappearing.
+rm -rf /tmp/rn; mkdir -p /tmp/rn/dir
+echo content > /tmp/rn/file
+mv /tmp/rn/file /tmp/rn/file
+check "a name renamed onto itself" "content" "$(cat /tmp/rn/file 2>/dev/null)"
+check "a directory under itself"   "1"       "$(mv /tmp/rn/dir /tmp/rn/dir/under 2>/dev/null; echo $?)"
+check "and it is still where it was" "0"     "$(test -d /tmp/rn/dir; echo $?)"
+# The name the move lands on had a file of its own, with another name still
+# pointing at it, so that file is down to one name afterwards.
+echo one > /tmp/rn/one
+ln /tmp/rn/one /tmp/rn/two
+echo three > /tmp/rn/three
+mv /tmp/rn/three /tmp/rn/two
+check "a replaced name drops a link" "1"     "$(stat -c %h /tmp/rn/one)"
+rm -rf /tmp/rn
+
 mkfifo /tmp/lk/f
 check "mkfifo makes a fifo"  "0"        "$(test -p /tmp/lk/f; echo $?)"
 check "a fifo carries data"  "through"  "$(echo through > /tmp/lk/f & cat /tmp/lk/f)"
