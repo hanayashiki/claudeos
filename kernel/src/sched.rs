@@ -69,16 +69,38 @@ pub fn init() {
 }
 
 pub fn register(task: Box<Task>) -> u32 {
+    reap_dead_threads();
     let pid = task.pid;
+    // The entry in /proc is built before the task is in the table, because the
+    // moment it is in the table the timer can hand it the CPU. A child
+    // scheduled in between finds its own directory half-built or not there at
+    // all, and our shell applies its redirections through that directory a few
+    // instructions after fork returns.
+    crate::fs::procfs::add_process(pid);
     let ptr = Box::into_raw(task);
     TASKS.lock().push(TaskPtr(ptr));
-    crate::fs::procfs::add_process(pid);
     pid
 }
 
+/// Look up a task and hand the reference out. The table is unlocked again
+/// before this returns, so the reference is only good for as long as nothing
+/// can reap the task: a field or two read or written with interrupts still off,
+/// or inside a block that holds them off itself. Anything longer takes the
+/// table with it through `with_task`.
 pub fn find(pid: u32) -> Option<&'static mut Task> {
     let tasks = TASKS.lock();
     tasks.iter().find(|t| t.get().pid == pid).map(|t| t.get())
+}
+
+/// Run `f` on the task with `pid`, with the table held for as long as it runs.
+///
+/// A reader that walks a task -- every page of every region, every descriptor
+/// it has open -- is holding a pointer that a reap on another task would free
+/// underneath it. Holding the table is what stops that reap happening.
+pub fn with_task<R>(pid: u32, f: impl FnOnce(&mut Task) -> R) -> Option<R> {
+    let tasks = TASKS.lock();
+    let entry = tasks.iter().find(|t| t.get().pid == pid)?;
+    Some(f(entry.get()))
 }
 
 /// The running task's pid, or zero before there is one.
@@ -251,11 +273,24 @@ pub fn on_tick() {
     schedule();
 }
 
-/// Put the current task to sleep for `ticks` timer ticks.
+/// Put the current task to sleep for `ticks` timer ticks, or until a signal
+/// arrives.
 pub fn sleep_ticks(ticks: u64) {
-    let mut task = current();
-    task.wake_at = crate::trap::ticks() + ticks.max(1);
-    task.state = State::Sleeping;
+    // A signal landing between a caller's own check and this sleep finds a task
+    // that is still runnable, so it wakes nothing, and the task then parks
+    // itself for the whole of the time it asked for with the signal pending and
+    // nothing left that will deliver it. `pause` asks for about 2^62 ticks,
+    // which is for good. Turning interrupts off only stops something else
+    // starting now, so the question has to be asked again inside the same
+    // window and the sleep skipped if the answer has changed.
+    crate::sync::without_interrupts(|| {
+        if has_pending_signal() {
+            return;
+        }
+        let mut task = current();
+        task.wake_at = crate::trap::ticks() + ticks.max(1);
+        task.state = State::Sleeping;
+    });
     schedule();
 }
 
@@ -313,6 +348,11 @@ pub fn exit_group(status: i32) -> ! {
 
 pub fn exit_current(status: i32) -> ! {
     {
+        // Threads that finished earlier are still holding a kernel stack and a
+        // reference to this process's region list, and the second of those is
+        // what decides below whether the user memory may go.
+        reap_dead_threads();
+
         let mut task = current();
         task.exit_code = status;
 
@@ -330,7 +370,7 @@ pub fn exit_current(status: i32) -> ! {
         if task.clear_child_tid != 0 {
             let address = task.clear_child_tid;
             task.clear_child_tid = 0;
-            let _ = crate::uaccess::write_u32(address, 0);
+            let _ = crate::uaccess::write_u32_in(&task, address, 0);
             crate::futex::wake(crate::futex::futex_key(address), u32::MAX);
         }
         // Under CLONE_FILES the table belongs to the whole process, so only
@@ -348,6 +388,10 @@ pub fn exit_current(status: i32) -> ! {
         }
         let ppid = task.ppid;
         let pid = task.pid;
+        // A thread is not a child of the process's parent, so its exit is not
+        // a child exit to report there. Whoever joins it is woken through the
+        // cleared tid word above.
+        let is_process = task.pid == task.tgid;
 
         if pid == 1 {
             crate::println!();
@@ -392,14 +436,16 @@ pub fn exit_current(status: i32) -> ! {
             if adopted_zombie && ppid != 1 {
                 if let Some(init) = find(1) {
                     init.pending_signals |= 1u64 << (SIGCHLD as u64 & 63);
-                    if init.state == State::Sleeping && init.waiting_for.is_some() {
+                    if init.state == State::Sleeping {
                         init.state = State::Runnable;
                         init.wake_at = 0;
                     }
                 }
             }
 
-            notify_parent(ppid);
+            if is_process {
+                notify_parent(ppid);
+            }
         });
     }
     loop {
@@ -430,7 +476,12 @@ pub fn raise_on_current(signal: i32) {
 pub fn notify_parent(ppid: u32) {
     if let Some(parent) = find(ppid) {
         parent.pending_signals |= 1u64 << (SIGCHLD as u64 & 63);
-        if parent.state == State::Sleeping && parent.waiting_for.is_some() {
+        // Any sleep, not only a wait for a child. This is a signal, and every
+        // other signal returns a sleeping task to the run queue; a shell
+        // blocked reading its terminal has a handler for this one and would
+        // otherwise not learn that a background job had finished until the next
+        // key was pressed.
+        if parent.state == State::Sleeping {
             parent.state = State::Runnable;
             parent.wake_at = 0;
         }
@@ -460,6 +511,10 @@ pub fn post_signal(task: &mut Task, signal: i32) -> Option<u32> {
         if task.state == State::Stopped {
             task.state = State::Runnable;
             task.wake_at = 0;
+            // A stop nobody has been told about yet has stopped being true.
+            // Left standing it is handed to whatever asks next, which is a
+            // suspension reported after the job is running again.
+            task.report_stop = false;
             task.report_continue = true;
             restarted = Some(task.ppid);
         }
@@ -476,13 +531,32 @@ pub fn post_signal(task: &mut Task, signal: i32) -> Option<u32> {
 
 /// Stop the running task until something sends it SIGCONT.
 fn stop_current(signal: i32) {
-    let mut task = current();
-    task.stop_signal = signal;
-    task.report_stop = true;
-    task.state = State::Stopped;
-    let ppid = task.ppid;
-    notify_parent(ppid);
-    schedule();
+    // Leaving the run queue and telling the parent about it have to happen in
+    // the same breath. A tick in between hands the CPU to something else and
+    // never hands it back, because this task is no longer runnable, so the
+    // notification is left undelivered by a task that can no longer deliver
+    // it and the parent sleeps in wait4 for good.
+    let stopped = crate::sync::without_interrupts(|| {
+        let mut task = current();
+        // The stop signal's pending bit was cleared before this was called, so
+        // a continue that arrived since then found a runnable task with no
+        // stop to discard and nothing to restart: it recorded nothing. Asked
+        // again here, where nothing else can run, it is a continue that beat
+        // the stop, and stopping now would park the task with a continue
+        // pending that nothing would ever act on.
+        if task.pending_signals & (1u64 << (SIGCONT as u64 & 63)) != 0 {
+            return false;
+        }
+        task.stop_signal = signal;
+        task.report_stop = true;
+        task.state = State::Stopped;
+        let ppid = task.ppid;
+        notify_parent(ppid);
+        true
+    });
+    if stopped {
+        schedule();
+    }
 }
 
 /// Woken whenever a descriptor changes what it would report to a poll: bytes
@@ -569,14 +643,22 @@ pub fn signal_group(pgid: u32, signal: i32) {
 /// job is pending on most processes most of the time, and treating it as a
 /// reason to fail turns unrelated reads and opens into spurious errors.
 pub fn has_pending_signal() -> bool {
+    has_pending_signal_except(0)
+}
+
+/// The same question with the signals in `ignore` left out of it, for a call
+/// that acts on one itself rather than giving up. `wait4` is here to collect
+/// what the child signal is telling it about, so that one is not a reason for
+/// it to fail.
+pub fn has_pending_signal_except(ignore: u64) -> bool {
     if !has_current() {
         return false;
     }
     let task = current();
-    let mut pending = task.pending_signals & !task.signal_mask;
+    let waiting = task.pending_signals & !ignore;
+    let mut pending = waiting & !task.signal_mask;
     // Neither of these can be blocked.
-    pending |= task.pending_signals
-        & ((1u64 << (SIGKILL as u64 & 63)) | (1u64 << (SIGSTOP as u64 & 63)));
+    pending |= waiting & ((1u64 << (SIGKILL as u64 & 63)) | (1u64 << (SIGSTOP as u64 & 63)));
     if pending == 0 {
         return false;
     }
@@ -668,6 +750,34 @@ pub fn check_signals() {
     }
 }
 
+/// True when `task` is a child `wait4` may be told about, rather than one of
+/// the threads inside one.
+///
+/// A thread is given its process's parent as its own parent, so that an orphan
+/// is adopted the same way a process is. Matching on that field alone offers
+/// the thread to that parent as if it were a child of its own: the parent is
+/// woken out of its wait and handed a task id it never forked, with the
+/// thread's status, while the process it is actually waiting for is still
+/// running. A thread is reported to a joiner inside the process and to nothing
+/// else.
+fn is_child_process(task: &Task, parent_pid: u32) -> bool {
+    task.ppid == parent_pid && task.pid == task.tgid
+}
+
+/// Does `task` match the pid argument `wait4` was given?
+///
+/// Above zero it names one task; minus one is any child; below minus one is
+/// the process group its negation names, which is how a shell waits for a job
+/// rather than for a particular process. Zero is any child here, where Linux
+/// reads it as the caller's own process group.
+fn matches_want(task: &Task, want: i32) -> bool {
+    match want {
+        w if w > 0 => task.pid == w as u32,
+        w if w < -1 => task.pgid == (-w) as u32,
+        _ => true,
+    }
+}
+
 /// Collect a finished child. Returns (pid, exit code).
 pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
     let mut found: Option<(u32, i32, *mut Task)> = None;
@@ -675,10 +785,10 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
         let tasks = TASKS.lock();
         for entry in tasks.iter() {
             let task = entry.get();
-            if task.ppid != parent_pid || task.state != State::Zombie {
+            if !is_child_process(task, parent_pid) || task.state != State::Zombie {
                 continue;
             }
-            if want > 0 && task.pid != want as u32 {
+            if !matches_want(task, want) {
                 continue;
             }
             found = Some((task.pid, task.exit_code, entry.0));
@@ -705,6 +815,47 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
     Some((pid, code))
 }
 
+/// Release the tasks of threads that have finished.
+///
+/// Nothing waits for a thread, so no `wait4` ever takes its entry out of the
+/// table: the kernel stack, the task itself and the share it holds of the
+/// process's region list would stay taken for as long as the machine ran.
+/// Called where threads are made and where one exits, so a program that starts
+/// and joins them in a loop leaves at most the one that has not finished
+/// switching away yet.
+pub fn reap_dead_threads() {
+    let mut dead = Vec::new();
+    {
+        let cur = unsafe { CURRENT };
+        let mut tasks = TASKS.lock();
+        tasks.retain(|entry| {
+            let task = entry.get();
+            // The running task is in the middle of its own exit and is still on
+            // the stack this would hand back.
+            let finished =
+                task.state == State::Zombie && task.pid != task.tgid && entry.0 != cur;
+            if finished {
+                dead.push(entry.0);
+            }
+            !finished
+        });
+    }
+    for ptr in dead {
+        unsafe {
+            let mut task = Box::from_raw(ptr);
+            crate::fs::procfs::remove_process(task.pid);
+            // Out of the table already, so this asks whether anything else --
+            // the process, or another of its threads -- still names the space.
+            if !space_in_use(task.space) {
+                task.space.destroy();
+            }
+            task.free_kernel_stack();
+            task.state = State::Dead;
+            drop(task);
+        }
+    }
+}
+
 /// Report a child that stopped or was continued since the last report. The
 /// child stays where it is; this is a status change, not an exit.
 pub fn child_status_change(
@@ -716,10 +867,10 @@ pub fn child_status_change(
     let tasks = TASKS.lock();
     for entry in tasks.iter() {
         let task = entry.get();
-        if task.ppid != parent_pid {
+        if !is_child_process(task, parent_pid) {
             continue;
         }
-        if want > 0 && task.pid != want as u32 {
+        if !matches_want(task, want) {
             continue;
         }
         if untraced && task.report_stop {
@@ -747,10 +898,10 @@ pub fn child_event_pending(
     let tasks = TASKS.lock();
     tasks.iter().any(|t| {
         let task = t.get();
-        if task.ppid != parent_pid {
+        if !is_child_process(task, parent_pid) {
             return false;
         }
-        if want > 0 && task.pid != want as u32 {
+        if !matches_want(task, want) {
             return false;
         }
         task.state == State::Zombie
@@ -764,7 +915,7 @@ pub fn has_children(parent_pid: u32, want: i32) -> bool {
     let tasks = TASKS.lock();
     tasks.iter().any(|t| {
         let task = t.get();
-        task.ppid == parent_pid && (want <= 0 || task.pid == want as u32)
+        is_child_process(task, parent_pid) && matches_want(task, want)
     })
 }
 

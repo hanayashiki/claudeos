@@ -16,6 +16,7 @@ static SIGNAL_TOTAL: AtomicUsize = AtomicUsize::new(0);
 extern "C" {
     fn signal(signum: i32, handler: usize) -> usize;
     fn raise(signum: i32) -> i32;
+    fn pause() -> i32;
 }
 
 extern "C" fn handle_signal(signum: i32) {
@@ -178,6 +179,609 @@ fn absent_numbers(report: &mut Report) {
         "numbers past the table answer ENOSYS",
         answered.is_empty(),
         format!("{:?}", answered),
+    );
+}
+
+/// A thread of a child process is not a child of this one. It is given its
+/// process's parent as its own so that an orphan is adopted the same way, and
+/// a wait that matches on that alone hands back a task id this process never
+/// forked while the child it is waiting for is still running.
+fn thread_of_a_child_is_not_a_child(report: &mut Report) {
+    use crate::sys;
+
+    let child = sys::fork();
+    if child == 0 {
+        let worker = std::thread::spawn(|| 1u8);
+        let _ = worker.join();
+        // Outlive the thread by long enough that a wait which took the thread
+        // would have come back well before this task did.
+        std::thread::sleep(Duration::from_millis(400));
+        sys::exit_group(7);
+    }
+    let started = Instant::now();
+    let (reaped, status) = sys::wait4(-1, 0);
+    let waited = started.elapsed();
+    report.check(
+        "wait skips the threads of a child",
+        reaped == child && sys::exit_code_of(status) == 7,
+        format!("forked {} reaped {} status {:#x} after {:?}", child, reaped, status, waited),
+    );
+}
+
+/// A process blocked on something other than a child still has to learn that a
+/// child finished: the child signal is a signal, and every other one returns a
+/// sleeping task to the run queue. A shell waiting for a key is the case that
+/// matters.
+fn a_child_exit_reaches_a_blocked_parent(report: &mut Report) {
+    use crate::sys;
+    use std::sync::atomic::AtomicBool;
+
+    const SIGCHLD: i32 = 17;
+    const SIG_DFL: usize = 0;
+    static DONE: AtomicBool = AtomicBool::new(false);
+
+    let Ok((reader, writer)) = sys::pipe() else {
+        report.check("a pipe for the blocked read", false, String::new());
+        return;
+    };
+    unsafe { signal(SIGCHLD, handle_signal as extern "C" fn(i32) as usize) };
+    let before = SIGNAL_TOTAL.load(Ordering::SeqCst);
+
+    let child = sys::fork();
+    if child == 0 {
+        std::thread::sleep(Duration::from_millis(250));
+        sys::exit_group(0);
+    }
+    // Nothing will ever be written to this pipe, so only the child signal ends
+    // the read. The watchdog writes a byte if it does not, so a regression is a
+    // failed check rather than a suite that never finishes.
+    let watchdog = std::thread::spawn(move || {
+        for _ in 0..30 {
+            if DONE.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        sys::write(writer, b"x");
+    });
+
+    let started = Instant::now();
+    let mut buf = [0u8; 1];
+    let n = sys::read(reader, &mut buf);
+    let waited = started.elapsed();
+    DONE.store(true, Ordering::Relaxed);
+    let _ = watchdog.join();
+
+    let ran = SIGNAL_TOTAL.load(Ordering::SeqCst) - before == SIGCHLD as usize;
+    unsafe { signal(SIGCHLD, SIG_DFL) };
+    let _ = sys::wait4(child as i32, 0);
+    sys::close(reader);
+    sys::close(writer);
+
+    report.check(
+        "a child's exit ends a read the parent was blocked in",
+        n == -4 && ran && waited < Duration::from_millis(1500),
+        format!("read returned {} after {:?}, handler ran: {}", n, waited, ran),
+    );
+}
+
+/// What a wait does with signals: a signal that would be discarded on delivery
+/// is no reason to give the wait up, and the child signal has to survive the
+/// wait so that a process with a handler sees it run for the child it reaped.
+fn what_a_wait_does_with_signals(report: &mut Report) {
+    use crate::sys;
+
+    const SIGCHLD: i32 = 17;
+    const SIGWINCH: i32 = 28;
+    const SIG_DFL: usize = 0;
+
+    // A terminal resize is ignored by default, so a wait must not fail on it.
+    let child = sys::fork();
+    if child == 0 {
+        sys::kill(sys::getppid() as i32, SIGWINCH);
+        std::thread::sleep(Duration::from_millis(300));
+        sys::exit_group(7);
+    }
+    let (pid, status) = sys::wait4(child as i32, 0);
+    report.check(
+        "a discarded signal does not interrupt a wait",
+        pid == child && sys::exit_code_of(status) == 7,
+        format!("reaped {} status {:#x}", pid, status),
+    );
+
+    // And the child signal is still there to be delivered afterwards.
+    unsafe { signal(SIGCHLD, handle_signal as extern "C" fn(i32) as usize) };
+    let before = SIGNAL_TOTAL.load(Ordering::SeqCst);
+    let child = sys::fork();
+    if child == 0 {
+        std::thread::sleep(Duration::from_millis(100));
+        sys::exit_group(0);
+    }
+    let (pid, _) = sys::wait4(child as i32, 0);
+    // The handler runs on the way out of the wait.
+    for _ in 0..4 {
+        std::thread::yield_now();
+    }
+    let ran = SIGNAL_TOTAL.load(Ordering::SeqCst) - before == SIGCHLD as usize;
+    unsafe { signal(SIGCHLD, SIG_DFL) };
+    report.check(
+        "a handler runs for a child the process reaped itself",
+        pid == child && ran,
+        format!("reaped {}, handler ran: {}", pid, ran),
+    );
+}
+
+/// A stop nobody asked to be told about has to stop being reportable once the
+/// job is running again, or the next wait that does ask is handed a suspension
+/// that has already ended.
+fn a_continued_job_has_no_stop_to_report(report: &mut Report) {
+    use crate::sys;
+
+    const SIGKILL: i32 = 9;
+    const SIGCONT: i32 = 18;
+    const SIGTSTP: i32 = 20;
+    const WNOHANG: u64 = 1;
+    const WUNTRACED: u64 = 2;
+    const WCONTINUED: u64 = 8;
+
+    let child = sys::fork();
+    if child == 0 {
+        loop {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let child = child as i32;
+
+    sys::kill(child, SIGTSTP);
+    std::thread::sleep(Duration::from_millis(150));
+    // This wait does not ask about stops, so it is told nothing.
+    let (idle, _) = sys::wait4(child, WNOHANG);
+    sys::kill(child, SIGCONT);
+    std::thread::sleep(Duration::from_millis(150));
+    // This one asks about both, and the job is running.
+    let (pid, status) = sys::wait4(child, WNOHANG | WUNTRACED | WCONTINUED);
+
+    sys::kill(child, SIGKILL);
+    let _ = sys::wait4(child, 0);
+    report.check(
+        "a continued job has no stop left to report",
+        idle == 0 && pid == child as i64 && sys::is_continued(status),
+        format!("first wait {}, then {} status {:#x}", idle, pid, status),
+    );
+}
+
+/// A wait for a negative value below minus one names a process group, which is
+/// how a shell waits for a job rather than for one process of it.
+fn waiting_on_a_process_group(report: &mut Report) {
+    use crate::sys;
+
+    // One child in a group of its own, taking its time, and one in this
+    // process's group that finishes at once.
+    let member = sys::fork();
+    if member == 0 {
+        sys::setpgid(0, 0);
+        std::thread::sleep(Duration::from_millis(300));
+        sys::exit_group(4);
+    }
+    // Set it from here as well, so the group is right whichever task runs next.
+    sys::setpgid(member as i32, member as i32);
+
+    let outsider = sys::fork();
+    if outsider == 0 {
+        sys::exit_group(5);
+    }
+    std::thread::sleep(Duration::from_millis(50));
+
+    let (pid, status) = sys::wait4(-(member as i32), 0);
+    let ok = pid == member && sys::exit_code_of(status) == 4;
+    let _ = sys::wait4(outsider as i32, 0);
+    report.check(
+        "a wait for a process group skips a child outside it",
+        ok,
+        format!("group {} outsider {} reaped {} status {:#x}", member, outsider, pid, status),
+    );
+}
+
+/// A task's entry in /proc has to be there before the task can run. The first
+/// thing a forked child does here is open its own status file, which is what a
+/// shell applying a redirection through its own descriptor directory amounts
+/// to. Fifteen hundred rounds is a smoke test: the window is however long the
+/// entry takes to build, and it is missed only when a tick lands inside it.
+fn a_child_finds_its_own_proc_entry(report: &mut Report) {
+    use crate::sys;
+
+    let mut misses = 0;
+    for _ in 0..1500 {
+        let child = sys::fork();
+        if child == 0 {
+            let fd = sys::open("/proc/self/status", sys::O_RDONLY, 0);
+            if fd < 0 {
+                sys::exit_group(1);
+            }
+            sys::close(fd as i32);
+            sys::exit_group(0);
+        }
+        let (_, status) = sys::wait4(child as i32, 0);
+        if sys::exit_code_of(status) != 0 {
+            misses += 1;
+        }
+    }
+    report.check(
+        "a forked child finds its own entry in /proc",
+        misses == 0,
+        format!("{} of 1500 missed it", misses),
+    );
+}
+
+/// A fork takes write permission away from every page of the address space it
+/// copies, the parent's included. A sibling thread inside a write to user
+/// memory has already had its buffer checked by then, so the copy that follows
+/// stores into a page that has just become read-only.
+fn a_fork_while_a_sibling_writes(report: &mut Report) {
+    use crate::sys;
+    use std::sync::atomic::AtomicBool;
+
+    static RUNNING: AtomicBool = AtomicBool::new(true);
+    let devnull = sys::open("/dev/null", sys::O_WRONLY, 0);
+    let writes = Arc::new(AtomicUsize::new(0));
+    let writer_count = Arc::clone(&writes);
+    let writer = std::thread::spawn(move || {
+        let buf = vec![7u8; 8192];
+        let mut back = vec![0u8; 8192];
+        let fd = sys::open("/tmp/forkrace.dat", sys::O_WRONLY | 0o100 | 0o1000, 0o644);
+        while RUNNING.load(Ordering::Relaxed) {
+            if fd >= 0 {
+                sys::write(fd as i32, &buf);
+            }
+            if devnull >= 0 {
+                sys::write(devnull as i32, &buf);
+            }
+            // A read is what puts the kernel on the writing side of a user
+            // buffer, which is where the store happens.
+            let rd = sys::open("/tmp/forkrace.dat", sys::O_RDONLY, 0);
+            if rd >= 0 {
+                sys::read(rd as i32, &mut back);
+                sys::close(rd as i32);
+            }
+            writer_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if fd >= 0 {
+            sys::close(fd as i32);
+        }
+    });
+
+    let mut rounds = 0;
+    for _ in 0..60 {
+        let child = sys::fork();
+        if child == 0 {
+            sys::exit_group(0);
+        }
+        let (pid, _) = sys::wait4(child as i32, 0);
+        if pid == child {
+            rounds += 1;
+        }
+    }
+    RUNNING.store(false, Ordering::Relaxed);
+    let _ = writer.join();
+    if devnull >= 0 {
+        sys::close(devnull as i32);
+    }
+    let _ = std::fs::remove_file("/tmp/forkrace.dat");
+
+    report.check(
+        "a fork does not fault a sibling's copy out of the kernel",
+        rounds == 60 && writes.load(Ordering::Relaxed) > 0,
+        format!("{} rounds, {} writes", rounds, writes.load(Ordering::Relaxed)),
+    );
+}
+
+/// Reading a process's entry in /proc walks every page of every region it has.
+/// The task can be reaped while that walk is running, by another thread of the
+/// same process, so the reader has to hold the process table rather than a
+/// pointer it took out of it.
+fn reading_proc_while_a_child_is_reaped(report: &mut Report) {
+    use crate::sys;
+    use std::sync::atomic::{AtomicBool, AtomicUsize as Atomic};
+
+    static WATCHED: Atomic = Atomic::new(0);
+    static RUNNING: AtomicBool = AtomicBool::new(true);
+
+    let reads = Arc::new(AtomicUsize::new(0));
+    let reader_count = Arc::clone(&reads);
+    let reader = std::thread::spawn(move || {
+        while RUNNING.load(Ordering::Relaxed) {
+            let pid = WATCHED.load(Ordering::Relaxed);
+            if pid == 0 {
+                std::thread::yield_now();
+                continue;
+            }
+            let _ = std::fs::read_to_string(format!("/proc/{}/stat", pid));
+            let _ = std::fs::read_to_string(format!("/proc/{}/maps", pid));
+            reader_count.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let mut rounds = 0;
+    for _ in 0..100 {
+        let child = sys::fork();
+        if child == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+            sys::exit_group(0);
+        }
+        WATCHED.store(child as usize, Ordering::Relaxed);
+        let (pid, _) = sys::wait4(child as i32, 0);
+        WATCHED.store(0, Ordering::Relaxed);
+        if pid == child {
+            rounds += 1;
+        }
+    }
+    RUNNING.store(false, Ordering::Relaxed);
+    let _ = reader.join();
+
+    let reads = reads.load(Ordering::Relaxed);
+    report.check(
+        "reading /proc survives the task being reaped",
+        rounds == 100 && reads > 0,
+        format!("{} rounds, {} reads", rounds, reads),
+    );
+}
+
+/// A child that has not written to its stack since the fork still shares those
+/// pages with the parent, so the signal frame the kernel writes there goes
+/// through the path that breaks the sharing first.
+fn a_signal_frame_on_a_shared_page(report: &mut Report) {
+    use crate::sys;
+
+    let before = SIGNAL_TOTAL.load(Ordering::SeqCst);
+    let child = sys::fork();
+    if child == 0 {
+        // Straight to the kernel rather than through libc's `raise`: this task
+        // was made by a bare fork, so the thread id libc remembers is still the
+        // parent's and the signal would go there.
+        // The result of this call is stored over the frame a handler is
+        // entered on, so a signal sent to oneself has to come back as zero for
+        // the handler to be given the right number.
+        let sent = sys::kill(sys::getpid() as i32, SIGUSR2);
+        // The handler runs on the way out, and execution has to carry on from
+        // where it left off afterwards.
+        let ran = SIGNAL_TOTAL.load(Ordering::SeqCst) - before == SIGUSR2 as usize;
+        sys::exit_group(if ran && sent == 0 { 0 } else { 1 });
+    }
+    let (pid, status) = sys::wait4(child as i32, 0);
+    report.check(
+        "a signal frame lands on a page shared after a fork",
+        pid == child && sys::exit_code_of(status) == 0,
+        format!("reaped {} status {:#x}", pid, status),
+    );
+}
+
+/// Stopping a job and telling its parent are one step. A tick between them
+/// takes the CPU away from a task that is no longer runnable, so the parent is
+/// never told and sleeps in wait4 for good: the shell that pressed the suspend
+/// key never gets its prompt back.
+///
+/// Forty rounds is a smoke test, not proof: the window is two instructions
+/// wide. A watchdog kills the child if a round takes too long, so a regression
+/// reads as a failed check rather than a suite that never finishes.
+fn stopping_a_job_reaches_the_parent(report: &mut Report) {
+    use crate::sys;
+    use std::sync::atomic::AtomicBool;
+
+    const SIGKILL: i32 = 9;
+    const SIGCONT: i32 = 18;
+    const SIGTSTP: i32 = 20;
+    const WUNTRACED: u64 = 2;
+    const WCONTINUED: u64 = 8;
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+
+    let child = sys::fork();
+    if child == 0 {
+        loop {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let child = child as i32;
+
+    let watchdog = std::thread::spawn(move || {
+        for _ in 0..100 {
+            if DONE.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        sys::kill(child, SIGKILL);
+    });
+
+    let mut rounds = 0;
+    let mut detail = String::new();
+    for round in 0..40 {
+        sys::kill(child, SIGTSTP);
+        let (pid, status) = sys::wait4(child, WUNTRACED);
+        if pid != child as i64 || sys::stop_signal_of(status) != Some(SIGTSTP) {
+            detail = format!("round {}: stop reported as {} {:#x}", round, pid, status);
+            break;
+        }
+        sys::kill(child, SIGCONT);
+        let (pid, status) = sys::wait4(child, WCONTINUED);
+        if pid != child as i64 || !sys::is_continued(status) {
+            detail = format!("round {}: continue reported as {} {:#x}", round, pid, status);
+            break;
+        }
+        rounds += 1;
+    }
+    // A continue that lands while the task is on its way into a stop finds it
+    // still runnable, so it has nothing to restart; the stop that follows must
+    // give way to it rather than park the task with a continue pending that
+    // nothing will ever look at. Back-to-back pairs is the closest a program
+    // can get to that from outside.
+    for _ in 0..60 {
+        sys::kill(child, SIGTSTP);
+        sys::kill(child, SIGCONT);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let state = std::fs::read_to_string(format!("/proc/{}/stat", child))
+        .ok()
+        .and_then(|line| line.split(' ').nth(2).map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    DONE.store(true, Ordering::Relaxed);
+    let _ = watchdog.join();
+    sys::kill(child, SIGCONT);
+    sys::kill(child, SIGKILL);
+    let _ = sys::wait4(child, 0);
+
+    report.check(
+        "a stop and a continue both reach the parent",
+        rounds == 40,
+        format!("{} rounds; {}", rounds, detail),
+    );
+    report.check(
+        "a continue is not lost to the stop it races",
+        state != "T" && !state.is_empty(),
+        format!("child state {:?} after 60 stop-continue pairs", state),
+    );
+}
+
+/// A signal that arrives while a task is still runnable finds nothing to wake.
+/// If the task then parks itself without asking again, the signal waits out the
+/// whole sleep: a minute for a bounded one, and for good for the unbounded
+/// sleep `pause` asks for.
+///
+/// Forty rounds with the signal walked across the child's way into the sleep is
+/// a smoke test, not proof: the window is a handful of instructions.
+fn a_signal_ends_a_sleep(report: &mut Report) {
+    use crate::sys;
+
+    // A signal whose default action kills: the handler for SIGUSR1 is set to
+    // ignore by the time this runs, and an ignored signal is no reason to end a
+    // sleep.
+    const SIGTERM: i32 = 15;
+
+    let mut rounds = 0;
+    let mut worst = Duration::ZERO;
+    let mut detail = String::new();
+    for k in 0..40 {
+        let child = sys::fork();
+        if child == 0 {
+            // Long enough that a sleep which ignored the signal is unmistakable.
+            std::thread::sleep(Duration::from_secs(4));
+            sys::exit_group(0);
+        }
+        // Walk the signal's arrival across the child's way into the sleep.
+        std::thread::sleep(Duration::from_millis(5 + (k % 7)));
+        let started = Instant::now();
+        sys::kill(child as i32, SIGTERM);
+        let (pid, _) = sys::wait4(child as i32, 0);
+        let waited = started.elapsed();
+        worst = worst.max(waited);
+        if pid != child {
+            detail = format!("round {}: reaped {} not {}", k, pid, child);
+            break;
+        }
+        if waited > Duration::from_millis(1500) {
+            detail = format!("round {}: the sleep ran on for {:?}", k, waited);
+            break;
+        }
+        rounds += 1;
+    }
+    report.check(
+        "a signal ends a bounded sleep",
+        rounds == 40,
+        format!("{} rounds, worst {:?}; {}", rounds, worst, detail),
+    );
+
+    // And the unbounded one. A pause with nothing pending never ends on its
+    // own, so the signal goes in after the child is certainly inside it.
+    let child = sys::fork();
+    if child == 0 {
+        unsafe { pause() };
+        sys::exit_group(0);
+    }
+    std::thread::sleep(Duration::from_millis(250));
+    let started = Instant::now();
+    sys::kill(child as i32, SIGTERM);
+    let (pid, _) = sys::wait4(child as i32, 0);
+    let waited = started.elapsed();
+    report.check(
+        "a signal ends a pause",
+        pid == child && waited < Duration::from_millis(1500),
+        format!("reaped {} after {:?}", pid, waited),
+    );
+}
+
+/// A failed exec has to put the task back on the address space it came from
+/// and on the page tables that go with it together. A thread running in the
+/// same address space is what notices if it does not: it is resumed on the
+/// record's word that nothing reloaded, which is the half-built image the exec
+/// was assembling.
+///
+/// Running the path many times is a smoke test, not proof: the window is a few
+/// instructions wide and lands only if a tick falls inside it.
+fn failed_exec_and_siblings(report: &mut Report) {
+    use crate::sys;
+    use std::sync::atomic::AtomicBool;
+
+    static RUNNING: AtomicBool = AtomicBool::new(true);
+    let devnull = sys::open("/dev/null", sys::O_WRONLY, 0);
+    let rounds = Arc::new(AtomicUsize::new(0));
+    let refused = Arc::new(AtomicUsize::new(0));
+
+    // Both halves run on threads rather than on the main one. The scheduler
+    // takes the next task in the table, and the one after the main thread is
+    // the kernel's network task, which runs on the kernel's own page tables
+    // and so reloads them on the way past; a task whose neighbour is its own
+    // sibling is what gets handed straight over.
+    let execer_refused = Arc::clone(&refused);
+    let execer = std::thread::spawn(move || {
+        // An argument list past what the stack may hold fails after the new
+        // image is loaded and the CPU is running on it, which is the path that
+        // has to put the old one back.
+        let argv: Vec<String> = (0..600).map(|_| "x".repeat(4000)).collect();
+        for _ in 0..40 {
+            if sys::execve("/bin/echo", &argv, &[]) < 0 {
+                execer_refused.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        RUNNING.store(false, Ordering::Relaxed);
+    });
+
+    let worker_rounds = Arc::clone(&rounds);
+    let worker = std::thread::spawn(move || {
+        let mut heap = vec![0u8; 512 * 1024];
+        while RUNNING.load(Ordering::Relaxed) {
+            let mut i = 0;
+            while i < heap.len() {
+                heap[i] = heap[i].wrapping_add(1);
+                i += 4096;
+            }
+            // And once through the kernel: a buffer the kernel itself reads is
+            // where page tables that do not match the record are fatal rather
+            // than a fault the handler can retry.
+            if devnull >= 0 {
+                sys::write(devnull as i32, &heap[..4096]);
+            }
+            worker_rounds.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let _ = execer.join();
+    let _ = worker.join();
+    if devnull >= 0 {
+        sys::close(devnull as i32);
+    }
+
+    let rounds = rounds.load(Ordering::Relaxed);
+    let refused = refused.load(Ordering::Relaxed);
+    report.check(
+        "an oversized argument list is refused",
+        refused == 40,
+        format!("{} of 40 refused", refused),
+    );
+    report.check(
+        "a thread runs through its sibling's failed execs",
+        rounds > 0,
+        format!("{} rounds", rounds),
     );
 }
 
@@ -437,6 +1041,21 @@ pub fn main(_args: &[String]) -> i32 {
     println!();
     println!("-- waiting on several things at once --");
     event_and_poll(&mut report);
+
+    println!();
+    println!("-- threads, processes and waiting --");
+    thread_of_a_child_is_not_a_child(&mut report);
+    a_child_exit_reaches_a_blocked_parent(&mut report);
+    what_a_wait_does_with_signals(&mut report);
+    a_continued_job_has_no_stop_to_report(&mut report);
+    waiting_on_a_process_group(&mut report);
+    a_child_finds_its_own_proc_entry(&mut report);
+    a_fork_while_a_sibling_writes(&mut report);
+    reading_proc_while_a_child_is_reaped(&mut report);
+    a_signal_frame_on_a_shared_page(&mut report);
+    stopping_a_job_reaches_the_parent(&mut report);
+    a_signal_ends_a_sleep(&mut report);
+    failed_exec_and_siblings(&mut report);
 
     println!();
     println!("=== {} passed, {} failed ===", report.passed, report.failed);

@@ -153,7 +153,6 @@ pub struct Task {
     /// Pid this task is waiting for, if it is in wait4.
     pub waiting_for: Option<i32>,
 
-    pub children: Vec<u32>,
     pub umask: u32,
     /// Set once the task has been switched away from at least once, so a
     /// freshly created task is not resumed from a stale frame.
@@ -219,7 +218,6 @@ impl Task {
             signal_mask: 0,
             wake_at: 0,
             waiting_for: None,
-            children: Vec::new(),
             umask: 0o022,
             started: false,
             pending_exec: None,
@@ -384,7 +382,13 @@ impl Task {
 
     /// Give this task a private copy of a shared page it is trying to write.
     /// Returns false when the fault was not a copy-on-write fault.
-    pub fn handle_cow(&mut self, addr: u64) -> bool {
+    ///
+    /// Nothing in the task itself changes: the page tables are reached through
+    /// a value the task holds by copy, and the region list through a lock. A
+    /// shared reference is what the validating path can hand over, and asking
+    /// for an exclusive one there would mean a second one to a task the caller
+    /// already holds.
+    pub fn handle_cow(&self, addr: u64) -> bool {
         use crate::arch::paging::COW;
         let page = page_align_down(addr);
         let Some(flags) = self.space.flags_of(page) else {
@@ -432,7 +436,7 @@ impl Task {
     }
 
     /// Back `addr`'s page with memory if the heap or a region covers it.
-    pub fn fault_in(&mut self, addr: u64) -> bool {
+    pub fn fault_in(&self, addr: u64) -> bool {
         let page = page_align_down(addr);
         if self.space.translate(page).is_some() {
             // Already present: the fault was a protection violation.
@@ -500,7 +504,7 @@ impl Task {
 /// Build the initial user stack: argv, envp and the auxiliary vector, laid out
 /// the way a Linux process expects to find them.
 pub fn build_user_stack(
-    task: &mut Task,
+    task: &Task,
     image: &crate::elf::LoadedImage,
     argv: &[String],
     envp: &[String],
@@ -543,10 +547,13 @@ pub fn build_user_stack(
     // path: only the top of the stack is mapped at this point, and a block
     // longer than that lands on a page nothing has faulted in, which in the
     // kernel is fatal rather than a fault the handler can serve.
+    // These go through the form that takes the task rather than reading it
+    // back out of the scheduler: this function was handed a reference to it and
+    // a second one alongside would be two references to the same task.
     let push_bytes = |sp: &mut u64, bytes: &[u8]| -> Result<u64, Errno> {
         *sp -= bytes.len() as u64 + 1;
-        crate::uaccess::write_bytes(*sp, bytes)?;
-        crate::uaccess::write_bytes(*sp + bytes.len() as u64, &[0])?;
+        crate::uaccess::write_bytes_in(task, *sp, bytes)?;
+        crate::uaccess::write_bytes_in(task, *sp + bytes.len() as u64, &[0])?;
         Ok(*sp)
     };
 
@@ -571,7 +578,7 @@ pub fn build_user_stack(
     let random_addr = sp;
     let mut bytes = [0u8; 16];
     crate::fs::dev::fill_random(&mut bytes);
-    crate::uaccess::write_bytes(random_addr, &bytes)?;
+    crate::uaccess::write_bytes_in(task, random_addr, &bytes)?;
 
     let auxv: [(u64, u64); 14] = [
         (AT_PHDR, image.phdr_addr),
@@ -605,7 +612,7 @@ pub fn build_user_stack(
 
     let mut at = sp;
     let push_word = |value: u64, at: &mut u64| -> Result<(), Errno> {
-        crate::uaccess::write_u64(*at, value)?;
+        crate::uaccess::write_u64_in(task, *at, value)?;
         *at += 8;
         Ok(())
     };
@@ -712,12 +719,22 @@ pub fn spawn(
     envp: Vec<String>,
     parent_pid: u32,
 ) -> Result<u32, Errno> {
+    // Nothing owns the address space or the kernel stack until the task is
+    // registered, so anything that goes wrong before then hands them back here
+    // or they are held by nobody: dropping the task frees neither.
     let space = crate::arch::paging::AddressSpace::new_user().ok_or(Errno::ENOMEM)?;
     let name = path.rsplit('/').next().unwrap_or(path);
-    let mut task = Task::new(name, space).ok_or(Errno::ENOMEM)?;
+    let Some(mut task) = Task::new(name, space) else {
+        space.destroy();
+        return Err(Errno::ENOMEM);
+    };
     task.ppid = parent_pid;
     task.pgid = task.pid;
-    attach_console(&mut task)?;
+    if let Err(err) = attach_console(&mut task) {
+        task.free_kernel_stack();
+        space.destroy();
+        return Err(err);
+    }
     task.pending_exec = Some((path.to_string(), argv, envp));
     task.prepare_kernel_frame(user_bootstrap as extern "C" fn() -> ! as usize as u64);
     Ok(crate::sched::register(task))

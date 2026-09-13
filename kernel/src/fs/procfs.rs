@@ -62,12 +62,15 @@ pub fn refresh_dir(node: &crate::fs::NodeRef) {
         Some(pid) => *pid,
         None => return,
     };
-    let task = match crate::sched::find(pid) {
-        Some(task) => task,
+    // Take a copy of the table and let the process table go again: what follows
+    // allocates nodes and formats names, and the task could be reaped in the
+    // middle of it.
+    let open = match crate::sched::with_task(pid, |task| task.fds.snapshot()) {
+        Some(open) => open,
         None => return,
     };
     let mut children = alloc::collections::BTreeMap::new();
-    for (fd, file) in task.fds.snapshot() {
+    for (fd, file) in open {
         // The entry stands for the descriptor itself: opening it opens that
         // descriptor rather than reopening whatever it is attached to, which
         // is what makes /dev/stdout work when stdout is a pipe. Reading the
@@ -185,45 +188,43 @@ pub fn render(kind: Generated) -> String {
             });
             out
         }
-        Generated::PidStat(pid) => match crate::sched::find(pid) {
-            Some(task) => {
-                // Readers skip to fields by counting separators, so all 52
-                // fields Linux documents have to be present.
-                let vsize = task.virtual_size();
-                let rss = task.resident_pages();
-                let ticks = crate::trap::ticks();
-                let mut out = String::new();
-                out.push_str(&format!(
-                    "{} ({}) {} {} {} {} 0 -1 0 ",
-                    task.pid,
-                    task.name,
-                    state_char(task.state),
-                    task.ppid,
-                    task.pgid,
-                    task.pgid, // session
-                ));
-                // minflt cminflt majflt cmajflt utime stime cutime cstime
-                out.push_str(&format!("0 0 0 0 {} 0 0 0 ", ticks));
-                // priority nice num_threads itrealvalue starttime
-                out.push_str("20 0 1 0 0 ");
-                // vsize rss rsslim
-                out.push_str(&format!("{} {} 18446744073709551615 ", vsize, rss));
-                // startcode endcode startstack kstkesp kstkeip
-                out.push_str("0 0 0 0 0 ");
-                // signal blocked sigignore sigcatch wchan nswap cnswap
-                out.push_str(&format!("{} {} 0 0 0 0 0 ", task.pending_signals, task.signal_mask));
-                // exit_signal processor rt_priority policy delayacct_blkio
-                out.push_str("17 0 0 0 0 ");
-                // guest_time cguest_time start_data end_data start_brk
-                out.push_str(&format!("0 0 0 0 {} ", task.brk_start()));
-                // arg_start arg_end env_start env_end exit_code
-                out.push_str("0 0 0 0 0\n");
-                out
-            }
-            None => String::new(),
-        },
-        Generated::PidStatus(pid) => match crate::sched::find(pid) {
-            Some(task) => format!(
+        Generated::PidStat(pid) => crate::sched::with_task(pid, |task| {
+            // Readers skip to fields by counting separators, so all 52
+            // fields Linux documents have to be present.
+            let vsize = task.virtual_size();
+            let rss = task.resident_pages();
+            let ticks = crate::trap::ticks();
+            let mut out = String::new();
+            out.push_str(&format!(
+                "{} ({}) {} {} {} {} 0 -1 0 ",
+                task.pid,
+                task.name,
+                state_char(task.state),
+                task.ppid,
+                task.pgid,
+                task.pgid, // session
+            ));
+            // minflt cminflt majflt cmajflt utime stime cutime cstime
+            out.push_str(&format!("0 0 0 0 {} 0 0 0 ", ticks));
+            // priority nice num_threads itrealvalue starttime
+            out.push_str("20 0 1 0 0 ");
+            // vsize rss rsslim
+            out.push_str(&format!("{} {} 18446744073709551615 ", vsize, rss));
+            // startcode endcode startstack kstkesp kstkeip
+            out.push_str("0 0 0 0 0 ");
+            // signal blocked sigignore sigcatch wchan nswap cnswap
+            out.push_str(&format!("{} {} 0 0 0 0 0 ", task.pending_signals, task.signal_mask));
+            // exit_signal processor rt_priority policy delayacct_blkio
+            out.push_str("17 0 0 0 0 ");
+            // guest_time cguest_time start_data end_data start_brk
+            out.push_str(&format!("0 0 0 0 {} ", task.brk_start()));
+            // arg_start arg_end env_start env_end exit_code
+            out.push_str("0 0 0 0 0\n");
+            out
+        })
+        .unwrap_or_default(),
+        Generated::PidStatus(pid) => crate::sched::with_task(pid, |task| {
+            format!(
                 "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n\
                  Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\n\
                  VmSize:\t{} kB\nVmRSS:\t{} kB\nVmData:\t{} kB\n\
@@ -245,56 +246,53 @@ pub fn render(kind: Generated) -> String {
                 (task.brk().saturating_sub(task.brk_start())) / 1024,
                 task.pending_signals,
                 task.signal_mask,
-            ),
-            None => String::new(),
-        },
-        Generated::PidMaps(pid) => match crate::sched::find(pid) {
-            Some(task) => {
-                let mut out = String::new();
-                let mut regions = task.snapshot_vmas();
-                regions.sort_by_key(|region| region.start);
-                let (brk_start, brk) = (task.brk_start(), task.brk());
-                let stack_top = crate::mm::USER_STACK_TOP;
+            )
+        })
+        .unwrap_or_default(),
+        Generated::PidMaps(pid) => crate::sched::with_task(pid, |task| {
+            let mut out = String::new();
+            let mut regions = task.snapshot_vmas();
+            regions.sort_by_key(|region| region.start);
+            let (brk_start, brk) = (task.brk_start(), task.brk());
+            let stack_top = crate::mm::USER_STACK_TOP;
 
-                let mut emit = |start: u64, end: u64, prot: u64, label: &str| {
-                    out.push_str(&format!(
-                        "{:012x}-{:012x} {}{}{}p 00000000 00:00 0 {}{}\n",
-                        start,
-                        end,
-                        if prot & crate::abi::PROT_READ != 0 { "r" } else { "-" },
-                        if prot & crate::abi::PROT_WRITE != 0 { "w" } else { "-" },
-                        if prot & crate::abi::PROT_EXEC != 0 { "x" } else { "-" },
-                        if label.is_empty() { "" } else { "                    " },
-                        label,
-                    ));
+            let mut emit = |start: u64, end: u64, prot: u64, label: &str| {
+                out.push_str(&format!(
+                    "{:012x}-{:012x} {}{}{}p 00000000 00:00 0 {}{}\n",
+                    start,
+                    end,
+                    if prot & crate::abi::PROT_READ != 0 { "r" } else { "-" },
+                    if prot & crate::abi::PROT_WRITE != 0 { "w" } else { "-" },
+                    if prot & crate::abi::PROT_EXEC != 0 { "x" } else { "-" },
+                    if label.is_empty() { "" } else { "                    " },
+                    label,
+                ));
+            };
+
+            for region in &regions {
+                let label = if region.end > stack_top - crate::task::STACK_RESERVE
+                    && region.end <= stack_top
+                {
+                    "[stack]"
+                } else {
+                    ""
                 };
-
-                for region in &regions {
-                    let label = if region.end > stack_top - crate::task::STACK_RESERVE
-                        && region.end <= stack_top
-                    {
-                        "[stack]"
-                    } else {
-                        ""
-                    };
-                    emit(region.start, region.end, region.prot, label);
-                }
-                if brk > brk_start {
-                    emit(
-                        brk_start,
-                        brk,
-                        crate::abi::PROT_READ | crate::abi::PROT_WRITE,
-                        "[heap]",
-                    );
-                }
-                out
+                emit(region.start, region.end, region.prot, label);
             }
-            None => String::new(),
-        },
-        Generated::PidCmdline(pid) => match crate::sched::find(pid) {
-            Some(task) => format!("{}\0", task.exe_path),
-            None => String::new(),
-        },
+            if brk > brk_start {
+                emit(
+                    brk_start,
+                    brk,
+                    crate::abi::PROT_READ | crate::abi::PROT_WRITE,
+                    "[heap]",
+                );
+            }
+            out
+        })
+        .unwrap_or_default(),
+        Generated::PidCmdline(pid) => {
+            crate::sched::with_task(pid, |task| format!("{}\0", task.exe_path)).unwrap_or_default()
+        }
     }
 }
 

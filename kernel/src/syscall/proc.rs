@@ -18,7 +18,7 @@ pub fn fork(
     child_tid: u64,
     tls: u64,
 ) -> SysResult {
-    let mut parent = sched::current();
+    let parent = sched::current();
     let share_vm = flags & CLONE_VM != 0;
 
     // A fresh address space belongs to nothing until the child is registered
@@ -97,10 +97,10 @@ pub fn fork(
     // shared with the parent we are running in.
     if share_vm {
         if flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
-            let _ = uaccess::write_u32(parent_tid, child_pid);
+            let _ = uaccess::write_u32_in(&parent, parent_tid, child_pid);
         }
         if flags & CLONE_CHILD_SETTID != 0 && child_tid != 0 {
-            let _ = uaccess::write_u32(child_tid, child_pid);
+            let _ = uaccess::write_u32_in(&parent, child_tid, child_pid);
         }
     }
 
@@ -109,7 +109,6 @@ pub fn fork(
         child.vfork_parent = Some(parent.pid);
     }
 
-    parent.children.push(child_pid);
     sched::register(child);
 
     if vfork {
@@ -152,9 +151,16 @@ fn abandon_exec(
     old_mm: alloc::sync::Arc<crate::sync::Spinlock<crate::task::MemState>>,
     new_space: AddressSpace,
 ) {
-    task.space = old_space;
-    task.mm = old_mm;
-    unsafe { old_space.switch_to() };
+    // A context switch reloads the page table root only when the two tasks'
+    // recorded spaces differ, so between the record going back to the old space
+    // and the CPU following it the two disagree. A sibling thread recorded on
+    // the old space is then resumed with no reload and runs on the half-built
+    // exec image. The pair has to move together.
+    crate::sync::without_interrupts(|| {
+        task.space = old_space;
+        task.mm = old_mm;
+        unsafe { old_space.switch_to() };
+    });
     new_space.destroy();
 }
 
@@ -189,19 +195,24 @@ pub fn exec_into_current(
     // Everything below runs against the new address space; the kernel half is
     // shared so the stack and heap stay valid across the switch.
     //
-    // The task's recorded address space is the authority a context switch
-    // restores the page table root from, so it has to be updated before the
-    // CPU's is, or a preemption in between would put the old page tables back
-    // underneath us.
-    let mut task = sched::current();
-    task.space = new_space;
+    // The task's recorded address space is what a context switch compares to
+    // decide whether to reload the page table root, so the record and the CPU
+    // have to change together: while they disagree, a sibling thread recorded
+    // on the space the record names is resumed with no reload and runs on the
+    // other one.
+    //
     // exec starts a fresh address space; a shared record must not follow it.
-    // The old record is kept until the image is known to load, because the
-    // page tables it describes are still there and the task goes back to
-    // running on them if it does not.
+    // The old record is kept until the image is known to load, because the page
+    // tables it describes are still there and the task goes back to running on
+    // them if it does not.
+    let mut task = sched::current();
     let old_mm = alloc::sync::Arc::clone(&task.mm);
-    task.mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
-    unsafe { new_space.switch_to() };
+    let new_mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
+    crate::sync::without_interrupts(|| {
+        task.space = new_space;
+        task.mm = new_mm;
+        unsafe { new_space.switch_to() };
+    });
 
     // The file stays locked while its headers are read and its first pages
     // are assembled; the rest arrives through the fault handler later.
@@ -275,7 +286,7 @@ pub fn exec_into_current(
         }
     }
 
-    let sp = match task::build_user_stack(&mut task, &image, &argv, &envp, &exec_path, interp_base) {
+    let sp = match task::build_user_stack(&task, &image, &argv, &envp, &exec_path, interp_base) {
         Ok(sp) => sp,
         Err(err) => {
             abandon_exec(&mut task, old_space, old_mm, new_space);
@@ -381,12 +392,23 @@ pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
             sched::schedule();
             sched::current().waiting_for = None;
         }
-        // A signal arriving while blocked interrupts the wait.
-        let pending = sched::current().pending_signals & !sched::current().signal_mask;
-        if pending & !(1u64 << (SIGCHLD as u64 & 63)) != 0 {
+        // A signal arriving while blocked interrupts the wait, but only one
+        // that will do something when it is delivered. Asking the raw pending
+        // set instead turns a terminal resize, or anything else the process has
+        // told the kernel to discard, into a failed wait.
+        let child_bit = 1u64 << (SIGCHLD as u64 & 63);
+        if sched::has_pending_signal_except(child_bit) {
             return Err(Errno::EINTR);
         }
-        sched::current().pending_signals &= !(1u64 << (SIGCHLD as u64 & 63));
+        // The child signal is what this call came for, so it is not a reason to
+        // give up; but clearing it outright means a process with a handler
+        // never sees that handler run for a child it reaped itself. Only the
+        // dispositions that would discard it on delivery are cleared here.
+        let mut task = sched::current();
+        let handler = task.signal_actions[SIGCHLD as usize].handler;
+        if handler == crate::signal::SIG_DFL || handler == crate::signal::SIG_IGN {
+            task.pending_signals &= !child_bit;
+        }
     }
 }
 
@@ -420,9 +442,12 @@ pub fn kill(pid: i64, signal: i32) -> SysResult {
     if !delivered {
         return Err(Errno::ESRCH);
     }
-    if !probe {
-        sched::check_signals();
-    }
+    // A signal sent to this task is not acted on here. The entry path does that
+    // once this call's result has been stored, and doing it first means the
+    // result is stored over the frame a handler was about to be entered on:
+    // on aarch64 the register a syscall returns in is the one a handler takes
+    // its signal number in, so the handler was entered with the result in place
+    // of the signal and this call returned whatever its first argument was.
     Ok(0)
 }
 
@@ -693,11 +718,11 @@ pub fn rt_sigaction(signal: usize, act: u64, old: u64) -> SysResult {
         buf[8..16].copy_from_slice(&existing.flags.to_le_bytes());
         buf[16..24].copy_from_slice(&existing.restorer.to_le_bytes());
         buf[24..32].copy_from_slice(&existing.mask.to_le_bytes());
-        uaccess::write_bytes(old, &buf)?;
+        uaccess::write_bytes_in(&task, old, &buf)?;
     }
     if act != 0 {
         let mut buf = [0u8; 32];
-        uaccess::read_bytes(act, &mut buf)?;
+        uaccess::read_bytes_in(&task, act, &mut buf)?;
         let read = |offset: usize| {
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&buf[offset..offset + 8]);
@@ -720,10 +745,10 @@ pub fn rt_sigreturn(frame: &mut TrapFrame) -> SysResult {
 pub fn rt_sigprocmask(how: u32, set: u64, old: u64) -> SysResult {
     let mut task = sched::current();
     if old != 0 {
-        uaccess::write_u64(old, task.signal_mask)?;
+        uaccess::write_u64_in(&task, old, task.signal_mask)?;
     }
     if set != 0 {
-        let value = uaccess::read_u64(set)?;
+        let value = uaccess::read_u64_in(&task, set)?;
         task.signal_mask = match how {
             0 => task.signal_mask | value,  // SIG_BLOCK
             1 => task.signal_mask & !value, // SIG_UNBLOCK
