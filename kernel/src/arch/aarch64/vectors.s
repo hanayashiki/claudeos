@@ -45,6 +45,16 @@
 .endm
 
 .macro LOAD_STATE
+    /* From here until the ERET reads them, where to carry on and with what
+     * processor state live in ELR_EL1 and SPSR_EL1, and any exception taken in
+     * between overwrites both with its own. The kernel is preemptible, so
+     * without this mask a timer tick landing in this sequence leaves the ERET
+     * returning to the instruction after the tick, at this level, with the
+     * stack pointer already stepped past the frame -- and the next ERET does
+     * it again, walking the stack pointer up through memory until it leaves
+     * what is mapped. The ERET takes the processor state from SPSR_EL1, so
+     * the mask does not outlive the return. */
+    msr  daifset, #0xf
     ldp  x22, x23, [sp, #16 * 16]
     msr  elr_el1, x22
     msr  spsr_el1, x23
