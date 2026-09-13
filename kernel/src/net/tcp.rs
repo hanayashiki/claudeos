@@ -61,6 +61,11 @@ const SYN_RETRIES: u32 = 5;
 /// waits ten, because nothing here runs long enough for a segment from an old
 /// connection to turn up, and a shorter wait keeps the socket table small.
 const TIME_WAIT_TICKS: u64 = 1000;
+/// How long a connection whose descriptor is gone waits in FIN-WAIT-2 for the
+/// other end to finish. Linux bounds the same wait with tcp_fin_timeout, which
+/// is sixty seconds; without a bound a peer that acknowledges the finish and
+/// then says nothing keeps the record, and everything it holds, until reboot.
+const FIN_WAIT_2_TICKS: u64 = 6000;
 
 #[inline]
 pub fn seq_lt(a: u32, b: u32) -> bool {
@@ -281,6 +286,10 @@ pub struct Tcb {
     pub fin_acknowledged: bool,
     pub fin_received: bool,
     pub read_shutdown: bool,
+    /// No descriptor names this connection any more. Nothing can read what
+    /// arrives and nothing can close it a second time, so the states that
+    /// wait on the other end have to give up by themselves.
+    pub abandoned: bool,
     pub error: Option<Errno>,
 
     peer_mss: usize,
@@ -289,7 +298,10 @@ pub struct Tcb {
     pub retransmit_at: u64,
     rto: u64,
     retries: u32,
-    time_wait_at: u64,
+    /// Tick at which a state that waits on a clock rather than on the other
+    /// end gives up: TIME-WAIT's two segment lifetimes, and the bound on
+    /// FIN-WAIT-2. Zero is off.
+    expire_at: u64,
 
     congestion_window: u32,
     slow_start_threshold: u32,
@@ -320,12 +332,13 @@ impl Tcb {
             fin_acknowledged: false,
             fin_received: false,
             read_shutdown: false,
+            abandoned: false,
             error: None,
             peer_mss: MSS,
             retransmit_at: 0,
             rto: INITIAL_RTO,
             retries: 0,
-            time_wait_at: 0,
+            expire_at: 0,
             congestion_window: MSS as u32,
             slow_start_threshold: 64 * 1024,
             backlog: 1,
@@ -720,7 +733,7 @@ impl Tcb {
         if self.fin_acknowledged {
             match self.state {
                 State::FinWait1 => {
-                    self.state = State::FinWait2;
+                    self.enter_fin_wait_2();
                 }
                 State::Closing => {
                     self.enter_time_wait();
@@ -750,7 +763,7 @@ impl Tcb {
         if !segment.payload.is_empty() {
             need_ack = true;
             if in_order && !payload.is_empty() {
-                if self.read_shutdown {
+                if !self.can_receive() {
                     // Nobody will ever read this. Taking it off the sequence
                     // space anyway is what keeps the other end from sending
                     // it again forever.
@@ -839,27 +852,67 @@ impl Tcb {
 
     fn enter_time_wait(&mut self) {
         self.state = State::TimeWait;
-        self.time_wait_at = crate::trap::ticks() + TIME_WAIT_TICKS;
+        self.expire_at = crate::trap::ticks() + TIME_WAIT_TICKS;
         self.retransmit_at = 0;
         self.pending.clear();
+        self.read_shutdown = true;
+        if self.abandoned {
+            // Both ends have finished and no descriptor is left, so what
+            // arrived and was never read is held for nobody.
+            self.received.clear();
+        }
+    }
+
+    fn enter_fin_wait_2(&mut self) {
+        self.state = State::FinWait2;
+        if self.abandoned {
+            self.expire_at = crate::trap::ticks() + FIN_WAIT_2_TICKS;
+        }
+    }
+
+    /// The last descriptor naming this connection has gone.
+    pub fn abandon(&mut self) {
+        self.abandoned = true;
+        if self.state == State::FinWait2 && self.expire_at == 0 {
+            self.expire_at = crate::trap::ticks() + FIN_WAIT_2_TICKS;
+        }
+    }
+
+    /// Whether anything arriving now could still be read. A connection with
+    /// no descriptor has nobody to read it, one whose read side is shut has
+    /// been told there is nothing more, and in any other state the other end
+    /// has already finished sending.
+    fn can_receive(&self) -> bool {
+        !self.read_shutdown
+            && !self.abandoned
+            && matches!(
+                self.state,
+                State::Established | State::FinWait1 | State::FinWait2
+            )
     }
 
     // ---- timers ----------------------------------------------------------
 
     pub fn next_deadline(&self) -> u64 {
-        if self.state == State::TimeWait {
-            return self.time_wait_at;
+        let mut earliest = u64::MAX;
+        if self.expire_at != 0 {
+            earliest = self.expire_at;
         }
         if self.retransmit_at != 0 {
-            return self.retransmit_at;
+            earliest = earliest.min(self.retransmit_at);
         }
-        u64::MAX
+        earliest
     }
 
     pub fn on_timer(&mut self, now: u64) -> bool {
-        if self.state == State::TimeWait {
-            if now >= self.time_wait_at {
+        if self.expire_at != 0 {
+            // Waiting on a clock rather than on the other end: there is
+            // nothing to send, and reaching the deadline is the end of it.
+            if now >= self.expire_at {
                 self.state = State::Closed;
+                self.expire_at = 0;
+                self.retransmit_at = 0;
+                self.pending.clear();
                 return true;
             }
             return false;

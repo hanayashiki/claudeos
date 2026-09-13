@@ -630,9 +630,12 @@ pub fn close(socket: &Arc<InetSocket>) {
         match &mut *inner {
             Protocol::Tcp(tcb) => {
                 let children = core::mem::take(&mut tcb.children);
+                // Said before anything else, because it is what bounds the
+                // states that go on waiting after this returns.
+                tcb.abandon();
                 if tcb.state == tcp::State::Listen {
                     tcb.state = tcp::State::Closed;
-                } else if !tcb.received.is_empty() || tcb.read_shutdown {
+                } else if !tcb.received.is_empty() {
                     // Data arrived that nobody will ever read. The other end
                     // is told so rather than being left to time out.
                     tcb.abort();

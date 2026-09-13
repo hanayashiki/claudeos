@@ -266,6 +266,8 @@ pub fn run() -> bool {
     connection(&mut report, nic);
     crate::println!("net: segments that are nobody's business");
     unacceptable_segments(&mut report, nic);
+    crate::println!("net: a connection nobody holds");
+    abandoned_connection(&mut report, nic);
     crate::println!("net: datagrams");
     datagrams(&mut report, nic);
     // The driver for this board's own Ethernet, as far as it can be exercised
@@ -987,6 +989,156 @@ fn unacceptable_segments(report: &mut Report, nic: &FakeNic) {
     };
     report.check("a repeated connection request is answered again", repeated);
     socket::close(&listener);
+    socket::reset();
+    nic.take();
+}
+
+fn received_len_of(socket: &Arc<InetSocket>) -> usize {
+    match &*socket.inner.lock() {
+        Protocol::Tcp(tcb) => tcb.received.len(),
+        Protocol::Udp(_) => 0,
+    }
+}
+
+fn read_shutdown_of(socket: &Arc<InetSocket>) -> bool {
+    match &*socket.inner.lock() {
+        Protocol::Tcp(tcb) => tcb.read_shutdown,
+        Protocol::Udp(_) => false,
+    }
+}
+
+fn deadline_of(socket: &Arc<InetSocket>) -> u64 {
+    match &*socket.inner.lock() {
+        Protocol::Tcp(tcb) => tcb.next_deadline(),
+        Protocol::Udp(_) => u64::MAX,
+    }
+}
+
+/// Put the clock where the connection says its next deadline is. Nothing here
+/// can wait out a minute, so the timer is driven to the tick it named rather
+/// than waited for.
+fn fire_timer(socket: &Arc<InetSocket>, now: u64) {
+    match &mut *socket.inner.lock() {
+        Protocol::Tcp(tcb) => {
+            tcb.on_timer(now);
+        }
+        Protocol::Udp(_) => {}
+    }
+}
+
+/// A connection closed at this end, acknowledged by the other end, and then
+/// left alone. Nothing can ever be read from it and nobody can close it
+/// again, so the stack is what has to let go of it.
+fn abandoned_connection(report: &mut Report, nic: &FakeNic) {
+    const SERVER_PORT: u16 = 8082;
+    const CLIENT_PORT: u16 = 40200;
+
+    socket::reset();
+    let Some(connection) = establish(nic, SERVER_PORT, CLIENT_PORT, 5_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    socket::close(&connection.socket);
+    nic.take();
+    deliver_ip(
+        ip::PROTO_TCP,
+        &segment(
+            CLIENT_PORT,
+            SERVER_PORT,
+            connection.client_next,
+            connection.server_next.wrapping_add(1),
+            tcp::ACK,
+            64240,
+            &[],
+            &[],
+            PEER_IP,
+            OUR_IP,
+        ),
+    );
+    report.check(
+        "the finish was acknowledged",
+        state_of(&connection.socket) == tcp::State::FinWait2,
+    );
+    nic.take();
+
+    let deadline = deadline_of(&connection.socket);
+    report.check("and the connection does not then wait forever", deadline != u64::MAX);
+
+    // The other end sends data at a socket no descriptor names.
+    let payload = [0x5Au8; 1024];
+    deliver_ip(
+        ip::PROTO_TCP,
+        &segment(
+            CLIENT_PORT,
+            SERVER_PORT,
+            connection.client_next,
+            connection.server_next.wrapping_add(1),
+            tcp::PSH | tcp::ACK,
+            64240,
+            &[],
+            &payload,
+            PEER_IP,
+            OUR_IP,
+        ),
+    );
+    report.check(
+        "data nobody can read is not held",
+        received_len_of(&connection.socket) == 0,
+    );
+    let sent = nic.take();
+    report.check(
+        "but is acknowledged, so the other end stops sending it",
+        sent.len() == 1
+            && is_bare_ack(
+                &sent[0],
+                CLIENT_PORT,
+                connection.server_next.wrapping_add(1),
+                connection.client_next.wrapping_add(payload.len() as u32),
+            ),
+    );
+
+    // And then the other end says nothing at all.
+    report.check("two sockets in the table", socket::count() == 2);
+    fire_timer(&connection.socket, deadline);
+    report.check(
+        "the deadline closes it",
+        state_of(&connection.socket) == tcp::State::Closed,
+    );
+    super::tcp::on_tick();
+    report.check("and it leaves the table", socket::count() == 1);
+
+    // The same connection, finished properly by the other end: the wait state
+    // holds nothing and reads as an end.
+    socket::reset();
+    let Some(connection) = establish(nic, SERVER_PORT, CLIENT_PORT + 1, 6_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    socket::close(&connection.socket);
+    nic.take();
+    deliver_ip(
+        ip::PROTO_TCP,
+        &segment(
+            CLIENT_PORT + 1,
+            SERVER_PORT,
+            connection.client_next,
+            connection.server_next.wrapping_add(1),
+            tcp::FIN | tcp::ACK,
+            64240,
+            &[],
+            &[],
+            PEER_IP,
+            OUR_IP,
+        ),
+    );
+    report.check(
+        "the other end's finish reaches the wait state",
+        state_of(&connection.socket) == tcp::State::TimeWait,
+    );
+    report.check(
+        "which holds nothing and takes nothing more",
+        received_len_of(&connection.socket) == 0 && read_shutdown_of(&connection.socket),
+    );
     socket::reset();
     nic.take();
 }
