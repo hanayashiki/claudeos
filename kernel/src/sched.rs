@@ -77,9 +77,25 @@ pub fn register(task: Box<Task>) -> u32 {
     pid
 }
 
+/// Look up a task and hand the reference out. The table is unlocked again
+/// before this returns, so the reference is only good for as long as nothing
+/// can reap the task: a field or two read or written with interrupts still off,
+/// or inside a block that holds them off itself. Anything longer takes the
+/// table with it through `with_task`.
 pub fn find(pid: u32) -> Option<&'static mut Task> {
     let tasks = TASKS.lock();
     tasks.iter().find(|t| t.get().pid == pid).map(|t| t.get())
+}
+
+/// Run `f` on the task with `pid`, with the table held for as long as it runs.
+///
+/// A reader that walks a task -- every page of every region, every descriptor
+/// it has open -- is holding a pointer that a reap on another task would free
+/// underneath it. Holding the table is what stops that reap happening.
+pub fn with_task<R>(pid: u32, f: impl FnOnce(&mut Task) -> R) -> Option<R> {
+    let tasks = TASKS.lock();
+    let entry = tasks.iter().find(|t| t.get().pid == pid)?;
+    Some(f(entry.get()))
 }
 
 /// The running task's pid, or zero before there is one.

@@ -349,6 +349,57 @@ fn a_fork_while_a_sibling_writes(report: &mut Report) {
     );
 }
 
+/// Reading a process's entry in /proc walks every page of every region it has.
+/// The task can be reaped while that walk is running, by another thread of the
+/// same process, so the reader has to hold the process table rather than a
+/// pointer it took out of it.
+fn reading_proc_while_a_child_is_reaped(report: &mut Report) {
+    use crate::sys;
+    use std::sync::atomic::{AtomicBool, AtomicUsize as Atomic};
+
+    static WATCHED: Atomic = Atomic::new(0);
+    static RUNNING: AtomicBool = AtomicBool::new(true);
+
+    let reads = Arc::new(AtomicUsize::new(0));
+    let reader_count = Arc::clone(&reads);
+    let reader = std::thread::spawn(move || {
+        while RUNNING.load(Ordering::Relaxed) {
+            let pid = WATCHED.load(Ordering::Relaxed);
+            if pid == 0 {
+                std::thread::yield_now();
+                continue;
+            }
+            let _ = std::fs::read_to_string(format!("/proc/{}/stat", pid));
+            let _ = std::fs::read_to_string(format!("/proc/{}/maps", pid));
+            reader_count.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let mut rounds = 0;
+    for _ in 0..100 {
+        let child = sys::fork();
+        if child == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+            sys::exit_group(0);
+        }
+        WATCHED.store(child as usize, Ordering::Relaxed);
+        let (pid, _) = sys::wait4(child as i32, 0);
+        WATCHED.store(0, Ordering::Relaxed);
+        if pid == child {
+            rounds += 1;
+        }
+    }
+    RUNNING.store(false, Ordering::Relaxed);
+    let _ = reader.join();
+
+    let reads = reads.load(Ordering::Relaxed);
+    report.check(
+        "reading /proc survives the task being reaped",
+        rounds == 100 && reads > 0,
+        format!("{} rounds, {} reads", rounds, reads),
+    );
+}
+
 /// A child that has not written to its stack since the fork still shares those
 /// pages with the parent, so the signal frame the kernel writes there goes
 /// through the path that breaks the sharing first.
@@ -864,6 +915,7 @@ pub fn main(_args: &[String]) -> i32 {
     a_child_exit_reaches_a_blocked_parent(&mut report);
     what_a_wait_does_with_signals(&mut report);
     a_fork_while_a_sibling_writes(&mut report);
+    reading_proc_while_a_child_is_reaped(&mut report);
     a_signal_frame_on_a_shared_page(&mut report);
     stopping_a_job_reaches_the_parent(&mut report);
     a_signal_ends_a_sleep(&mut report);
