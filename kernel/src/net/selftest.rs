@@ -281,6 +281,8 @@ pub fn run() -> bool {
     unacceptable_segments(&mut report, nic);
     crate::println!("net: a link that loses and reorders");
     lossy_link(&mut report, nic);
+    crate::println!("net: segments that arrive out of order");
+    reassembly(&mut report, nic);
     crate::println!("net: a connection the program has closed");
     abandoned_connection(&mut report, nic);
     crate::println!("net: addresses this machine does not have");
@@ -1550,6 +1552,241 @@ fn abandoned_connection(report: &mut Report, nic: &FakeNic) {
         "which holds nothing and takes nothing more",
         received_len_of(&connection.socket) == 0 && read_shutdown_of(&connection.socket),
     );
+    socket::reset();
+    nic.take();
+}
+
+fn held_runs_of(socket: &Arc<InetSocket>) -> usize {
+    match &*socket.inner.lock() {
+        Protocol::Tcp(tcb) => tcb.held_runs(),
+        Protocol::Udp(_) => 0,
+    }
+}
+
+/// A segment that arrives before the bytes in front of it is held until they
+/// come, and what is held is bounded in every direction someone could push on
+/// it.
+fn reassembly(report: &mut Report, nic: &'static FakeNic) {
+    const SERVER_PORT: u16 = 8086;
+    let first_half = b"1234567890";
+    let second_half = b"abcdefghij";
+
+    // ---- two segments the wrong way round ----
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40600, 14_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    let first = peer.send_next;
+    let second = first.wrapping_add(first_half.len() as u32);
+    peer.send(second, tcp::PSH | tcp::ACK, second_half);
+    report.check(
+        "a segment that arrives early is not delivered yet",
+        received_len_of(&peer.socket) == 0,
+    );
+    let sent = nic.take();
+    report.check(
+        "but is held rather than thrown away",
+        tcp::held_bytes() == second_half.len(),
+    );
+    report.check(
+        "and the answer still names the byte that is missing",
+        sent.len() == 1 && ack_number(&sent[0]) == Some(first),
+    );
+
+    peer.send(first, tcp::PSH | tcp::ACK, first_half);
+    let sent = nic.take();
+    report.check(
+        "filling the gap acknowledges both segments at once",
+        sent.len() == 1 && ack_number(&sent[0]) == Some(second + second_half.len() as u32),
+    );
+    report.check("and nothing is held any more", tcp::held_bytes() == 0);
+    let mut buf = [0u8; 64];
+    match peer.socket.receive_into(&mut buf, false) {
+        Ok((n, _)) => report.bytes(
+            "the stream reads in order",
+            &buf[..n],
+            b"1234567890abcdefghij",
+        ),
+        Err(_) => report.check("the stream reads in order", false),
+    }
+    report.check(
+        "and the other end was never asked for anything twice",
+        peer.to_stack.carried == 2,
+    );
+    peer.finish();
+
+    // ---- a finish that arrives before the last of the data ----
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40601, 15_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    let first = peer.send_next;
+    let second = first.wrapping_add(first_half.len() as u32);
+    peer.send(second, tcp::FIN | tcp::PSH | tcp::ACK, second_half);
+    report.check(
+        "a finish behind a gap is not the end of the stream yet",
+        !fin_received_of(&peer.socket)
+            && state_of(&peer.socket) == tcp::State::Established,
+    );
+    nic.take();
+    peer.send(first, tcp::PSH | tcp::ACK, first_half);
+    report.check(
+        "and is taken when the gap fills",
+        fin_received_of(&peer.socket)
+            && state_of(&peer.socket) == tcp::State::CloseWait,
+    );
+    let sent = nic.take();
+    report.check(
+        "acknowledged past the last byte and the finish",
+        sent.len() == 1
+            && ack_number(&sent[0]) == Some(second + second_half.len() as u32 + 1),
+    );
+    peer.finish();
+
+    // ---- a stream with one segment held back on the way ----
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40604, 18_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    peer.to_stack.script(&[Fate::Pass, Fate::Pass, Fate::Late, Fate::Pass, Fate::Pass]);
+    let block: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+    for chunk in block.chunks(400) {
+        peer.write(chunk);
+    }
+    let mut arrived = Vec::new();
+    let mut buf = [0u8; 2048];
+    while let Ok((n, _)) = peer.socket.receive_into(&mut buf, false) {
+        if n == 0 {
+            break;
+        }
+        arrived.extend_from_slice(&buf[..n]);
+    }
+    report.check(
+        "a stream with one segment delivered late still reads in order",
+        arrived == block,
+    );
+    report.check(
+        "and costs the other end nothing to send again",
+        peer.to_stack.carried == 5,
+    );
+    peer.finish();
+
+    // ---- a gap that never fills ----
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40602, 16_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    let payload = [0x77u8; 1400];
+    peer.send(peer.send_next.wrapping_add(10), tcp::PSH | tcp::ACK, &payload);
+    nic.take();
+    report.check("what arrived early is held", tcp::held_bytes() == payload.len());
+    let deadline = deadline_of(&peer.socket);
+    report.check("and there is a deadline to give it up at", deadline != u64::MAX);
+    fire_timer(&peer.socket, deadline);
+    report.check("which lets it go", tcp::held_bytes() == 0);
+    report.check(
+        "and leaves the connection up",
+        state_of(&peer.socket) == tcp::State::Established,
+    );
+    peer.finish();
+
+    // ---- one connection, a gap in front of every byte ----
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40603, 17_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    let base = peer.send_next;
+    for i in 1..64u32 {
+        peer.send(base.wrapping_add(i * 2), tcp::PSH | tcp::ACK, b"x");
+    }
+    nic.take();
+    report.check(
+        "a gap in front of every byte holds only so many runs",
+        held_runs_of(&peer.socket) <= 16 && tcp::held_bytes() <= 16,
+    );
+    peer.finish();
+
+    // ---- one segment held on each of many connections ----
+    socket::reset();
+    let listener = InetSocket::new(true);
+    if listener.bind(Endpoint::new(Ipv4Addr::UNSPECIFIED, SERVER_PORT)).is_err()
+        || listener.listen(4).is_err()
+    {
+        report.check("a listening socket", false);
+        return;
+    }
+    nic.take();
+    const CONNECTIONS: u32 = 128;
+    let mut sockets: Vec<Arc<InetSocket>> = Vec::new();
+    let early = [0x5Au8; tcp::MSS];
+    for i in 0..CONNECTIONS {
+        let client_port = 41000 + i as u16;
+        let client_iss = 20_000_000 + i * 100_000;
+        deliver_ip(
+            ip::PROTO_TCP,
+            &segment(
+                client_port, SERVER_PORT, client_iss, 0, tcp::SYN, 64240, &[], &[], PEER_IP,
+                OUR_IP,
+            ),
+        );
+        let sent = nic.take();
+        let Some(answer) = sent.first().and_then(|frame| tcp::Segment::parse(&frame[34..]))
+        else {
+            break;
+        };
+        let server_next = answer.sequence.wrapping_add(1);
+        deliver_ip(
+            ip::PROTO_TCP,
+            &segment(
+                client_port,
+                SERVER_PORT,
+                client_iss.wrapping_add(1),
+                server_next,
+                tcp::ACK,
+                64240,
+                &[],
+                &[],
+                PEER_IP,
+                OUR_IP,
+            ),
+        );
+        nic.take();
+        let Ok(Some(socket)) = listener.accept_ready() else { break };
+        // A segment one whole segment past what this connection wants next,
+        // and nothing to fill the gap it leaves.
+        deliver_ip(
+            ip::PROTO_TCP,
+            &segment(
+                client_port,
+                SERVER_PORT,
+                client_iss.wrapping_add(1 + tcp::MSS as u32),
+                server_next,
+                tcp::PSH | tcp::ACK,
+                64240,
+                &[],
+                &early,
+                PEER_IP,
+                OUR_IP,
+            ),
+        );
+        nic.take();
+        sockets.push(socket);
+    }
+    report.check("a connection each for all of them", sockets.len() == CONNECTIONS as usize);
+    report.check(
+        "what every connection together holds is bounded",
+        tcp::held_bytes() <= tcp::REASSEMBLY_LIMIT
+            && tcp::held_bytes() + tcp::MSS > tcp::REASSEMBLY_LIMIT,
+    );
+    socket::reset();
+    drop(sockets);
+    report.check("and letting them go gives all of it back", tcp::held_bytes() == 0);
+    socket::close(&listener);
     socket::reset();
     nic.take();
 }

@@ -6,12 +6,18 @@
 //! acknowledges what it takes, retransmits what is not acknowledged, and
 //! closes in order with the wait state at the end. An active open is here too.
 //!
+//! A segment that arrives before the bytes in front of it is held until they
+//! come, so one packet taking a different route costs nothing. What is held
+//! is bounded three ways: by the receive window, which every held byte lies
+//! inside; by a count of separate runs, so a gap in front of every byte is
+//! not a gap in front of every byte's allocation; and by a count every
+//! connection shares, so a thousand connections each holding one segment hold
+//! no more between them than one does at full stretch. A gap that never fills
+//! is given up on after thirty seconds and what was held behind it released.
+//!
 //! What is not here, all of which only matters on a link that loses or
 //! reorders packets:
 //!
-//!   * No reassembly queue. A segment that arrives out of order is dropped and
-//!     the acknowledgement repeats what is still wanted, so the sender has to
-//!     send everything from that point again.
 //!   * Loss recovery is the retransmission timer alone. There is no duplicate
 //!     acknowledgement count, no fast retransmit, no fast recovery, and no
 //!     selective acknowledgement, so one lost segment costs a whole timeout
@@ -34,6 +40,7 @@ use crate::abi::Errno;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const FIN: u8 = 0x01;
 pub const SYN: u8 = 0x02;
@@ -66,6 +73,36 @@ const TIME_WAIT_TICKS: u64 = 1000;
 /// is sixty seconds; without a bound a peer that acknowledges the finish and
 /// then says nothing keeps the record, and everything it holds, until reboot.
 const FIN_WAIT_2_TICKS: u64 = 6000;
+/// How long a gap in the stream is waited on. The other end retransmits what
+/// is missing long before this; what the bound is for is the other end that
+/// leaves a gap and then says nothing, which would otherwise hold what came
+/// after it until the machine rebooted.
+const REASSEMBLY_TICKS: u64 = 3000;
+
+/// Separate runs of bytes one connection will hold past a gap.
+///
+/// What one connection holds is already bounded by the receive window, since
+/// every byte held lies inside it. The number of runs is not: a peer that
+/// sends every other byte leaves a gap in front of each one, and sixteen
+/// thousand allocations for thirty-two kilobytes is not a trade worth making.
+/// Past this the run furthest ahead is dropped, which costs whoever sent it a
+/// retransmission.
+const MAX_HELD_RUNS: usize = 16;
+
+/// Bytes held past a gap across every connection at once.
+///
+/// A window's worth each is bounded per connection and unbounded in total:
+/// somebody who opens a thousand connections and leaves a gap in each holds
+/// as much as they care to. Past this a segment that arrives early is dropped
+/// rather than held, which costs its sender a retransmission and costs this
+/// machine nothing.
+pub const REASSEMBLY_LIMIT: usize = 128 * 1024;
+static HELD_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Bytes every connection together is holding past a gap.
+pub fn held_bytes() -> usize {
+    HELD_BYTES.load(Ordering::Relaxed)
+}
 
 #[inline]
 pub fn seq_lt(a: u32, b: u32) -> bool {
@@ -298,6 +335,18 @@ fn initial_sequence(local: Endpoint, remote: Endpoint) -> u32 {
 
 // ---- the transmission control block --------------------------------------
 
+/// A run of bytes that arrived before the bytes in front of it.
+struct Held {
+    sequence: u32,
+    data: Vec<u8>,
+}
+
+impl Held {
+    fn end(&self) -> u32 {
+        self.sequence.wrapping_add(self.data.len() as u32)
+    }
+}
+
 pub struct Tcb {
     pub state: State,
     pub local: Endpoint,
@@ -320,6 +369,21 @@ pub struct Tcb {
 
     pub irs: u32,
     pub receive_next: u32,
+    /// Runs of bytes that arrived before the bytes in front of them, in order
+    /// and with the ones that touch joined. Acknowledging only what is
+    /// contiguous is what tells the other end which segment to send again;
+    /// holding the rest is what keeps that one segment from costing every
+    /// segment behind it as well.
+    out_of_order: Vec<Held>,
+    /// Bytes in `out_of_order`, which is also this connection's share of the
+    /// count every connection shares.
+    held: usize,
+    /// The other end's finish, when it arrived past a gap. It is one sequence
+    /// number rather than a run, and it is taken when the gap fills.
+    held_fin: Option<u32>,
+    /// Tick at which what is held is let go because the gap never filled.
+    /// Zero is off.
+    reassembly_expire_at: u64,
 
     /// Everything from `send_unacknowledged` onwards: what has been sent and
     /// not acknowledged, followed by what has not been sent.
@@ -373,6 +437,10 @@ impl Tcb {
             window_ack: 0,
             irs: 0,
             receive_next: 0,
+            out_of_order: Vec::new(),
+            held: 0,
+            held_fin: None,
+            reassembly_expire_at: 0,
             pending: VecDeque::new(),
             received: VecDeque::new(),
             fin_queued: false,
@@ -591,6 +659,7 @@ impl Tcb {
         self.retransmit_at = 0;
         self.pending.clear();
         self.fin_queued = false;
+        self.drop_out_of_order();
     }
 
     // ---- output ----------------------------------------------------------
@@ -710,6 +779,7 @@ impl Tcb {
             self.state = State::Closed;
             self.retransmit_at = 0;
             self.pending.clear();
+            self.drop_out_of_order();
             if self.error.is_none() {
                 self.error = Some(Errno::ECONNRESET);
             }
@@ -812,8 +882,8 @@ impl Tcb {
         }
 
         // Data. Anything already delivered is trimmed off the front; anything
-        // beyond what is wanted next is dropped, because there is no queue to
-        // hold it in.
+        // that arrived before the bytes in front of it is held until they
+        // come, and until then the acknowledgement keeps naming the gap.
         let mut payload: &[u8] = segment.payload;
         let mut sequence = segment.sequence;
         if seq_lt(sequence, self.receive_next) {
@@ -821,47 +891,47 @@ impl Tcb {
             payload = if skip >= payload.len() { &[] } else { &payload[skip..] };
             sequence = self.receive_next;
         }
-        let in_order = sequence == self.receive_next;
         let mut need_ack = false;
         if !segment.payload.is_empty() {
             need_ack = true;
-            if in_order && !payload.is_empty() {
-                if !self.can_receive() {
-                    // Nobody will ever read this. Taking it off the sequence
-                    // space anyway is what keeps the other end from sending
-                    // it again forever.
+            if payload.is_empty() {
+                // Every byte of it had already arrived.
+            } else if !self.can_receive() {
+                // Nobody will ever read this. Taking it off the sequence
+                // space anyway is what keeps the other end from sending it
+                // again forever, and only what is contiguous can be taken
+                // off it.
+                if sequence == self.receive_next {
                     self.receive_next =
                         self.receive_next.wrapping_add(payload.len() as u32);
-                } else {
-                    let free = RECEIVE_WINDOW.saturating_sub(self.received.len());
-                    let n = payload.len().min(free);
-                    self.received.extend(payload[..n].iter().copied());
-                    self.receive_next = self.receive_next.wrapping_add(n as u32);
-                    woke = true;
                 }
+            } else if sequence == self.receive_next {
+                let free = RECEIVE_WINDOW.saturating_sub(self.received.len());
+                let n = payload.len().min(free);
+                self.received.extend(payload[..n].iter().copied());
+                self.receive_next = self.receive_next.wrapping_add(n as u32);
+                self.deliver_held();
+                woke = true;
+            } else {
+                self.hold(sequence, payload);
             }
         }
 
         // The FIN sits one past the segment's data, and is only taken once
-        // every byte before it has been.
+        // every byte in front of it has been -- which may be now, or may be
+        // when the gap in front of it fills.
         if segment.flags & FIN != 0 {
-            let fin_sequence = sequence.wrapping_add(payload.len() as u32);
-            if self.receive_next == fin_sequence {
-                need_ack = true;
-                if !self.fin_received {
-                    self.fin_received = true;
-                    self.receive_next = self.receive_next.wrapping_add(1);
-                    woke = true;
-                    match self.state {
-                        State::Established => self.state = State::CloseWait,
-                        State::FinWait1 => self.state = State::Closing,
-                        State::FinWait2 => self.enter_time_wait(),
-                        _ => {}
-                    }
-                }
-            } else if self.fin_received && self.receive_next == fin_sequence.wrapping_add(1) {
-                need_ack = true;
+            need_ack = true;
+            let finish = sequence.wrapping_add(payload.len() as u32);
+            if finish == self.receive_next {
+                self.held_fin = Some(finish);
+            } else if seq_gt(finish, self.receive_next) && self.can_receive() {
+                self.held_fin = Some(finish);
+                self.arm_reassembly();
             }
+        }
+        if self.held_fin == Some(self.receive_next) && self.take_fin() {
+            woke = true;
         }
 
         if need_ack && self.state != State::Closed {
@@ -915,6 +985,9 @@ impl Tcb {
 
     fn enter_time_wait(&mut self) {
         self.state = State::TimeWait;
+        // Nothing more will arrive to fill a gap, so nothing held past one
+        // can ever be delivered.
+        self.drop_out_of_order();
         self.expire_at = crate::trap::ticks() + TIME_WAIT_TICKS;
         self.retransmit_at = 0;
         self.pending.clear();
@@ -936,6 +1009,9 @@ impl Tcb {
     /// The last descriptor naming this connection has gone.
     pub fn abandon(&mut self) {
         self.abandoned = true;
+        // Nobody is left to read what is held, or what filling the gap would
+        // deliver.
+        self.drop_out_of_order();
         if self.state == State::FinWait2 && self.expire_at == 0 {
             self.expire_at = crate::trap::ticks() + FIN_WAIT_2_TICKS;
         }
@@ -954,6 +1030,142 @@ impl Tcb {
             )
     }
 
+    // ---- what arrived before the bytes in front of it --------------------
+
+    /// How many separate runs are held. The suite asks; nothing else does.
+    pub fn held_runs(&self) -> usize {
+        self.out_of_order.len()
+    }
+
+    /// Account for a change in what this connection holds, in the count every
+    /// connection shares.
+    fn account(&mut self) {
+        let held: usize = self.out_of_order.iter().map(|run| run.data.len()).sum();
+        if held > self.held {
+            HELD_BYTES.fetch_add(held - self.held, Ordering::Relaxed);
+        } else {
+            HELD_BYTES.fetch_sub(self.held - held, Ordering::Relaxed);
+        }
+        self.held = held;
+    }
+
+    /// Let go of everything held past a gap.
+    pub fn drop_out_of_order(&mut self) {
+        self.out_of_order.clear();
+        self.held_fin = None;
+        self.reassembly_expire_at = 0;
+        self.account();
+    }
+
+    fn arm_reassembly(&mut self) {
+        self.reassembly_expire_at = crate::trap::ticks() + REASSEMBLY_TICKS;
+    }
+
+    /// Keep a run that arrived before the bytes in front of it.
+    fn hold(&mut self, sequence: u32, payload: &[u8]) {
+        // Everything held lies inside the window this end advertised, and
+        // that window is what is left of the receive buffer, so what one
+        // connection holds needs no bound of its own: the two together never
+        // exceed the buffer.
+        let right = self.receive_next.wrapping_add(self.advertised_window() as u32);
+        if !seq_lt(sequence, right) {
+            return;
+        }
+        let room = right.wrapping_sub(sequence) as usize;
+        let payload = &payload[..payload.len().min(room)];
+        if payload.is_empty() {
+            return;
+        }
+        if held_bytes() + payload.len() > REASSEMBLY_LIMIT {
+            return;
+        }
+        self.out_of_order.push(Held { sequence, data: payload.to_vec() });
+        self.coalesce();
+        if self.out_of_order.len() > MAX_HELD_RUNS {
+            // The run furthest ahead goes: it is the one with the most
+            // missing in front of it, so it is the one whose sender has the
+            // furthest to go before any of it can be delivered.
+            self.out_of_order.pop();
+        }
+        self.account();
+        self.arm_reassembly();
+    }
+
+    /// Put the runs in order and join the ones that touch or overlap.
+    fn coalesce(&mut self) {
+        let base = self.receive_next;
+        let mut runs = core::mem::take(&mut self.out_of_order);
+        runs.sort_unstable_by_key(|run| run.sequence.wrapping_sub(base));
+        let mut joined: Vec<Held> = Vec::with_capacity(runs.len());
+        for run in runs {
+            match joined.last_mut() {
+                Some(last) if seq_le(run.sequence, last.end()) => {
+                    let overlap = last.end().wrapping_sub(run.sequence) as usize;
+                    if overlap < run.data.len() {
+                        last.data.extend_from_slice(&run.data[overlap..]);
+                    }
+                }
+                _ => joined.push(run),
+            }
+        }
+        self.out_of_order = joined;
+    }
+
+    /// Move everything that now follows on into what the reader sees.
+    fn deliver_held(&mut self) {
+        while let Some(run) = self.out_of_order.first() {
+            if seq_gt(run.sequence, self.receive_next) {
+                break;
+            }
+            let run = self.out_of_order.remove(0);
+            let skip = self.receive_next.wrapping_sub(run.sequence) as usize;
+            if skip >= run.data.len() {
+                continue;
+            }
+            let free = RECEIVE_WINDOW.saturating_sub(self.received.len());
+            let take = (run.data.len() - skip).min(free);
+            self.received.extend(run.data[skip..skip + take].iter().copied());
+            self.receive_next = self.receive_next.wrapping_add(take as u32);
+            if skip + take < run.data.len() {
+                // No room for the rest of this run. The window is what bounds
+                // what was held, so this does not arise; leaving the stream
+                // whole rather than assuming so costs one insert.
+                let sequence = self.receive_next;
+                let rest = run.data[skip + take..].to_vec();
+                self.out_of_order.insert(0, Held { sequence, data: rest });
+                break;
+            }
+        }
+        self.account();
+        if self.out_of_order.is_empty() && self.held_fin.is_none() {
+            self.reassembly_expire_at = 0;
+        } else {
+            // Something moved, so the wait for the rest starts again.
+            self.arm_reassembly();
+        }
+    }
+
+    /// Take the other end's finish, once every byte in front of it has been
+    /// taken.
+    fn take_fin(&mut self) -> bool {
+        self.held_fin = None;
+        if self.out_of_order.is_empty() {
+            self.reassembly_expire_at = 0;
+        }
+        if self.fin_received {
+            return false;
+        }
+        self.fin_received = true;
+        self.receive_next = self.receive_next.wrapping_add(1);
+        match self.state {
+            State::Established => self.state = State::CloseWait,
+            State::FinWait1 => self.state = State::Closing,
+            State::FinWait2 => self.enter_time_wait(),
+            _ => {}
+        }
+        true
+    }
+
     // ---- timers ----------------------------------------------------------
 
     pub fn next_deadline(&self) -> u64 {
@@ -964,10 +1176,19 @@ impl Tcb {
         if self.retransmit_at != 0 {
             earliest = earliest.min(self.retransmit_at);
         }
+        if self.reassembly_expire_at != 0 {
+            earliest = earliest.min(self.reassembly_expire_at);
+        }
         earliest
     }
 
     pub fn on_timer(&mut self, now: u64) -> bool {
+        if self.reassembly_expire_at != 0 && now >= self.reassembly_expire_at {
+            // The gap never filled. What is held behind it is of no use to
+            // anybody until it does, and the end that left it has stopped
+            // trying.
+            self.drop_out_of_order();
+        }
         if self.expire_at != 0 {
             // Waiting on a clock rather than on the other end: there is
             // nothing to send, and reaching the deadline is the end of it.
@@ -1024,6 +1245,15 @@ impl Tcb {
             }
         }
         false
+    }
+}
+
+impl Drop for Tcb {
+    fn drop(&mut self) {
+        // The count every connection shares is what bounds them all together,
+        // so a connection that goes away while holding something has to give
+        // its share back.
+        HELD_BYTES.fetch_sub(self.held, Ordering::Relaxed);
     }
 }
 
