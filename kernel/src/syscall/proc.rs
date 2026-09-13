@@ -393,12 +393,23 @@ pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
             sched::schedule();
             sched::current().waiting_for = None;
         }
-        // A signal arriving while blocked interrupts the wait.
-        let pending = sched::current().pending_signals & !sched::current().signal_mask;
-        if pending & !(1u64 << (SIGCHLD as u64 & 63)) != 0 {
+        // A signal arriving while blocked interrupts the wait, but only one
+        // that will do something when it is delivered. Asking the raw pending
+        // set instead turns a terminal resize, or anything else the process has
+        // told the kernel to discard, into a failed wait.
+        let child_bit = 1u64 << (SIGCHLD as u64 & 63);
+        if sched::has_pending_signal_except(child_bit) {
             return Err(Errno::EINTR);
         }
-        sched::current().pending_signals &= !(1u64 << (SIGCHLD as u64 & 63));
+        // The child signal is what this call came for, so it is not a reason to
+        // give up; but clearing it outright means a process with a handler
+        // never sees that handler run for a child it reaped itself. Only the
+        // dispositions that would discard it on delivery are cleared here.
+        let mut task = sched::current();
+        let handler = task.signal_actions[SIGCHLD as usize].handler;
+        if handler == crate::signal::SIG_DFL || handler == crate::signal::SIG_IGN {
+            task.pending_signals &= !child_bit;
+        }
     }
 }
 

@@ -618,14 +618,22 @@ pub fn signal_group(pgid: u32, signal: i32) {
 /// job is pending on most processes most of the time, and treating it as a
 /// reason to fail turns unrelated reads and opens into spurious errors.
 pub fn has_pending_signal() -> bool {
+    has_pending_signal_except(0)
+}
+
+/// The same question with the signals in `ignore` left out of it, for a call
+/// that acts on one itself rather than giving up. `wait4` is here to collect
+/// what the child signal is telling it about, so that one is not a reason for
+/// it to fail.
+pub fn has_pending_signal_except(ignore: u64) -> bool {
     if !has_current() {
         return false;
     }
     let task = current();
-    let mut pending = task.pending_signals & !task.signal_mask;
+    let waiting = task.pending_signals & !ignore;
+    let mut pending = waiting & !task.signal_mask;
     // Neither of these can be blocked.
-    pending |= task.pending_signals
-        & ((1u64 << (SIGKILL as u64 & 63)) | (1u64 << (SIGSTOP as u64 & 63)));
+    pending |= waiting & ((1u64 << (SIGKILL as u64 & 63)) | (1u64 << (SIGSTOP as u64 & 63)));
     if pending == 0 {
         return false;
     }

@@ -241,6 +241,52 @@ fn a_child_exit_reaches_a_blocked_parent(report: &mut Report) {
     );
 }
 
+/// What a wait does with signals: a signal that would be discarded on delivery
+/// is no reason to give the wait up, and the child signal has to survive the
+/// wait so that a process with a handler sees it run for the child it reaped.
+fn what_a_wait_does_with_signals(report: &mut Report) {
+    use crate::sys;
+
+    const SIGCHLD: i32 = 17;
+    const SIGWINCH: i32 = 28;
+    const SIG_DFL: usize = 0;
+
+    // A terminal resize is ignored by default, so a wait must not fail on it.
+    let child = sys::fork();
+    if child == 0 {
+        sys::kill(sys::getppid() as i32, SIGWINCH);
+        std::thread::sleep(Duration::from_millis(300));
+        sys::exit_group(7);
+    }
+    let (pid, status) = sys::wait4(child as i32, 0);
+    report.check(
+        "a discarded signal does not interrupt a wait",
+        pid == child && sys::exit_code_of(status) == 7,
+        format!("reaped {} status {:#x}", pid, status),
+    );
+
+    // And the child signal is still there to be delivered afterwards.
+    unsafe { signal(SIGCHLD, handle_signal as extern "C" fn(i32) as usize) };
+    let before = SIGNAL_TOTAL.load(Ordering::SeqCst);
+    let child = sys::fork();
+    if child == 0 {
+        std::thread::sleep(Duration::from_millis(100));
+        sys::exit_group(0);
+    }
+    let (pid, _) = sys::wait4(child as i32, 0);
+    // The handler runs on the way out of the wait.
+    for _ in 0..4 {
+        std::thread::yield_now();
+    }
+    let ran = SIGNAL_TOTAL.load(Ordering::SeqCst) - before == SIGCHLD as usize;
+    unsafe { signal(SIGCHLD, SIG_DFL) };
+    report.check(
+        "a handler runs for a child the process reaped itself",
+        pid == child && ran,
+        format!("reaped {}, handler ran: {}", pid, ran),
+    );
+}
+
 /// A child that has not written to its stack since the fork still shares those
 /// pages with the parent, so the signal frame the kernel writes there goes
 /// through the path that breaks the sharing first.
@@ -754,6 +800,7 @@ pub fn main(_args: &[String]) -> i32 {
     println!("-- threads, processes and waiting --");
     thread_of_a_child_is_not_a_child(&mut report);
     a_child_exit_reaches_a_blocked_parent(&mut report);
+    what_a_wait_does_with_signals(&mut report);
     a_signal_frame_on_a_shared_page(&mut report);
     stopping_a_job_reaches_the_parent(&mut report);
     a_signal_ends_a_sleep(&mut report);
