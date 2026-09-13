@@ -5,6 +5,7 @@ use super::{align_up, KERNEL_HEAP_BASE, KERNEL_HEAP_SIZE, PAGE_SIZE_U64};
 use crate::sync::Spinlock;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Smallest block that can still hold a free-list node.
 const MIN_BLOCK: usize = 16;
@@ -40,12 +41,17 @@ impl HoleList {
     /// Take a range of heap address space to map, or nothing when the heap has
     /// reached its ceiling or physical memory is too low to spare.
     ///
+    /// `least` is how much to take when `needed` is smaller than that. The
+    /// allocator asks for a chunk, because the caller waiting on it pays for
+    /// every claim it has to make; the margin asks for little, because the
+    /// pages it takes are pages a program cannot have and the heap never gives
+    /// any of them back.
+    ///
     /// `mapped` moves here rather than when the pages arrive, so the range
     /// belongs to this claim from now on and a second grower, running while
     /// this one has let the lock go, takes a different one.
-    fn claim(&mut self, needed: usize) -> Option<Claim> {
-        const CHUNK: usize = 8 * 1024 * 1024;
-        let want = super::align_up(needed.max(CHUNK) as u64, PAGE_SIZE_U64) as usize;
+    fn claim(&mut self, needed: usize, least: usize) -> Option<Claim> {
+        let want = super::align_up(needed.max(least) as u64, PAGE_SIZE_U64) as usize;
         if self.mapped + want > super::KERNEL_HEAP_MAX {
             return None;
         }
@@ -161,7 +167,17 @@ impl HoleList {
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
     }
+
+    /// Say outside the lock whether the margin has been eaten into, so the
+    /// check that tops it up is one relaxed load in the ordinary case.
+    fn publish_margin(&self) {
+        BELOW_MARGIN.store(self.free_bytes < super::HEAP_MARGIN, Ordering::Relaxed);
+    }
 }
+
+/// Whether the free list holds less than the margin. Written under the heap
+/// lock, read without it.
+static BELOW_MARGIN: AtomicBool = AtomicBool::new(false);
 
 /// Heap address space that belongs to one grower and has yet to be mapped.
 struct Claim {
@@ -194,23 +210,28 @@ unsafe impl GlobalAlloc for LockedHeap {
             let mut heap = self.0.lock();
             let ptr = heap.alloc(layout);
             if !ptr.is_null() {
+                heap.publish_margin();
                 return ptr;
             }
         }
 
-        // Out of room. The lock masks interrupts, and mapping a growth of the
-        // heap is up to forty thousand page table writes with a translation
-        // buffer invalidation each: done under the lock it held the timer off
-        // for a third of a second on the Pi's instruction set. So the range is
-        // claimed under the lock, mapped with it released, and handed to the
-        // free list under it again.
+        // The free list had no room, so this allocation is the one that maps.
+        // Releasing the heap lock over the mapping is not enough: the lock a
+        // caller of its own is holding masks interrupts over the top of it,
+        // and the heap cannot see who is holding what. `top_up` is what keeps
+        // this path out of the ordinary allocation; reaching it means the
+        // margin did not cover the request, and mapping here is the only way
+        // to answer it. It costs the caller's critical section the length of
+        // the mapping, which is what the margin exists to make rare rather
+        // than impossible.
         //
         // Another task allocating in that window and finding the heap full
         // claims a range of its own, which is a second growth rather than a
         // wrong one. A claim only partly mapped keeps the rest of its address
         // space, which costs nothing worth recovering: the only way there is
         // to be out of physical memory already.
-        let claim = match self.0.lock().claim(layout.size()) {
+        const CHUNK: usize = 8 * 1024 * 1024;
+        let claim = match self.0.lock().claim(layout.size(), CHUNK) {
             Some(claim) => claim,
             None => return ptr::null_mut(),
         };
@@ -221,11 +242,63 @@ unsafe impl GlobalAlloc for LockedHeap {
 
         let mut heap = self.0.lock();
         heap.add_region(claim.start, mapped);
-        heap.alloc(layout)
+        let ptr = heap.alloc(layout);
+        heap.publish_margin();
+        ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.0.lock().dealloc(ptr, layout)
+        let mut heap = self.0.lock();
+        heap.dealloc(ptr, layout);
+        heap.publish_margin();
     }
+}
+
+/// Map heap ahead of what the free list holds, so that the allocation which
+/// finds it empty is not the ordinary one.
+///
+/// Called on the way out of a system call, which is a place where the kernel
+/// holds nothing and interrupts are on. The thousands of page table writes a
+/// growth costs are paid there instead of inside whichever critical section
+/// happened to make the allocation that ran the heap out.
+///
+/// When the machine has no memory to spare this does nothing and leaves the
+/// margin short. The allocator's own growth then runs as it did before, and
+/// fails the same way, so nothing here decides whether an allocation can be
+/// answered -- only where the work of answering it lands.
+pub fn top_up() {
+    /// Least to map in one go, so a margin nibbled at by one system call after
+    /// another does not cost a page table write per call.
+    const STEP: usize = 256 * 1024;
+
+    if !BELOW_MARGIN.load(Ordering::Relaxed) {
+        return;
+    }
+    let short = {
+        let heap = HEAP.0.lock();
+        // Bytes freed since the flag was set may have put the margin back.
+        // Saying so here is what keeps the next system call from asking the
+        // frame allocator a question already answered.
+        heap.publish_margin();
+        super::HEAP_MARGIN.saturating_sub(heap.free_bytes())
+    };
+    if short == 0 {
+        return;
+    }
+
+    let Some(claim) = HEAP.0.lock().claim(short, STEP) else { return };
+    let mapped = unsafe { map_claim(&claim) };
+    if mapped == 0 {
+        return;
+    }
+    let mut heap = HEAP.0.lock();
+    unsafe { heap.add_region(claim.start, mapped) };
+    heap.publish_margin();
+}
+
+/// Heap address space with page tables under it. Only the checks read this:
+/// an allocation that does not move it is one that mapped nothing.
+pub fn mapped_bytes() -> usize {
+    HEAP.0.lock().mapped
 }
 
 #[global_allocator]
@@ -245,6 +318,7 @@ pub fn init() {
         let mut heap = HEAP.0.lock();
         heap.mapped = KERNEL_HEAP_SIZE;
         heap.add_region(KERNEL_HEAP_BASE, KERNEL_HEAP_SIZE);
+        heap.publish_margin();
     }
 }
 

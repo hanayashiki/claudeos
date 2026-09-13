@@ -56,6 +56,13 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
     }
 
     sched::check_signals();
+
+    // Here the kernel holds nothing and interrupts are on, which is what the
+    // heap needs and cannot ask for: an allocation that runs the free list out
+    // maps its own pages, and it does that inside whatever critical section
+    // the caller was in. Mapping ahead from here keeps the ordinary allocation
+    // out of that.
+    crate::mm::heap::top_up();
 }
 
 fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {

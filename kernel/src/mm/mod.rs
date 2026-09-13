@@ -19,6 +19,18 @@ pub use crate::arch::{
 pub const KERNEL_HEAP_SIZE: usize = 16 * 1024 * 1024;
 /// Physical memory kept back from the heap for user pages.
 pub const FRAME_RESERVE: usize = 8 * 1024 * 1024;
+/// Mapped heap the free list is kept holding over what it has handed out.
+///
+/// An allocation that finds no hole is the one that maps the pages the heap
+/// grows by, and it does that inside whatever critical section its caller is
+/// in. This is how much room is kept ahead of it so that the ordinary
+/// allocation is not that one.
+///
+/// It is counted in free bytes rather than in one run of them, so what it
+/// answers for is the small allocation -- a node, a string, a formatted line,
+/// which is every allocation this kernel makes under another lock -- and not a
+/// request larger than whatever hole the free list happens to have.
+pub const HEAP_MARGIN: usize = 4 * 1024 * 1024;
 
 /// Where user mmap allocations start growing up from.
 pub const USER_MMAP_BASE: u64 = 0x0000_7F00_0000_0000;
