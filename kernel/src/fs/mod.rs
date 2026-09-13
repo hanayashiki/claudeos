@@ -43,6 +43,10 @@ pub struct NodeInner {
     pub mtime: i64,
     /// How many directory entries name this node.
     pub nlink: u32,
+    /// Set while a task is changing this file's contents in pieces, with the
+    /// node unlocked between them. Another writer waits for it: what the
+    /// first one is copying must not change underneath it.
+    changing: bool,
 }
 
 pub struct Node {
@@ -53,30 +57,45 @@ pub struct Node {
 
 static NEXT_INO: AtomicU64 = AtomicU64::new(1);
 
-/// Make room for `target` bytes of file contents.
+/// How big a buffer to ask for so a file holding `current` bytes of room can
+/// hold `target` bytes of contents.
 ///
 /// Files live in RAM, so a write has to be refused before the allocator runs
-/// the machine out of memory. Growing a vector copies the old contents into a
-/// new allocation, so the peak is the old capacity plus the new one; this
-/// grows by half again when that peak fits and falls back to an exact fit when
+/// the machine out of memory. The old contents are copied into the new
+/// allocation, so the peak is the old capacity plus the new one; this asks for
+/// half again as much when that peak fits and falls back to an exact fit when
 /// memory is tight.
-fn reserve_for(data: &mut Vec<u8>, target: usize) -> Result<(), Errno> {
-    if target <= data.capacity() {
-        return Ok(());
-    }
+fn room_for(current: usize, target: usize) -> Result<usize, Errno> {
     let available = crate::mm::file_available_bytes();
-    let current = data.capacity();
     let roomy = target.max(current + current / 2);
 
     if current.saturating_add(roomy) <= available {
-        data.reserve_exact(roomy - data.len());
-        return Ok(());
+        return Ok(roomy);
     }
     if current.saturating_add(target) <= available {
-        data.reserve_exact(target - data.len());
-        return Ok(());
+        return Ok(target);
     }
     Err(Errno::ENOSPC)
+}
+
+/// The right to change a file's contents, held across every piece the change
+/// is done in.
+///
+/// The node lock masks interrupts, so nothing proportional to the file's
+/// length can be done under it, and growing a file copies every byte it holds.
+/// The copy therefore takes the lock a piece at a time and lets go in between,
+/// and this is what keeps a second writer out of those gaps: it would change
+/// what the copy has already taken, and that change would be lost when the
+/// bigger buffer went in. Readers are not kept out. They see the buffer the
+/// file has now, and the bigger one replaces it in one step under the lock.
+struct Changing<'a> {
+    node: &'a Node,
+}
+
+impl Drop for Changing<'_> {
+    fn drop(&mut self) {
+        self.node.inner.lock().changing = false;
+    }
 }
 
 impl Node {
@@ -92,6 +111,7 @@ impl Node {
                 children: BTreeMap::new(),
                 mtime: crate::time::unix_time(),
                 nlink: 1,
+                changing: false,
             }),
         })
     }
@@ -183,19 +203,88 @@ impl Node {
         }
     }
 
+    /// Wait for any other change to this file's contents to finish, and keep
+    /// the next one out until the returned value is dropped.
+    fn change(&self) -> Changing<'_> {
+        loop {
+            {
+                let mut inner = self.inner.lock();
+                if !inner.changing {
+                    inner.changing = true;
+                    return Changing { node: self };
+                }
+            }
+            // The task holding it runs with interrupts on and will finish.
+            // Spinning here would keep it off the processor to do it.
+            crate::sched::yield_or_sleep();
+        }
+    }
+
+    /// Make the file at least `target` bytes long, with zeros past whatever it
+    /// already holds.
+    ///
+    /// Outgrowing the buffer is an allocation and a copy of the whole file,
+    /// and the node lock masks interrupts: held across both, a file the test
+    /// suite grows to fifty megabytes stopped the timer for 165 ms between one
+    /// tick and the next on x86-64 and 316 ms on aarch64. The allocation is
+    /// the larger half, because a buffer the kernel heap has no room for grows
+    /// the heap, which maps thousands of pages. So it happens with the lock
+    /// released, and the copy that follows takes the lock a megabyte at a time.
+    ///
+    /// The caller's claim on the file is what lets the copy be split up:
+    /// nothing else writes the buffer being read, and what is being written is
+    /// not the file until it goes in, which is one assignment.
+    fn make_room(&self, target: usize, _change: &Changing<'_>) -> Result<(), Errno> {
+        /// How much to copy under one turn of the lock. At the three gigabytes
+        /// a second these machines copy at, a piece this size is a third of a
+        /// millisecond against the ten a timer tick has.
+        const PIECE: usize = 1024 * 1024;
+
+        let (current, held) = {
+            let mut inner = self.inner.lock();
+            if target <= inner.data.capacity() {
+                // The room is already there, so this is a write of bytes the
+                // file owns rather than a call on the allocator.
+                if target > inner.data.len() {
+                    inner.data.resize(target, 0);
+                }
+                return Ok(());
+            }
+            (inner.data.capacity(), inner.data.len())
+        };
+
+        let mut grown = Vec::new();
+        grown.reserve_exact(room_for(current, target)?);
+
+        let mut copied = 0;
+        while copied < held {
+            let end = (copied + PIECE).min(held);
+            let inner = self.inner.lock();
+            grown.extend_from_slice(&inner.data[copied..end]);
+            copied = end;
+        }
+        grown.resize(target, 0);
+
+        let mut inner = self.inner.lock();
+        let old = core::mem::replace(&mut inner.data, grown);
+        // The old buffer is handed back with the node unlocked: a free is the
+        // allocator's lock, and this one holds a whole file.
+        drop(inner);
+        drop(old);
+        Ok(())
+    }
+
     pub fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, Errno> {
         match self.kind {
             NodeKind::Device(kind) => dev::write(kind, buf),
             NodeKind::Generated(_) => Err(Errno::EACCES),
             NodeKind::Dir => Err(Errno::EISDIR),
             _ => {
-                let mut inner = self.inner.lock();
                 let start = offset as usize;
                 let end = start + buf.len();
-                if end > inner.data.len() {
-                    reserve_for(&mut inner.data, end)?;
-                    inner.data.resize(end, 0);
-                }
+                let change = self.change();
+                self.make_room(end, &change)?;
+                let mut inner = self.inner.lock();
                 inner.data[start..end].copy_from_slice(buf);
                 inner.mtime = crate::time::unix_time();
                 Ok(buf.len())
@@ -207,11 +296,12 @@ impl Node {
         if self.is_dir() {
             return Err(Errno::EISDIR);
         }
-        let mut inner = self.inner.lock();
         let target = len as usize;
-        if target > inner.data.len() {
-            reserve_for(&mut inner.data, target)?;
-        }
+        let change = self.change();
+        self.make_room(target, &change)?;
+        let mut inner = self.inner.lock();
+        // Only ever shorter from here: making room saw to the other direction,
+        // and the claim is what keeps that true.
         inner.data.resize(target, 0);
         inner.mtime = crate::time::unix_time();
         Ok(())
