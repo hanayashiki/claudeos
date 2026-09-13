@@ -19,6 +19,20 @@ else
   ALPINE="$ROOT/build/alpine.cpio"
 fi
 
+# Build before testing, rather than running whatever was last left in build/.
+# Without this the suites silently test a stale kernel or userland, which reads
+# as a passing run of code that is not the code in the tree. Both builds are
+# incremental, so this costs nothing when there is nothing to do. NOBUILD=1
+# skips it for the rare case of testing a binary on purpose.
+if [ -z "${NOBUILD:-}" ]; then
+  "$ROOT/scripts/build.sh" > /dev/null || exit 1
+  if [ "$ARCH" = aarch64 ]; then
+    "$ROOT/scripts/build-user-aarch64.sh" > /dev/null || exit 1
+  else
+    "$ROOT/scripts/build-user.sh" > /dev/null || exit 1
+  fi
+fi
+
 status=0
 # Suites that did not run at all. A skip is not a pass, so the summary says so.
 skipped=0
