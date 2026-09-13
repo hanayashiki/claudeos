@@ -23,6 +23,7 @@ mod numbers {
     pub const SYS_CLOSE: u64 = 3;
     pub const SYS_OPENAT: u64 = 257;
     pub const SYS_MMAP: u64 = 9;
+    pub const SYS_MPROTECT: u64 = 10;
     pub const SYS_MUNMAP: u64 = 11;
     pub const SYS_MREMAP: u64 = 25;
     pub const SYS_BRK: u64 = 12;
@@ -42,6 +43,7 @@ mod numbers {
     pub const SYS_CLOSE: u64 = 57;
     pub const SYS_OPENAT: u64 = 56;
     pub const SYS_MMAP: u64 = 222;
+    pub const SYS_MPROTECT: u64 = 226;
     pub const SYS_MUNMAP: u64 = 215;
     pub const SYS_MREMAP: u64 = 216;
     pub const SYS_BRK: u64 = 214;
@@ -137,6 +139,10 @@ pub fn munmap(addr: u64, len: u64) -> i64 {
     unsafe { syscall(SYS_MUNMAP, addr, len, 0, 0, 0, 0) }
 }
 
+pub fn mprotect(addr: u64, len: u64, prot: u64) -> i64 {
+    unsafe { syscall(SYS_MPROTECT, addr, len, prot, 0, 0, 0) }
+}
+
 #[cfg(target_arch = "x86_64")]
 pub fn fork() -> i64 {
     unsafe { syscall(SYS_FORK, 0, 0, 0, 0, 0, 0) }
@@ -193,6 +199,16 @@ pub fn wait4(pid: i32, options: u64) -> (i64, i32) {
         )
     };
     (rc, (status >> 8) & 0xFF)
+}
+
+/// The same, giving back the signal that killed the child rather than the code
+/// it exited with. Zero for a child that was not killed.
+pub fn wait4_signal(pid: i32) -> (i64, i32) {
+    let mut status: i32 = 0;
+    let rc = unsafe {
+        syscall(SYS_WAIT4, pid as i64 as u64, &mut status as *mut i32 as u64, 0, 0, 0, 0)
+    };
+    (rc, status & 0x7F)
 }
 
 /// Give `from` the name `to`, and give back the negated errno on failure

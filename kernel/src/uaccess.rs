@@ -16,9 +16,9 @@
 //! claim about uniqueness that is not true.
 
 use crate::abi::Errno;
-use crate::arch::paging::{is_user_addr, COW, WRITABLE};
+use crate::arch::paging::is_user_addr;
 use crate::mm::{page_align_down, PAGE_SIZE_U64};
-use crate::task::Task;
+use crate::task::{PageAccess, Task};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -39,38 +39,27 @@ pub fn validate_in(task: &Task, addr: u64, len: u64, write: bool) -> Result<(), 
 
     let mut page = page_align_down(addr);
     while page < end {
-        match task.space().flags_of(page) {
-            Some(flags) => {
-                // A page shared after a fork is read-only until someone writes
-                // to it. The kernel writing on the task's behalf counts, so
-                // take the private copy here rather than reporting a bad
-                // address.
-                //
-                // The mark decides, not the write permission. aarch64 keeps
-                // the permission the caller asked for and derives read-only
-                // from the mark, so a shared page there reads back as writable
-                // while the hardware refuses the store; asking the permission
-                // alone would let the copy through and fault in the kernel.
-                //
-                // Taking the copy is one step from the entry it reads to the
-                // entry it writes, so it asks for interrupts to be off for the
-                // whole of it. Opening the section here rather than around the
-                // loop keeps it to one page: the caller may be validating a
-                // buffer megabytes long, and the pages it has not reached yet
-                // are no part of this.
-                if write && (flags & COW != 0 || flags & WRITABLE == 0) {
-                    let copied =
-                        crate::sync::without_interrupts(|irq| task.handle_cow(page, irq));
-                    if !copied {
-                        return Err(Errno::EFAULT);
-                    }
-                }
-            }
-            None => {
+        // What the entry says and the copy a write to a shared page needs are
+        // one operation with interrupts off, because apart, a sibling thread
+        // that takes that copy in between leaves the repair looking at a page
+        // that is no longer shared -- which is also what a page that may not
+        // be written at all looks like. Opening the section per page rather
+        // than around the loop keeps it to one page: the caller may be
+        // validating a buffer megabytes long, and the pages it has not reached
+        // yet are no part of this.
+        match reach(task, page, write) {
+            PageAccess::Ready => {}
+            PageAccess::Refused => return Err(Errno::EFAULT),
+            PageAccess::Absent => {
                 if !task.fault_in(page) {
                     return Err(Errno::EFAULT);
                 }
-                if write && !writable(task, page) {
+                // Backing a page reads a file and takes a frame, so it is no
+                // part of the section above and what it left has to be asked
+                // about rather than assumed: a sibling that forks in between
+                // marks the page shared, and it is then a write away from
+                // being private again rather than a bad address.
+                if reach(task, page, write) != PageAccess::Ready {
                     return Err(Errno::EFAULT);
                 }
             }
@@ -80,8 +69,8 @@ pub fn validate_in(task: &Task, addr: u64, len: u64, write: bool) -> Result<(), 
     Ok(())
 }
 
-fn writable(task: &Task, page: u64) -> bool {
-    matches!(task.space().flags_of(page), Some(flags) if flags & WRITABLE != 0)
+fn reach(task: &Task, page: u64, write: bool) -> PageAccess {
+    crate::sync::without_interrupts(|irq| task.access_page(page, write, irq))
 }
 
 pub fn read_bytes(addr: u64, buf: &mut [u8]) -> Result<(), Errno> {
