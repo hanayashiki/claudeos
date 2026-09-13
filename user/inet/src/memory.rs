@@ -14,6 +14,47 @@ pub fn run(report: &mut Report) {
     a_thread_left_unreaped_keeps_the_space(report);
     argument_blocks_larger_than_the_stack_is_mapped_with(report);
     addresses_outside_user_space_are_refused(report);
+    a_hint_over_a_live_mapping_is_not_taken(report);
+}
+
+/// A hint names where a mapping should start, and the mapping is as long as it
+/// was asked to be. A hint whose first page is free and whose next one is not
+/// is a hint that cannot be honoured, and taking it hands the program an
+/// address range it is already using for something else.
+fn a_hint_over_a_live_mapping_is_not_taken(report: &mut Report) {
+    // Where mappings are placed from. A hint below it is passed over whatever
+    // else is true of it, so the check would prove nothing there.
+    const MMAP_BASE: u64 = 0x0000_7F00_0000_0000;
+    const LEN: u64 = 4 * 4096;
+
+    let below = sys::mmap_anon(0, LEN);
+    let live = sys::mmap_anon(0, LEN);
+    if below < 0 || live < 0 || (below as u64) < MMAP_BASE + LEN {
+        report.check(
+            "two mappings to hint across",
+            false,
+            format!("mmap returned {:#x} and {:#x}", below, live),
+        );
+        return;
+    }
+    let (below, live) = (below as u64, live as u64);
+    // Freeing the lower one leaves the page just under `live` unclaimed, which
+    // is what makes the hint below look available one page at a time.
+    sys::munmap(below, LEN);
+
+    let hint = live - 4096;
+    let placed = sys::mmap_anon(hint, LEN);
+    let overlaps = placed > 0 && (placed as u64) < live + LEN && live < placed as u64 + LEN;
+    report.check(
+        "a hint whose range is already taken is not honoured",
+        placed > 0 && !overlaps,
+        format!("{:#x} was given for a hint of {:#x}, over a mapping at {:#x}", placed, hint, live),
+    );
+
+    if placed > 0 {
+        sys::munmap(placed as u64, LEN);
+    }
+    sys::munmap(live, LEN);
 }
 
 /// mmap takes an address from the program, and has to satisfy itself that it

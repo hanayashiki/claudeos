@@ -277,6 +277,11 @@ impl Task {
         self.mm.lock().vmas.iter().find(|v| v.contains(addr)).cloned()
     }
 
+    /// True when no recorded region overlaps `[start, end)`.
+    pub fn range_is_free(&self, start: u64, end: u64) -> bool {
+        self.mm.lock().vmas.iter().all(|v| v.end <= start || v.start >= end)
+    }
+
     pub fn clear_vmas(&self) {
         let mut mm = self.mm.lock();
         mm.vmas.clear();

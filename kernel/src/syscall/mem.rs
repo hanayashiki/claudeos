@@ -85,11 +85,14 @@ pub fn mmap(
         let task = sched::current();
         let hint = page_align_down(addr);
         // A hint is a suggestion, so one that cannot be honoured is passed
-        // over rather than reported.
+        // over rather than reported. What has to be free is the whole range
+        // the mapping will occupy: asking only about the page the hint names
+        // takes a hint that sits just below a region already there and lays
+        // the rest of the new mapping across it.
         if hint != 0
             && hint >= USER_MMAP_BASE
             && in_user_space(hint, len)
-            && task.find_vma(hint).is_none()
+            && task.range_is_free(hint, hint + len)
         {
             hint
         } else {
