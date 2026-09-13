@@ -6,6 +6,13 @@
 //! the same code that produced the frame, so a header laid out wrongly fails
 //! rather than agreeing with itself.
 //!
+//! Above that sits a peer with a link in each direction, for the behaviour
+//! that only shows when packets go missing. The link is told what to do with
+//! each segment before the test runs -- lose this one, hold that one back,
+//! deliver the next twice, damage the one after -- so a failure names one
+//! packet and happens again on the next run, which is what a real network
+//! cannot be asked for.
+//!
 //! Run with `net=test` on the kernel command line.
 
 use super::ether;
@@ -280,6 +287,14 @@ pub fn run() -> bool {
     connection(&mut report, nic);
     crate::println!("net: segments outside the window");
     unacceptable_segments(&mut report, nic);
+    crate::println!("net: a link that loses and reorders");
+    lossy_link(&mut report, nic);
+    crate::println!("net: segments that arrive out of order");
+    reassembly(&mut report, nic);
+    crate::println!("net: the round trip, measured");
+    round_trip_estimate(&mut report, nic);
+    crate::println!("net: a segment lost out of the middle of a stream");
+    fast_retransmit(&mut report, nic);
     crate::println!("net: a connection the program has closed");
     abandoned_connection(&mut report, nic);
     crate::println!("net: addresses this machine does not have");
@@ -653,7 +668,11 @@ fn connection(report: &mut Report, nic: &FakeNic) {
                 server_iss + 1,
                 CLIENT_ISS + 1 + request.len() as u32,
                 tcp::PSH | tcp::ACK,
-                WINDOW,
+                // The right edge of the window has not moved since the
+                // handshake: the request that was read out of the socket
+                // freed 34 bytes, and the edge only moves when it can move
+                // by a whole segment.
+                WINDOW - request.len() as u16,
                 &[],
                 answer_body,
                 OUR_IP,
@@ -704,7 +723,7 @@ fn connection(report: &mut Report, nic: &FakeNic) {
                 server_next,
                 client_next,
                 tcp::FIN | tcp::ACK,
-                WINDOW,
+                WINDOW - request.len() as u16,
                 &[],
                 &[],
                 OUR_IP,
@@ -766,7 +785,7 @@ fn connection(report: &mut Report, nic: &FakeNic) {
                 server_next + 1,
                 client_next + 1,
                 tcp::ACK,
-                WINDOW,
+                WINDOW - request.len() as u16 - 1,
                 &[],
                 &[],
                 OUR_IP,
@@ -854,6 +873,379 @@ fn establish(nic: &FakeNic, server_port: u16, client_port: u16, client_iss: u32)
         client_next: client_iss.wrapping_add(1),
         server_next: server_iss.wrapping_add(1),
     })
+}
+
+// ---- a link that loses, reorders, duplicates and corrupts -----------------
+
+/// What a link does with one segment. A test lists these in the order the
+/// segments reach it, so the same segment meets the same fate on every run
+/// and a failure names one packet rather than a probability.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fate {
+    Pass,
+    /// Lost, with nothing anywhere to say so.
+    Lose,
+    /// Held back until the segment behind it has gone, so the two arrive the
+    /// wrong way round.
+    Late,
+    /// Delivered, and then delivered again.
+    Twice,
+    /// A bit of the checksum flipped, which is what corruption of any part of
+    /// the segment looks like to the end that receives it.
+    Corrupt,
+}
+
+/// One direction of a link.
+struct Link {
+    /// Where the TCP header starts in what this carries: a frame has the
+    /// Ethernet and IPv4 headers in front of it, a datagram only the IPv4 one.
+    tcp_at: usize,
+    fates: Vec<Fate>,
+    carried: usize,
+    late: Option<Vec<u8>>,
+    lost: usize,
+}
+
+impl Link {
+    fn new(tcp_at: usize) -> Link {
+        Link { tcp_at, fates: Vec::new(), carried: 0, late: None, lost: 0 }
+    }
+
+    /// What is to happen to the next segments through here. Anything past the
+    /// end of the list passes.
+    fn script(&mut self, fates: &[Fate]) {
+        self.fates = fates.to_vec();
+        self.carried = 0;
+        self.lost = 0;
+    }
+
+    /// Hand one segment to the link. What comes back is what arrives at the
+    /// far end, in the order it arrives there.
+    fn carry(&mut self, packet: Vec<u8>) -> Vec<Vec<u8>> {
+        let fate = self.fates.get(self.carried).copied().unwrap_or(Fate::Pass);
+        self.carried += 1;
+        let mut out = Vec::new();
+        match fate {
+            Fate::Pass => out.push(packet),
+            Fate::Lose => self.lost += 1,
+            Fate::Late => {
+                // One held at a time: a test that wants two reordered says
+                // Late twice with something between.
+                if let Some(earlier) = self.late.replace(packet) {
+                    out.push(earlier);
+                }
+                return out;
+            }
+            Fate::Twice => {
+                out.push(packet.clone());
+                out.push(packet);
+            }
+            Fate::Corrupt => {
+                let mut damaged = packet;
+                damaged[self.tcp_at + 16] ^= 0x40;
+                out.push(damaged);
+            }
+        }
+        if let Some(earlier) = self.late.take() {
+            out.push(earlier);
+        }
+        out
+    }
+}
+
+/// The other end of a connection, reached over a link in each direction.
+///
+/// It is a small TCP of its own: it acknowledges what arrives, holds what
+/// arrives before the bytes in front of it so that resending one segment
+/// finishes the stream, and counts the acknowledgements it has repeated. What
+/// the links do to each segment is scripted, so a test names the segment that
+/// is lost rather than waiting for a link to lose one.
+struct Peer {
+    nic: &'static FakeNic,
+    listener: Arc<InetSocket>,
+    socket: Arc<InetSocket>,
+    port: u16,
+    server_port: u16,
+    /// The peer's own numbers: what it sends next, and what it wants next.
+    send_next: u32,
+    receive_next: u32,
+    window: u16,
+    /// The stream as the peer has taken it, and what arrived past a gap.
+    stream: Vec<u8>,
+    early: Vec<(u32, Vec<u8>)>,
+    fin_seen: bool,
+    /// The last number the peer acknowledged, and how many times it has since
+    /// acknowledged the same one again.
+    last_ack: u32,
+    repeated_acks: usize,
+    to_peer: Link,
+    to_stack: Link,
+}
+
+impl Peer {
+    /// Take a connection through its handshake and keep both ends' numbers.
+    fn open(
+        nic: &'static FakeNic,
+        server_port: u16,
+        client_port: u16,
+        client_iss: u32,
+    ) -> Option<Peer> {
+        let connection = establish(nic, server_port, client_port, client_iss)?;
+        Some(Peer {
+            nic,
+            listener: connection.listener,
+            socket: connection.socket,
+            port: client_port,
+            server_port,
+            send_next: connection.client_next,
+            receive_next: connection.server_next,
+            window: 64240,
+            stream: Vec::new(),
+            early: Vec::new(),
+            fin_seen: false,
+            last_ack: connection.server_next,
+            repeated_acks: 0,
+            to_peer: Link::new(34),
+            to_stack: Link::new(20),
+        })
+    }
+
+    /// Send one segment at a sequence number of the caller's choosing, which
+    /// is what puts a stream out of order or repeats a segment already sent.
+    fn send(&mut self, sequence: u32, flags: u8, payload: &[u8]) {
+        let body = segment(
+            self.port,
+            self.server_port,
+            sequence,
+            self.receive_next,
+            flags,
+            self.window,
+            &[],
+            payload,
+            PEER_IP,
+            OUR_IP,
+        );
+        let packet = datagram(0x4242, ip::PROTO_TCP, PEER_IP, OUR_IP, &body);
+        for arriving in self.to_stack.carry(packet) {
+            deliver(ether::ETHERTYPE_IPV4, &arriving);
+        }
+    }
+
+    /// Send the next bytes of the peer's own stream.
+    fn write(&mut self, payload: &[u8]) {
+        let sequence = self.send_next;
+        self.send_next = self.send_next.wrapping_add(payload.len() as u32);
+        self.send(sequence, tcp::PSH | tcp::ACK, payload);
+    }
+
+    fn ack(&mut self) {
+        if self.receive_next == self.last_ack {
+            self.repeated_acks += 1;
+        }
+        self.last_ack = self.receive_next;
+        let sequence = self.send_next;
+        self.send(sequence, tcp::ACK, &[]);
+    }
+
+    /// Take one segment the stack sent. True when an acknowledgement is owed
+    /// for it.
+    fn absorb(&mut self, frame: &[u8]) -> bool {
+        let Some((_, datagram)) = ip::parse(&frame[14..]) else { return false };
+        let pseudo = ip::pseudo_sum(OUR_IP, PEER_IP, ip::PROTO_TCP, datagram.len());
+        if ip::fold(ip::sum(datagram, pseudo)) != 0 {
+            // Damaged on the way: nothing here can be believed, so the peer
+            // behaves as if it never arrived.
+            return false;
+        }
+        let Some(parsed) = tcp::Segment::parse(datagram) else { return false };
+        let mut owed = false;
+        if !parsed.payload.is_empty() {
+            owed = true;
+            self.take(parsed.sequence, parsed.payload);
+        }
+        if parsed.flags & tcp::FIN != 0 {
+            owed = true;
+            let finish = parsed.sequence.wrapping_add(parsed.payload.len() as u32);
+            if finish == self.receive_next && !self.fin_seen {
+                self.fin_seen = true;
+                self.receive_next = self.receive_next.wrapping_add(1);
+            }
+        }
+        owed
+    }
+
+    /// Put one segment's bytes where they belong in the peer's own stream.
+    fn take(&mut self, sequence: u32, payload: &[u8]) {
+        let mut sequence = sequence;
+        let mut payload = payload;
+        if tcp::seq_lt(sequence, self.receive_next) {
+            let skip = self.receive_next.wrapping_sub(sequence) as usize;
+            if skip >= payload.len() {
+                return;
+            }
+            payload = &payload[skip..];
+            sequence = self.receive_next;
+        }
+        if sequence != self.receive_next {
+            self.early.push((sequence, payload.to_vec()));
+            return;
+        }
+        self.stream.extend_from_slice(payload);
+        self.receive_next = self.receive_next.wrapping_add(payload.len() as u32);
+        // Whatever arrived early and now follows on.
+        while let Some(index) = self.early.iter().position(|(start, data)| {
+            tcp::seq_le(*start, self.receive_next)
+                && tcp::seq_gt(start.wrapping_add(data.len() as u32), self.receive_next)
+        }) {
+            let (start, data) = self.early.remove(index);
+            let skip = self.receive_next.wrapping_sub(start) as usize;
+            self.stream.extend_from_slice(&data[skip..]);
+            self.receive_next = self.receive_next.wrapping_add((data.len() - skip) as u32);
+        }
+    }
+
+    /// Let the stack say everything it has to say, answering each segment as
+    /// it arrives. Returns how many segments reached the peer.
+    fn pump(&mut self) -> usize {
+        let mut seen = 0;
+        for _ in 0..512 {
+            let sent = self.nic.take();
+            if sent.is_empty() {
+                break;
+            }
+            for frame in sent {
+                for arriving in self.to_peer.carry(frame) {
+                    seen += 1;
+                    if self.absorb(&arriving) {
+                        self.ack();
+                    }
+                }
+            }
+        }
+        seen
+    }
+
+    fn finish(self) {
+        socket::close(&self.socket);
+        socket::close(&self.listener);
+        self.nic.take();
+    }
+}
+
+/// The number a segment this stack sent acknowledges.
+fn ack_number(frame: &[u8]) -> Option<u32> {
+    Some(ack_and_window(frame)?.0)
+}
+
+/// That, and the window it offers alongside it.
+fn ack_and_window(frame: &[u8]) -> Option<(u32, u16)> {
+    let (_, datagram) = ip::parse(&frame[14..])?;
+    let parsed = tcp::Segment::parse(datagram)?;
+    Some((parsed.acknowledgement, parsed.window))
+}
+
+/// Write a whole stream out through a socket, letting the peer answer each
+/// segment, and moving the clock on whenever nothing else can move. Returns
+/// how many times the clock was what moved it.
+fn transfer(peer: &mut Peer, body: &[u8]) -> usize {
+    let mut offset = 0;
+    let mut timeouts = 0;
+    for _ in 0..8192 {
+        while offset < body.len() {
+            match peer.socket.send(&body[offset..], None) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => offset += n,
+            }
+        }
+        if peer.pump() > 0 {
+            continue;
+        }
+        if offset >= body.len() && peer.stream.len() >= body.len() {
+            break;
+        }
+        // Nothing arrived and nothing can arrive: what is left is the clock.
+        let deadline = deadline_of(&peer.socket);
+        if deadline == u64::MAX {
+            break;
+        }
+        fire_timer(&peer.socket, deadline);
+        timeouts += 1;
+    }
+    timeouts
+}
+
+/// What the link can do that a real one cannot be asked for: deliver a
+/// segment twice, damage one, and lose a chosen one out of a long stream.
+fn lossy_link(report: &mut Report, nic: &'static FakeNic) {
+    const SERVER_PORT: u16 = 8085;
+
+    // ---- a segment delivered twice ----
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40500, 11_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    peer.to_stack.script(&[Fate::Twice]);
+    peer.write(b"twelve bytes");
+    report.check(
+        "a segment delivered twice is taken once",
+        received_len_of(&peer.socket) == 12,
+    );
+    let sent = nic.take();
+    let acks: Vec<u32> = sent.iter().filter_map(|frame| ack_number(frame)).collect();
+    report.check(
+        "and each copy is acknowledged in the same place",
+        acks.len() == 2 && acks[0] == acks[1],
+    );
+    peer.finish();
+
+    // ---- a segment damaged on the way ----
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40501, 12_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    peer.to_stack.script(&[Fate::Corrupt]);
+    let sequence = peer.send_next;
+    peer.send(sequence, tcp::PSH | tcp::ACK, b"damaged");
+    report.check(
+        "a damaged segment is neither taken nor answered",
+        received_len_of(&peer.socket) == 0 && nic.take().is_empty(),
+    );
+    peer.to_stack.script(&[]);
+    peer.send(sequence, tcp::PSH | tcp::ACK, b"damaged");
+    report.check(
+        "and the same segment again is taken",
+        received_len_of(&peer.socket) == 7,
+    );
+    peer.finish();
+
+    // ---- a long transfer over a link that loses segments ----
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40502, 13_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    // One in seven of what this stack sends, for as far ahead as the stream
+    // reaches, so several separate losses have to be recovered from.
+    let fates: Vec<Fate> = (0..96)
+        .map(|i| if i % 7 == 6 { Fate::Lose } else { Fate::Pass })
+        .collect();
+    peer.to_peer.script(&fates);
+    let body: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+    let timeouts = transfer(&mut peer, &body);
+    report.check(
+        "a transfer over a link that loses segments arrives whole",
+        peer.stream == body,
+    );
+    report.check("with several segments lost on the way", peer.to_peer.lost >= 9);
+    report.check(
+        "and fewer waits on the clock than there were losses",
+        timeouts < peer.to_peer.lost,
+    );
+    peer.finish();
+    socket::reset();
+    nic.take();
 }
 
 fn fin_received_of(socket: &Arc<InetSocket>) -> bool {
@@ -1179,6 +1571,416 @@ fn abandoned_connection(report: &mut Report, nic: &FakeNic) {
         "which holds nothing and takes nothing more",
         received_len_of(&connection.socket) == 0 && read_shutdown_of(&connection.socket),
     );
+    socket::reset();
+    nic.take();
+}
+
+fn held_runs_of(socket: &Arc<InetSocket>) -> usize {
+    match &*socket.inner.lock() {
+        Protocol::Tcp(tcb) => tcb.held_runs(),
+        Protocol::Udp(_) => 0,
+    }
+}
+
+/// A segment that arrives before the bytes in front of it is held until they
+/// come, and what is held is bounded in every direction someone could push on
+/// it.
+fn reassembly(report: &mut Report, nic: &'static FakeNic) {
+    const SERVER_PORT: u16 = 8086;
+    let first_half = b"1234567890";
+    let second_half = b"abcdefghij";
+
+    // ---- two segments the wrong way round ----
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40600, 14_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    let first = peer.send_next;
+    let second = first.wrapping_add(first_half.len() as u32);
+    peer.send(second, tcp::PSH | tcp::ACK, second_half);
+    report.check(
+        "a segment that arrives early is not delivered yet",
+        received_len_of(&peer.socket) == 0,
+    );
+    let sent = nic.take();
+    report.check(
+        "but is held rather than thrown away",
+        tcp::held_bytes() == second_half.len(),
+    );
+    report.check(
+        "and the answer still names the byte that is missing",
+        sent.len() == 1 && ack_number(&sent[0]) == Some(first),
+    );
+
+    peer.send(first, tcp::PSH | tcp::ACK, first_half);
+    let sent = nic.take();
+    report.check(
+        "filling the gap acknowledges both segments at once",
+        sent.len() == 1 && ack_number(&sent[0]) == Some(second + second_half.len() as u32),
+    );
+    report.check("and nothing is held any more", tcp::held_bytes() == 0);
+    let mut buf = [0u8; 64];
+    match peer.socket.receive_into(&mut buf, false) {
+        Ok((n, _)) => report.bytes(
+            "the stream reads in order",
+            &buf[..n],
+            b"1234567890abcdefghij",
+        ),
+        Err(_) => report.check("the stream reads in order", false),
+    }
+    report.check(
+        "and the other end was never asked for anything twice",
+        peer.to_stack.carried == 2,
+    );
+    peer.finish();
+
+    // ---- a finish that arrives before the last of the data ----
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40601, 15_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    let first = peer.send_next;
+    let second = first.wrapping_add(first_half.len() as u32);
+    peer.send(second, tcp::FIN | tcp::PSH | tcp::ACK, second_half);
+    report.check(
+        "a finish behind a gap is not the end of the stream yet",
+        !fin_received_of(&peer.socket)
+            && state_of(&peer.socket) == tcp::State::Established,
+    );
+    nic.take();
+    peer.send(first, tcp::PSH | tcp::ACK, first_half);
+    report.check(
+        "and is taken when the gap fills",
+        fin_received_of(&peer.socket)
+            && state_of(&peer.socket) == tcp::State::CloseWait,
+    );
+    let sent = nic.take();
+    report.check(
+        "acknowledged past the last byte and the finish",
+        sent.len() == 1
+            && ack_number(&sent[0]) == Some(second + second_half.len() as u32 + 1),
+    );
+    peer.finish();
+
+    // ---- a stream with one segment held back on the way ----
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40604, 18_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    peer.to_stack.script(&[Fate::Pass, Fate::Pass, Fate::Late, Fate::Pass, Fate::Pass]);
+    let block: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+    for chunk in block.chunks(400) {
+        peer.write(chunk);
+    }
+    let mut arrived = Vec::new();
+    let mut buf = [0u8; 2048];
+    while let Ok((n, _)) = peer.socket.receive_into(&mut buf, false) {
+        if n == 0 {
+            break;
+        }
+        arrived.extend_from_slice(&buf[..n]);
+    }
+    report.check(
+        "a stream with one segment delivered late still reads in order",
+        arrived == block,
+    );
+    report.check(
+        "and costs the other end nothing to send again",
+        peer.to_stack.carried == 5,
+    );
+    peer.finish();
+
+    // ---- a gap that never fills ----
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40602, 16_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    let payload = [0x77u8; 1400];
+    peer.send(peer.send_next.wrapping_add(10), tcp::PSH | tcp::ACK, &payload);
+    nic.take();
+    report.check("what arrived early is held", tcp::held_bytes() == payload.len());
+    let deadline = deadline_of(&peer.socket);
+    report.check("and there is a deadline to give it up at", deadline != u64::MAX);
+    fire_timer(&peer.socket, deadline);
+    report.check("which lets it go", tcp::held_bytes() == 0);
+    report.check(
+        "and leaves the connection up",
+        state_of(&peer.socket) == tcp::State::Established,
+    );
+    peer.finish();
+
+    // ---- one connection, a gap in front of every byte ----
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40603, 17_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    let base = peer.send_next;
+    for i in 1..64u32 {
+        peer.send(base.wrapping_add(i * 2), tcp::PSH | tcp::ACK, b"x");
+    }
+    nic.take();
+    report.check(
+        "a gap in front of every byte holds only so many runs",
+        held_runs_of(&peer.socket) <= 16 && tcp::held_bytes() <= 16,
+    );
+    peer.finish();
+
+    // ---- one segment held on each of many connections ----
+    socket::reset();
+    let listener = InetSocket::new(true);
+    if listener.bind(Endpoint::new(Ipv4Addr::UNSPECIFIED, SERVER_PORT)).is_err()
+        || listener.listen(4).is_err()
+    {
+        report.check("a listening socket", false);
+        return;
+    }
+    nic.take();
+    const CONNECTIONS: u32 = 128;
+    let mut sockets: Vec<Arc<InetSocket>> = Vec::new();
+    let early = [0x5Au8; tcp::MSS];
+    for i in 0..CONNECTIONS {
+        let client_port = 41000 + i as u16;
+        let client_iss = 20_000_000 + i * 100_000;
+        deliver_ip(
+            ip::PROTO_TCP,
+            &segment(
+                client_port, SERVER_PORT, client_iss, 0, tcp::SYN, 64240, &[], &[], PEER_IP,
+                OUR_IP,
+            ),
+        );
+        let sent = nic.take();
+        let Some(answer) = sent.first().and_then(|frame| tcp::Segment::parse(&frame[34..]))
+        else {
+            break;
+        };
+        let server_next = answer.sequence.wrapping_add(1);
+        deliver_ip(
+            ip::PROTO_TCP,
+            &segment(
+                client_port,
+                SERVER_PORT,
+                client_iss.wrapping_add(1),
+                server_next,
+                tcp::ACK,
+                64240,
+                &[],
+                &[],
+                PEER_IP,
+                OUR_IP,
+            ),
+        );
+        nic.take();
+        let Ok(Some(socket)) = listener.accept_ready() else { break };
+        // A segment one whole segment past what this connection wants next,
+        // and nothing to fill the gap it leaves.
+        deliver_ip(
+            ip::PROTO_TCP,
+            &segment(
+                client_port,
+                SERVER_PORT,
+                client_iss.wrapping_add(1 + tcp::MSS as u32),
+                server_next,
+                tcp::PSH | tcp::ACK,
+                64240,
+                &[],
+                &early,
+                PEER_IP,
+                OUR_IP,
+            ),
+        );
+        nic.take();
+        sockets.push(socket);
+    }
+    report.check("a connection each for all of them", sockets.len() == CONNECTIONS as usize);
+    report.check(
+        "what every connection together holds is bounded",
+        tcp::held_bytes() <= tcp::REASSEMBLY_LIMIT
+            && tcp::held_bytes() + tcp::MSS > tcp::REASSEMBLY_LIMIT,
+    );
+    socket::reset();
+    drop(sockets);
+    report.check("and letting them go gives all of it back", tcp::held_bytes() == 0);
+    socket::close(&listener);
+    socket::reset();
+    nic.take();
+}
+
+fn rto_of(socket: &Arc<InetSocket>) -> u64 {
+    match &*socket.inner.lock() {
+        Protocol::Tcp(tcb) => tcb.retransmit_timeout(),
+        Protocol::Udp(_) => 0,
+    }
+}
+
+fn srtt_of(socket: &Arc<InetSocket>) -> u32 {
+    match &*socket.inner.lock() {
+        Protocol::Tcp(tcb) => tcb.smoothed_round_trip(),
+        Protocol::Udp(_) => 0,
+    }
+}
+
+/// The retransmission timeout comes from a measured round trip, and a segment
+/// that was sent twice is not measured.
+fn round_trip_estimate(report: &mut Report, nic: &'static FakeNic) {
+    const SERVER_PORT: u16 = 8087;
+
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40700, 19_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    // The handshake is itself a round trip: the answer to the connection
+    // request was timed and the acknowledgement that completed it measured.
+    report.check("the handshake measures a round trip", srtt_of(&peer.socket) != 0);
+    let measured = rto_of(&peer.socket);
+    report.check(
+        "and the timeout comes from that rather than from the opening guess",
+        (20..100).contains(&measured),
+    );
+
+    // ---- a segment lost, and the one sent in its place ----
+    peer.to_peer.script(&[Fate::Lose]);
+    let _ = peer.socket.send(b"lost on the way", None);
+    peer.pump();
+    report.check("a segment the link ate reaches nobody", peer.stream.is_empty());
+
+    let deadline = deadline_of(&peer.socket);
+    fire_timer(&peer.socket, deadline);
+    let backed_off = rto_of(&peer.socket);
+    report.check("the timeout doubles when one runs out", backed_off == measured * 2);
+    peer.pump();
+    report.check("what was sent again does arrive", peer.stream == b"lost on the way");
+    // Karn: the acknowledgement does not say which copy it answers, so the
+    // time to it is either the round trip or the round trip plus a timeout.
+    report.check(
+        "but says nothing about the round trip, so the timeout stays doubled",
+        rto_of(&peer.socket) == backed_off,
+    );
+
+    // ---- and one that went out once ----
+    let _ = peer.socket.send(b"sent once", None);
+    peer.pump();
+    report.check(
+        "a segment sent once brings the timeout back down",
+        rto_of(&peer.socket) < backed_off,
+    );
+    peer.finish();
+    socket::reset();
+    nic.take();
+}
+
+fn fast_retransmits_of(socket: &Arc<InetSocket>) -> u32 {
+    match &*socket.inner.lock() {
+        Protocol::Tcp(tcb) => tcb.fast_retransmits,
+        Protocol::Udp(_) => 0,
+    }
+}
+
+fn timeouts_of(socket: &Arc<InetSocket>) -> u32 {
+    match &*socket.inner.lock() {
+        Protocol::Tcp(tcb) => tcb.timeouts,
+        Protocol::Udp(_) => 0,
+    }
+}
+
+fn slow_start_threshold_of(socket: &Arc<InetSocket>) -> u32 {
+    match &*socket.inner.lock() {
+        Protocol::Tcp(tcb) => tcb.slow_start_threshold(),
+        Protocol::Udp(_) => 0,
+    }
+}
+
+/// A segment lost out of the middle of a stream is sent again on the third
+/// acknowledgement that says the same thing, without waiting out a timeout.
+fn fast_retransmit(report: &mut Report, nic: &'static FakeNic) {
+    const SERVER_PORT: u16 = 8088;
+
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40800, 21_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    // Far enough into the stream that several segments are in flight behind
+    // the one that goes missing, which is what produces the repeated
+    // acknowledgements at all.
+    let mut fates = [Fate::Pass; 9];
+    fates[8] = Fate::Lose;
+    peer.to_peer.script(&fates);
+    let opened = slow_start_threshold_of(&peer.socket);
+    let body: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
+    let waits = transfer(&mut peer, &body);
+
+    report.check("the stream arrives whole", peer.stream == body);
+    report.check(
+        "after the other end said the same thing three times or more",
+        peer.repeated_acks >= 3,
+    );
+    report.check(
+        "the missing segment was sent again on that",
+        fast_retransmits_of(&peer.socket) >= 1,
+    );
+    report.check(
+        "and the clock was never waited out",
+        waits == 0 && timeouts_of(&peer.socket) == 0,
+    );
+    // A machine that retransmits quickly and sends just as much as before is
+    // worse on a congested link than one that does neither.
+    report.check(
+        "and the point it stops opening the window at came down with it",
+        slow_start_threshold_of(&peer.socket) < opened,
+    );
+    peer.finish();
+
+    // ---- what the other end tests before it believes a repeat ----
+    //
+    // The other end counts an acknowledgement as a repeat only if the window
+    // it offers has not changed; one that has changed is a window update. A
+    // window that moved every time the program read a byte, in between the
+    // repeats, left the other end waiting out its own timeout for every
+    // segment it lost.
+    socket::reset();
+    let Some(mut peer) = Peer::open(nic, SERVER_PORT, 40801, 22_000_000) else {
+        report.check("a connection to drive", false);
+        return;
+    };
+    let block = [0x33u8; 1460];
+    for _ in 0..3 {
+        peer.write(&block);
+    }
+    nic.take();
+    let hole = peer.send_next;
+    peer.send_next = peer.send_next.wrapping_add(block.len() as u32);
+    let mut repeats: Vec<(u32, u16)> = Vec::new();
+    for i in 0..4u32 {
+        peer.send(
+            hole.wrapping_add((i + 1) * block.len() as u32),
+            tcp::PSH | tcp::ACK,
+            &block,
+        );
+        // The program takes some of what arrived before the gap, which is
+        // what used to move the window between one repeat and the next.
+        let mut buf = [0u8; 1024];
+        let _ = peer.socket.receive_into(&mut buf, false);
+        for frame in nic.take() {
+            if let Some(pair) = ack_and_window(&frame) {
+                repeats.push(pair);
+            }
+        }
+    }
+    report.check(
+        "an acknowledgement repeated while a gap waits names the same byte",
+        repeats.len() >= 4 && repeats.iter().all(|(ack, _)| *ack == hole),
+    );
+    report.check(
+        "and offers the same window, which is what makes it count as a repeat",
+        repeats.windows(2).all(|pair| pair[0].1 == pair[1].1),
+    );
+    peer.finish();
     socket::reset();
     nic.take();
 }

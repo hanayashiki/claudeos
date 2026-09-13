@@ -43,6 +43,10 @@ struct BootOptions {
     /// checks instead of booting.
     net: net::Config,
     net_test: bool,
+    /// Throw one frame in this many away in each direction, so what the
+    /// protocols do about loss can be seen on the real card path. Zero is
+    /// off, and it is zero unless the command line says otherwise.
+    net_loss: u32,
     args: Vec<String>,
 }
 
@@ -53,6 +57,7 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
         nettest: false,
         net: net::Config::QEMU_USER,
         net_test: false,
+        net_loss: 0,
         args: Vec::new(),
     };
     for word in cmdline.split_whitespace() {
@@ -70,6 +75,8 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
             // The protocols against a card that only records what it is
             // asked to send, in place of booting anything.
             options.net_test = value == "test";
+        } else if let Some(value) = word.strip_prefix("netloss=") {
+            options.net_loss = value.parse().unwrap_or(0);
         } else if let Some(value) = word.strip_prefix("ip=") {
             if let Some(address) = net::ip::parse_address(value) {
                 options.net.address = address;
@@ -154,6 +161,10 @@ pub fn start(boot: &boot::BootInfo) -> ! {
     // The protocol stack takes its addresses from here rather than naming any
     // of its own; a driver that attaches later does not change them.
     net::configure(options.net);
+    if options.net_loss != 0 {
+        net::set_loss(options.net_loss);
+        println!("net: losing one frame in {} in each direction", options.net_loss);
+    }
     println!(
         "net: {} netmask {} gateway {}",
         options.net.address, options.net.netmask, options.net.gateway

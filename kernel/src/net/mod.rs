@@ -100,8 +100,42 @@ pub fn interface() -> Option<&'static dyn Interface> {
     *INTERFACE.lock()
 }
 
+/// One frame in this many is thrown away in each direction. Zero is off,
+/// which is what it is unless `netloss=` says otherwise on the command line.
+///
+/// This is here because there is nowhere else to put it. QEMU's user mode
+/// network cannot be asked to lose a packet: its netfilters can delay, dump,
+/// mirror, redirect and rewrite, and none of them drops one. So the link this
+/// kernel sees is made lossy at the seam every driver sends and receives
+/// through, which leaves everything below it -- the card, its rings, its
+/// interrupt -- doing exactly what it does on a link that loses nothing.
+static LOSS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static ARRIVED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+pub fn set_loss(one_in: u32) {
+    LOSS.store(one_in, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this frame is one of the ones that goes missing. Counted rather
+/// than drawn at random, so a run loses the same frames as the run before it
+/// and a failure can be looked at twice.
+fn lost(counter: &core::sync::atomic::AtomicU32) -> bool {
+    use core::sync::atomic::Ordering;
+    let one_in = LOSS.load(Ordering::Relaxed);
+    if one_in == 0 {
+        return false;
+    }
+    counter.fetch_add(1, Ordering::Relaxed) % one_in == one_in - 1
+}
+
 /// Send one frame, if there is a card to send it through.
 pub fn transmit(frame: &[u8]) -> Result<(), Errno> {
+    if lost(&SENT) {
+        // As far as everything above here is concerned it went out, because
+        // a frame the link loses is one that went out.
+        return Ok(());
+    }
     match interface() {
         Some(nic) => nic.transmit(frame),
         None => Err(Errno::ENODEV),
@@ -233,6 +267,12 @@ pub fn poll() {
 
 /// One received Ethernet frame.
 pub fn receive(frame: &[u8]) {
+    if lost(&ARRIVED) {
+        // Gone, and nothing above is told. Time has still passed, and the
+        // timers are what recovers from this.
+        tick();
+        return;
+    }
     let Some(parsed) = ether::Frame::parse(frame) else { return };
     // The card may be in promiscuous mode, and a hub or a bridge will hand
     // over frames addressed elsewhere. Only ours and the broadcasts count.

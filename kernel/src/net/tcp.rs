@@ -6,27 +6,45 @@
 //! acknowledges what it takes, retransmits what is not acknowledged, and
 //! closes in order with the wait state at the end. An active open is here too.
 //!
-//! What is not here, all of which only matters on a link that loses or
-//! reorders packets:
+//! A segment that arrives before the bytes in front of it is held until they
+//! come, so one packet taking a different route costs nothing. What is held
+//! is bounded three ways: by the receive window, which every held byte lies
+//! inside; by a count of separate runs, so a gap in front of every byte is
+//! not a gap in front of every byte's allocation; and by a count every
+//! connection shares, so a thousand connections each holding one segment hold
+//! no more between them than one does at full stretch. A gap that never fills
+//! is given up on after thirty seconds and what was held behind it released.
 //!
-//!   * No reassembly queue. A segment that arrives out of order is dropped and
-//!     the acknowledgement repeats what is still wanted, so the sender has to
-//!     send everything from that point again.
-//!   * Loss recovery is the retransmission timer alone. There is no duplicate
-//!     acknowledgement count, no fast retransmit, no fast recovery, and no
-//!     selective acknowledgement, so one lost segment costs a whole timeout
-//!     and a go-back-N retransmission.
-//!   * The retransmission timeout is a fixed starting value doubled on each
-//!     loss. Round trip time is never measured, so there is no Karn or
-//!     Jacobson estimator behind it.
-//!   * Congestion control is slow start and the textbook congestion avoidance
-//!     increment, reset to one segment on every timeout. Without duplicate
-//!     acknowledgements there is nothing else it could react to.
-//!   * No Nagle, no delayed acknowledgement, no window scaling, no timestamps
-//!     and so no protection against wrapped sequence numbers.
+//! The retransmission timeout comes from RFC 6298's estimator: one segment at
+//! a time is timed from the moment it goes out to the acknowledgement that
+//! covers it, and the smoothed average and variation of those samples are
+//! what the timeout is built from. Karn's rule decides what may be sampled --
+//! a segment sent twice is not, because its acknowledgement does not say
+//! which copy it answers -- and a timeout doubles the timeout and leaves it
+//! doubled until a segment that went out once is acknowledged.
 //!
-//! On a quiet link -- which is what QEMU's user mode network is -- none of
-//! that shows. On a lossy one it would be slow rather than wrong.
+//! A segment lost out of the middle of a stream is not waited out. Three
+//! acknowledgements naming the same byte mean the segments behind that one
+//! arrived, so it alone is sent again and the ones behind it are not. RFC
+//! 6582's partial acknowledgement handling covers a second loss inside the
+//! same window without leaving recovery. The congestion response goes with
+//! it: the threshold halves and the window comes down to it, because
+//! retransmitting quickly and sending just as much as before is worse on a
+//! congested link than doing neither.
+//!
+//! What is not here:
+//!
+//!   * No selective acknowledgement. A lost segment is found by the
+//!     acknowledgements repeating, one loss per round trip, rather than by
+//!     the other end naming what it has; on a link that loses several
+//!     segments out of one window that is slower, and it is still correct.
+//!   * No window scaling, so the window is bounded at 64 KiB, which bounds
+//!     throughput on a link whose delay and bandwidth multiply out past that.
+//!   * No timestamps, and so no protection against wrapped sequence numbers,
+//!     and one round trip sample in flight at a time rather than one per
+//!     segment.
+//!   * No Nagle and no delayed acknowledgement: every segment is sent as soon
+//!     as there is a window for it and answered as soon as it arrives.
 
 use super::ip::{self, Ipv4Addr};
 use super::socket::{self, Endpoint, InetSocket, Protocol};
@@ -34,6 +52,7 @@ use crate::abi::Errno;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const FIN: u8 = 0x01;
 pub const SYN: u8 = 0x02;
@@ -49,13 +68,33 @@ pub const MSS: usize = 1460;
 /// The smallest maximum segment size a peer is allowed to insist on.
 const MIN_MSS: usize = 536;
 /// Bytes a connection will hold in each direction.
-pub const RECEIVE_WINDOW: usize = 32 * 1024;
-pub const SEND_BUFFER: usize = 32 * 1024;
+///
+/// The window field is sixteen bits and there is no window scaling here, so
+/// this is as much as can ever be offered, and offering it is what keeps
+/// enough segments in flight for a lost one to be found by the
+/// acknowledgements repeating rather than by the clock. Half of it, which is
+/// what this was, collapsed to three or four segments whenever the program
+/// reading was behind, and three or four segments in flight cannot produce
+/// the three repeats that find a loss.
+pub const RECEIVE_WINDOW: usize = 65535;
+pub const SEND_BUFFER: usize = 64 * 1024;
 
 /// Timer values, in timer ticks. The tick is ten milliseconds.
-const INITIAL_RTO: u64 = 50;
+///
+/// RFC 6298 2.1: one second, until a round trip has actually been measured.
+const INITIAL_RTO: u64 = 100;
+/// RFC 6298 2.4 puts the floor at one second. Linux uses a fifth of that and
+/// so does this: what the floor is for is keeping the timeout clear of the
+/// clock's own granularity, not waiting out a second on a link whose round
+/// trip is measured in microseconds.
+const MIN_RTO: u64 = 20;
 const MAX_RTO: u64 = 600;
 const MAX_RETRIES: u32 = 8;
+/// RFC 5681: acknowledgements naming the same byte that mean the segment for
+/// it was lost rather than that two arrived in the wrong order. Fewer would
+/// fire on ordinary reordering, which costs a retransmission that was never
+/// needed; more waits longer than the segments behind the gap take to arrive.
+const DUPLICATE_ACK_THRESHOLD: u32 = 3;
 const SYN_RETRIES: u32 = 5;
 /// Twice the maximum segment lifetime. A real stack waits sixty seconds; this
 /// waits ten, because nothing here runs long enough for a segment from an old
@@ -66,6 +105,36 @@ const TIME_WAIT_TICKS: u64 = 1000;
 /// is sixty seconds; without a bound a peer that acknowledges the finish and
 /// then says nothing keeps the record, and everything it holds, until reboot.
 const FIN_WAIT_2_TICKS: u64 = 6000;
+/// How long a gap in the stream is waited on. The other end retransmits what
+/// is missing long before this; what the bound is for is the other end that
+/// leaves a gap and then says nothing, which would otherwise hold what came
+/// after it until the machine rebooted.
+const REASSEMBLY_TICKS: u64 = 3000;
+
+/// Separate runs of bytes one connection will hold past a gap.
+///
+/// What one connection holds is already bounded by the receive window, since
+/// every byte held lies inside it. The number of runs is not: a peer that
+/// sends every other byte leaves a gap in front of each one, and sixteen
+/// thousand allocations for thirty-two kilobytes is not a trade worth making.
+/// Past this the run furthest ahead is dropped, which costs whoever sent it a
+/// retransmission.
+const MAX_HELD_RUNS: usize = 16;
+
+/// Bytes held past a gap across every connection at once.
+///
+/// A window's worth each is bounded per connection and unbounded in total:
+/// somebody who opens a thousand connections and leaves a gap in each holds
+/// as much as they care to. Past this a segment that arrives early is dropped
+/// rather than held, which costs its sender a retransmission and costs this
+/// machine nothing.
+pub const REASSEMBLY_LIMIT: usize = 128 * 1024;
+static HELD_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Bytes every connection together is holding past a gap.
+pub fn held_bytes() -> usize {
+    HELD_BYTES.load(Ordering::Relaxed)
+}
 
 #[inline]
 pub fn seq_lt(a: u32, b: u32) -> bool {
@@ -307,6 +376,18 @@ fn initial_sequence(local: Endpoint, remote: Endpoint) -> u32 {
 
 // ---- the transmission control block --------------------------------------
 
+/// A run of bytes that arrived before the bytes in front of it.
+struct Held {
+    sequence: u32,
+    data: Vec<u8>,
+}
+
+impl Held {
+    fn end(&self) -> u32 {
+        self.sequence.wrapping_add(self.data.len() as u32)
+    }
+}
+
 pub struct Tcb {
     pub state: State,
     pub local: Endpoint,
@@ -316,12 +397,37 @@ pub struct Tcb {
     pub iss: u32,
     pub send_unacknowledged: u32,
     pub send_next: u32,
+    /// The highest sequence number this end has ever sent. `send_next` goes
+    /// back to the first unacknowledged byte when the timer retransmits, so
+    /// it is not what says whether an acknowledgement names something that
+    /// was sent: an acknowledgement for what went out before the timer moved
+    /// the pointer back is perfectly ordinary, and rejecting it deadlocks the
+    /// connection until it times out altogether.
+    pub send_high: u32,
     pub send_window: u32,
     window_sequence: u32,
     window_ack: u32,
 
     pub irs: u32,
     pub receive_next: u32,
+    /// The right edge of the window this end has offered: the first sequence
+    /// number it has not promised room for.
+    receive_high: u32,
+    /// Runs of bytes that arrived before the bytes in front of them, in order
+    /// and with the ones that touch joined. Acknowledging only what is
+    /// contiguous is what tells the other end which segment to send again;
+    /// holding the rest is what keeps that one segment from costing every
+    /// segment behind it as well.
+    out_of_order: Vec<Held>,
+    /// Bytes in `out_of_order`, which is also this connection's share of the
+    /// count every connection shares.
+    held: usize,
+    /// The other end's finish, when it arrived past a gap. It is one sequence
+    /// number rather than a run, and it is taken when the gap fills.
+    held_fin: Option<u32>,
+    /// Tick at which what is held is let go because the gap never filled.
+    /// Zero is off.
+    reassembly_expire_at: u64,
 
     /// Everything from `send_unacknowledged` onwards: what has been sent and
     /// not acknowledged, followed by what has not been sent.
@@ -346,6 +452,22 @@ pub struct Tcb {
     /// Tick at which the unacknowledged data is sent again. Zero is off.
     pub retransmit_at: u64,
     rto: u64,
+    /// RFC 6298's estimator, in microseconds: the smoothed round trip time
+    /// and how much it varies. Zero says nothing has been measured yet, and
+    /// the timeout is still the opening guess.
+    srtt: u32,
+    rttvar: u32,
+    /// The segment being timed: the sequence number just past it, and the
+    /// clock when it went out.
+    ///
+    /// Karn's rule is what the `None` is for. An acknowledgement of a segment
+    /// that was sent twice does not say which copy it answers, so the time
+    /// from either one to it is not a round trip: it is either the real one
+    /// or the real one plus a whole timeout, and there is no way to tell.
+    /// Every retransmission clears this, so the next sample comes from a
+    /// segment that went out once.
+    timed: Option<u32>,
+    timed_at: u64,
     retries: u32,
     /// Tick at which a state that waits on a clock rather than on the other
     /// end gives up: TIME-WAIT's two segment lifetimes, and the bound on
@@ -354,6 +476,19 @@ pub struct Tcb {
 
     congestion_window: u32,
     slow_start_threshold: u32,
+    /// Acknowledgements that named the byte the one before named.
+    duplicate_acks: u32,
+    /// While recovering from a loss the duplicate acknowledgements found:
+    /// the highest sequence number that had been sent when it was found.
+    /// RFC 6582's `recover`. Recovery ends when everything up to it has been
+    /// acknowledged, and a gap found before then belongs to the same loss
+    /// rather than to a new one.
+    recover: Option<u32>,
+    /// Segments sent again because three acknowledgements said the same
+    /// thing, and segments sent again because the clock ran out. Counted so
+    /// the suite can say which of the two recovered a loss.
+    pub fast_retransmits: u32,
+    pub timeouts: u32,
 
     pub backlog: usize,
     pub children: Vec<Arc<InetSocket>>,
@@ -369,11 +504,17 @@ impl Tcb {
             iss: 0,
             send_unacknowledged: 0,
             send_next: 0,
+            send_high: 0,
             send_window: MSS as u32,
             window_sequence: 0,
             window_ack: 0,
             irs: 0,
             receive_next: 0,
+            receive_high: 0,
+            out_of_order: Vec::new(),
+            held: 0,
+            held_fin: None,
+            reassembly_expire_at: 0,
             pending: VecDeque::new(),
             received: VecDeque::new(),
             fin_queued: false,
@@ -386,10 +527,18 @@ impl Tcb {
             peer_mss: MSS,
             retransmit_at: 0,
             rto: INITIAL_RTO,
+            srtt: 0,
+            rttvar: 0,
+            timed: None,
+            timed_at: 0,
             retries: 0,
             expire_at: 0,
             congestion_window: MSS as u32,
             slow_start_threshold: 64 * 1024,
+            duplicate_acks: 0,
+            recover: None,
+            fast_retransmits: 0,
+            timeouts: 0,
             backlog: 1,
             children: Vec::new(),
         }
@@ -409,11 +558,52 @@ impl Tcb {
         }
     }
 
-    /// How much more this end is prepared to receive.
+    /// How much more this end has said it is prepared to receive: the right
+    /// edge it last offered, less what it has taken since.
     fn advertised_window(&self) -> u16 {
-        RECEIVE_WINDOW
-            .saturating_sub(self.received.len())
-            .min(u16::MAX as usize) as u16
+        if seq_le(self.receive_high, self.receive_next) {
+            return 0;
+        }
+        self.receive_high
+            .wrapping_sub(self.receive_next)
+            .min(u16::MAX as u32) as u16
+    }
+
+    /// Move the right edge of the window forward.
+    ///
+    /// It never moves left, and it only moves right by a whole segment or
+    /// more, which is RFC 1122 4.2.3.3's rule against offering the other end
+    /// room a byte at a time.
+    ///
+    /// `advanced` says whether the byte wanted next has moved since the last
+    /// acknowledgement went out. When it has not -- which is every
+    /// acknowledgement repeated while a gap is waiting to be filled -- the
+    /// edge is left alone even if there is room to move it, so every one of
+    /// those acknowledgements carries the same window. The other end tests
+    /// exactly that: an acknowledgement whose window has changed is a window
+    /// update rather than a repeat, and does not count towards the three that
+    /// make it send the missing segment again. A window that moved with the
+    /// reader draining the buffer, in between the repeats, left the other end
+    /// waiting out its own timeout for every lost segment.
+    ///
+    /// A window that has closed is the exception: it has to be able to open
+    /// again whether the byte wanted next moved or not, or the other end
+    /// waits for room that is already there.
+    fn open_window(&mut self, advanced: bool) {
+        if seq_lt(self.receive_high, self.receive_next) {
+            self.receive_high = self.receive_next;
+        }
+        let free = RECEIVE_WINDOW.saturating_sub(self.received.len()) as u32;
+        let wanted = self.receive_next.wrapping_add(free);
+        let step = (MSS as u32).min((RECEIVE_WINDOW / 2) as u32);
+        if !seq_gt(wanted, self.receive_high)
+            || wanted.wrapping_sub(self.receive_high) < step
+        {
+            return;
+        }
+        if advanced || self.advertised_window() < step as u16 {
+            self.receive_high = wanted;
+        }
     }
 
     fn send_segment(&mut self, flags: u8, sequence: u32, payload: &[u8], with_mss: bool) {
@@ -445,6 +635,62 @@ impl Tcb {
         self.arm_retransmit();
     }
 
+    /// Note that everything up to `sequence` has now been put on the wire.
+    fn sent_through(&mut self, sequence: u32) {
+        self.send_next = sequence;
+        if seq_lt(self.send_high, sequence) {
+            self.send_high = sequence;
+        }
+    }
+
+    /// The timeout the estimate gives. RFC 6298 2.2: the smoothed average
+    /// plus four times its variation, never less than the clock the timer
+    /// runs on can measure, and bounded at both ends.
+    fn estimated_rto(&self) -> u64 {
+        let granularity = 1_000_000 / crate::arch::TICK_HZ;
+        let slack = self.rttvar.saturating_mul(4).max(granularity);
+        let microseconds = self.srtt.saturating_add(slack) as u64;
+        crate::time::ns_to_ticks(microseconds * 1000).clamp(MIN_RTO, MAX_RTO)
+    }
+
+    /// One round trip, measured. RFC 6298 2.2 and 2.3: the first sample is
+    /// the average outright and half of it the variation; every one after
+    /// moves each of them a fraction of the way.
+    fn measure(&mut self, microseconds: u32) {
+        let sample = microseconds.max(1);
+        if self.srtt == 0 {
+            self.srtt = sample;
+            self.rttvar = sample / 2;
+        } else {
+            let difference = self.srtt.abs_diff(sample) as u64;
+            self.rttvar = ((self.rttvar as u64 * 3 + difference) / 4) as u32;
+            self.srtt = ((self.srtt as u64 * 7 + sample as u64) / 8) as u32;
+        }
+        self.rto = self.estimated_rto();
+    }
+
+    /// Time the segment that ends at `sequence`, if nothing is being timed.
+    fn time_segment(&mut self, sequence: u32) {
+        if self.timed.is_none() {
+            self.timed = Some(sequence);
+            self.timed_at = crate::time::monotonic_ns();
+        }
+    }
+
+    /// What the timeout stands at, and what the estimate behind it is. The
+    /// suite asks; nothing else does.
+    pub fn retransmit_timeout(&self) -> u64 {
+        self.rto
+    }
+
+    pub fn smoothed_round_trip(&self) -> u32 {
+        self.srtt
+    }
+
+    pub fn slow_start_threshold(&self) -> u32 {
+        self.slow_start_threshold
+    }
+
     fn arm_retransmit(&mut self) {
         if self.retransmit_at == 0 {
             self.retransmit_at = crate::trap::ticks() + self.rto;
@@ -455,15 +701,18 @@ impl Tcb {
 
     /// Start an active open: send the first connection request.
     pub fn open(&mut self, _passive: bool) {
+        self.receive_high = self.receive_next.wrapping_add(RECEIVE_WINDOW as u32);
         self.iss = initial_sequence(self.local, self.remote);
         self.send_unacknowledged = self.iss;
         self.send_next = self.iss;
+        self.send_high = self.iss;
         self.state = State::SynSent;
         self.congestion_window = MSS as u32;
         self.rto = INITIAL_RTO;
         self.retries = 0;
         self.send_segment(SYN, self.iss, &[], true);
-        self.send_next = self.iss.wrapping_add(1);
+        self.sent_through(self.iss.wrapping_add(1));
+        self.time_segment(self.iss.wrapping_add(1));
         self.arm_retransmit();
     }
 
@@ -472,6 +721,7 @@ impl Tcb {
     fn accept_open(&mut self, segment: &Segment) {
         self.irs = segment.sequence;
         self.receive_next = segment.sequence.wrapping_add(1);
+        self.receive_high = self.receive_next.wrapping_add(RECEIVE_WINDOW as u32);
         if let Some(mss) = segment.mss {
             self.peer_mss = (mss as usize).clamp(MIN_MSS, MSS);
         }
@@ -479,7 +729,9 @@ impl Tcb {
         self.window_sequence = segment.sequence;
         self.iss = initial_sequence(self.local, self.remote);
         self.send_unacknowledged = self.iss;
-        self.send_next = self.iss.wrapping_add(1);
+        self.send_high = self.iss;
+        self.sent_through(self.iss.wrapping_add(1));
+        self.time_segment(self.iss.wrapping_add(1));
         self.window_ack = self.iss;
         self.state = State::SynReceived;
         self.congestion_window = MSS as u32;
@@ -513,7 +765,6 @@ impl Tcb {
 
     pub fn read(&mut self, buf: &mut [u8], peek: bool) -> Result<usize, Errno> {
         if !self.received.is_empty() {
-            let free_before = RECEIVE_WINDOW.saturating_sub(self.received.len());
             let n = buf.len().min(self.received.len());
             for (i, slot) in buf[..n].iter_mut().enumerate() {
                 *slot = self.received[i];
@@ -523,11 +774,12 @@ impl Tcb {
                 // A window that was closed and is now open again has to be
                 // advertised, or the other end waits for a segment that only
                 // this acknowledgement can carry.
-                let free_after = RECEIVE_WINDOW.saturating_sub(self.received.len());
-                if free_before < self.effective_mss() && free_after >= self.effective_mss() {
-                    if self.state.is_synchronised() {
-                        self.acknowledge();
-                    }
+                let offered_before = self.advertised_window();
+                self.open_window(false);
+                if offered_before < self.advertised_window()
+                    && self.state.is_synchronised()
+                {
+                    self.acknowledge();
                 }
             }
             return Ok(n);
@@ -582,6 +834,7 @@ impl Tcb {
         self.retransmit_at = 0;
         self.pending.clear();
         self.fin_queued = false;
+        self.drop_out_of_order();
     }
 
     // ---- output ----------------------------------------------------------
@@ -610,20 +863,77 @@ impl Tcb {
                 let sequence = self.send_next;
                 let last = offset + n == self.pending.len();
                 let flags = ACK | if last { PSH } else { 0 };
+                let end = sequence.wrapping_add(n as u32);
+                // Only a segment going out for the first time is worth
+                // timing: Karn again, and the retransmission path comes
+                // through here too.
+                let first_time = seq_lt(self.send_high, end);
                 self.send_segment(flags, sequence, &chunk, false);
-                self.send_next = sequence.wrapping_add(n as u32);
+                self.sent_through(end);
+                if first_time {
+                    self.time_segment(end);
+                }
                 self.arm_retransmit();
             } else if self.fin_queued && self.fin_sequence.is_none() {
                 let sequence = self.send_next;
                 self.send_segment(FIN | ACK, sequence, &[], false);
                 self.fin_sequence = Some(sequence);
-                self.send_next = sequence.wrapping_add(1);
+                self.sent_through(sequence.wrapping_add(1));
                 self.arm_retransmit();
                 break;
             } else {
                 break;
             }
         }
+    }
+
+    /// Send the first segment of what is still unacknowledged again,
+    /// without moving the point new data is sent from. This is the one
+    /// segment the duplicate acknowledgements say is missing; everything
+    /// behind it arrived, so sending that too would be sending it twice.
+    fn retransmit_head(&mut self) {
+        let n = self.pending.len().min(self.effective_mss());
+        if n == 0 {
+            // Nothing but a finish is outstanding.
+            match self.fin_sequence {
+                Some(sequence) if !self.fin_acknowledged => {
+                    self.send_segment(FIN | ACK, sequence, &[], false);
+                }
+                _ => return,
+            }
+        } else {
+            let chunk: Vec<u8> = self.pending.iter().take(n).copied().collect();
+            let flags = ACK | if n == self.pending.len() { PSH } else { 0 };
+            let sequence = self.send_unacknowledged;
+            self.send_segment(flags, sequence, &chunk, false);
+        }
+        // Karn: nothing sent twice is timed. RFC 6298 5.5: the timer starts
+        // over from the retransmission.
+        self.timed = None;
+        self.retransmit_at = crate::trap::ticks() + self.rto;
+    }
+
+    /// RFC 5681: three acknowledgements naming the same byte mean the segment
+    /// that byte is in went missing and the segments behind it arrived, which
+    /// is enough to send that one again now rather than when the clock says
+    /// so.
+    ///
+    /// The congestion response goes with it rather than being left out.
+    /// Duplicate acknowledgements mean segments were dropped somewhere, and a
+    /// machine that answers that by retransmitting quickly and sending just
+    /// as much as before is worse on a congested link than one that does
+    /// neither.
+    fn enter_recovery(&mut self) {
+        let flight = self.send_high.wrapping_sub(self.send_unacknowledged);
+        self.slow_start_threshold = (flight / 2).max(2 * MSS as u32);
+        self.recover = Some(self.send_high);
+        self.fast_retransmits += 1;
+        self.retransmit_head();
+        // Three segments have left the network since the missing one, which
+        // is what the three added here stand for.
+        self.congestion_window = self
+            .slow_start_threshold
+            .saturating_add(DUPLICATE_ACK_THRESHOLD * MSS as u32);
     }
 
     // ---- input -----------------------------------------------------------
@@ -670,6 +980,7 @@ impl Tcb {
             // The connection request again, because our answer was lost. It
             // sits one before what is wanted next, so the window test turns
             // it away, and it is still the handshake carrying on.
+            self.timed = None;
             self.send_syn_ack();
             return false;
         }
@@ -701,6 +1012,7 @@ impl Tcb {
             self.state = State::Closed;
             self.retransmit_at = 0;
             self.pending.clear();
+            self.drop_out_of_order();
             if self.error.is_none() {
                 self.error = Some(Errno::ECONNRESET);
             }
@@ -721,11 +1033,22 @@ impl Tcb {
         }
 
         let mut woke = false;
+        let wanted_before = self.receive_next;
         let acknowledgement = segment.acknowledgement;
+        // RFC 5681's duplicate acknowledgement: it carries nothing, changes
+        // nothing, names the byte already named, and there is data
+        // outstanding for it to be about. Tested before the window this
+        // segment carries is taken, because an unchanged window is one of the
+        // things that makes it a duplicate.
+        let duplicate = segment.payload.is_empty()
+            && segment.flags & (SYN | FIN) == 0
+            && acknowledgement == self.send_unacknowledged
+            && seq_lt(self.send_unacknowledged, self.send_high)
+            && segment.window as u32 == self.send_window;
 
         if self.state == State::SynReceived {
             if seq_lt(self.send_unacknowledged, acknowledgement)
-                && seq_le(acknowledgement, self.send_next)
+                && seq_le(acknowledgement, self.send_high)
             {
                 self.state = State::Established;
                 self.retransmit_at = 0;
@@ -739,7 +1062,7 @@ impl Tcb {
         }
 
         if seq_gt(acknowledgement, self.send_unacknowledged)
-            && seq_le(acknowledgement, self.send_next)
+            && seq_le(acknowledgement, self.send_high)
         {
             let mut acked = acknowledgement.wrapping_sub(self.send_unacknowledged) as usize;
             if let Some(fin_sequence) = self.fin_sequence {
@@ -751,20 +1074,66 @@ impl Tcb {
             let drop_count = acked.min(self.pending.len());
             self.pending.drain(..drop_count);
             self.send_unacknowledged = acknowledgement;
-            self.retries = 0;
-            self.rto = INITIAL_RTO;
-            if self.congestion_window < self.slow_start_threshold {
-                self.congestion_window = self.congestion_window.saturating_add(MSS as u32);
-            } else {
-                let increment = (MSS * MSS) as u32 / self.congestion_window.max(1);
-                self.congestion_window = self.congestion_window.saturating_add(increment.max(1));
+            if let Some(timed) = self.timed {
+                if seq_le(timed, acknowledgement) {
+                    let elapsed =
+                        crate::time::monotonic_ns().saturating_sub(self.timed_at);
+                    self.timed = None;
+                    self.measure((elapsed / 1000).min(u32::MAX as u64) as u32);
+                }
             }
+            if seq_lt(self.send_next, self.send_unacknowledged) {
+                // The timer moved the pointer back over bytes that turned out
+                // to have arrived. There is nothing there left to send again.
+                self.send_next = self.send_unacknowledged;
+            }
+            self.retries = 0;
+            self.duplicate_acks = 0;
             self.retransmit_at = if self.send_unacknowledged == self.send_next {
                 0
             } else {
                 crate::trap::ticks() + self.rto
             };
+            match self.recover {
+                Some(recover) if seq_lt(acknowledgement, recover) => {
+                    // Only part of what was outstanding when the loss was
+                    // found: a second segment behind the first was lost too,
+                    // and this acknowledgement says which one. RFC 6582.
+                    self.congestion_window = self
+                        .congestion_window
+                        .saturating_sub(acked as u32)
+                        .saturating_add(MSS as u32)
+                        .max(MSS as u32);
+                    self.fast_retransmits += 1;
+                    self.retransmit_head();
+                }
+                Some(_) => {
+                    // Everything that was outstanding then has arrived: the
+                    // loss is behind us and the window comes back down to
+                    // what the loss set it to.
+                    self.recover = None;
+                    self.congestion_window = self.slow_start_threshold;
+                }
+                None if self.congestion_window < self.slow_start_threshold => {
+                    self.congestion_window = self.congestion_window.saturating_add(MSS as u32);
+                }
+                None => {
+                    let increment = (MSS * MSS) as u32 / self.congestion_window.max(1);
+                    self.congestion_window = self.congestion_window.saturating_add(increment.max(1));
+                }
+            }
             woke = true;
+        }
+
+        if duplicate {
+            self.duplicate_acks += 1;
+            if self.duplicate_acks == DUPLICATE_ACK_THRESHOLD && self.recover.is_none() {
+                self.enter_recovery();
+            } else if self.duplicate_acks > DUPLICATE_ACK_THRESHOLD {
+                // Each one past the third says one more segment has left the
+                // network, so there is room for one more to go in.
+                self.congestion_window = self.congestion_window.saturating_add(MSS as u32);
+            }
         }
 
         // The send window, taken from the most recent segment that carries a
@@ -798,8 +1167,8 @@ impl Tcb {
         }
 
         // Data. Anything already delivered is trimmed off the front; anything
-        // beyond what is wanted next is dropped, because there is no queue to
-        // hold it in.
+        // that arrived before the bytes in front of it is held until they
+        // come, and until then the acknowledgement keeps naming the gap.
         let mut payload: &[u8] = segment.payload;
         let mut sequence = segment.sequence;
         if seq_lt(sequence, self.receive_next) {
@@ -807,50 +1176,51 @@ impl Tcb {
             payload = if skip >= payload.len() { &[] } else { &payload[skip..] };
             sequence = self.receive_next;
         }
-        let in_order = sequence == self.receive_next;
         let mut need_ack = false;
         if !segment.payload.is_empty() {
             need_ack = true;
-            if in_order && !payload.is_empty() {
-                if !self.can_receive() {
-                    // Nobody will ever read this. Taking it off the sequence
-                    // space anyway is what keeps the other end from sending
-                    // it again forever.
+            if payload.is_empty() {
+                // Every byte of it had already arrived.
+            } else if !self.can_receive() {
+                // Nobody will ever read this. Taking it off the sequence
+                // space anyway is what keeps the other end from sending it
+                // again forever, and only what is contiguous can be taken
+                // off it.
+                if sequence == self.receive_next {
                     self.receive_next =
                         self.receive_next.wrapping_add(payload.len() as u32);
-                } else {
-                    let free = RECEIVE_WINDOW.saturating_sub(self.received.len());
-                    let n = payload.len().min(free);
-                    self.received.extend(payload[..n].iter().copied());
-                    self.receive_next = self.receive_next.wrapping_add(n as u32);
-                    woke = true;
                 }
+            } else if sequence == self.receive_next {
+                let free = RECEIVE_WINDOW.saturating_sub(self.received.len());
+                let n = payload.len().min(free);
+                self.received.extend(payload[..n].iter().copied());
+                self.receive_next = self.receive_next.wrapping_add(n as u32);
+                self.deliver_held();
+                woke = true;
+            } else {
+                self.hold(sequence, payload);
             }
         }
 
         // The FIN sits one past the segment's data, and is only taken once
-        // every byte before it has been.
+        // every byte in front of it has been -- which may be now, or may be
+        // when the gap in front of it fills.
         if segment.flags & FIN != 0 {
-            let fin_sequence = sequence.wrapping_add(payload.len() as u32);
-            if self.receive_next == fin_sequence {
-                need_ack = true;
-                if !self.fin_received {
-                    self.fin_received = true;
-                    self.receive_next = self.receive_next.wrapping_add(1);
-                    woke = true;
-                    match self.state {
-                        State::Established => self.state = State::CloseWait,
-                        State::FinWait1 => self.state = State::Closing,
-                        State::FinWait2 => self.enter_time_wait(),
-                        _ => {}
-                    }
-                }
-            } else if self.fin_received && self.receive_next == fin_sequence.wrapping_add(1) {
-                need_ack = true;
+            need_ack = true;
+            let finish = sequence.wrapping_add(payload.len() as u32);
+            if finish == self.receive_next {
+                self.held_fin = Some(finish);
+            } else if seq_gt(finish, self.receive_next) && self.can_receive() {
+                self.held_fin = Some(finish);
+                self.arm_reassembly();
             }
+        }
+        if self.held_fin == Some(self.receive_next) && self.take_fin() {
+            woke = true;
         }
 
         if need_ack && self.state != State::Closed {
+            self.open_window(self.receive_next != wanted_before);
             self.acknowledge();
         }
         self.output();
@@ -878,6 +1248,7 @@ impl Tcb {
         }
         self.irs = segment.sequence;
         self.receive_next = segment.sequence.wrapping_add(1);
+        self.receive_high = self.receive_next.wrapping_add(RECEIVE_WINDOW as u32);
         if let Some(mss) = segment.mss {
             self.peer_mss = (mss as usize).clamp(MIN_MSS, MSS);
         }
@@ -901,6 +1272,9 @@ impl Tcb {
 
     fn enter_time_wait(&mut self) {
         self.state = State::TimeWait;
+        // Nothing more will arrive to fill a gap, so nothing held past one
+        // can ever be delivered.
+        self.drop_out_of_order();
         self.expire_at = crate::trap::ticks() + TIME_WAIT_TICKS;
         self.retransmit_at = 0;
         self.pending.clear();
@@ -922,6 +1296,9 @@ impl Tcb {
     /// The last descriptor naming this connection has gone.
     pub fn abandon(&mut self) {
         self.abandoned = true;
+        // Nobody is left to read what is held, or what filling the gap would
+        // deliver.
+        self.drop_out_of_order();
         if self.state == State::FinWait2 && self.expire_at == 0 {
             self.expire_at = crate::trap::ticks() + FIN_WAIT_2_TICKS;
         }
@@ -940,6 +1317,143 @@ impl Tcb {
             )
     }
 
+    // ---- what arrived before the bytes in front of it --------------------
+
+    /// How many separate runs are held. The suite asks; nothing else does.
+    pub fn held_runs(&self) -> usize {
+        self.out_of_order.len()
+    }
+
+    /// Account for a change in what this connection holds, in the count every
+    /// connection shares.
+    fn account(&mut self) {
+        let held: usize = self.out_of_order.iter().map(|run| run.data.len()).sum();
+        if held > self.held {
+            HELD_BYTES.fetch_add(held - self.held, Ordering::Relaxed);
+        } else {
+            HELD_BYTES.fetch_sub(self.held - held, Ordering::Relaxed);
+        }
+        self.held = held;
+    }
+
+    /// Let go of everything held past a gap.
+    pub fn drop_out_of_order(&mut self) {
+        self.out_of_order.clear();
+        self.held_fin = None;
+        self.reassembly_expire_at = 0;
+        self.account();
+    }
+
+    fn arm_reassembly(&mut self) {
+        self.reassembly_expire_at = crate::trap::ticks() + REASSEMBLY_TICKS;
+    }
+
+    /// Keep a run that arrived before the bytes in front of it.
+    fn hold(&mut self, sequence: u32, payload: &[u8]) {
+        // Nothing past the right edge this end offered is kept, so everything
+        // held lies inside the window. The edge is never further out than the
+        // room left in the receive buffer, so what is held and what has been
+        // delivered never exceed the buffer between them, and what one
+        // connection holds needs no bound of its own.
+        let right = self.receive_next.wrapping_add(self.advertised_window() as u32);
+        if !seq_lt(sequence, right) {
+            return;
+        }
+        let room = right.wrapping_sub(sequence) as usize;
+        let payload = &payload[..payload.len().min(room)];
+        if payload.is_empty() {
+            return;
+        }
+        if held_bytes() + payload.len() > REASSEMBLY_LIMIT {
+            return;
+        }
+        self.out_of_order.push(Held { sequence, data: payload.to_vec() });
+        self.coalesce();
+        if self.out_of_order.len() > MAX_HELD_RUNS {
+            // The run furthest ahead goes: it is the one with the most
+            // missing in front of it, so it is the one whose sender has the
+            // furthest to go before any of it can be delivered.
+            self.out_of_order.pop();
+        }
+        self.account();
+        self.arm_reassembly();
+    }
+
+    /// Put the runs in order and join the ones that touch or overlap.
+    fn coalesce(&mut self) {
+        let base = self.receive_next;
+        let mut runs = core::mem::take(&mut self.out_of_order);
+        runs.sort_unstable_by_key(|run| run.sequence.wrapping_sub(base));
+        let mut joined: Vec<Held> = Vec::with_capacity(runs.len());
+        for run in runs {
+            match joined.last_mut() {
+                Some(last) if seq_le(run.sequence, last.end()) => {
+                    let overlap = last.end().wrapping_sub(run.sequence) as usize;
+                    if overlap < run.data.len() {
+                        last.data.extend_from_slice(&run.data[overlap..]);
+                    }
+                }
+                _ => joined.push(run),
+            }
+        }
+        self.out_of_order = joined;
+    }
+
+    /// Move everything that now follows on into what the reader sees.
+    fn deliver_held(&mut self) {
+        while let Some(run) = self.out_of_order.first() {
+            if seq_gt(run.sequence, self.receive_next) {
+                break;
+            }
+            let run = self.out_of_order.remove(0);
+            let skip = self.receive_next.wrapping_sub(run.sequence) as usize;
+            if skip >= run.data.len() {
+                continue;
+            }
+            let free = RECEIVE_WINDOW.saturating_sub(self.received.len());
+            let take = (run.data.len() - skip).min(free);
+            self.received.extend(run.data[skip..skip + take].iter().copied());
+            self.receive_next = self.receive_next.wrapping_add(take as u32);
+            if skip + take < run.data.len() {
+                // No room for the rest of this run. The window is what bounds
+                // what was held, so this does not arise; leaving the stream
+                // whole rather than assuming so costs one insert.
+                let sequence = self.receive_next;
+                let rest = run.data[skip + take..].to_vec();
+                self.out_of_order.insert(0, Held { sequence, data: rest });
+                break;
+            }
+        }
+        self.account();
+        if self.out_of_order.is_empty() && self.held_fin.is_none() {
+            self.reassembly_expire_at = 0;
+        } else {
+            // Something moved, so the wait for the rest starts again.
+            self.arm_reassembly();
+        }
+    }
+
+    /// Take the other end's finish, once every byte in front of it has been
+    /// taken.
+    fn take_fin(&mut self) -> bool {
+        self.held_fin = None;
+        if self.out_of_order.is_empty() {
+            self.reassembly_expire_at = 0;
+        }
+        if self.fin_received {
+            return false;
+        }
+        self.fin_received = true;
+        self.receive_next = self.receive_next.wrapping_add(1);
+        match self.state {
+            State::Established => self.state = State::CloseWait,
+            State::FinWait1 => self.state = State::Closing,
+            State::FinWait2 => self.enter_time_wait(),
+            _ => {}
+        }
+        true
+    }
+
     // ---- timers ----------------------------------------------------------
 
     pub fn next_deadline(&self) -> u64 {
@@ -950,10 +1464,19 @@ impl Tcb {
         if self.retransmit_at != 0 {
             earliest = earliest.min(self.retransmit_at);
         }
+        if self.reassembly_expire_at != 0 {
+            earliest = earliest.min(self.reassembly_expire_at);
+        }
         earliest
     }
 
     pub fn on_timer(&mut self, now: u64) -> bool {
+        if self.reassembly_expire_at != 0 && now >= self.reassembly_expire_at {
+            // The gap never filled. What is held behind it is of no use to
+            // anybody until it does, and the end that left it has stopped
+            // trying.
+            self.drop_out_of_order();
+        }
         if self.expire_at != 0 {
             // Waiting on a clock rather than on the other end: there is
             // nothing to send, and reaching the deadline is the end of it.
@@ -984,11 +1507,19 @@ impl Tcb {
             self.error = Some(reason);
             return true;
         }
+        // RFC 6298 5.5: the timeout doubles, and it stays doubled until a
+        // segment that went out once is acknowledged.
         self.rto = (self.rto * 2).min(MAX_RTO);
+        self.timed = None;
         self.retransmit_at = now + self.rto;
-        let flight = self.send_next.wrapping_sub(self.send_unacknowledged);
+        let flight = self.send_high.wrapping_sub(self.send_unacknowledged);
         self.slow_start_threshold = (flight / 2).max(2 * MSS as u32);
         self.congestion_window = MSS as u32;
+        // Whatever the duplicate acknowledgements were saying, the clock
+        // running out says more: start again from one segment.
+        self.recover = None;
+        self.duplicate_acks = 0;
+        self.timeouts += 1;
 
         match self.state {
             State::SynSent => self.send_segment(SYN, self.iss, &[], true),
@@ -1003,13 +1534,22 @@ impl Tcb {
                     let byte = [self.pending[0]];
                     let sequence = self.send_next;
                     self.send_segment(ACK, sequence, &byte, false);
-                    self.send_next = sequence.wrapping_add(1);
+                    self.sent_through(sequence.wrapping_add(1));
                 } else {
                     self.output();
                 }
             }
         }
         false
+    }
+}
+
+impl Drop for Tcb {
+    fn drop(&mut self) {
+        // The count every connection shares is what bounds them all together,
+        // so a connection that goes away while holding something has to give
+        // its share back.
+        HELD_BYTES.fetch_sub(self.held, Ordering::Relaxed);
     }
 }
 
