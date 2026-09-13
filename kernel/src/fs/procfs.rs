@@ -87,24 +87,51 @@ pub fn refresh_dir(node: &crate::fs::NodeRef) {
     node.inner.lock().children = children;
 }
 
-/// Create /proc/<pid> for a new task.
-pub fn add_process(pid: u32) {
-    let dir = format!("/proc/{}", pid);
-    if mkdir_p(&dir).is_err() {
-        return;
-    }
+/// A /proc/<pid> directory that has been built but is not in the tree yet,
+/// along with the entry it is waiting to become.
+pub struct ProcessEntry {
+    proc_root: Option<crate::fs::NodeRef>,
+    name: String,
+    dir: crate::fs::NodeRef,
+}
+
+/// Assemble /proc/<pid> for a new task, with nothing linked into /proc yet.
+///
+/// Every file it will hold is a child of the directory before the directory is
+/// anywhere, and the name and the parent it will be entered under are worked
+/// out here too. So there is no moment at which something walking /proc finds
+/// the directory half-made, and `publish_process` is left with one insertion
+/// to do rather than a path to resolve.
+pub fn build_process(pid: u32) -> ProcessEntry {
+    let dir = Node::new(NodeKind::Dir, crate::abi::S_IFDIR | 0o755);
     let files = [
         ("stat", Generated::PidStat(pid)),
         ("status", Generated::PidStatus(pid)),
         ("cmdline", Generated::PidCmdline(pid)),
         ("maps", Generated::PidMaps(pid)),
     ];
-    for (name, kind) in files {
-        let node = Node::new(NodeKind::Generated(kind), S_IFREG | 0o444);
-        let _ = link_node(&format!("{}/{}", dir, name), node);
-    }
-    if let Ok(fd_dir) = mkdir_p(&format!("{}/fd", dir)) {
+    {
+        let mut inner = dir.inner.lock();
+        for (name, kind) in files {
+            let node = Node::new(NodeKind::Generated(kind), S_IFREG | 0o444);
+            inner.children.insert(String::from(name), node);
+        }
+        let fd_dir = Node::new(NodeKind::Dir, crate::abi::S_IFDIR | 0o755);
         FD_DIRS.lock().insert(fd_dir.ino, pid);
+        inner.children.insert(String::from("fd"), fd_dir);
+    }
+    ProcessEntry {
+        proc_root: crate::fs::lookup("/proc").ok(),
+        name: format!("{}", pid),
+        dir,
+    }
+}
+
+/// Put a built /proc/<pid> in the tree. One insertion, so a reader either sees
+/// the whole directory or does not see it at all.
+pub fn publish_process(entry: ProcessEntry, _irq: crate::sync::NoInterrupts) {
+    if let Some(root) = entry.proc_root {
+        root.inner.lock().children.insert(entry.name, entry.dir);
     }
 }
 
@@ -176,13 +203,13 @@ pub fn render(kind: Generated) -> String {
         Generated::Tasks => {
             // pid ppid pgid state name -- one process per line.
             let mut out = String::new();
-            crate::sched::for_each(|task| {
+            crate::sched::for_each(|task, _table| {
                 out.push_str(&format!(
                     "{} {} {} {} {}\n",
                     task.pid,
                     task.ppid,
                     task.pgid,
-                    state_char(task.state),
+                    state_char(task.state()),
                     task.name
                 ));
             });
@@ -199,7 +226,7 @@ pub fn render(kind: Generated) -> String {
                 "{} ({}) {} {} {} {} 0 -1 0 ",
                 task.pid,
                 task.name,
-                state_char(task.state),
+                state_char(task.state()),
                 task.ppid,
                 task.pgid,
                 task.pgid, // session
@@ -230,8 +257,8 @@ pub fn render(kind: Generated) -> String {
                  VmSize:\t{} kB\nVmRSS:\t{} kB\nVmData:\t{} kB\n\
                  SigPnd:\t{:016x}\nSigBlk:\t{:016x}\n",
                 task.name,
-                state_char(task.state),
-                match task.state {
+                state_char(task.state()),
+                match task.state() {
                     crate::task::State::Runnable => "running",
                     crate::task::State::Sleeping => "sleeping",
                     crate::task::State::Stopped => "stopped",

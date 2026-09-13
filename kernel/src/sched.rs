@@ -2,7 +2,9 @@
 
 use crate::abi::*;
 use crate::arch;
-use crate::sync::{disable_interrupts, enable_interrupts, interrupts_enabled, Spinlock};
+use crate::sync::{
+    disable_interrupts, enable_interrupts, interrupts_enabled, NoInterrupts, Spinlock,
+};
 use crate::task::{State, Task, TaskPtr};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -52,13 +54,57 @@ pub fn has_current() -> bool {
     unsafe { !CURRENT.is_null() }
 }
 
+/// The process table, held, with interrupts off.
+///
+/// A state change on one task nearly always has to reach a second one: a stop
+/// is reported to a parent, a continue restarts a child and tells the same
+/// parent, an exit wakes whoever is in `wait4`. The table's lock does not
+/// nest, so the second task has to be found through the hold that is already
+/// taken, and that hold is also what proves a tick cannot land between the two
+/// halves. Both facts are the same object rather than two arguments.
+pub struct Held<'a> {
+    tasks: &'a [TaskPtr],
+    irq: NoInterrupts<'a>,
+}
+
+impl<'a> Held<'a> {
+    /// Proof that interrupts are off, for a transition that needs nothing
+    /// else from the table.
+    pub fn irq(&self) -> NoInterrupts<'a> {
+        self.irq
+    }
+
+    pub fn find(&self, pid: u32) -> Option<&'static mut Task> {
+        self.tasks.iter().find(|t| t.get().pid == pid).map(|t| t.get())
+    }
+
+    pub fn for_each(&self, mut f: impl FnMut(&'static mut Task)) {
+        for entry in self.tasks {
+            f(entry.get());
+        }
+    }
+
+    /// Tell `ppid` that one of its children changed state, and wake it if it
+    /// is blocked.
+    pub fn notify_parent(&self, ppid: u32) {
+        if let Some(parent) = self.find(ppid) {
+            parent.child_changed_state(self.irq);
+        }
+    }
+}
+
+/// Take the process table and run `f` with it held.
+pub fn with_tasks<R>(f: impl FnOnce(&Held) -> R) -> R {
+    let tasks = TASKS.lock();
+    f(&Held { tasks: &tasks, irq: tasks.irq() })
+}
+
 /// Adopt the boot context as the idle task.
 pub fn init() {
     let space = arch::paging::AddressSpace::current();
     let mut idle = Task::new("idle", space).expect("idle task");
     idle.pid = 0;
     idle.tgid = 0;
-    idle.state = State::Runnable;
     let ptr = Box::into_raw(idle);
     unsafe {
         CURRENT = ptr;
@@ -68,18 +114,32 @@ pub fn init() {
     crate::task::reset_pid_counter(1);
 }
 
+/// Build everything a task needs and admit it to the scheduler.
+///
+/// Owning the box is what keeps a half-built task out of the table: nothing
+/// else can reach the task until this hands it over, and this is the only way
+/// in. The entry in /proc is built here for the same reason it used to be
+/// built by every caller in the right order -- the moment the task is in the
+/// table the timer can hand it the CPU, and a child scheduled then found its
+/// own directory half-made or missing, which our shell walks a few
+/// instructions after fork returns.
 pub fn register(task: Box<Task>) -> u32 {
     reap_dead_threads();
     let pid = task.pid;
-    // The entry in /proc is built before the task is in the table, because the
-    // moment it is in the table the timer can hand it the CPU. A child
-    // scheduled in between finds its own directory half-built or not there at
-    // all, and our shell applies its redirections through that directory a few
-    // instructions after fork returns.
-    crate::fs::procfs::add_process(pid);
-    let ptr = Box::into_raw(task);
-    TASKS.lock().push(TaskPtr(ptr));
+    // Assembling the directory allocates, which is not something to do with
+    // interrupts off; linking it into /proc is a pointer's worth of work and
+    // happens in the same breath as the table push.
+    let entry = crate::fs::procfs::build_process(pid);
+    crate::sync::without_interrupts(|irq| {
+        crate::fs::procfs::publish_process(entry, irq);
+        admit(task, irq);
+    });
     pid
+}
+
+/// Put a task in the table, where the scheduler can pick it.
+fn admit(task: Box<Task>, _irq: NoInterrupts) {
+    TASKS.lock().push(TaskPtr(Box::into_raw(task)));
 }
 
 /// Look up a task and hand the reference out. The table is unlocked again
@@ -116,11 +176,11 @@ pub fn task_count() -> usize {
     TASKS.lock().len()
 }
 
-pub fn for_each<F: FnMut(&'static mut Task)>(mut f: F) {
-    let tasks = TASKS.lock();
-    for t in tasks.iter() {
-        f(t.get());
-    }
+/// Run `f` on every task, with the table held for as long as it runs. The
+/// closure is handed the hold alongside each task, because a state change it
+/// makes may have to reach that task's parent, which is in the same table.
+pub fn for_each<F: FnMut(&'static mut Task, &Held)>(mut f: F) {
+    with_tasks(|table| table.for_each(|task| f(task, table)));
 }
 
 pub fn set_foreground(pgid: u32) {
@@ -144,19 +204,19 @@ pub fn current_pgid() -> u32 {
 /// it. A caller that is about to stop naming the space asks after it has
 /// stopped.
 pub fn space_in_use(space: arch::paging::AddressSpace) -> bool {
-    TASKS.lock().iter().any(|t| t.get().space == space)
+    TASKS.lock().iter().any(|t| t.get().space() == space)
 }
 
 fn pick_next() -> Option<*mut Task> {
     let tasks = TASKS.lock();
+    let irq = tasks.irq();
     let now = crate::trap::ticks();
     let idle = unsafe { IDLE };
 
     for entry in tasks.iter() {
         let task = entry.get();
-        if task.state == State::Sleeping && task.wake_at != 0 && now >= task.wake_at {
-            task.wake_at = 0;
-            task.state = State::Runnable;
+        if task.state() == State::Sleeping && task.wake_at() != 0 && now >= task.wake_at() {
+            task.deadline_reached(irq);
         }
     }
 
@@ -173,7 +233,7 @@ fn pick_next() -> Option<*mut Task> {
             continue;
         }
         let task = entry.get();
-        if task.state == State::Runnable {
+        if task.state() == State::Runnable {
             if entry.0 == cur {
                 return None; // already running the only candidate
             }
@@ -182,7 +242,7 @@ fn pick_next() -> Option<*mut Task> {
     }
 
     let current = unsafe { &mut *cur };
-    if cur != idle && current.state == State::Runnable {
+    if cur != idle && current.state() == State::Runnable {
         return None;
     }
     if cur == idle {
@@ -210,8 +270,8 @@ unsafe fn switch_to(next: *mut Task) {
     arch::set_kernel_entry_stack(next_task.kstack_top);
     arch::set_current_task(next as u64);
 
-    if next_task.space != prev_task.space {
-        next_task.space.switch_to();
+    if next_task.space() != prev_task.space() {
+        next_task.space().switch_to();
     }
 
     CURRENT = next;
@@ -240,7 +300,7 @@ pub fn other_runnable() -> bool {
     let idle = unsafe { IDLE };
     let tasks = TASKS.lock();
     tasks.iter().any(|t| {
-        t.0 != cur && t.0 != idle && t.get().state == State::Runnable
+        t.0 != cur && t.0 != idle && t.get().state() == State::Runnable
     })
 }
 
@@ -283,13 +343,11 @@ pub fn sleep_ticks(ticks: u64) {
     // which is for good. Turning interrupts off only stops something else
     // starting now, so the question has to be asked again inside the same
     // window and the sleep skipped if the answer has changed.
-    crate::sync::without_interrupts(|| {
+    crate::sync::without_interrupts(|irq| {
         if has_pending_signal() {
             return;
         }
-        let mut task = current();
-        task.wake_at = crate::trap::ticks() + ticks.max(1);
-        task.state = State::Sleeping;
+        current().sleep(crate::trap::ticks() + ticks.max(1), irq);
     });
     schedule();
 }
@@ -302,12 +360,11 @@ pub fn wait_until<F: FnMut() -> bool>(mut predicate: F) {
 }
 
 pub fn wake(pid: u32) {
-    if let Some(task) = find(pid) {
-        if task.state == State::Sleeping {
-            task.state = State::Runnable;
-            task.wake_at = 0;
+    with_tasks(|table| {
+        if let Some(task) = table.find(pid) {
+            task.wake(table.irq());
         }
-    }
+    });
 }
 
 /// Hand the faulting address to the current task's region list to be backed
@@ -334,13 +391,10 @@ pub fn handle_user_page_fault(fault: &arch::PageFault) -> bool {
 pub fn exit_group(status: i32) -> ! {
     let tgid = current().tgid;
     let me = current().pid;
-    for_each(|task| {
-        if task.tgid == tgid && task.pid != me && task.state != State::Zombie {
+    for_each(|task, table| {
+        if task.tgid == tgid && task.pid != me && task.state() != State::Zombie {
             task.pending_signals |= 1u64 << (SIGKILL as u64 & 63);
-            if task.state == State::Sleeping {
-                task.state = State::Runnable;
-                task.wake_at = 0;
-            }
+            task.wake(table.irq());
         }
     });
     exit_current(status)
@@ -381,17 +435,13 @@ pub fn exit_current(status: i32) -> ! {
 
         // Threads share an address space and its region list; only the last
         // thread out may tear either of them down.
-        let last_thread = alloc::sync::Arc::strong_count(&task.mm) == 1;
+        let last_thread = alloc::sync::Arc::strong_count(task.mm()) == 1;
         if last_thread {
-            task.space.free_user_memory();
+            task.space().free_user_memory();
             task.clear_vmas();
         }
         let ppid = task.ppid;
         let pid = task.pid;
-        // A thread is not a child of the process's parent, so its exit is not
-        // a child exit to report there. Whoever joins it is woken through the
-        // cleared tid word above.
-        let is_process = task.pid == task.tgid;
 
         if pid == 1 {
             crate::println!();
@@ -402,50 +452,30 @@ pub fn exit_current(status: i32) -> ! {
             arch::power_off();
         }
 
-        // Becoming a zombie takes this task off the run queue for good, so
-        // everything that has to be done on its behalf has to be done in the
-        // same breath. A timer landing between the two would hand the CPU to
-        // something else and never hand it back, leaving the parent's
-        // wake-up undelivered by a task that can no longer deliver it.
-        crate::sync::without_interrupts(|| {
-            let mut task = current();
-            task.state = State::Zombie;
-
-            if let Some(parent_pid) = task.vfork_parent.take() {
-                if let Some(parent) = find(parent_pid) {
-                    if parent.state == State::Sleeping {
-                        parent.state = State::Runnable;
-                        parent.wake_at = 0;
-                    }
-                }
-            }
-
+        // Handing the children on and becoming a zombie are one step. The
+        // second takes this task off the run queue for good, so anything still
+        // owed on its behalf after it is owed by a task that can no longer pay
+        // it: a tick in between hands the CPU to something else and never
+        // hands it back.
+        with_tasks(|table| {
             // Orphans are adopted by init. One that has already exited still
             // needs reaping, and init is normally asleep in wait4, so it has
             // to be woken here; nothing else will report the adopted zombie
             // to it.
             let mut adopted_zombie = false;
-            for_each(|other| {
+            table.for_each(|other| {
                 if other.ppid == pid {
                     other.ppid = 1;
-                    if other.state == State::Zombie {
+                    if other.state() == State::Zombie {
                         adopted_zombie = true;
                     }
                 }
             });
             if adopted_zombie && ppid != 1 {
-                if let Some(init) = find(1) {
-                    init.pending_signals |= 1u64 << (SIGCHLD as u64 & 63);
-                    if init.state == State::Sleeping {
-                        init.state = State::Runnable;
-                        init.wake_at = 0;
-                    }
-                }
+                table.notify_parent(1);
             }
 
-            if is_process {
-                notify_parent(ppid);
-            }
+            current().become_zombie(table);
         });
     }
     loop {
@@ -470,73 +500,34 @@ pub fn raise_on_current(signal: i32) {
     current().pending_signals |= 1u64 << (signal as u64 & 63);
 }
 
-/// Tell `ppid` that one of its children changed state, and wake it if it is
-/// blocked in wait. Takes the task list, so it must not be called from inside
-/// `for_each`.
-pub fn notify_parent(ppid: u32) {
-    if let Some(parent) = find(ppid) {
-        parent.pending_signals |= 1u64 << (SIGCHLD as u64 & 63);
-        // Any sleep, not only a wait for a child. This is a signal, and every
-        // other signal returns a sleeping task to the run queue; a shell
-        // blocked reading its terminal has a handler for this one and would
-        // otherwise not learn that a background job had finished until the next
-        // key was pressed.
-        if parent.state == State::Sleeping {
-            parent.state = State::Runnable;
-            parent.wake_at = 0;
-        }
-    }
-}
-
 /// Make `signal` pending on `task`.
 ///
 /// Two of the job-control rules act on the task rather than on the handler: a
 /// continue restarts a stopped task and discards a stop that has not been
-/// taken yet, and a stop discards a continue the same way. Returns the parent
-/// to notify when the task was actually restarted.
-pub fn post_signal(task: &mut Task, signal: i32) -> Option<u32> {
+/// taken yet, and a stop discards a continue the same way. Restarting is what
+/// the parent has to be told about, and the table is held here, which is where
+/// the parent is found.
+pub fn post_signal(task: &mut Task, signal: i32, table: &Held) {
     const STOPS: u64 = (1 << (SIGSTOP as u64 & 63))
         | (1 << (SIGTSTP as u64 & 63))
         | (1 << (SIGTTIN as u64 & 63))
         | (1 << (SIGTTOU as u64 & 63));
-    let mut restarted = None;
-    if signal == SIGKILL && task.state == State::Stopped {
-        // Nothing else gets a stopped task running again, and a kill it can
-        // never look at is not a kill.
-        task.state = State::Runnable;
-        task.wake_at = 0;
+    if signal == SIGKILL {
+        task.restart_for_kill(table.irq());
     }
     if signal == SIGCONT {
         task.pending_signals &= !STOPS;
-        if task.state == State::Stopped {
-            task.state = State::Runnable;
-            task.wake_at = 0;
-            // A stop nobody has been told about yet has stopped being true.
-            // Left standing it is handed to whatever asks next, which is a
-            // suspension reported after the job is running again.
-            task.report_stop = false;
-            task.report_continue = true;
-            restarted = Some(task.ppid);
-        }
+        task.continue_after_stop(table);
     } else if crate::abi::is_stop_signal(signal) {
         task.pending_signals &= !(1u64 << (SIGCONT as u64 & 63));
     }
     task.pending_signals |= 1u64 << (signal as u64 & 63);
-    if task.state == State::Sleeping {
-        task.state = State::Runnable;
-        task.wake_at = 0;
-    }
-    restarted
+    task.wake(table.irq());
 }
 
 /// Stop the running task until something sends it SIGCONT.
 fn stop_current(signal: i32) {
-    // Leaving the run queue and telling the parent about it have to happen in
-    // the same breath. A tick in between hands the CPU to something else and
-    // never hands it back, because this task is no longer runnable, so the
-    // notification is left undelivered by a task that can no longer deliver
-    // it and the parent sleeps in wait4 for good.
-    let stopped = crate::sync::without_interrupts(|| {
+    let stopped = with_tasks(|table| {
         let mut task = current();
         // The stop signal's pending bit was cleared before this was called, so
         // a continue that arrived since then found a runnable task with no
@@ -547,11 +538,7 @@ fn stop_current(signal: i32) {
         if task.pending_signals & (1u64 << (SIGCONT as u64 & 63)) != 0 {
             return false;
         }
-        task.stop_signal = signal;
-        task.report_stop = true;
-        task.state = State::Stopped;
-        let ppid = task.ppid;
-        notify_parent(ppid);
+        task.stop(signal, table);
         true
     });
     if stopped {
@@ -622,17 +609,11 @@ pub fn signal_group(pgid: u32, signal: i32) {
     if pgid == 0 {
         return;
     }
-    let mut parents = Vec::new();
-    for_each(|task| {
-        if task.pgid == pgid && task.pid != 1 && task.state != State::Zombie {
-            if let Some(ppid) = post_signal(task, signal) {
-                parents.push(ppid);
-            }
+    for_each(|task, table| {
+        if task.pgid == pgid && task.pid != 1 && task.state() != State::Zombie {
+            post_signal(task, signal, table);
         }
     });
-    for ppid in parents {
-        notify_parent(ppid);
-    }
 }
 
 /// True when a signal is waiting that the task has not blocked.
@@ -785,7 +766,7 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
         let tasks = TASKS.lock();
         for entry in tasks.iter() {
             let task = entry.get();
-            if !is_child_process(task, parent_pid) || task.state != State::Zombie {
+            if !is_child_process(task, parent_pid) || task.state() != State::Zombie {
                 continue;
             }
             if !matches_want(task, want) {
@@ -805,11 +786,11 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
         let mut task = Box::from_raw(ptr);
         // The task being reaped is already out of the table, so this asks
         // whether anything else still names the address space it ran in.
-        if !space_in_use(task.space) {
-            task.space.destroy();
+        if !space_in_use(task.space()) {
+            task.space().destroy();
         }
         task.free_kernel_stack();
-        task.state = State::Dead;
+        task.mark_dead();
         drop(task);
     }
     Some((pid, code))
@@ -833,7 +814,7 @@ pub fn reap_dead_threads() {
             // The running task is in the middle of its own exit and is still on
             // the stack this would hand back.
             let finished =
-                task.state == State::Zombie && task.pid != task.tgid && entry.0 != cur;
+                task.state() == State::Zombie && task.pid != task.tgid && entry.0 != cur;
             if finished {
                 dead.push(entry.0);
             }
@@ -846,11 +827,11 @@ pub fn reap_dead_threads() {
             crate::fs::procfs::remove_process(task.pid);
             // Out of the table already, so this asks whether anything else --
             // the process, or another of its threads -- still names the space.
-            if !space_in_use(task.space) {
-                task.space.destroy();
+            if !space_in_use(task.space()) {
+                task.space().destroy();
             }
             task.free_kernel_stack();
-            task.state = State::Dead;
+            task.mark_dead();
             drop(task);
         }
     }
@@ -904,7 +885,7 @@ pub fn child_event_pending(
         if !matches_want(task, want) {
             return false;
         }
-        task.state == State::Zombie
+        task.state() == State::Zombie
             || (untraced && task.report_stop)
             || (continued && task.report_continue)
     })
@@ -928,6 +909,13 @@ pub struct WaitQueue {
     waiters: Spinlock<Vec<u32>>,
 }
 
+/// How a round of `wait_until_or_at` ended.
+enum Woke {
+    Ready,
+    TimedOut,
+    Parked,
+}
+
 impl WaitQueue {
     pub const fn new() -> WaitQueue {
         WaitQueue { waiters: Spinlock::new(Vec::new()) }
@@ -941,14 +929,17 @@ impl WaitQueue {
     pub fn wait_until(&self, mut ready: impl FnMut() -> bool) {
         let pid = current().pid;
         loop {
-            disable_interrupts();
-            if ready() {
-                enable_interrupts();
+            let parked = crate::sync::without_interrupts(|irq| {
+                if ready() {
+                    return false;
+                }
+                self.waiters.lock().push(pid);
+                current().sleep(0, irq);
+                true
+            });
+            if !parked {
                 return;
             }
-            self.waiters.lock().push(pid);
-            current().state = State::Sleeping;
-            enable_interrupts();
 
             schedule();
 
@@ -963,39 +954,41 @@ impl WaitQueue {
     pub fn wait_until_or_at(&self, deadline: u64, mut ready: impl FnMut() -> bool) -> bool {
         let pid = current().pid;
         loop {
-            disable_interrupts();
-            if ready() {
-                enable_interrupts();
-                return true;
+            match crate::sync::without_interrupts(|irq| {
+                if ready() {
+                    return Woke::Ready;
+                }
+                if crate::trap::ticks() >= deadline {
+                    return Woke::TimedOut;
+                }
+                self.waiters.lock().push(pid);
+                // The timer wakes a sleeping task when its deadline passes, so
+                // the same sleep serves both the event and the timeout.
+                current().sleep(if deadline == u64::MAX { 0 } else { deadline }, irq);
+                Woke::Parked
+            }) {
+                Woke::Ready => return true,
+                Woke::TimedOut => return false,
+                Woke::Parked => {}
             }
-            if crate::trap::ticks() >= deadline {
-                enable_interrupts();
-                return false;
-            }
-            self.waiters.lock().push(pid);
-            current().state = State::Sleeping;
-            // The timer wakes a sleeping task when its deadline passes, so the
-            // same sleep serves both the event and the timeout.
-            current().wake_at = if deadline == u64::MAX { 0 } else { deadline };
-            enable_interrupts();
 
+            // Nothing returns a sleeping task to the run queue without
+            // clearing its deadline, so there is none left to clear here.
             schedule();
 
-            current().wake_at = 0;
             self.waiters.lock().retain(|waiter| *waiter != pid);
         }
     }
 
     pub fn wake_all(&self) {
         let mut waiters = self.waiters.lock();
-        for pid in waiters.drain(..) {
-            if let Some(task) = find(pid) {
-                if task.state == State::Sleeping {
-                    task.state = State::Runnable;
-                    task.wake_at = 0;
+        with_tasks(|table| {
+            for pid in waiters.drain(..) {
+                if let Some(task) = table.find(pid) {
+                    task.wake(table.irq());
                 }
             }
-        }
+        });
     }
 
     pub fn is_empty(&self) -> bool {

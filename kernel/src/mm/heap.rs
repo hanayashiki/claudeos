@@ -37,13 +37,17 @@ impl HoleList {
         HoleList { head: ptr::null_mut(), free_bytes: 0, total_bytes: 0, mapped: 0 }
     }
 
-    /// Map more heap and donate it. Returns false when the heap has reached
-    /// its ceiling or physical memory is too low to spare.
-    unsafe fn grow(&mut self, needed: usize) -> bool {
+    /// Take a range of heap address space to map, or nothing when the heap has
+    /// reached its ceiling or physical memory is too low to spare.
+    ///
+    /// `mapped` moves here rather than when the pages arrive, so the range
+    /// belongs to this claim from now on and a second grower, running while
+    /// this one has let the lock go, takes a different one.
+    fn claim(&mut self, needed: usize) -> Option<Claim> {
         const CHUNK: usize = 8 * 1024 * 1024;
         let want = super::align_up(needed.max(CHUNK) as u64, PAGE_SIZE_U64) as usize;
         if self.mapped + want > super::KERNEL_HEAP_MAX {
-            return false;
+            return None;
         }
 
         // Leave enough physical memory for the user pages the caller will
@@ -51,27 +55,12 @@ impl HoleList {
         let (used, total) = super::frame::stats();
         let free_bytes = (total - used) * super::PAGE_SIZE;
         if free_bytes < want + super::FRAME_RESERVE {
-            return false;
+            return None;
         }
 
-        let space = AddressSpace::current();
         let start = super::KERNEL_HEAP_BASE + self.mapped as u64;
-        let pages = want as u64 / PAGE_SIZE_U64;
-        for i in 0..pages {
-            let virt = start + i * PAGE_SIZE_U64;
-            if space.map_new(virt, PRESENT | WRITABLE | NO_EXECUTE).is_err() {
-                // Donate whatever was mapped before giving up.
-                if i > 0 {
-                    let got = (i * PAGE_SIZE_U64) as usize;
-                    self.mapped += got;
-                    self.add_region(start, got);
-                }
-                return i > 0;
-            }
-        }
         self.mapped += want;
-        self.add_region(start, want);
-        true
+        Some(Claim { start, bytes: want })
     }
 
     /// Donate `[start, start + size)` to the heap.
@@ -174,20 +163,65 @@ impl HoleList {
     }
 }
 
+/// Heap address space that belongs to one grower and has yet to be mapped.
+struct Claim {
+    start: u64,
+    bytes: usize,
+}
+
+/// Put pages under a claim. Returns how many bytes got them, which is all of
+/// them unless physical memory ran out partway.
+///
+/// Thousands of page table writes and an invalidation each, so this is what
+/// the heap lock must not be held across.
+unsafe fn map_claim(claim: &Claim) -> usize {
+    let space = AddressSpace::current();
+    let pages = claim.bytes as u64 / PAGE_SIZE_U64;
+    for page in 0..pages {
+        let virt = claim.start + page * PAGE_SIZE_U64;
+        if space.map_new(virt, PRESENT | WRITABLE | NO_EXECUTE).is_err() {
+            return (page * PAGE_SIZE_U64) as usize;
+        }
+    }
+    claim.bytes
+}
+
 pub struct LockedHeap(Spinlock<HoleList>);
 
 unsafe impl GlobalAlloc for LockedHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        {
+            let mut heap = self.0.lock();
+            let ptr = heap.alloc(layout);
+            if !ptr.is_null() {
+                return ptr;
+            }
+        }
+
+        // Out of room. The lock masks interrupts, and mapping a growth of the
+        // heap is up to forty thousand page table writes with a translation
+        // buffer invalidation each: done under the lock it held the timer off
+        // for a third of a second on the Pi's instruction set. So the range is
+        // claimed under the lock, mapped with it released, and handed to the
+        // free list under it again.
+        //
+        // Another task allocating in that window and finding the heap full
+        // claims a range of its own, which is a second growth rather than a
+        // wrong one. A claim only partly mapped keeps the rest of its address
+        // space, which costs nothing worth recovering: the only way there is
+        // to be out of physical memory already.
+        let claim = match self.0.lock().claim(layout.size()) {
+            Some(claim) => claim,
+            None => return ptr::null_mut(),
+        };
+        let mapped = map_claim(&claim);
+        if mapped == 0 {
+            return ptr::null_mut();
+        }
+
         let mut heap = self.0.lock();
-        let ptr = heap.alloc(layout);
-        if !ptr.is_null() {
-            return ptr;
-        }
-        // Out of room: map more heap and try once more.
-        if heap.grow(layout.size()) {
-            return heap.alloc(layout);
-        }
-        ptr::null_mut()
+        heap.add_region(claim.start, mapped);
+        heap.alloc(layout)
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         self.0.lock().dealloc(ptr, layout)

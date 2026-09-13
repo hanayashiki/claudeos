@@ -51,9 +51,75 @@ fn index_of(virt: u64, level: u32) -> usize {
     ((virt >> (12 + 9 * level)) & 0x1FF) as usize
 }
 
+/// One entry in a page table.
+///
+/// The hardware that translates addresses walks these tables itself, so an
+/// entry is memory a second observer reads, and a store to one has to be
+/// ordered against whatever the entry makes reachable. `store` is the only way
+/// to write one and carries that ordering, so it cannot be left out: a table is
+/// an array of these and nothing hands out the word inside.
+///
+/// This processor orders a walker's reads against its own stores, so there is
+/// nothing to emit here. It is spelled this way because the other machine needs
+/// a barrier and the two halves keep one shape; writing the word directly is
+/// how that barrier gets left out on the machine that needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct Entry(u64);
+
+impl Entry {
+    pub const EMPTY: Entry = Entry(0);
+
+    #[inline]
+    pub const fn new(bits: u64) -> Entry {
+        Entry(bits)
+    }
+
+    #[inline]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn is_present(self) -> bool {
+        self.0 & PRESENT != 0
+    }
+
+    /// The physical address the entry names.
+    #[inline]
+    pub const fn addr(self) -> u64 {
+        self.0 & ADDR_MASK
+    }
+
+    #[inline]
+    pub const fn flags(self) -> u64 {
+        self.0 & !ADDR_MASK
+    }
+
+    /// Write this entry where the walker will read it.
+    #[inline]
+    pub unsafe fn store(self, at: *mut Entry) {
+        core::ptr::write(at, self);
+    }
+}
+
+/// Put a fresh table under `at` and link it there.
+///
+/// The three steps belong together and are here and nowhere else: the frame is
+/// zeroed, the zeroing is made visible to the walker, and only then does an
+/// entry name it. In any other order, or with anything in between, the walker
+/// can reach the entry and read whatever the frame held before it was cleared.
+/// The entry above holds the table's reference from here on; `free_table`
+/// takes it back.
+unsafe fn publish_table(at: *mut Entry, flags: u64) -> Result<u64, MapError> {
+    let table = frame::alloc_zeroed().ok_or(MapError::OutOfMemory)?.into_recorded();
+    Entry::new(table | PRESENT | WRITABLE | (flags & USER)).store(at);
+    Ok(table)
+}
+
 #[inline]
-unsafe fn table_at(phys: u64) -> *mut u64 {
-    phys_to_virt(phys) as *mut u64
+unsafe fn table_at(phys: u64) -> *mut Entry {
+    phys_to_virt(phys) as *mut Entry
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +155,7 @@ impl AddressSpace {
             let dst = table_at(pml4);
             // Entries 256..512 cover the kernel: direct map, heap, image.
             for i in 256..512 {
-                *dst.add(i) = *src.add(i);
+                (*src.add(i)).store(dst.add(i));
             }
         }
         Some(AddressSpace { pml4 })
@@ -105,32 +171,28 @@ impl AddressSpace {
         virt: u64,
         create: bool,
         parent_flags: u64,
-    ) -> Result<*mut u64, MapError> {
+    ) -> Result<*mut Entry, MapError> {
         let mut table = self.pml4;
         for level in (1..4).rev() {
             let idx = index_of(virt, level);
             let entry_ptr = table_at(table).add(idx);
             let entry = *entry_ptr;
-            if entry & PRESENT == 0 {
+            if !entry.is_present() {
                 if !create {
                     return Err(MapError::OutOfMemory);
                 }
-                // The entry above it holds the table's reference from here
-                // on; `free_table` takes it back.
-                let new = frame::alloc_zeroed().ok_or(MapError::OutOfMemory)?.into_recorded();
-                *entry_ptr = new | PRESENT | WRITABLE | (parent_flags & USER);
-                table = new;
+                table = publish_table(entry_ptr, parent_flags)?;
             } else {
-                if entry & HUGE != 0 {
+                if entry.bits() & HUGE != 0 {
                     // A large page already covers this address.
                     return Err(MapError::AlreadyMapped);
                 }
                 // Widen permissions on the way down: a user leaf is
                 // unreachable if any parent lacks the user bit.
-                if parent_flags & USER != 0 && entry & USER == 0 {
-                    *entry_ptr = entry | USER;
+                if parent_flags & USER != 0 && entry.bits() & USER == 0 {
+                    Entry::new(entry.bits() | USER).store(entry_ptr);
                 }
-                table = entry & ADDR_MASK;
+                table = entry.addr();
             }
         }
         Ok(table_at(table).add(index_of(virt, 0)))
@@ -149,10 +211,10 @@ impl AddressSpace {
         let virt = page_align_down(virt);
         unsafe {
             let entry = self.entry_for(virt, true, flags)?;
-            if *entry & PRESENT != 0 {
+            if (*entry).is_present() {
                 return Err(MapError::AlreadyMapped);
             }
-            *entry = (frame.into_recorded() & ADDR_MASK) | flags | PRESENT;
+            Entry::new((frame.into_recorded() & ADDR_MASK) | flags | PRESENT).store(entry);
         }
         flush_tlb(virt);
         Ok(())
@@ -165,7 +227,7 @@ impl AddressSpace {
         let virt = page_align_down(virt);
         unsafe {
             let entry = self.entry_for(virt, true, flags)?;
-            *entry = (phys & ADDR_MASK) | flags | PRESENT;
+            Entry::new((phys & ADDR_MASK) | flags | PRESENT).store(entry);
         }
         flush_tlb(virt);
         Ok(())
@@ -187,12 +249,12 @@ impl AddressSpace {
         unsafe {
             let entry = self.entry_for(virt, false, 0).ok()?;
             let value = *entry;
-            if value & PRESENT == 0 {
+            if !value.is_present() {
                 return None;
             }
-            *entry = 0;
+            Entry::EMPTY.store(entry);
             flush_tlb(virt);
-            Some(Frame::from_recorded(value & ADDR_MASK))
+            Some(Frame::from_recorded(value.addr()))
         }
     }
 
@@ -201,20 +263,20 @@ impl AddressSpace {
             let mut table = self.pml4;
             for level in (1..4).rev() {
                 let entry = *table_at(table).add(index_of(virt, level));
-                if entry & PRESENT == 0 {
+                if !entry.is_present() {
                     return None;
                 }
-                if entry & HUGE != 0 {
+                if entry.bits() & HUGE != 0 {
                     let page_size = 1u64 << (12 + 9 * level);
-                    return Some((entry & ADDR_MASK & !(page_size - 1)) | (virt & (page_size - 1)));
+                    return Some((entry.addr() & !(page_size - 1)) | (virt & (page_size - 1)));
                 }
-                table = entry & ADDR_MASK;
+                table = entry.addr();
             }
             let entry = *table_at(table).add(index_of(virt, 0));
-            if entry & PRESENT == 0 {
+            if !entry.is_present() {
                 return None;
             }
-            Some((entry & ADDR_MASK) | (virt & 0xFFF))
+            Some(entry.addr() | (virt & 0xFFF))
         }
     }
 
@@ -222,10 +284,10 @@ impl AddressSpace {
         unsafe {
             let entry = self.entry_for(virt, false, 0).ok()?;
             let value = *entry;
-            if value & PRESENT == 0 {
+            if !value.is_present() {
                 None
             } else {
-                Some(value & !ADDR_MASK)
+                Some(value.flags())
             }
         }
     }
@@ -234,10 +296,10 @@ impl AddressSpace {
         unsafe {
             let entry = self.entry_for(virt, false, flags).ok()?;
             let value = *entry;
-            if value & PRESENT == 0 {
+            if !value.is_present() {
                 return None;
             }
-            *entry = (value & ADDR_MASK) | flags | PRESENT;
+            Entry::new(value.addr() | flags | PRESENT).store(entry);
         }
         flush_tlb(virt);
         Some(())
@@ -264,18 +326,18 @@ impl AddressSpace {
     /// mapping to it still exists can be given to another address space and
     /// written through the old one.
     pub fn free_user_memory(&self) {
-        let mut detached = [0u64; 256];
+        let mut detached = [Entry::EMPTY; 256];
         unsafe {
             let pml4 = table_at(self.pml4);
             for (i, entry) in detached.iter_mut().enumerate() {
                 *entry = *pml4.add(i);
-                *pml4.add(i) = 0;
+                Entry::EMPTY.store(pml4.add(i));
             }
         }
         flush_tlb_all();
         for entry in detached {
-            if entry & PRESENT != 0 {
-                unsafe { self.free_table(entry & ADDR_MASK, 3) };
+            if entry.is_present() {
+                unsafe { self.free_table(entry.addr(), 3) };
             }
         }
     }
@@ -285,17 +347,17 @@ impl AddressSpace {
             let table = table_at(table_phys);
             for i in 0..512 {
                 let entry = *table.add(i);
-                if entry & PRESENT == 0 || entry & HUGE != 0 {
+                if !entry.is_present() || entry.bits() & HUGE != 0 {
                     continue;
                 }
-                self.free_table(entry & ADDR_MASK, level - 1);
+                self.free_table(entry.addr(), level - 1);
             }
         } else {
             let table = table_at(table_phys);
             for i in 0..512 {
                 let entry = *table.add(i);
-                if entry & PRESENT != 0 {
-                    drop(Frame::from_recorded(entry & ADDR_MASK));
+                if entry.is_present() {
+                    drop(Frame::from_recorded(entry.addr()));
                 }
             }
         }
@@ -323,25 +385,25 @@ impl AddressSpace {
         let src_pml4 = table_at(src.pml4);
         for i in 0..256usize {
             let e4 = *src_pml4.add(i);
-            if e4 & PRESENT == 0 {
+            if !e4.is_present() {
                 continue;
             }
-            let pdpt = table_at(e4 & ADDR_MASK);
+            let pdpt = table_at(e4.addr());
             for j in 0..512usize {
                 let e3 = *pdpt.add(j);
-                if e3 & PRESENT == 0 || e3 & HUGE != 0 {
+                if !e3.is_present() || e3.bits() & HUGE != 0 {
                     continue;
                 }
-                let pd = table_at(e3 & ADDR_MASK);
+                let pd = table_at(e3.addr());
                 for k in 0..512usize {
                     let e2 = *pd.add(k);
-                    if e2 & PRESENT == 0 || e2 & HUGE != 0 {
+                    if !e2.is_present() || e2.bits() & HUGE != 0 {
                         continue;
                     }
-                    let pt = table_at(e2 & ADDR_MASK);
+                    let pt = table_at(e2.addr());
                     for l in 0..512usize {
                         let entry = *pt.add(l);
-                        if entry & PRESENT == 0 {
+                        if !entry.is_present() {
                             continue;
                         }
                         let virt = sign_extend(
@@ -350,14 +412,14 @@ impl AddressSpace {
                                 | ((k as u64) << 21)
                                 | ((l as u64) << 12),
                         );
-                        let phys = entry & ADDR_MASK;
-                        let flags = entry & !ADDR_MASK;
+                        let phys = entry.addr();
+                        let flags = entry.flags();
 
                         let shared = if flags & WRITABLE != 0 {
                             let shared = (flags & !WRITABLE) | COW;
                             // The parent loses write access too, or it
                             // would change pages the child can see.
-                            *pt.add(l) = phys | shared;
+                            Entry::new(phys | shared).store(pt.add(l));
                             shared
                         } else {
                             flags
@@ -383,7 +445,7 @@ impl AddressSpace {
 /// entirely out of the higher half. This frees PML4[0] for user programs.
 pub unsafe fn drop_identity_map() {
     let pml4 = table_at(read_cr3());
-    *pml4.add(0) = 0;
+    Entry::EMPTY.store(pml4.add(0));
     flush_tlb_all();
 }
 

@@ -123,7 +123,7 @@ pub fn unhandled(frame: &mut TrapFrame) {
 /// was inside a region at all.
 fn dump_regions(addr: u64) {
     let task = crate::sched::current();
-    let mm = task.mm.lock();
+    let mm = task.mm().lock();
     println!(
         "  regions: brk {:#x}..{:#x}  mmap_top {:#x}  {} vmas",
         mm.brk_start,

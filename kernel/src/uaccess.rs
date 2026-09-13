@@ -35,7 +35,7 @@ pub fn validate_in(task: &Task, addr: u64, len: u64, write: bool) -> Result<(), 
 
     let mut page = page_align_down(addr);
     while page < end {
-        match task.space.flags_of(page) {
+        match task.space().flags_of(page) {
             Some(flags) => {
                 // A page shared after a fork is read-only until someone writes
                 // to it. The kernel writing on the task's behalf counts, so
@@ -68,7 +68,7 @@ pub fn validate_in(task: &Task, addr: u64, len: u64, write: bool) -> Result<(), 
 }
 
 fn writable(task: &Task, page: u64) -> bool {
-    matches!(task.space.flags_of(page), Some(flags) if flags & WRITABLE != 0)
+    matches!(task.space().flags_of(page), Some(flags) if flags & WRITABLE != 0)
 }
 
 pub fn read_bytes(addr: u64, buf: &mut [u8]) -> Result<(), Errno> {
@@ -104,7 +104,7 @@ pub fn write_bytes_in(task: &Task, addr: u64, buf: &[u8]) -> Result<(), Errno> {
         let chunk_end = (page_align_down(at) + PAGE_SIZE_U64).min(end);
         let from = (at - addr) as usize;
         let len = (chunk_end - at) as usize;
-        crate::sync::without_interrupts(|| -> Result<(), Errno> {
+        crate::sync::without_interrupts(|_irq| -> Result<(), Errno> {
             validate_in(task, at, len as u64, true)?;
             unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr().add(from), at as *mut u8, len) };
             Ok(())
@@ -158,7 +158,7 @@ pub fn write_struct<T: Copy>(addr: u64, value: &T) -> Result<(), Errno> {
     let size = core::mem::size_of::<T>();
     let task = crate::sched::current();
     // Checked and written together, for the same reason `write_bytes_in` is.
-    crate::sync::without_interrupts(|| -> Result<(), Errno> {
+    crate::sync::without_interrupts(|_irq| -> Result<(), Errno> {
         validate_in(&task, addr, size as u64, true)?;
         unsafe { core::ptr::write_unaligned(addr as *mut T, *value) };
         Ok(())

@@ -12,7 +12,7 @@ use crate::fs::{FdTable, OpenFile};
 use crate::mm::{page_align_down, page_align_up, PAGE_SIZE_U64, USER_MMAP_BASE, USER_STACK_TOP};
 use alloc::alloc::{alloc, dealloc, Layout};
 use alloc::string::{String, ToString};
-use crate::sync::Spinlock;
+use crate::sync::{NoInterrupts, Spinlock};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -110,16 +110,26 @@ pub struct Task {
     pub tgid: u32,
     pub ppid: u32,
     pub pgid: u32,
-    pub state: State,
+    /// What the scheduler will do with this task, and when the timer should
+    /// put it back on the run queue. Private, and changed only by the
+    /// transitions below: every one of them is a step that has a second half
+    /// somewhere else -- a parent to tell, a waiter to wake -- and a field
+    /// anyone could assign to is how the two halves came apart.
+    state: State,
+    /// Tick count to wake at when sleeping, or zero for no deadline.
+    wake_at: u64,
 
     /// Saved kernel stack pointer between context switches.
     pub kernel_sp: u64,
     kstack: *mut u8,
     pub kstack_top: u64,
 
-    pub space: AddressSpace,
+    /// The page tables the task runs on, and the record of what is in them.
+    /// Private for the same reason the scheduling state is: the two have to
+    /// change together, and `run_on_space` is where that happens.
+    space: AddressSpace,
     /// Shared with every thread running in the same address space.
-    pub mm: Arc<Spinlock<MemState>>,
+    mm: Arc<Spinlock<MemState>>,
     /// Shared with every task that cloned with `CLONE_FILES`.
     pub fds: FdTable,
     /// Shared with every task that cloned with `CLONE_FS`, so that a directory
@@ -148,8 +158,6 @@ pub struct Task {
     pub signal_actions: [crate::signal::SigAction; 64],
     pub signal_mask: u64,
 
-    /// Tick count to wake at when sleeping, or zero.
-    pub wake_at: u64,
     /// Pid this task is waiting for, if it is in wait4.
     pub waiting_for: Option<i32>,
 
@@ -498,6 +506,175 @@ impl Task {
             unsafe { dealloc(self.kstack, kstack_layout()) };
             self.kstack = core::ptr::null_mut();
         }
+    }
+
+    pub fn state(&self) -> State {
+        self.state
+    }
+
+    /// The tick this task is due to be woken at, or zero for no deadline.
+    pub fn wake_at(&self) -> u64 {
+        self.wake_at
+    }
+
+    /// The page tables the task runs on.
+    pub fn space(&self) -> AddressSpace {
+        self.space
+    }
+
+    /// The record of what is in them, shared with this task's threads.
+    pub fn mm(&self) -> &Arc<Spinlock<MemState>> {
+        &self.mm
+    }
+
+    /// Run in the address space `other` runs in, sharing its region list.
+    ///
+    /// Only for a task that has not been admitted to the scheduler yet, which
+    /// is why it asks for no proof of anything: nothing can see this task to
+    /// be confused by a half-done change. A task that is already running
+    /// changes address space through `run_on_space`.
+    pub fn share_space_of(&mut self, other: &Task) {
+        self.space = other.space;
+        self.mm = other.mm.clone();
+    }
+
+    // -----------------------------------------------------------------------
+    // Transitions
+    // -----------------------------------------------------------------------
+    //
+    // Each of these is one step with two halves: the task stops being runnable
+    // and something is told about it, or it becomes runnable and the reason it
+    // was waiting is cleared, or the record of the address space moves and the
+    // register follows it. A tick landing between the halves is what the six
+    // defects these replace all were, so each asks for proof that interrupts
+    // are off for the whole of it. The three that have to reach a second task
+    // take the process table, held, which is that proof and is also where the
+    // other task is found.
+
+    /// Park the task until `wake_at` ticks, or until something wakes it. Zero
+    /// means no deadline: only a wake-up ends it.
+    ///
+    /// Whatever the caller is waiting for has to have been checked for inside
+    /// the same section. A wake-up that lands between the check and this call
+    /// finds a runnable task and wakes nothing, and the task then sleeps out
+    /// the whole of the time it asked for with the reason to run already
+    /// delivered.
+    pub fn sleep(&mut self, wake_at: u64, _irq: NoInterrupts) {
+        self.state = State::Sleeping;
+        self.wake_at = wake_at;
+    }
+
+    /// Put a sleeping task back on the run queue, clearing its deadline.
+    /// A task that is stopped stays stopped: only a continue restarts one.
+    pub fn wake(&mut self, _irq: NoInterrupts) {
+        if self.state == State::Sleeping {
+            self.state = State::Runnable;
+            self.wake_at = 0;
+        }
+    }
+
+    /// Restart a stopped task without the report a continue owes its parent.
+    /// A kill it can never look at is not a kill, and nothing else gets a
+    /// stopped task running again.
+    pub fn restart_for_kill(&mut self, _irq: NoInterrupts) {
+        if self.state == State::Stopped {
+            self.state = State::Runnable;
+            self.wake_at = 0;
+        }
+    }
+
+    /// Take the task off the run queue and tell its parent, in one step.
+    ///
+    /// The parent is normally asleep in wait4. If a tick lands between the two
+    /// halves it hands the CPU to something else and never hands it back,
+    /// because this task is no longer runnable, so the notification is left
+    /// undelivered by a task that can no longer deliver it.
+    pub fn stop(&mut self, signal: i32, table: &crate::sched::Held) {
+        self.stop_signal = signal;
+        self.report_stop = true;
+        self.state = State::Stopped;
+        table.notify_parent(self.ppid);
+    }
+
+    /// Restart a stopped task and record the continue for whoever waits.
+    ///
+    /// Returns false when the task was not stopped, which is a continue with
+    /// nothing to undo.
+    pub fn continue_after_stop(&mut self, table: &crate::sched::Held) -> bool {
+        if self.state != State::Stopped {
+            return false;
+        }
+        self.state = State::Runnable;
+        self.wake_at = 0;
+        // A stop nobody has been told about yet has stopped being true. Left
+        // standing it is handed to whatever asks next, which is a suspension
+        // reported after the job is running again.
+        self.report_stop = false;
+        self.report_continue = true;
+        table.notify_parent(self.ppid);
+        true
+    }
+
+    /// Make this task a zombie and wake whoever is waiting for it.
+    ///
+    /// This takes the task off the run queue for good, so everything owed on
+    /// its behalf is owed now: a parent in vfork that has been holding the
+    /// address space open, and, for a process rather than one of the threads
+    /// inside one, the parent that may be in wait4. A thread's exit is not a
+    /// child exit; whoever joins it is woken through its cleared tid word.
+    pub fn become_zombie(&mut self, table: &crate::sched::Held) {
+        self.state = State::Zombie;
+        if let Some(parent_pid) = self.vfork_parent.take() {
+            if let Some(parent) = table.find(parent_pid) {
+                parent.wake(table.irq());
+            }
+        }
+        if self.pid == self.tgid {
+            table.notify_parent(self.ppid);
+        }
+    }
+
+    /// Record that a child of this task changed state, and put it back on the
+    /// run queue if it was asleep.
+    ///
+    /// Any sleep, not only a wait for a child. This is a signal, and every
+    /// other signal returns a sleeping task to the run queue; a shell blocked
+    /// reading its terminal has a handler for this one and would otherwise not
+    /// learn that a background job had finished until the next key was
+    /// pressed.
+    pub fn child_changed_state(&mut self, irq: NoInterrupts) {
+        self.pending_signals |= 1u64 << (SIGCHLD as u64 & 63);
+        self.wake(irq);
+    }
+
+    /// The timer found this task's deadline passed.
+    pub fn deadline_reached(&mut self, _irq: NoInterrupts) {
+        self.wake_at = 0;
+        self.state = State::Runnable;
+    }
+
+    /// The task's memory has been handed back and its entry is out of the
+    /// table. Nothing can reach it from here.
+    pub fn mark_dead(&mut self) {
+        self.state = State::Dead;
+    }
+
+    /// Run on `space` from here on, with `mm` as the record of what is in it.
+    ///
+    /// A context switch reloads the page table root only when the two tasks'
+    /// recorded spaces differ, so between the record changing and the CPU
+    /// following it the two disagree, and a sibling thread recorded on the
+    /// other one is resumed with no reload. The record and the register move
+    /// together or not at all.
+    pub fn run_on_space(
+        &mut self,
+        space: AddressSpace,
+        mm: Arc<Spinlock<MemState>>,
+        _irq: NoInterrupts,
+    ) {
+        self.space = space;
+        self.mm = mm;
+        unsafe { space.switch_to() };
     }
 }
 

@@ -26,10 +26,10 @@ pub fn fork(
     // or it is held by nobody: the tables under it, and the references its
     // entries took on the parent's frames, would stay taken for good.
     let space = if share_vm {
-        parent.space
+        parent.space()
     } else {
         let space = AddressSpace::new_user().ok_or(Errno::ENOMEM)?;
-        if space.clone_user_from(&parent.space).is_err() {
+        if space.clone_user_from(&parent.space()).is_err() {
             space.destroy();
             return Err(Errno::ENOMEM);
         }
@@ -44,10 +44,10 @@ pub fn fork(
     };
     if share_vm {
         // Threads must see each other's mappings, so they share one record.
-        child.mm = parent.mm.clone();
+        child.share_space_of(&parent);
     } else {
-        let source = parent.mm.lock();
-        let mut target = child.mm.lock();
+        let source = parent.mm().lock();
+        let mut target = child.mm().lock();
         target.vmas = source.vmas.clone();
         target.brk_start = source.brk_start;
         target.brk = source.brk;
@@ -122,12 +122,14 @@ pub fn fork(
         // child among them, must not end the wait, so this sleeps until the
         // link is gone rather than once.
         loop {
-            crate::sync::disable_interrupts();
-            let waiting = sched::find(child_pid).map_or(false, |c| c.vfork_parent.is_some());
-            if waiting {
-                sched::current().state = State::Sleeping;
-            }
-            crate::sync::enable_interrupts();
+            let waiting = crate::sync::without_interrupts(|irq| {
+                let waiting =
+                    sched::find(child_pid).map_or(false, |c| c.vfork_parent.is_some());
+                if waiting {
+                    sched::current().sleep(0, irq);
+                }
+                waiting
+            });
             if !waiting {
                 break;
             }
@@ -156,11 +158,7 @@ fn abandon_exec(
     // and the CPU following it the two disagree. A sibling thread recorded on
     // the old space is then resumed with no reload and runs on the half-built
     // exec image. The pair has to move together.
-    crate::sync::without_interrupts(|| {
-        task.space = old_space;
-        task.mm = old_mm;
-        unsafe { old_space.switch_to() };
-    });
+    crate::sync::without_interrupts(|irq| task.run_on_space(old_space, old_mm, irq));
     new_space.destroy();
 }
 
@@ -189,7 +187,7 @@ pub fn exec_into_current(
 
     elf::validate(&node.inner.lock().data)?;
 
-    let old_space = sched::current().space;
+    let old_space = sched::current().space();
     let new_space = AddressSpace::new_user().ok_or(Errno::ENOMEM)?;
 
     // Everything below runs against the new address space; the kernel half is
@@ -206,13 +204,9 @@ pub fn exec_into_current(
     // tables it describes are still there and the task goes back to running on
     // them if it does not.
     let mut task = sched::current();
-    let old_mm = alloc::sync::Arc::clone(&task.mm);
+    let old_mm = alloc::sync::Arc::clone(task.mm());
     let new_mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
-    crate::sync::without_interrupts(|| {
-        task.space = new_space;
-        task.mm = new_mm;
-        unsafe { new_space.switch_to() };
-    });
+    crate::sync::without_interrupts(|irq| task.run_on_space(new_space, new_mm, irq));
 
     // The file stays locked while its headers are read and its first pages
     // are assembled; the rest arrives through the fault handler later.
@@ -375,19 +369,20 @@ pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
         // starting now, not something that already happened, so the question
         // has to be asked again inside the same window, and the sleep skipped
         // if the answer has changed.
-        crate::sync::disable_interrupts();
-        let sleep = !sched::child_event_pending(
-            me,
-            pid as i32,
-            options & WUNTRACED != 0,
-            options & WCONTINUED != 0,
-        );
-        if sleep {
+        let sleep = crate::sync::without_interrupts(|irq| {
+            if sched::child_event_pending(
+                me,
+                pid as i32,
+                options & WUNTRACED != 0,
+                options & WCONTINUED != 0,
+            ) {
+                return false;
+            }
             let mut task = sched::current();
             task.waiting_for = Some(pid as i32);
-            task.state = State::Sleeping;
-        }
-        crate::sync::enable_interrupts();
+            task.sleep(0, irq);
+            true
+        });
         if sleep {
             sched::schedule();
             sched::current().waiting_for = None;
@@ -417,28 +412,22 @@ pub fn kill(pid: i64, signal: i32) -> SysResult {
     // which is how a program watches something it did not fork.
     let probe = signal == 0;
     let mut delivered = false;
-    let mut parents = alloc::vec::Vec::new();
     let me = sched::current().pid;
     let my_pgid = sched::current_pgid();
-    sched::for_each(|task| {
+    sched::for_each(|task, table| {
         let target = match pid {
             p if p > 0 => task.pid == p as u32,
             0 => task.pgid == my_pgid,
             -1 => task.pid != me && task.pid != 0,
             p => task.pgid == (-p) as u32,
         };
-        if target && task.state != State::Zombie && task.pid != 0 {
+        if target && task.state() != State::Zombie && task.pid != 0 {
             if !probe {
-                if let Some(ppid) = sched::post_signal(task, signal) {
-                    parents.push(ppid);
-                }
+                sched::post_signal(task, signal, table);
             }
             delivered = true;
         }
     });
-    for ppid in parents {
-        sched::notify_parent(ppid);
-    }
     if !delivered {
         return Err(Errno::ESRCH);
     }
