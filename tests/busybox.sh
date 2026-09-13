@@ -31,8 +31,11 @@ bb mkdir -p /tmp/bb/deep
 bb seq 1 100 > /tmp/bb/n.txt
 
 echo "-- core --"
+# Which machine this is comes from /proc/cpuinfo, whose fields are written per
+# architecture, so the answer does not come from the call under test.
+if bb grep -q "^CPU implementer" /proc/cpuinfo; then machine=aarch64; else machine=x86_64; fi
 check "uname"           "Linux"       "$(bb uname)"
-check "arch"            "x86_64"      "$(bb uname -m)"
+check "arch"            "$machine"    "$(bb uname -m)"
 check "echo"            "hi"          "$(bb echo hi)"
 check "seq and wc"      "100"         "$(bb seq 1 100 | bb wc -l)"
 check "mkdir -p"        "0"           "$(bb test -d /tmp/bb/deep; echo $?)"

@@ -6,9 +6,10 @@ runs on x86-64 and on aarch64, where the machine it targets is a Raspberry Pi 4.
 
 It boots an unmodified Alpine Linux root filesystem. It also runs a stock
 `rustc --target x86_64-unknown-linux-musl` executable, a C program linked
-against musl, and an upstream busybox binary downloaded from busybox.net. The
-userland shipped here is built the same way: an ordinary Linux program, not
-something written against a private kernel interface.
+against musl, and an upstream busybox binary downloaded from busybox.net, or
+from Alpine's package repository on aarch64, which busybox.net has no build
+for. The userland shipped here is built the same way: an ordinary Linux
+program, not something written against a private kernel interface.
 
 ```
 claudeos: starting /bin/sh as pid 1
@@ -71,11 +72,17 @@ ARCH=aarch64 ./scripts/build.sh          # build/kernel8.img
 ./scripts/build-user-aarch64.sh          # build/initramfs-aarch64.cpio
 ARCH=aarch64 ./scripts/run.sh --initrd build/initramfs-aarch64.cpio \
     --append 'init=/bin/init'
-ARCH=aarch64 ./scripts/test.sh           # the suites that are not x86-64 only
+ARCH=aarch64 make busybox                # an aarch64 busybox to test against
+ARCH=aarch64 make alpine                 # an aarch64 Alpine root filesystem
+ARCH=aarch64 ./scripts/test.sh           # all seven suites
 ```
 
-Two suites are skipped there rather than run: the busybox and Alpine images are
-fetched as x86-64 binaries, so on any other machine there is nothing to run.
+Both third-party images are fetched for the machine `ARCH` names, so the same
+seven suites run on either one. busybox.net has no aarch64 build among its
+prebuilt binaries, so that one comes from Alpine's `busybox-static` package
+instead; `scripts/fetch-busybox.sh` refuses anything that is not a static ELF
+for the machine asked for, since a dynamically linked one has no interpreter to
+load it here.
 
 ## Putting it on a Raspberry Pi 4
 
@@ -351,12 +358,16 @@ failures.
   host computes for the same input), `ps`, `df`, `xargs`, `timeout`, and
   busybox's own `ash` shell running loops, pipelines and arithmetic. Run
   `make busybox` first to fetch it; the suite is skipped when it is absent.
+  The x86-64 binary is busybox.net's own 1.35.0 build against musl; the aarch64
+  one is Alpine's `busybox-static` 1.36.1, because busybox.net publishes no
+  aarch64 build.
 - `tests/alpine.sh` runs **34 checks** inside an unmodified Alpine Linux root
   filesystem, where every program is dynamically linked and loaded by Alpine's
   own musl loader: `awk`, `sed`, `tar` with gzip, `md5sum` and `sha256sum`
   against digests the host computes, `find`, `stat`, `ps`, and ash running
   loops, `case` and here-documents. Run `make alpine` first; the suite is
-  skipped when it is absent.
+  skipped when it is absent. Alpine publishes the same minimal root filesystem
+  for both machines, so the same 34 checks run on either.
 - An **interactive session** is driven over the serial console: typing after
   boot, backspace and Ctrl-U line editing, `Ctrl-C` on a running job, `Ctrl-Z`
   followed by `jobs`, `bg` and `kill %1`, a background `cat` stopped for

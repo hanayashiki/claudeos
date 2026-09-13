@@ -25,11 +25,15 @@ rm -rf /tmp/w
 mkdir -p /tmp/w
 seq 1 200 > /tmp/w/n.txt
 
+# Which machine this is comes from /proc/cpuinfo, whose fields are written per
+# architecture, so the answer does not come from the calls under test.
+if grep -q "^CPU implementer" /proc/cpuinfo; then machine=aarch64; else machine=x86_64; fi
+
 echo "-- dynamic loading --"
-check "interpreter present" "0"       "$(test -x /lib/ld-musl-x86_64.so.1; echo $?)"
+check "interpreter present" "0"       "$(test -x /lib/ld-musl-$machine.so.1; echo $?)"
 check "echo"                "hi"      "$(echo hi)"
 check "uname"               "Linux"   "$(uname)"
-check "arch"                "x86_64"  "$(uname -m)"
+check "arch"                "$machine" "$(uname -m)"
 check "shell is pid 1"      "1"       "$(echo $$)"
 
 echo

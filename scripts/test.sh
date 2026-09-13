@@ -11,8 +11,12 @@ ARCH="${ARCH:-x86_64}"
 export ARCH
 if [ "$ARCH" = aarch64 ]; then
   IMAGE="$ROOT/build/initramfs-aarch64.cpio"
+  BUSYBOX="$ROOT/build/rootfs-aarch64/bin/busybox"
+  ALPINE="$ROOT/build/alpine-aarch64.cpio"
 else
   IMAGE="$ROOT/build/initramfs.cpio"
+  BUSYBOX="$ROOT/build/rootfs/bin/busybox"
+  ALPINE="$ROOT/build/alpine.cpio"
 fi
 
 status=0
@@ -108,25 +112,17 @@ run_suite "network protocols" "net=test" 60
 # address, so no card has to be there.
 run_suite "internet sockets" "init=/bin/inet" 120
 # The two suites below run software this project did not build. Both images
-# are fetched as x86-64 binaries, so on any other machine there is nothing to
-# run rather than something that fails.
-if [ "$ARCH" != x86_64 ]; then
-  echo ">> upstream busybox: skipped (the fetched image is x86-64 only)"
-  echo
-elif [ -x "$ROOT/build/rootfs/bin/busybox" ]; then
+# are fetched for the machine ARCH names, so both run on either one.
+if [ -x "$BUSYBOX" ]; then
   run_suite "upstream busybox" "/root/busybox.sh" 300
 else
-  echo ">> upstream busybox: skipped (run scripts/fetch-busybox.sh)"
+  echo ">> upstream busybox: skipped (run ARCH=$ARCH scripts/fetch-busybox.sh)"
   echo
 fi
-if [ "$ARCH" != x86_64 ]; then
-  echo ">> alpine linux userland: skipped (the fetched image is x86-64 only)"
-  echo
-elif [ -f "$ROOT/build/alpine.cpio" ]; then
-  run_suite "alpine linux userland" "init=/bin/sh /root/alpine.sh" 300 \
-      "$ROOT/build/alpine.cpio"
+if [ -f "$ALPINE" ]; then
+  run_suite "alpine linux userland" "init=/bin/sh /root/alpine.sh" 300 "$ALPINE"
 else
-  echo ">> alpine linux userland: skipped (run scripts/fetch-alpine.sh)"
+  echo ">> alpine linux userland: skipped (run ARCH=$ARCH scripts/fetch-alpine.sh)"
   echo
 fi
 run_interactive
