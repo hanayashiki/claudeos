@@ -212,6 +212,9 @@ const DMA_MAX_BURST_LENGTH: u32 = 0x08;
 // Descriptor common bits".
 const DMA_BUFLENGTH_SHIFT: u32 = 16;
 const DMA_BUFLENGTH_MASK: u32 = 0x0FFF;
+/// Where the descriptor count goes in a ring's size register. The same place
+/// as a length in a descriptor, and a different register.
+const DMA_RING_SIZE_SHIFT: u32 = 16;
 const DMA_EOP: u32 = 0x4000;
 const DMA_SOP: u32 = 0x2000;
 /// Have the controller compute and append the Ethernet CRC.
@@ -243,9 +246,22 @@ const RX_BUF_OFFSET: usize = 2;
 
 /// Descriptors this driver uses, of the 256 there are. The ring's size has to
 /// divide the index space so that a descriptor's position is the index's low
-/// bits, which means a power of two.
+/// bits, which means a power of two. The receive ring keeps all 256 so that
+/// the flow control thresholds below are the ones both references compute.
 const RX_DESCS: usize = 256;
 const TX_DESCS: usize = 64;
+
+// What the arithmetic above takes for granted. None of it can be found out by
+// running the driver, so it is said here where the compiler will check it.
+const _: () = assert!(RX_DESCS.is_power_of_two() && RX_DESCS <= TOTAL_DESCS);
+const _: () = assert!(TX_DESCS.is_power_of_two() && TX_DESCS <= TOTAL_DESCS);
+/// The index space is 65536 wide, so a power of two ring divides it and the
+/// two wrap together.
+const _: () = assert!(RX_DESCS <= 0x1_0000 && TX_DESCS <= 0x1_0000);
+/// Buffers are cut out of whole pages and none may straddle one.
+const _: () = assert!(PAGE_SIZE % BUFFER_SIZE == 0);
+/// A frame the controller will accept has to fit in a buffer.
+const _: () = assert!(MAX_FRAME_LEN as usize <= BUFFER_SIZE);
 
 /// Flow control thresholds for the receive ring, in descriptors: ask the other
 /// end to pause when this many are left, resume when this many are free again.
@@ -316,6 +332,22 @@ pub(crate) const fn ring_end_word(count: usize) -> u32 {
 // The management bus and the chip on the other end of it
 // ---------------------------------------------------------------------------
 
+/// `micros` microseconds, as a count of architected counter ticks. Rounded up,
+/// so a wait shorter than one tick still waits for one.
+fn counter_ticks(micros: u64) -> u64 {
+    let frequency = arch::counter_frequency();
+    if frequency == 0 {
+        return 0;
+    }
+    (micros * frequency + 999_999) / 1_000_000
+}
+
+/// Microseconds to wait for one management transfer.
+const MDIO_TIMEOUT_US: u32 = 20_000;
+/// Microseconds to wait for the PHY to come out of its reset. The standard
+/// gives a PHY half a second.
+const PHY_RESET_TIMEOUT_US: u32 = 500_000;
+
 const MDIO_START_BUSY: u32 = 1 << 29;
 const MDIO_READ_FAIL: u32 = 1 << 28;
 const MDIO_RD: u32 = 2 << 26;
@@ -339,13 +371,18 @@ const BMCR_ANRESTART: u16 = 1 << 9;
 const BMSR_LSTATUS: u16 = 1 << 2;
 const BMSR_ANEGCOMPLETE: u16 = 1 << 5;
 
+// What is advertised in register 4 and read back from the other end in
+// register 5, which put the same abilities in the same bits.
+const ADVERTISE_CSMA: u16 = 1 << 0;
 const ADVERTISE_10HALF: u16 = 1 << 5;
 const ADVERTISE_10FULL: u16 = 1 << 6;
 const ADVERTISE_100HALF: u16 = 1 << 7;
 const ADVERTISE_100FULL: u16 = 1 << 8;
-const ADVERTISE_CSMA: u16 = 1 << 0;
-const ADVERTISE_1000FULL: u16 = 1 << 9;
+// The gigabit pair, which live in registers 9 and 10 instead. Their numbering
+// starts again from the bottom, so 1 << 8 here is not the same ability as
+// 1 << 8 above, and the two sets must not be mixed between registers.
 const ADVERTISE_1000HALF: u16 = 1 << 8;
+const ADVERTISE_1000FULL: u16 = 1 << 9;
 
 /// Broadcom's shadow-register windows, which is how the delay settings are
 /// reached. `include/linux/brcmphy.h`.
@@ -430,6 +467,12 @@ pub fn trace_received(on: bool) {
 
 static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static OVERRUNS: AtomicU64 = AtomicU64::new(0);
+/// Frames given up on because the transmit ring stayed full.
+static TX_BLOCKED: AtomicU64 = AtomicU64::new(0);
+
+pub fn transmits_dropped() -> u64 {
+    TX_BLOCKED.load(Ordering::Relaxed)
+}
 
 pub fn interrupts() -> u64 {
     IRQ_COUNT.load(Ordering::Relaxed)
@@ -475,9 +518,12 @@ pub struct Genet {
     phy: u8,
     mode: PhyMode,
     /// Whether the tree said this device's transfers are coherent with the
-    /// caches, in which case the maintenance below is unnecessary. It is left
-    /// in the code rather than compiled out so that a board which does say so
-    /// costs nothing but the branch.
+    /// caches. On a Pi 4 it does not, and the maintenance below is done
+    /// whatever it says: on a device that is coherent the maintenance is
+    /// wasted work and not a mistake, while the barrier at the end of it is
+    /// still what orders a buffer's bytes against the descriptor that points
+    /// at them. Skipping it on the strength of one property would leave that
+    /// ordering to a path no board here has ever taken.
     coherent: bool,
     /// Physical addresses of the packet buffers, one per descriptor. They are
     /// allocated once and never released.
@@ -510,14 +556,18 @@ impl Genet {
         self.write(offset, value);
     }
 
-    /// Spin for roughly `micros` microseconds. There is no usable clock during
-    /// bring-up -- the timer tick is not running yet -- so this is a register
-    /// read per pass, which cannot be optimised away and which costs at least
-    /// a bus round trip each time. It is only ever used where the reference
-    /// asks for a delay of a few microseconds and overshooting is harmless.
-    fn delay(&self, micros: u32) {
-        for _ in 0..micros * 8 {
-            let _ = self.read(SYS_REV_CTRL);
+    /// Spin for `micros` microseconds.
+    ///
+    /// The timer tick is not running during bring-up -- interrupts are still
+    /// off -- but the architected counter is, and it reports its own rate, so
+    /// this is a measured wait rather than a guessed number of iterations.
+    /// Every use is a delay the reference driver asks for by name, where the
+    /// hardware needs a moment and nothing says when it is done.
+    fn delay(&self, micros: u64) {
+        let ticks = counter_ticks(micros);
+        let start = arch::cycle_counter();
+        while arch::cycle_counter().wrapping_sub(start) < ticks {
+            core::hint::spin_loop();
         }
     }
 
@@ -557,13 +607,13 @@ impl Genet {
     /// Wait for a management transfer to finish. One frame on this bus is 64
     /// bit times at 2.5 MHz, so about 26 microseconds; the limit here is far
     /// beyond that and is only there so a bus with nothing driving it cannot
-    /// stop the kernel.
+    /// stop the kernel. u-boot waits 20 milliseconds for the same bit.
     fn mdio_wait(&self) -> bool {
-        for _ in 0..1_000_000 {
+        for _ in 0..MDIO_TIMEOUT_US {
             if self.read(UMAC_MDIO_CMD) & MDIO_START_BUSY == 0 {
                 return true;
             }
-            core::hint::spin_loop();
+            self.delay(1);
         }
         false
     }
@@ -641,14 +691,15 @@ impl Genet {
     /// copper port can do and let the other end choose.
     fn start_phy(&self) {
         self.mdio_write(self.phy, MII_BMCR, BMCR_RESET);
-        // The standard gives a PHY half a second to come out of reset; this is
-        // a bounded poll of the bit that says it has.
-        for _ in 0..1000 {
+        // The reset bit clears itself when the PHY is done. Poll it in
+        // millisecond steps rather than waiting the whole half second, since
+        // it is usually a few milliseconds.
+        for _ in 0..PHY_RESET_TIMEOUT_US / 1000 {
             match self.mdio_read(self.phy, MII_BMCR) {
                 Some(value) if value & BMCR_RESET == 0 => break,
                 _ => {}
             }
-            self.delay(500);
+            self.delay(1000);
         }
         // A reset puts the delay settings back to their strapped values, so
         // they are written after it rather than before.
@@ -746,13 +797,12 @@ impl Genet {
             100 => CMD_SPEED_100,
             _ => CMD_SPEED_10,
         };
-        let mut set = speed << CMD_SPEED_SHIFT;
+        // Nothing here negotiates pause frames or would know what to do with
+        // one, so both directions ignore them whatever the duplex is. Linux
+        // decides this from what the two ends advertised.
+        let mut set = (speed << CMD_SPEED_SHIFT) | CMD_RX_PAUSE_IGNORE | CMD_TX_PAUSE_IGNORE;
         if !link.full_duplex {
-            // Half duplex, and nothing here negotiates pause frames, so both
-            // directions ignore them.
-            set |= CMD_HD_EN | CMD_RX_PAUSE_IGNORE | CMD_TX_PAUSE_IGNORE;
-        } else {
-            set |= CMD_RX_PAUSE_IGNORE | CMD_TX_PAUSE_IGNORE;
+            set |= CMD_HD_EN;
         }
         // Promiscuous, because the stack decides what is addressed to it and
         // the controller's own destination filter is left switched off. See
@@ -779,7 +829,7 @@ impl Genet {
     pub fn poll_link(&self) {
         let now = self.read_link();
         let mut held = self.link.lock();
-        if now.up == held.up && now.speed == held.speed && now.full_duplex == held.full_duplex {
+        if now == *held {
             return;
         }
         *held = now;
@@ -948,9 +998,7 @@ impl Genet {
             // kernel has in cache for it -- it was just zeroed, so there is --
             // has to go out and be dropped, or a write-back later would land
             // on top of a received frame.
-            if !self.coherent {
-                arch::flush_data_cache(phys_to_virt(buffer), BUFFER_SIZE);
-            }
+            arch::flush_data_cache(phys_to_virt(buffer), BUFFER_SIZE);
             let desc = rx_desc(index);
             self.write(desc + DESC_ADDRESS_LO, buffer as u32);
             self.write(desc + DESC_ADDRESS_HI, (buffer >> 32) as u32);
@@ -972,7 +1020,7 @@ impl Genet {
 
         self.write(
             RDMA_RING + DMA_RING_BUF_SIZE,
-            ((RX_DESCS as u32) << DMA_BUFLENGTH_SHIFT) | BUFFER_SIZE as u32,
+            ((RX_DESCS as u32) << DMA_RING_SIZE_SHIFT) | BUFFER_SIZE as u32,
         );
         self.write(
             RDMA_RING + RDMA_XON_XOFF_THRESH,
@@ -1017,7 +1065,7 @@ impl Genet {
         self.write(TDMA_RING + TDMA_FLOW_PERIOD, 0);
         self.write(
             TDMA_RING + DMA_RING_BUF_SIZE,
-            ((TX_DESCS as u32) << DMA_BUFLENGTH_SHIFT) | BUFFER_SIZE as u32,
+            ((TX_DESCS as u32) << DMA_RING_SIZE_SHIFT) | BUFFER_SIZE as u32,
         );
 
         self.write(TDMA_CTRL + DMA_RING_CFG, 1 << DEFAULT_RING);
@@ -1045,20 +1093,22 @@ impl Genet {
             // The descriptor is inside the device, so this is a register read
             // and there is nothing cached about it to worry over.
             let length_status = self.read(desc + DESC_LENGTH_STATUS);
+            // The count includes the two alignment bytes in front of the
+            // frame and excludes the Ethernet CRC, because `CMD_CRC_FWD` is
+            // never set and the controller therefore strips it. Linux trims
+            // four bytes here when it has asked for the CRC to be kept.
             let length = rx_length(length_status);
             let flags = length_status & 0xFFFF;
 
             let whole = flags & DMA_SOP != 0 && flags & DMA_EOP != 0;
-            let sane = length > RX_BUF_OFFSET + 14 && length <= BUFFER_SIZE;
+            let sane = length >= RX_BUF_OFFSET + 14 && length <= BUFFER_SIZE;
             if whole && sane && flags & DMA_RX_ERRORS == 0 {
                 let buffer = self.rx_buffers[index];
                 // What the device wrote is in memory and not in the cache.
                 // Everything cached over the buffer has to go before the
                 // bytes are read, or the read is answered from a line fetched
                 // before the transfer.
-                if !self.coherent {
-                    arch::invalidate_data_cache(phys_to_virt(buffer), BUFFER_SIZE);
-                }
+                arch::invalidate_data_cache(phys_to_virt(buffer), BUFFER_SIZE);
                 let start = phys_to_virt(buffer) + RX_BUF_OFFSET as u64;
                 let frame = unsafe {
                     core::slice::from_raw_parts(start as *const u8, length - RX_BUF_OFFSET)
@@ -1114,17 +1164,21 @@ impl Interface for Genet {
 
         let mut tx = self.tx.lock();
         // Wait for a descriptor to come free. The contract says `transmit` may
-        // not sleep, so this is a spin; it only runs when the ring is full,
-        // which on a link that is up means the wire is the bottleneck.
-        let mut spins = 0u32;
+        // not sleep, so this is a spin, and the lock above has interrupts off
+        // for the whole of it -- which is why the wait is short and the frame
+        // is dropped rather than waited out. A ring of sixty-four only fills
+        // if the stack has handed over sixty-four frames faster than the wire
+        // takes them, and a dropped frame is what a full card does anyway.
+        let started = arch::cycle_counter();
+        let limit = counter_ticks(TX_WAIT_US);
         loop {
             let consumer = self.read(TDMA_RING + TDMA_CONS_INDEX) & INDEX_MASK;
             if (outstanding(tx.producer, consumer) as usize) < TX_DESCS {
                 break;
             }
-            spins += 1;
-            if spins > TX_SPIN_LIMIT {
-                return Err(Errno::EIO);
+            if arch::cycle_counter().wrapping_sub(started) > limit {
+                TX_BLOCKED.fetch_add(1, Ordering::Relaxed);
+                return Err(Errno::EAGAIN);
             }
             core::hint::spin_loop();
         }
@@ -1138,9 +1192,7 @@ impl Interface for Genet {
         // The bytes have to be in memory before the device is told to fetch
         // them. The barrier at the end of this is also what orders the copy
         // above against the register writes below.
-        if !self.coherent {
-            arch::clean_data_cache(virt, frame.len());
-        }
+        arch::clean_data_cache(virt, frame.len());
 
         let desc = tx_desc(index);
         self.write(desc + DESC_ADDRESS_LO, buffer as u32);
@@ -1153,8 +1205,10 @@ impl Interface for Genet {
     }
 }
 
-/// How long `transmit` waits for a descriptor before giving up.
-const TX_SPIN_LIMIT: u32 = 10_000_000;
+/// How long `transmit` waits for a descriptor before dropping the frame. Two
+/// milliseconds is long enough for a gigabit link to empty a full ring twice
+/// over and short enough not to hold the timer off if it never does.
+const TX_WAIT_US: u64 = 2_000;
 
 // ---------------------------------------------------------------------------
 // Bring-up
@@ -1247,10 +1301,10 @@ fn format_mac(mac: &[u8; 6]) -> alloc::string::String {
 /// Find the controller, bring it up and register it with the stack.
 ///
 /// Returns false when there is nothing to bring up, which is what happens on
-/// every emulated run: QEMU's Pi 4 has no Ethernet at all, and when it is
-/// handed a real board's device tree it marks the node disabled rather than
-/// pretending. Every way of failing here leaves the kernel booting normally
-/// without a network.
+/// every emulated run: QEMU's Pi 4 has no Ethernet, and when it is handed a
+/// real board's device tree it takes the node out rather than pretending.
+/// Every way of failing here leaves the kernel booting normally without a
+/// network.
 ///
 /// Like the e1000's, this runs before the first user address space exists.
 pub fn probe() -> bool {
@@ -1393,9 +1447,9 @@ pub fn probe() -> bool {
     // handler's view of the device are all in place. Transmit completions are
     // not asked for, because `transmit` reads the consumer index itself and
     // an interrupt per frame sent would be work for nothing.
-    arch::register_irq_handler(irq, interrupt);
+    arch::register_irq_handler(card.irq, interrupt);
     card.write(INTRL2_0 + INTRL2_CPU_MASK_CLEAR, IRQ_RXDMA_DONE | IRQ_RBUF_OVERFLOW);
-    arch::unmask_irq(irq);
+    arch::unmask_irq(card.irq);
 
     // The link is not waited for. Negotiation takes a second or two and this
     // runs before there is a process to run, so it would be a second or two of

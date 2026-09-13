@@ -267,6 +267,15 @@ orderly close. It is correct on a quiet link. There is no reassembly queue, no
 fast retransmit and no round-trip estimator, so it is not correct on a lossy
 one.
 
+The Pi's wired port is the other driver under the same seam. Its controller is
+not on a bus that can be enumerated, so the device tree is what says where it
+is, which line it raises, and what hardware address the board was built with;
+its descriptors live inside the device rather than in memory; its packet
+buffers are cleaned out of the data cache before it reads one and invalidated
+after it writes one, because nothing on that chip snoops; and its link is a
+separate chip on a management bus, which has to negotiate before anything can
+be sent and has to be asked what it settled on.
+
 ```
 $ ./scripts/run.sh --hostfwd tcp::8080-:8080 --initrd build/initramfs.cpio \
       --append 'init=/bin/inet serve 8080'
@@ -409,11 +418,14 @@ tests/alpine.sh       in-OS suite run inside an Alpine root filesystem
 Single CPU; no SMP. There is no block device driver and no on-disk filesystem:
 the root filesystem lives in RAM and changes do not survive a reboot.
 
-On the Pi there is no network: the card is on PCIe, and the configuration space
-there is memory-mapped and would have to be found in the device tree, which is
-not written. There is nothing on the board that remembers the time across a
-power cycle, so the clock starts from the newest date on the ram disk rather
-than from the real one.
+The Pi's Ethernet driver has never run. QEMU's `raspi4b` machine emulates no
+network device at all, so nothing about it can be tried before it meets a
+board: what can be checked without one is checked at boot, and the rest is
+written against Linux's driver and u-boot's and has to be taken on that. The
+PCIe root complex on the same board is still not driven, so anything on it --
+which is where the USB controller is -- is out of reach. There is nothing on
+the board that remembers the time across a power cycle, so the clock starts
+from the newest date on the ram disk rather than from the real one.
 
 The TCP is correct on a quiet link and not on a lossy one: no reassembly queue,
 no fast retransmit, no round-trip estimator. There is no DHCP and no resolver,

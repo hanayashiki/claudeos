@@ -343,9 +343,9 @@ impl Node {
 
     /// Whether the firmware left this device switched on. A node whose
     /// `status` is anything but "okay" describes hardware that is in the tree
-    /// and not on the board, which is exactly what QEMU writes into the
-    /// Ethernet node of a Pi 4 tree handed to it, because it emulates no such
-    /// device.
+    /// and not usable on the board. The Ethernet node in the upstream source
+    /// for this chip is disabled and each board's own file turns it on, so a
+    /// tree assembled differently can arrive with it still off.
     pub fn enabled(&self) -> bool {
         match self.property(b"status") {
             None => true,
