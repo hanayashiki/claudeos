@@ -12,7 +12,7 @@
 
 use crate::abi::*;
 use crate::arch::paging::{
-    AddressSpace, FreshPage, MapError, NO_EXECUTE, PRESENT, USER, WRITABLE,
+    AddressSpace, FreshPage, MapError, COW, NO_EXECUTE, PRESENT, USER, WRITABLE,
 };
 use crate::arch::{self, TaskContext, TrapFrame};
 use crate::fs::{FdTable, OpenFile};
@@ -46,6 +46,17 @@ pub enum State {
     Stopped,
     Zombie,
     Dead,
+}
+
+/// What a page is to the kernel about to touch it on a task's behalf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageAccess {
+    /// Memory is there and the access may go ahead.
+    Ready,
+    /// Nothing is mapped at the address. Backing it is the caller's to do.
+    Absent,
+    /// Something is mapped, and this access is not one it allows.
+    Refused,
 }
 
 /// Where a region's contents come from, for a region backed by a file.
@@ -532,7 +543,8 @@ impl Task {
     }
 
     /// Give this task a private copy of a shared page it is trying to write.
-    /// Returns false when the fault was not a copy-on-write fault.
+    /// Returns whether a write to the page may be made now, which is false for
+    /// a page no write of this task's can complete on.
     ///
     /// Nothing in the task itself changes: the page tables are reached through
     /// a value the task holds by copy, and the region list through a lock. A
@@ -551,14 +563,20 @@ impl Task {
     /// and `mremap` reach here from a system call with them on whichever
     /// machine it is.
     pub fn handle_cow(&self, addr: u64, irq: NoInterrupts) -> bool {
-        use crate::arch::paging::COW;
         let page = page_align_down(addr);
         let space = self.space.get();
         let Some(flags) = space.flags_of(page) else {
             return false;
         };
         if flags & COW == 0 {
-            return false;
+            // Not shared. A page that was never shared and a page a sibling
+            // thread has already taken the copy of look exactly alike from
+            // here, and the permissions are what tell them apart: one that
+            // user code may write is repaired, whoever repaired it, and the
+            // store can be made again. Reading it as unrepairable instead is a
+            // bad address out of a system call, or a segmentation fault on a
+            // page whose walk shows present and writable.
+            return flags & WRITABLE != 0 && flags & USER != 0;
         }
         let Some(phys) = space.translate(page).map(page_align_down) else {
             return false;
@@ -594,6 +612,34 @@ impl Task {
         let replaced = shared.is_some();
         drop(shared);
         replaced
+    }
+
+    /// Whether the kernel may touch `addr`'s page on this task's behalf,
+    /// taking the private copy of a shared page when a write needs one.
+    ///
+    /// Reading what the entry says and repairing it are one operation under
+    /// the token rather than two calls a caller makes in order. Apart, a
+    /// sibling thread that takes the copy in between leaves the repair
+    /// looking at a page that is no longer shared, and a page that was never
+    /// shared looks exactly the same to it.
+    pub fn access_page(&self, addr: u64, write: bool, irq: NoInterrupts) -> PageAccess {
+        let page = page_align_down(addr);
+        let Some(flags) = self.space.get().flags_of(page) else {
+            return PageAccess::Absent;
+        };
+        // A page shared after a fork is read-only until someone writes to it.
+        // The kernel writing on the task's behalf counts, so take the private
+        // copy here rather than reporting a bad address.
+        //
+        // The mark decides, not the write permission. aarch64 keeps the
+        // permission the caller asked for and derives read-only from the mark,
+        // so a shared page there reads back as writable while the hardware
+        // refuses the store; asking the permission alone would let the copy
+        // through and fault in the kernel.
+        if write && (flags & COW != 0 || flags & WRITABLE == 0) && !self.handle_cow(page, irq) {
+            return PageAccess::Refused;
+        }
+        PageAccess::Ready
     }
 
     /// Back `addr`'s page with memory if the heap or a region covers it.

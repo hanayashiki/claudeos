@@ -11,6 +11,7 @@ use crate::Report;
 
 pub fn run(report: &mut Report) {
     pages_shared_by_a_fork_written_from_two_threads(report);
+    a_page_that_may_not_be_written_stays_refused(report);
     pages_a_fork_shared_are_out_of_the_parents_reach(report);
     a_user_buffer_unmapped_while_the_kernel_reads_it(report);
     a_mapping_moved_while_a_sibling_forks(report);
@@ -88,6 +89,78 @@ fn a_table_whose_last_page_goes_is_given_back(report: &mut Report) {
         "the table a page was mapped through is given back with it",
         lost <= SLACK,
         format!("free memory fell by {} kB over {} rounds", lost, ROUNDS),
+    );
+}
+
+/// Pages this program may not write, handed to the kernel and stored to.
+///
+/// Taking the private copy of a shared page reads the entry and can find the
+/// page not shared, which is what a page nobody ever shared looks like and
+/// also what a page a sibling thread took the copy of a moment ago looks like.
+/// The second is repaired and the write may be made; the first is not, and the
+/// permissions on the page are what tell the two apart. So the kinds this
+/// program may not write have to stay refusals: a mapping whose write
+/// permission is gone, handed to the kernel as a buffer to read into, and an
+/// address in the kernel's own half, stored to from user code. The second is
+/// present and writable in these tables and reachable only by the kernel, so
+/// reading it as repaired would retry a store the hardware goes on refusing,
+/// with nothing between one fault and the next.
+fn a_page_that_may_not_be_written_stays_refused(report: &mut Report) {
+    const EFAULT: i64 = -14;
+    const SIGSEGV: i32 = 11;
+    const PAGE: u64 = 4096;
+    /// The base of the kernel heap, which every address space maps and no
+    /// program may reach.
+    const KERNEL: u64 = 0xFFFF_C000_0000_0000;
+
+    let base = sys::mmap_anon(0, PAGE);
+    if base <= 0 {
+        report.check("a page to take write permission from", false, format!("{:#x}", base));
+        return;
+    }
+    let base = base as u64;
+    // Touched first, so the check is made against a page that is really there
+    // rather than against a region the kernel has only recorded.
+    unsafe { std::ptr::write_volatile(base as *mut u8, 1) };
+    if sys::mprotect(base, PAGE, sys::PROT_READ) != 0 {
+        report.check("write permission taken away", false, String::new());
+        sys::munmap(base, PAGE);
+        return;
+    }
+
+    let zero = sys::open("/dev/zero", 0);
+    if zero < 0 {
+        report.check("something for the kernel to read from", false, format!("{}", zero));
+        sys::munmap(base, PAGE);
+        return;
+    }
+    let slot = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, 1) };
+    let refused = sys::read(zero as i32, slot);
+    sys::close(zero as i32);
+    sys::munmap(base, PAGE);
+    report.check(
+        "a read into a mapping with no write permission is a bad address",
+        refused == EFAULT,
+        format!("read returned {}", refused),
+    );
+
+    // In a child, because the whole point is that it is killed. A parent that
+    // came back here at all is a fault that was refused rather than repaired
+    // and taken again.
+    let child = sys::fork();
+    if child == 0 {
+        unsafe { std::ptr::write_volatile(KERNEL as *mut u8, 1) };
+        sys::exit_group(0);
+    }
+    if child < 0 {
+        report.check("a child to store from", false, format!("fork returned {}", child));
+        return;
+    }
+    let (rc, signal) = sys::wait4_signal(child as i32);
+    report.check(
+        "a store into the kernel's half kills the program that made it",
+        rc > 0 && signal == SIGSEGV,
+        format!("wait4 returned {} with signal {}", rc, signal),
     );
 }
 
