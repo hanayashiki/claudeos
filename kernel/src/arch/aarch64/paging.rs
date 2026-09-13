@@ -334,6 +334,61 @@ impl AddressSpace {
         Ok(phys)
     }
 
+    /// Print the walk of `virt` through this hierarchy, descriptor by
+    /// descriptor.
+    ///
+    /// A fault report that says a page is present and writable is a summary of
+    /// the last descriptor only. When that descriptor looks right and the
+    /// access faulted anyway, what is wanted is every descriptor the walker
+    /// actually reads, out of the tables the machine is pointed at rather than
+    /// the ones a task is recorded on.
+    ///
+    /// Only the ones that end the walk are named by their permissions. The
+    /// bits that say read-only and reachable from the level below mean nothing
+    /// in a descriptor that points at another table, so printing them there
+    /// would be reporting a permission the walk does not have.
+    pub fn dump_walk(&self, virt: u64) {
+        crate::println!("  walk of {:#018x} through {:#x}:", virt, self.root);
+        unsafe {
+            let mut table = self.root;
+            for level in (0..4).rev() {
+                let idx = index_of(virt, level);
+                let entry = *table_at(table).add(idx);
+                if !entry.is_present() {
+                    crate::println!(
+                        "    level {} index {:3} = {:#018x} absent",
+                        level + 1,
+                        idx,
+                        entry.bits(),
+                    );
+                    return;
+                }
+                let block = level > 0 && entry.bits() & PAGE_DESCRIPTOR == 0;
+                if !block && level > 0 {
+                    crate::println!(
+                        "    level {} index {:3} = {:#018x} present, a table",
+                        level + 1,
+                        idx,
+                        entry.bits(),
+                    );
+                    table = entry.addr();
+                    continue;
+                }
+                crate::println!(
+                    "    level {} index {:3} = {:#018x} present{}{}{}{}",
+                    level + 1,
+                    idx,
+                    entry.bits(),
+                    if entry.bits() & READ_ONLY != 0 { " read-only" } else { " writable" },
+                    if entry.bits() & USER != 0 { " user" } else { " supervisor" },
+                    if entry.bits() & COW != 0 { " copy-on-write" } else { "" },
+                    if block { ", a block" } else { "" },
+                );
+                return;
+            }
+        }
+    }
+
     /// Put `frame` at `virt` in place of what is mapped there, handing back the
     /// reference the old descriptor held. Dropping the result releases it.
     ///

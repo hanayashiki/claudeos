@@ -248,6 +248,47 @@ impl AddressSpace {
         Ok(phys)
     }
 
+    /// Print the walk of `virt` through this hierarchy, entry by entry.
+    ///
+    /// A fault report that says a page is present and writable is a summary of
+    /// the last entry only. When that entry looks right and the access faulted
+    /// anyway, what is wanted is every entry the walker actually reads, out of
+    /// the table the machine is pointed at rather than the one a task is
+    /// recorded on.
+    pub fn dump_walk(&self, virt: u64) {
+        crate::println!("  walk of {:#018x} through {:#x}:", virt, self.pml4);
+        unsafe {
+            let mut table = self.pml4;
+            for level in (0..4).rev() {
+                let idx = index_of(virt, level);
+                let entry = *table_at(table).add(idx);
+                if !entry.is_present() {
+                    crate::println!(
+                        "    level {} index {:3} = {:#018x} absent",
+                        level + 1,
+                        idx,
+                        entry.bits(),
+                    );
+                    return;
+                }
+                crate::println!(
+                    "    level {} index {:3} = {:#018x} present{}{}{}{}",
+                    level + 1,
+                    idx,
+                    entry.bits(),
+                    if entry.bits() & WRITABLE != 0 { " writable" } else { " read-only" },
+                    if entry.bits() & USER != 0 { " user" } else { " supervisor" },
+                    if entry.bits() & HUGE != 0 { " huge" } else { "" },
+                    if level == 0 && entry.bits() & COW != 0 { " copy-on-write" } else { "" },
+                );
+                if entry.bits() & HUGE != 0 {
+                    return;
+                }
+                table = entry.addr();
+            }
+        }
+    }
+
     /// Put `frame` at `virt` in place of what is mapped there, handing back the
     /// reference the old entry held. Dropping the result releases it.
     ///
