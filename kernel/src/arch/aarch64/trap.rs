@@ -515,7 +515,7 @@ pub fn page_fault(frame: &TrapFrame) -> PageFault {
     PageFault {
         address: frame.far,
         raw: frame.esr,
-        present: (0x0D..=0x0F).contains(&status),
+        present: (0x0C..=0x0F).contains(&status),
         // Bit 6 says which way the access went, and only for data aborts.
         write: !instruction_fetch && frame.esr & (1 << 6) != 0,
         user: frame.from_user(),

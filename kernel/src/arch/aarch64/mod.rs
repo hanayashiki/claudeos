@@ -22,7 +22,7 @@ pub mod fdt;
 pub mod nr;
 pub mod paging;
 
-global_asm!(include_str!("boot.s"));
+global_asm!(include_str!("boot.s"), FIRST_DEVICE_BLOCK = const FIRST_DEVICE_BLOCK);
 // The entry and exit paths address the trap frame by the offsets the structure
 // in trap.rs actually has, rather than by numbers written out beside it.
 global_asm!(
@@ -92,9 +92,23 @@ pub const HHDM_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 ///
 /// It is also the ceiling on what the frame allocator may hand out: a frame
 /// above it has no cacheable alias, and the firmware on a 4 GiB or 8 GiB
-/// board reports memory running all the way up to this address. `boot.s`
-/// carries the same number, as the point its 2 MiB blocks change attribute.
+/// board reports memory running all the way up to this address. It is also
+/// the point at which the 2 MiB blocks `boot.s` builds change attribute, and
+/// that code is given the number below rather than carrying one of its own.
 pub const DEVICE_PHYS_BASE: u64 = 0xFC00_0000;
+
+/// Which of the fourth gigabyte's 2 MiB blocks is the first `boot.s` gives
+/// device attributes to. It is handed to that code as a constant, so the two
+/// cannot name different addresses.
+const FIRST_DEVICE_BLOCK: u64 = (DEVICE_PHYS_BASE - 3 * 1024 * 1024 * 1024) / (2 * 1024 * 1024);
+
+const _: () = {
+    // `boot.s` covers the fourth gigabyte in 2 MiB blocks and changes
+    // attribute at a block boundary inside it.
+    assert!(DEVICE_PHYS_BASE >= 3 * 1024 * 1024 * 1024);
+    assert!(DEVICE_PHYS_BASE < HHDM_LIMIT);
+    assert!(DEVICE_PHYS_BASE % (2 * 1024 * 1024) == 0);
+};
 
 /// Virtual base the kernel image is linked at.
 pub const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;
