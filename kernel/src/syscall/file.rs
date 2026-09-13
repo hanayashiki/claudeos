@@ -204,27 +204,58 @@ fn open_descriptor(fd: i32, flags: u32) -> SysResult {
     Ok(new as u64)
 }
 
+/// Where a trailing symbolic link points, when `path` ends in one.
+fn final_link_target(path: &str) -> Option<String> {
+    let node = fs::lookup_nofollow(path).ok()?;
+    if node.kind != fs::NodeKind::Symlink {
+        return None;
+    }
+    let target = node.symlink_target()?;
+    let (dir, _) = path.rsplit_once('/')?;
+    Some(fs::normalize(if dir.is_empty() { "/" } else { dir }, &target))
+}
+
 pub fn openat(dirfd: i64, path_addr: u64, flags: u32, mode: u32) -> SysResult {
     let mut path = resolve_at(dirfd, path_addr)?;
-    if let Some(target) = procfs_override(&path) {
-        path = target;
-    }
-    if let Some(fd) = own_descriptor(&path) {
-        return open_descriptor(fd, flags);
+    let mut found = None;
+
+    // A trailing symbolic link whose target is not there is followed here
+    // rather than left to the lookup, because what the name stands for is
+    // what it points at: O_CREAT has to make the target, and a link to a
+    // descriptor still has to reach that descriptor. Opening the link itself
+    // would replace the path it holds with whatever was written to it.
+    for _ in 0..fs::SYMLINK_DEPTH {
+        if let Some(target) = procfs_override(&path) {
+            path = target;
+        }
+        if let Some(fd) = own_descriptor(&path) {
+            return open_descriptor(fd, flags);
+        }
+        match fs::lookup(&path) {
+            Ok(node) => {
+                found = Some(node);
+                break;
+            }
+            Err(Errno::ENOENT) => match final_link_target(&path) {
+                Some(target) => path = target,
+                None => break,
+            },
+            Err(err) => return Err(err),
+        }
     }
 
-    let node = match fs::lookup(&path) {
-        Ok(node) => {
+    let node = match found {
+        Some(node) => {
             if flags & O_EXCL != 0 && flags & O_CREAT != 0 {
                 return Err(Errno::EEXIST);
             }
             node
         }
-        Err(Errno::ENOENT) if flags & O_CREAT != 0 => {
+        None if flags & O_CREAT != 0 => {
             let umask = sched::current().umask;
             fs::create(&path, mode & !umask)?
         }
-        Err(err) => return Err(err),
+        None => return Err(Errno::ENOENT),
     };
 
     // An entry in /proc/<pid>/fd is that descriptor. Opening it hands back

@@ -221,6 +221,15 @@ check "glob all"          "3"        "$(ls /tmp/g/* | wc -l)"
 check "find count"        "4"        "$(find /tmp/g | wc -l)"
 ln -s /tmp/t/file /tmp/t/link
 check "symlink follows"   "2"        "$(wc -l < /tmp/t/link)"
+# A redirection onto a link that points at nothing yet makes the file it
+# points at. Making the link itself into the file instead loses the write and
+# leaves a link whose target is whatever was written, so every later use of
+# it goes somewhere else again -- which is what /dev/stdout is, and how a
+# moment when /proc/self/fd/1 could not be reached became permanent.
+ln -s /tmp/t/made /tmp/t/dangling
+echo through > /tmp/t/dangling
+check "a dangling link is written through" "through" "$(cat /tmp/t/made 2>/dev/null)"
+check "and the link is still a link" "/tmp/t/made" "$(readlink /tmp/t/dangling)"
 check "redirect in"       "content"  "$(head -n 1 < /tmp/t/file)"
 check "seq to file"       "3"        "$(seq 1 3 > /tmp/t/n; wc -l < /tmp/t/n)"
 check "stderr redirect"   ""         "$(cat /tmp/t/missing 2> /dev/null)"
