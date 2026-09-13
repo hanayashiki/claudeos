@@ -315,9 +315,15 @@ pub fn grep(args: &[String]) -> i32 {
     let only_matching = flags.contains('o');
     let recursive = flags.contains('r') || flags.contains('R');
 
-    // -r turns each directory operand into the files beneath it.
+    // -r turns each directory operand into the files beneath it. Given none,
+    // it walks the working directory: a recursive search of standard input is
+    // not a thing that can be asked for, and waiting for a line to be typed
+    // looks the same as having hung.
     let mut paths: Vec<String> = operands[1..].to_vec();
     if recursive {
+        if paths.is_empty() {
+            paths.push(".".to_string());
+        }
         let mut expanded = Vec::new();
         for path in &paths {
             collect_files(path, &mut expanded);

@@ -343,13 +343,15 @@ kill sleep clear hexdump basename dirname yes true false`.
 `?`. `sed` takes line, `$`, regex and range addresses, `!`, and the `s`, `y`, `p`,
 `d`, `q` and `=` commands, with `-n`, `-e`, `-E` and `-i`. A group's text can be
 put back with `\1`, and `grep -o` prints what matched rather than the line.
+`grep -r` with no path searches the working directory, since a recursive
+search of standard input is not something that can be asked for.
 
 ## Tests
 
 `make test` boots the OS once per suite and requires each to report zero
 failures.
 
-- `tests/suite.sh` runs **249 checks** inside the OS, driving the shell through
+- `tests/suite.sh` runs **250 checks** inside the OS, driving the shell through
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
   subprocesses and `/proc`.
