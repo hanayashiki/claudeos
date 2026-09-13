@@ -36,11 +36,22 @@ fi
 status=0
 # Suites that did not run at all. A skip is not a pass, so the summary says so.
 skipped=0
+# The boot id the kernel printed in each boot below. It is drawn from the pool
+# the random number generator was seeded from, and two boots sharing one would
+# mean the seed did not vary -- which would make every byte the generator hands
+# out the same on both, sequence numbers and all.
+boot_ids=""
 
 banner() {
   echo "=============================================================="
   echo "  $1"
   echo "=============================================================="
+}
+
+record_boot_id() {
+  local id
+  id="$(printf '%s\n' "$1" | sed -n 's/.*boot id \([0-9a-f][0-9a-f]*\).*/\1/p' | head -n 1)"
+  if [ -n "$id" ]; then boot_ids="$boot_ids $id"; fi
 }
 
 # Run a script or program inside the OS and require "N passed, 0 failed".
@@ -52,6 +63,7 @@ run_suite() {
       --initrd "$image" --append "$append" 2>&1 | tr -d '\r')"
   echo "$output"
   echo
+  record_boot_id "$output"
 
   if echo "$output" | grep -qE "^=== [0-9]+ passed, 0 failed ===$"; then
     echo ">> $name: OK"
@@ -84,6 +96,7 @@ run_interactive() {
       "exit\n" "wait:3" 2>&1 | tr -d '\r')"
   echo "$output"
   echo
+  record_boot_id "$output"
 
   local ok=1
   # "^abcZ$" and "^line-kill-works$" only appear if the line discipline erased
@@ -135,6 +148,7 @@ run_interrupt_key() {
       "exit\n" "wait:4" 2>&1 | tr -d '\r')"
   echo "$output"
   echo
+  record_boot_id "$output"
 
   local ok=1
   # "^C" is what the line discipline echoes for the interrupt character, so it
@@ -156,6 +170,33 @@ run_interrupt_key() {
   else
     echo ">> interrupt key at a terminal: FAILED"
     status=1
+  fi
+  echo
+}
+
+# The boots above, compared against each other. Every one seeds its generator
+# from what it can observe of its own start-up, and the id says where that left
+# it; two the same would mean two machines produced one stream, which is the
+# failure that would make the rest of the generator's work pointless. This
+# costs no boot of its own: it reads what the sections above already printed.
+run_boot_ids() {
+  banner "two boots, two streams"
+  local count distinct
+  count=$(printf '%s\n' $boot_ids | grep -c .)
+  distinct=$(printf '%s\n' $boot_ids | grep . | sort -u | wc -l | tr -d ' ')
+  printf '%s\n' $boot_ids | grep . | sed 's/^/   /'
+  echo
+  if [ "$count" -lt 2 ]; then
+    echo "   only $count boot reported an id; there is nothing to compare"
+    echo ">> two boots, two streams: FAILED"
+    status=1
+  elif [ "$count" != "$distinct" ]; then
+    echo "   $count boots, $distinct distinct ids: two boots produced one stream"
+    echo ">> two boots, two streams: FAILED"
+    status=1
+  else
+    echo "   $count boots, $count distinct ids"
+    echo ">> two boots, two streams: OK"
   fi
   echo
 }
@@ -186,6 +227,7 @@ else
 fi
 run_interactive
 run_interrupt_key
+run_boot_ids
 
 if [ $status -ne 0 ]; then
   echo "some suites failed"

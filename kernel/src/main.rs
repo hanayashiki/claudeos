@@ -18,6 +18,7 @@ mod futex;
 mod mm;
 mod net;
 mod pci;
+mod rng;
 mod sched;
 mod signal;
 mod sync;
@@ -127,6 +128,10 @@ pub fn start(boot: &boot::BootInfo) -> ! {
     sync::enable_interrupts();
     time::calibrate();
     sync::disable_interrupts();
+
+    // The generator is seeded here rather than on first use, because the
+    // sources it draws on are boot timing and the machine only boots once.
+    rng::init(boot);
 
     syscall::init();
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(syscall::TRACE), options.trace) };

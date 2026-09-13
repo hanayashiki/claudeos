@@ -77,11 +77,11 @@ ARCH=aarch64 ./scripts/run.sh --initrd build/initramfs-aarch64.cpio \
     --append 'init=/bin/init'
 ARCH=aarch64 make busybox                # an aarch64 busybox to test against
 ARCH=aarch64 make alpine                 # an aarch64 Alpine root filesystem
-ARCH=aarch64 ./scripts/test.sh           # all eight suites
+ARCH=aarch64 ./scripts/test.sh           # all nine sections
 ```
 
 Both third-party images are fetched for the machine `ARCH` names, so the same
-eight suites run on either one. busybox.net has no aarch64 build among its
+nine sections run on either one. busybox.net has no aarch64 build among its
 prebuilt binaries, so that one comes from Alpine's `busybox-static` package
 instead; `scripts/fetch-busybox.sh` refuses anything that is not a static ELF
 for the machine asked for, since a dynamically linked one has no interpreter to
@@ -200,6 +200,92 @@ tick: aarch64 states it in `cntfrq_el0`, and x86-64, which states it nowhere, is
 measured against a channel of the interval timer counting down. Neither answer
 comes through the tick, so the tick's own length can be checked against it. The
 tick still drives scheduling and timeouts.
+
+**Random numbers.** `/dev/random`, `/dev/urandom`, `getrandom`, the `AT_RANDOM`
+bytes a program's libc is handed and TCP's initial sequence numbers all come
+from one generator: ChaCha20 run over a counter, keyed from an entropy pool.
+A request runs the cipher from block zero, keeps the first half of the block as
+the next key and hands the second half out, so the key that answered a request
+is gone before the answer is. Reading the output says nothing about the state:
+getting either key back from thirty-two bytes of keystream is the problem the
+cipher is built to be hard at. What was there before was a xorshift, whose
+state *is* its last output word, so anyone who read eight bytes of
+`/dev/urandom` could compute every value it had produced and every value it
+would produce, the sequence number secret among them.
+
+Seeding is the weaker half. Where the processor has a generator of its own it
+is asked -- RDSEED or RDRAND on x86-64, FEAT_RNG on aarch64 -- and its words
+are mixed into the pool rather than taken as the key, so a machine with one is
+no worse off than a machine without if it should turn out to be worth nothing.
+The Pi 4's Cortex-A72 has no such instruction. The board does have a hardware
+generator in its peripheral window, and it is not driven: QEMU's `raspi4b`
+emulates nothing at that address and a read there takes an external abort, so
+there is no way to try a driver for it before it meets a board.
+
+What the rest of the seed is worth was measured rather than assumed, over 300
+boots of each emulated machine, back to back:
+
+```
+                                            x86-64    Raspberry Pi 4
+the processor's own generator              present            absent
+the cycle counter at a fixed point        11.1 bits         8.5 bits
+a 63-sample jitter loop, taken whole       9.7 bits        14.5 bits
+one gap between two timer ticks            6.1 bits         5.5 bits
+eight consecutive gaps                   >15.5 bits       >15.5 bits
+memory the firmware left behind              0 bits           0 bits
+the machine's real-time clock              8.8 bits    0 bits, has none
+```
+
+Those are collision entropy, so the minimum entropy is at least half of each;
+`>15.5` means no two of the 300 boots agreed, which is all 300 samples can
+show. Memory the firmware left behind returned one value across all 300 boots
+on both machines, so it is not used, and a board that comes up the same way
+every time will have the same nothing to offer. The tick gaps do add up: two
+consecutive gaps measured twice what one did, and eight went past what 300
+samples can measure. That is what makes the reseeding below worth doing.
+
+An emulated machine is not the board. Under QEMU the cycle counter is derived
+from the host's clock, so what those timing figures measure is the host's
+scheduling noise; a Pi 4 reads its own counter and starts up far more
+repeatably. Take the timing lines as an upper bound for the real board rather
+than a measurement of it.
+
+So the generator reseeds. Every interrupt handler folds the cycle counter into
+four words with plain arithmetic -- no lock, a few nanoseconds -- and once a
+second, if at least sixteen interrupts have arrived since, those four words go
+into the pool along with the clock, another word from the processor's generator
+where there is one, and the key the generator is using now, and the generator
+takes a new key from the pool. Mixing the old key back in first is what makes a
+reseed unable to make things worse. A machine that has been up for a minute has
+folded in six thousand tick arrivals; one that booted a second ago has not.
+
+On a machine with no generator of its own, the seed at the moment the first
+process starts is boot timing, and is worth tens of bits rather than hundreds;
+someone who knows roughly when such a machine was started can search that. It
+is enough for what it is used for here: sequence numbers an off-machine
+attacker cannot predict, `AT_RANDOM` bytes, a program that wants something to
+vary. It is not enough to generate a long-term key with on a Pi 4 in the first
+seconds of its uptime. Which of the two a machine is, it says at boot:
+
+```
+random: chacha20 seeded from boot timing and 8 words from the cpu's own generator, boot id ...
+random: chacha20 seeded from boot timing alone -- this cpu has no generator, boot id ...
+```
+
+The boot id is a value derived from the pool that gives nothing about it away.
+It is printed so that two boots producing one stream is something the suites
+can see rather than something nobody would notice. Three hundred back-to-back
+boots of the emulated Pi 4, the machine with the least to go on, produced three
+hundred different ids.
+
+The cost, measured on the emulated machines: a ChaCha block is 0.48 microseconds
+on x86-64 and 0.58 on aarch64, which is what one outgoing connection's sequence
+number costs and what an eight-byte `getrandom` costs. A 64 KiB read of
+`/dev/urandom` costs 0.39 ms and 0.27 ms against 0.16 ms and 0.24 ms for the
+xorshift, because the xorshift was being asked for eight bytes at a time and
+ChaCha produces sixty-four. Seeding at boot costs 142 microseconds on both, most
+of it the jitter loop. A reseed costs 8.5 and 5.3 microseconds and happens at
+most once a second.
 
 **Blocking.** A task waiting for the terminal or a pipe sleeps on a wait queue
 rather than spinning, so the scheduler reaches the idle task and the CPU halts
@@ -368,10 +454,12 @@ search of standard input is not something that can be asked for.
 `make test` boots the OS once per suite and requires each to report zero
 failures.
 
-- `tests/suite.sh` runs **257 checks** inside the OS, driving the shell through
+- `tests/suite.sh` runs **261 checks** inside the OS, driving the shell through
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
-  subprocesses and `/proc`.
+  subprocesses and `/proc`. The device checks include `/dev/urandom`: that two
+  reads differ and that 4 KiB of it holds nearly all 256 byte values, which is
+  a check that the generator is running and not a check that it is any good.
 - The `rtest` applet runs **57 checks** against the Rust standard library:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
@@ -402,6 +490,17 @@ failures.
   loops, `case` and here-documents. Run `make alpine` first; the suite is
   skipped when it is absent. Alpine publishes the same minimal root filesystem
   for both machines, so the same 34 checks run on either.
+- The **kernel's own checks** run in a boot of their own and are counted into
+  one summary with the memory and protocol checks: 15 of them are the random
+  number generator, of which the three that matter compare the ChaCha20 block
+  function against the test vectors published with RFC 8439. A generator can
+  pass every statistical test there is while being a permutation anyone can
+  invert, so what is worth asserting is that this is the cipher it claims to
+  be. The rest check that a request leaves behind a key that is not the bytes
+  it handed out.
+- **Two boots, two streams** compares the boot id from every boot above. Two
+  the same would mean the seed did not vary, and every byte the generator
+  handed out would be the same in both. It costs no boot of its own.
 - An **interactive session** is driven over the serial console: typing after
   boot, backspace and Ctrl-U line editing, `Ctrl-C` on a running job, `Ctrl-Z`
   followed by `jobs`, `bg` and `kill %1`, a background `cat` stopped for
@@ -437,6 +536,7 @@ kernel/src
   syscall/            the Linux system call implementations
   fs/                 in-memory filesystem, devices, pipes, cpio, /proc
   elf.rs              ELF64 loader for static and static-PIE executables
+  rng.rs              ChaCha20, the entropy pool, and what seeds it
   task.rs             task control block, user stack and auxiliary vector
   sched.rs            round-robin scheduler, exit and reaping
   uaccess.rs          validated copying between kernel and user memory
@@ -468,6 +568,12 @@ PCIe root complex on the same board is still not driven, so anything on it --
 which is where the USB controller is -- is out of reach. There is nothing on
 the board that remembers the time across a power cycle, so the clock starts
 from the newest date on the ram disk rather than from the real one.
+
+The random number generator is ChaCha20 and its output does not give up its
+state, but on a machine whose processor has no generator of its own its seed is
+boot timing worth tens of bits until reseeding has had a few seconds to work.
+That is not enough to generate a key with. The Pi 4's own hardware generator is
+not driven.
 
 The TCP is correct on a quiet link and not on a lossy one: no reassembly queue,
 no fast retransmit, no round-trip estimator. There is no DHCP and no resolver,

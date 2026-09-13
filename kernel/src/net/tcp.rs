@@ -247,13 +247,22 @@ pub fn build(
 
 /// A secret drawn once per boot and mixed into every initial sequence number.
 ///
-/// It comes from the kernel's own generator, which is a xorshift seeded from
-/// the cycle counter. That is the best source here, and it is worth being
-/// plain about what it buys: someone off the machine cannot work the secret
-/// out from the sequence numbers it produces, and it is not a cryptographic
-/// hash and is not claimed to be one. Anyone who can read kernel memory, or
-/// who can watch this machine's start-up timing closely enough to guess the
-/// seed, has the secret and everything that follows from it.
+/// It comes from the kernel's generator, which is ChaCha20 keyed from an
+/// entropy pool, so reading `/dev/urandom` no longer hands a program the state
+/// the secret was drawn from. What is left is what the seed itself is worth:
+/// on a machine whose processor has a generator of its own the secret is as
+/// good as that, and on one that has none -- the Raspberry Pi 4 among them --
+/// it is worth what the generator held when the first connection was made,
+/// which on a machine that has just booted is boot timing and tens of bits.
+/// It is drawn once and kept for the boot rather than redrawn on a reseed,
+/// because RFC 6528 wants the same two endpoints to get sequence numbers that
+/// advance with the clock, and a secret that changed underneath them would
+/// not.
+///
+/// The mixing below is splitmix64 rather than a cryptographic hash, and is not
+/// claimed to be one: it keeps one connection's number from giving away
+/// another's, and someone who can read kernel memory has the secret whatever
+/// hashes it.
 static ISN_SECRET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn isn_secret() -> u64 {
@@ -264,7 +273,7 @@ fn isn_secret() -> u64 {
     }
     // Zero is what says it has not been drawn yet, so it is not a value the
     // secret may take.
-    let drawn = crate::fs::dev::random_u64() | 1;
+    let drawn = crate::rng::next_u64() | 1;
     match ISN_SECRET.compare_exchange(0, drawn, Ordering::Relaxed, Ordering::Relaxed) {
         Ok(_) => drawn,
         Err(other) => other,

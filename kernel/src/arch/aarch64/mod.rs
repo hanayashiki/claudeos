@@ -384,6 +384,50 @@ pub fn cpu_info_text() -> alloc::string::String {
     out
 }
 
+/// A word from the processor's own generator, or nothing if it has none.
+///
+/// FEAT_RNG puts one behind the RNDR system register, and the top nibble of
+/// `id_aa64isar0_el1` is what says whether it is there. Reading the register
+/// on a processor that does not implement it is an undefined instruction, so
+/// the check is what keeps the read from running at all rather than an
+/// optimisation.
+///
+/// The Cortex-A72 in a Raspberry Pi 4 is an ARMv8.0 core and does not have it,
+/// and neither does the one QEMU emulates, so nothing here has run this. The
+/// board's own generator sits at a fixed address in the peripheral window
+/// instead, and driving that would be a device driver rather than this.
+///
+/// The read reports through the condition flags: all clear for a word it
+/// stands behind, Z set for one it could not produce, which the architecture
+/// allows it for a while after a reset.
+pub fn hardware_random() -> Option<u64> {
+    let isar0: u64;
+    unsafe { asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack)) };
+    if isar0 >> 60 == 0 {
+        return None;
+    }
+    for _ in 0..16 {
+        let value: u64;
+        let ok: u64;
+        unsafe {
+            // s3_3_c2_c4_0 is RNDR, spelled by its encoding because the
+            // assembler only knows the name with the feature turned on, and
+            // this kernel is built for a machine that does not have it.
+            asm!(
+                "mrs {value}, s3_3_c2_c4_0",
+                "cset {ok}, ne",
+                value = out(reg) value,
+                ok = out(reg) ok,
+                options(nomem, nostack),
+            );
+        }
+        if ok != 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
 /// There is no debug-exit device on this board, so a test that wants the
 /// machine to stop gets it stopped and nothing more.
 pub fn qemu_exit(_code: u32) -> ! {
