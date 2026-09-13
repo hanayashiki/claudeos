@@ -287,6 +287,37 @@ fn what_a_wait_does_with_signals(report: &mut Report) {
     );
 }
 
+/// A task's entry in /proc has to be there before the task can run. The first
+/// thing a forked child does here is open its own status file, which is what a
+/// shell applying a redirection through its own descriptor directory amounts
+/// to. Fifteen hundred rounds is a smoke test: the window is however long the
+/// entry takes to build, and it is missed only when a tick lands inside it.
+fn a_child_finds_its_own_proc_entry(report: &mut Report) {
+    use crate::sys;
+
+    let mut misses = 0;
+    for _ in 0..1500 {
+        let child = sys::fork();
+        if child == 0 {
+            let fd = sys::open("/proc/self/status", sys::O_RDONLY, 0);
+            if fd < 0 {
+                sys::exit_group(1);
+            }
+            sys::close(fd as i32);
+            sys::exit_group(0);
+        }
+        let (_, status) = sys::wait4(child as i32, 0);
+        if sys::exit_code_of(status) != 0 {
+            misses += 1;
+        }
+    }
+    report.check(
+        "a forked child finds its own entry in /proc",
+        misses == 0,
+        format!("{} of 1500 missed it", misses),
+    );
+}
+
 /// A fork takes write permission away from every page of the address space it
 /// copies, the parent's included. A sibling thread inside a write to user
 /// memory has already had its buffer checked by then, so the copy that follows
@@ -914,6 +945,7 @@ pub fn main(_args: &[String]) -> i32 {
     thread_of_a_child_is_not_a_child(&mut report);
     a_child_exit_reaches_a_blocked_parent(&mut report);
     what_a_wait_does_with_signals(&mut report);
+    a_child_finds_its_own_proc_entry(&mut report);
     a_fork_while_a_sibling_writes(&mut report);
     reading_proc_while_a_child_is_reaped(&mut report);
     a_signal_frame_on_a_shared_page(&mut report);

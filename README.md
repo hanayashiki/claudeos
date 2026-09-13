@@ -368,7 +368,7 @@ failures.
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
   subprocesses and `/proc`.
-- The `rtest` applet runs **50 checks** against the Rust standard library:
+- The `rtest` applet runs **51 checks** against the Rust standard library:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
   thread sleep against the monotonic clock, file read/write/seek/append,

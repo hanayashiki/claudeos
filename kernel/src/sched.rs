@@ -71,9 +71,14 @@ pub fn init() {
 pub fn register(task: Box<Task>) -> u32 {
     reap_dead_threads();
     let pid = task.pid;
+    // The entry in /proc is built before the task is in the table, because the
+    // moment it is in the table the timer can hand it the CPU. A child
+    // scheduled in between finds its own directory half-built or not there at
+    // all, and our shell applies its redirections through that directory a few
+    // instructions after fork returns.
+    crate::fs::procfs::add_process(pid);
     let ptr = Box::into_raw(task);
     TASKS.lock().push(TaskPtr(ptr));
-    crate::fs::procfs::add_process(pid);
     pid
 }
 
