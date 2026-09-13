@@ -20,7 +20,7 @@ else
   IMAGE    = build/initramfs.cpio
 endif
 
-.PHONY: all kernel user run test demo busybox alpine clean
+.PHONY: all kernel user run test demo busybox alpine cloudflared clean
 
 all: kernel user
 
@@ -45,6 +45,10 @@ busybox:
 
 alpine: kernel
 	@./scripts/fetch-alpine.sh
+
+cloudflared:
+	@./scripts/fetch-cloudflared.sh
+	@$(USERLAND)
 
 clean:
 	@# build/thirdparty holds downloads; keep them so a rebuild stays offline.
