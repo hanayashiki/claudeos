@@ -316,23 +316,114 @@ fn http(report: &mut Report) {
 
 // ---- the server ----------------------------------------------------------
 
+/// The byte at `offset` of the stream the bulk paths carry. A pattern rather
+/// than zeroes, so a transfer that loses its place shows up as wrong bytes
+/// rather than as more of the same byte.
+fn pattern_byte(offset: u64) -> u8 {
+    (offset % 251) as u8
+}
+
+/// FNV-1a over a stream, which the other end can work out for itself without
+/// keeping the whole thing.
+struct Digest(u64);
+
+impl Digest {
+    fn new() -> Digest {
+        Digest(0xCBF2_9CE4_8422_2325)
+    }
+
+    fn eat(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= *byte as u64;
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+    }
+}
+
 fn answer(mut stream: TcpStream) {
     let mut request = Vec::new();
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; 8192];
     // Read until the end of the headers rather than to end of file: a client
     // that is waiting for an answer has not closed its end.
-    loop {
+    let head_len = loop {
         match stream.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => return,
             Ok(n) => {
                 request.extend_from_slice(&buf[..n]);
-                if request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
+                if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break at + 4;
                 }
             }
             Err(_) => return,
         }
+    };
+    let head = String::from_utf8_lossy(&request[..head_len]).into_owned();
+    let mut words = head.lines().next().unwrap_or("").split(' ');
+    let method = words.next().unwrap_or("");
+    let path = words.next().unwrap_or("/");
+
+    // A stream of a size the client asks for, for a transfer big enough that
+    // a lossy link has to recover from something.
+    if let Some(count) = path.strip_prefix("/bytes/").and_then(|n| n.parse::<u64>().ok()) {
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            count
+        );
+        if stream.write_all(header.as_bytes()).is_err() {
+            return;
+        }
+        let mut sent = 0u64;
+        let mut block = vec![0u8; 64 * 1024];
+        while sent < count {
+            let n = block.len().min((count - sent) as usize);
+            for (i, slot) in block[..n].iter_mut().enumerate() {
+                *slot = pattern_byte(sent + i as u64);
+            }
+            if stream.write_all(&block[..n]).is_err() {
+                return;
+            }
+            sent += n as u64;
+        }
+        let _ = stream.flush();
+        let _ = stream.shutdown(Shutdown::Write);
+        std::thread::sleep(Duration::from_millis(20));
+        return;
     }
+
+    // The same in the other direction: the client sends a body and is told
+    // how many bytes arrived and what they add up to.
+    if method == "POST" && path == "/sink" {
+        let length: u64 = head
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+            .and_then(|line| line[15..].trim().parse().ok())
+            .unwrap_or(0);
+        let mut digest = Digest::new();
+        let mut taken = (request.len() - head_len) as u64;
+        digest.eat(&request[head_len..]);
+        while taken < length {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    digest.eat(&buf[..n]);
+                    taken += n as u64;
+                }
+                Err(_) => break,
+            }
+        }
+        let body = format!("bytes={} digest={:016x}\n", taken, digest.0);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+        let _ = stream.shutdown(Shutdown::Write);
+        std::thread::sleep(Duration::from_millis(20));
+        return;
+    }
+
     let body = "hello from claudeos\n";
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
