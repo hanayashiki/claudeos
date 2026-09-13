@@ -11,6 +11,13 @@ opt-level = 1
 
 [profile.release]
 panic = "abort"
+# An arithmetic wrap on a value that came from a file, a device or a program is
+# how four bounds checks in the program loader were defeated. Every wrap this
+# kernel means is already spelled `wrapping_*`, so turning these on costs
+# nothing it wanted and turns the rest into a panic naming a file and a line,
+# which on a board with only a serial cable is the difference between a
+# diagnosis and a week.
+overflow-checks = true
 opt-level = 2
 debug = true
 lto = false
