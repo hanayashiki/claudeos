@@ -230,25 +230,50 @@ pub fn next_hop(destination: Ipv4Addr) -> Ipv4Addr {
     }
 }
 
+/// Where a datagram came from: off a card, or from this machine talking to
+/// itself. The two have different addresses to answer to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Card,
+    Loopback,
+}
+
 /// One received datagram, already stripped of its Ethernet header.
-pub fn receive(bytes: &[u8], source_mac: [u8; 6]) {
+pub fn receive(bytes: &[u8], source_mac: [u8; 6], origin: Origin) {
     let Some((header, payload)) = parse(bytes) else { return };
     let config = super::config();
-    let for_us = header.destination == config.address
-        || header.destination.is_loopback()
-        || header.destination.is_broadcast()
-        || header.destination == config.broadcast()
-        // Before the address is configured, take whatever turns up: the
-        // alternative is to drop the very packets that would configure it.
-        || config.address.is_unspecified();
+    let for_us = match origin {
+        Origin::Card => {
+            // A datagram off a card that claims this machine's own address is
+            // either a loop or a forgery, and 127/8 names whoever is asking,
+            // so it never crosses a link in either field.
+            if !config.address.is_unspecified() && header.source == config.address {
+                return;
+            }
+            if header.source.is_loopback() || header.destination.is_loopback() {
+                return;
+            }
+            header.destination == config.address
+                || header.destination.is_broadcast()
+                || header.destination == config.broadcast()
+                // Before the address is configured, take whatever turns up:
+                // the alternative is to drop the very packets that would
+                // configure it.
+                || config.address.is_unspecified()
+        }
+        // Built here for here; nothing else reaches the queue it came from.
+        Origin::Loopback => {
+            header.destination.is_loopback() || header.destination == config.address
+        }
+    };
     if !for_us {
         return;
     }
     // A neighbour that talks to us has just proved which hardware address it
     // is at, which saves a request the next time we answer it.
-    if config.on_link(header.source)
+    if origin == Origin::Card
+        && config.on_link(header.source)
         && !header.source.is_unspecified()
-        && header.source != config.address
     {
         super::arp::learn(header.source, source_mac);
     }

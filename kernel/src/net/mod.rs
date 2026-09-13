@@ -218,7 +218,7 @@ fn deliver_loopback() {
     }
     for _ in 0..LOOPBACK_LIMIT {
         let Some(datagram) = LOOPBACK.lock().pop_front() else { break };
-        ip::receive(&datagram, mac());
+        ip::receive(&datagram, mac(), ip::Origin::Loopback);
     }
     RUNNING.store(false, Ordering::Release);
 }
@@ -241,7 +241,9 @@ pub fn receive(frame: &[u8]) {
     }
     match parsed.ethertype {
         ether::ETHERTYPE_ARP => arp::receive(parsed.payload),
-        ether::ETHERTYPE_IPV4 => ip::receive(parsed.payload, parsed.source),
+        ether::ETHERTYPE_IPV4 => {
+            ip::receive(parsed.payload, parsed.source, ip::Origin::Card)
+        }
         // No IPv6.
         _ => {}
     }

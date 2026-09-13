@@ -61,6 +61,11 @@ const SYN_RETRIES: u32 = 5;
 /// waits ten, because nothing here runs long enough for a segment from an old
 /// connection to turn up, and a shorter wait keeps the socket table small.
 const TIME_WAIT_TICKS: u64 = 1000;
+/// How long a connection whose descriptor is gone waits in FIN-WAIT-2 for the
+/// other end to finish. Linux bounds the same wait with tcp_fin_timeout, which
+/// is sixty seconds; without a bound a peer that acknowledges the finish and
+/// then says nothing keeps the record, and everything it holds, until reboot.
+const FIN_WAIT_2_TICKS: u64 = 6000;
 
 #[inline]
 pub fn seq_lt(a: u32, b: u32) -> bool {
@@ -240,15 +245,55 @@ pub fn build(
     segment
 }
 
+/// A secret drawn once per boot and mixed into every initial sequence number.
+///
+/// It comes from the kernel's own generator, which is a xorshift seeded from
+/// the cycle counter. That is the best source here, and it is worth being
+/// plain about what it buys: someone off the machine cannot work the secret
+/// out from the sequence numbers it produces, and it is not a cryptographic
+/// hash and is not claimed to be one. Anyone who can read kernel memory, or
+/// who can watch this machine's start-up timing closely enough to guess the
+/// seed, has the secret and everything that follows from it.
+static ISN_SECRET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn isn_secret() -> u64 {
+    use core::sync::atomic::Ordering;
+    let held = ISN_SECRET.load(Ordering::Relaxed);
+    if held != 0 {
+        return held;
+    }
+    // Zero is what says it has not been drawn yet, so it is not a value the
+    // secret may take.
+    let drawn = crate::fs::dev::random_u64() | 1;
+    match ISN_SECRET.compare_exchange(0, drawn, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => drawn,
+        Err(other) => other,
+    }
+}
+
+/// splitmix64's finalizer: every input bit reaches the whole word.
+fn mix(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
 /// A starting sequence number that differs between connections and advances
 /// with the clock, so a segment left over from an earlier connection between
 /// the same two ports falls outside the new one's window.
+///
+/// RFC 6528: the clock, plus a hash of the connection's own addresses and
+/// ports with a secret this machine keeps to itself. The clock is what keeps
+/// the old segment out; the secret is what stops one connection's number,
+/// which the other end sees, from giving away every other connection's.
 fn initial_sequence(local: Endpoint, remote: Endpoint) -> u32 {
     let clock = (crate::time::monotonic_ns() / 4000) as u32;
-    let salt = ((local.port as u32) << 16)
-        ^ (remote.port as u32)
-        ^ remote.address.0.rotate_left(13);
-    clock.wrapping_add(salt.wrapping_mul(0x9E37_79B9))
+    let addresses = ((local.address.0 as u64) << 32) | remote.address.0 as u64;
+    let ports = ((local.port as u64) << 16) | remote.port as u64;
+    let hash = mix(mix(isn_secret() ^ addresses) ^ ports);
+    clock.wrapping_add(hash as u32)
 }
 
 // ---- the transmission control block --------------------------------------
@@ -281,6 +326,10 @@ pub struct Tcb {
     pub fin_acknowledged: bool,
     pub fin_received: bool,
     pub read_shutdown: bool,
+    /// No descriptor names this connection any more. Nothing can read what
+    /// arrives and nothing can close it a second time, so the states that
+    /// wait on the other end have to give up by themselves.
+    pub abandoned: bool,
     pub error: Option<Errno>,
 
     peer_mss: usize,
@@ -289,7 +338,10 @@ pub struct Tcb {
     pub retransmit_at: u64,
     rto: u64,
     retries: u32,
-    time_wait_at: u64,
+    /// Tick at which a state that waits on a clock rather than on the other
+    /// end gives up: TIME-WAIT's two segment lifetimes, and the bound on
+    /// FIN-WAIT-2. Zero is off.
+    expire_at: u64,
 
     congestion_window: u32,
     slow_start_threshold: u32,
@@ -320,12 +372,13 @@ impl Tcb {
             fin_acknowledged: false,
             fin_received: false,
             read_shutdown: false,
+            abandoned: false,
             error: None,
             peer_mss: MSS,
             retransmit_at: 0,
             rto: INITIAL_RTO,
             retries: 0,
-            time_wait_at: 0,
+            expire_at: 0,
             congestion_window: MSS as u32,
             slow_start_threshold: 64 * 1024,
             backlog: 1,
@@ -566,6 +619,55 @@ impl Tcb {
 
     // ---- input -----------------------------------------------------------
 
+    /// RFC 793 section 3.9's first test: does this segment fall anywhere in
+    /// the window this end is waiting for? A segment that does not belongs to
+    /// some other conversation, or to nobody at all, and nothing in it may be
+    /// acted on -- not the flags, not the acknowledgement, not the data.
+    fn acceptable(&self, segment: &Segment) -> bool {
+        let window = self.advertised_window() as u32;
+        let length = segment.length();
+        let first = segment.sequence;
+        if length == 0 {
+            if window == 0 {
+                return first == self.receive_next;
+            }
+            return seq_le(self.receive_next, first)
+                && seq_lt(first, self.receive_next.wrapping_add(window));
+        }
+        if window == 0 {
+            return false;
+        }
+        let last = first.wrapping_add(length - 1);
+        let right = self.receive_next.wrapping_add(window);
+        (seq_le(self.receive_next, first) && seq_lt(first, right))
+            || (seq_le(self.receive_next, last) && seq_lt(last, right))
+    }
+
+    /// What to do with a segment that fell outside the window. Nothing in it
+    /// is believed; the answer says where this end actually is, which is what
+    /// a peer that is genuinely out of step needs and what someone guessing
+    /// at the connection cannot see.
+    fn on_unacceptable(&mut self, segment: &Segment) -> bool {
+        if segment.flags & RST != 0 {
+            // RFC 5961 section 3: a reset this far out is not answered at
+            // all. An answer would tell whoever guessed how close they came.
+            return false;
+        }
+        if self.state == State::SynReceived
+            && segment.flags & SYN != 0
+            && segment.flags & ACK == 0
+            && segment.sequence == self.irs
+        {
+            // The connection request again, because our answer was lost. It
+            // sits one before what is wanted next, so the window test turns
+            // it away, and it is still the handshake carrying on.
+            self.send_syn_ack();
+            return false;
+        }
+        self.acknowledge();
+        false
+    }
+
     /// Returns true when something a waiter cares about changed.
     pub fn on_segment(&mut self, segment: &Segment) -> bool {
         match self.state {
@@ -574,7 +676,19 @@ impl Tcb {
             _ => {}
         }
 
+        if !self.acceptable(segment) {
+            return self.on_unacceptable(segment);
+        }
+
         if segment.flags & RST != 0 {
+            if segment.sequence != self.receive_next {
+                // RFC 5961 section 3: inside the window, but not the byte
+                // that is wanted next. Say where this end is and wait for a
+                // reset that names it, which leaves a blind sender one number
+                // to find rather than a whole window of them.
+                self.acknowledge();
+                return false;
+            }
             self.state = State::Closed;
             self.retransmit_at = 0;
             self.pending.clear();
@@ -585,15 +699,12 @@ impl Tcb {
         }
 
         if segment.flags & SYN != 0 {
-            if self.state == State::SynReceived && segment.flags & ACK == 0 {
-                // The connection request again, because our answer was lost.
-                self.send_syn_ack();
-                return false;
-            }
-            self.send_segment(RST, self.send_next, &[], false);
-            self.state = State::Closed;
-            self.error = Some(Errno::ECONNRESET);
-            return true;
+            // RFC 5961 section 4: a connection request inside an open
+            // connection draws the same acknowledgement rather than a reset.
+            // A peer that really has restarted answers that with a reset of
+            // its own, which does carry the sequence number this end named.
+            self.acknowledge();
+            return false;
         }
 
         if segment.flags & ACK == 0 {
@@ -662,7 +773,7 @@ impl Tcb {
         if self.fin_acknowledged {
             match self.state {
                 State::FinWait1 => {
-                    self.state = State::FinWait2;
+                    self.enter_fin_wait_2();
                 }
                 State::Closing => {
                     self.enter_time_wait();
@@ -692,7 +803,7 @@ impl Tcb {
         if !segment.payload.is_empty() {
             need_ack = true;
             if in_order && !payload.is_empty() {
-                if self.read_shutdown {
+                if !self.can_receive() {
                     // Nobody will ever read this. Taking it off the sequence
                     // space anyway is what keeps the other end from sending
                     // it again forever.
@@ -781,27 +892,67 @@ impl Tcb {
 
     fn enter_time_wait(&mut self) {
         self.state = State::TimeWait;
-        self.time_wait_at = crate::trap::ticks() + TIME_WAIT_TICKS;
+        self.expire_at = crate::trap::ticks() + TIME_WAIT_TICKS;
         self.retransmit_at = 0;
         self.pending.clear();
+        self.read_shutdown = true;
+        if self.abandoned {
+            // Both ends have finished and no descriptor is left, so what
+            // arrived and was never read is held for nobody.
+            self.received.clear();
+        }
+    }
+
+    fn enter_fin_wait_2(&mut self) {
+        self.state = State::FinWait2;
+        if self.abandoned {
+            self.expire_at = crate::trap::ticks() + FIN_WAIT_2_TICKS;
+        }
+    }
+
+    /// The last descriptor naming this connection has gone.
+    pub fn abandon(&mut self) {
+        self.abandoned = true;
+        if self.state == State::FinWait2 && self.expire_at == 0 {
+            self.expire_at = crate::trap::ticks() + FIN_WAIT_2_TICKS;
+        }
+    }
+
+    /// Whether anything arriving now could still be read. A connection with
+    /// no descriptor has nobody to read it, one whose read side is shut has
+    /// been told there is nothing more, and in any other state the other end
+    /// has already finished sending.
+    fn can_receive(&self) -> bool {
+        !self.read_shutdown
+            && !self.abandoned
+            && matches!(
+                self.state,
+                State::Established | State::FinWait1 | State::FinWait2
+            )
     }
 
     // ---- timers ----------------------------------------------------------
 
     pub fn next_deadline(&self) -> u64 {
-        if self.state == State::TimeWait {
-            return self.time_wait_at;
+        let mut earliest = u64::MAX;
+        if self.expire_at != 0 {
+            earliest = self.expire_at;
         }
         if self.retransmit_at != 0 {
-            return self.retransmit_at;
+            earliest = earliest.min(self.retransmit_at);
         }
-        u64::MAX
+        earliest
     }
 
     pub fn on_timer(&mut self, now: u64) -> bool {
-        if self.state == State::TimeWait {
-            if now >= self.time_wait_at {
+        if self.expire_at != 0 {
+            // Waiting on a clock rather than on the other end: there is
+            // nothing to send, and reaching the deadline is the end of it.
+            if now >= self.expire_at {
                 self.state = State::Closed;
+                self.expire_at = 0;
+                self.retransmit_at = 0;
+                self.pending.clear();
                 return true;
             }
             return false;
@@ -921,6 +1072,15 @@ pub fn receive(source: Ipv4Addr, destination: Ipv4Addr, bytes: &[u8]) {
     let Some(segment) = Segment::parse(bytes) else { return };
     let pseudo = ip::pseudo_sum(source, destination, ip::PROTO_TCP, bytes.len());
     if ip::fold(ip::sum(bytes, pseudo)) != 0 {
+        return;
+    }
+    // RFC 1122: a segment addressed to a broadcast or a multicast address is
+    // discarded. Answering one would name an address this machine does not
+    // have as the source, and open a connection with every host that answered.
+    if destination.is_broadcast()
+        || destination.is_multicast()
+        || destination == super::config().broadcast()
+    {
         return;
     }
     let local = Endpoint::new(destination, segment.destination_port);

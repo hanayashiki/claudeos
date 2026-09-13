@@ -116,7 +116,8 @@ impl InetSocket {
                     || tcb.error.is_some()
                     || tcb.state == tcp::State::Closed
             }
-            Protocol::Udp(state) => !state.queue.is_empty(),
+            // A read side that is shut reports the end rather than waiting.
+            Protocol::Udp(state) => !state.queue.is_empty() || state.read_shutdown,
         }
     }
 
@@ -442,7 +443,7 @@ impl InetSocket {
             }
             Protocol::Udp(state) => {
                 if read {
-                    state.queue.clear();
+                    state.shutdown_read();
                 }
                 if write {
                     state.write_shutdown = true;
@@ -630,9 +631,12 @@ pub fn close(socket: &Arc<InetSocket>) {
         match &mut *inner {
             Protocol::Tcp(tcb) => {
                 let children = core::mem::take(&mut tcb.children);
+                // Said before anything else, because it is what bounds the
+                // states that go on waiting after this returns.
+                tcb.abandon();
                 if tcb.state == tcp::State::Listen {
                     tcb.state = tcp::State::Closed;
-                } else if !tcb.received.is_empty() || tcb.read_shutdown {
+                } else if !tcb.received.is_empty() {
                     // Data arrived that nobody will ever read. The other end
                     // is told so rather than being left to time out.
                     tcb.abort();

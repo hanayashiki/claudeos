@@ -37,17 +37,17 @@ pub fn receive(source: Ipv4Addr, destination: Ipv4Addr, message: &[u8]) {
     if message[0] != TYPE_ECHO_REQUEST || message[1] != 0 {
         return;
     }
+    // Only a request addressed to this machine itself. A reply to one sent to
+    // a broadcast address makes this machine a way of pointing traffic at
+    // whoever the request claims to be from, which is why Linux ignores those
+    // by default.
+    if destination != super::config().address && !destination.is_loopback() {
+        return;
+    }
     // The identifier and sequence number go back unchanged; so does the body,
     // which is how the sender measures the round trip.
     let mut rest = [0u8; 4];
     rest.copy_from_slice(&message[4..8]);
     let reply = build(TYPE_ECHO_REPLY, 0, rest, &message[HEADER_LEN..]);
-    // Answer from the address that was asked, so a reply to a broadcast ping
-    // still comes from this machine's own address.
-    let from = if destination == super::config().address {
-        destination
-    } else {
-        super::config().address
-    };
-    let _ = ip::send_from(from, source, ip::PROTO_ICMP, &reply);
+    let _ = ip::send_from(destination, source, ip::PROTO_ICMP, &reply);
 }

@@ -57,6 +57,13 @@ pub fn learn(address: Ipv4Addr, mac: [u8; 6]) {
     if address.is_unspecified() || ether::is_group(&mac) {
         return;
     }
+    // Someone else on the segment saying they hold this machine's address is
+    // either a conflict or a lie. Believing it would send everything meant
+    // for us to their card.
+    let ours = super::config().address;
+    if !ours.is_unspecified() && address == ours {
+        return;
+    }
     let now = crate::trap::ticks();
     let mut released: Vec<Vec<u8>> = Vec::new();
     {
