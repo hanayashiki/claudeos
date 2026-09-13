@@ -11,6 +11,10 @@
 use super::gic;
 use crate::abi::{SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether the message below has been printed already.
+static SAID_NOT_OURS: AtomicBool = AtomicBool::new(false);
 
 /// What an exception entry saves, in the order `vectors.s` writes it.
 #[repr(C)]
@@ -80,8 +84,13 @@ pub const SERIAL_IRQ: u8 = 153;
 /// The second UART's line, which is where a board wired to the cut-down serial
 /// port announces input.
 pub const SERIAL_IRQ_ALT: u8 = 125;
-/// There is no keyboard on this board. The number has to be one the controller
-/// will accept an enable for and never raise.
+/// The number the portable console knows a keyboard's line by. There is no
+/// keyboard on this board and no number free to stand in for one: every number
+/// this controller implements is a line the chip can raise, and this one is a
+/// shared peripheral interrupt two above the Ethernet controller's. So the
+/// line is left masked -- `unmask_irq` declines it -- because a handler that
+/// ends an interrupt it never cleared leaves a level-triggered line asserting
+/// again as soon as it returns.
 pub const KEYBOARD_IRQ: u8 = 191;
 
 /// Timer interrupts per second. Every timeout in the kernel is a whole number
@@ -171,6 +180,11 @@ fn rearm_timer() {
 
 /// Let interrupts from `irq` through.
 pub fn unmask_irq(irq: u8) {
+    // Except the keyboard's, which names a device this board does not have on
+    // a line that belongs to something else: see KEYBOARD_IRQ.
+    if irq == KEYBOARD_IRQ {
+        return;
+    }
     gic::unmask(irq);
 }
 
@@ -251,6 +265,18 @@ fn interrupt(frame: &mut TrapFrame) {
     // way there is nothing to end, because a number in that range was never a
     // claim in the first place.
     if line >= gic::NOT_A_LINE || line >= IRQ_COUNT as u32 {
+        // One of those numbers means there was an interrupt and this
+        // interface was not allowed to take it. Nothing cleared the device
+        // and nothing can end what was never claimed, so a level-triggered
+        // line arrives again as soon as this returns and the machine makes no
+        // further progress. Said once: saying it every time is the same
+        // livelock with output.
+        if line == gic::NOT_OURS && !SAID_NOT_OURS.swap(true, Ordering::Relaxed) {
+            crate::println!(
+                "[gic] an interrupt arrived that this interface may not claim; \
+                 it cannot be ended and will arrive again"
+            );
+        }
         return;
     }
     if line == TIMER_IRQ as u32 {
