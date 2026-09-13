@@ -21,15 +21,27 @@ pub fn fork(
     let mut parent = sched::current();
     let share_vm = flags & CLONE_VM != 0;
 
+    // A fresh address space belongs to nothing until the child is registered
+    // on it, so anything that goes wrong before then has to hand it back here
+    // or it is held by nobody: the tables under it, and the references its
+    // entries took on the parent's frames, would stay taken for good.
     let space = if share_vm {
         parent.space
     } else {
         let space = AddressSpace::new_user().ok_or(Errno::ENOMEM)?;
-        space.clone_user_from(&parent.space).map_err(|_| Errno::ENOMEM)?;
+        if space.clone_user_from(&parent.space).is_err() {
+            space.destroy();
+            return Err(Errno::ENOMEM);
+        }
         space
     };
 
-    let mut child = Task::new(&parent.name, space).ok_or(Errno::ENOMEM)?;
+    let Some(mut child) = Task::new(&parent.name, space) else {
+        if !share_vm {
+            space.destroy();
+        }
+        return Err(Errno::ENOMEM);
+    };
     if share_vm {
         // Threads must see each other's mappings, so they share one record.
         child.mm = parent.mm.clone();
@@ -47,10 +59,23 @@ pub fn fork(
     child.ppid = if is_thread { parent.ppid } else { parent.pid };
     child.tgid = if is_thread { parent.tgid } else { child_pid };
     child.pgid = parent.pgid;
-    child.cwd = parent.cwd.clone();
+    // Two more things a thread shares with the task that started it. Without
+    // these a descriptor one thread opens is a descriptor the others do not
+    // have, and a directory one changes into is one the others do not resolve
+    // against. A fork takes a copy of each instead, which is what makes the
+    // two processes independent from that point on.
+    child.cwd = if flags & CLONE_FS != 0 {
+        parent.cwd.clone()
+    } else {
+        alloc::sync::Arc::new(crate::sync::Spinlock::new(parent.cwd()))
+    };
+    child.fds = if flags & CLONE_FILES != 0 {
+        parent.fds.share()
+    } else {
+        parent.fds.clone_table()
+    };
     child.exe_path = parent.exe_path.clone();
     child.name = parent.name.clone();
-    child.fds = parent.fds.clone_table();
     child.umask = parent.umask;
     child.signal_actions = parent.signal_actions;
     // The child carries on from the same instruction, so it starts on the
@@ -113,6 +138,26 @@ pub fn fork(
     Ok(child_pid as u64)
 }
 
+/// Put the task back on the image it was running when an exec could not be
+/// finished.
+///
+/// Both halves of what was swapped out have to come back. The page tables are
+/// the obvious one; the record of regions and the program break is the other,
+/// and the fault handler consults it for every page that has not been touched
+/// yet, so a task left running with an empty one takes a fault it cannot serve
+/// on the first stack page or heap byte it reaches.
+fn abandon_exec(
+    task: &mut Task,
+    old_space: AddressSpace,
+    old_mm: alloc::sync::Arc<crate::sync::Spinlock<crate::task::MemState>>,
+    new_space: AddressSpace,
+) {
+    task.space = old_space;
+    task.mm = old_mm;
+    unsafe { old_space.switch_to() };
+    new_space.destroy();
+}
+
 /// Replace the current task's program image.
 pub fn exec_into_current(
     path: &str,
@@ -151,6 +196,10 @@ pub fn exec_into_current(
     let mut task = sched::current();
     task.space = new_space;
     // exec starts a fresh address space; a shared record must not follow it.
+    // The old record is kept until the image is known to load, because the
+    // page tables it describes are still there and the task goes back to
+    // running on them if it does not.
+    let old_mm = alloc::sync::Arc::clone(&task.mm);
     task.mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
     unsafe { new_space.switch_to() };
 
@@ -159,9 +208,7 @@ pub fn exec_into_current(
     let image = match elf::load_at(&new_space, &node.inner.lock().data, None, Some(node.clone())) {
         Ok(image) => image,
         Err(err) => {
-            task.space = old_space;
-            unsafe { old_space.switch_to() };
-            new_space.destroy();
+            abandon_exec(&mut task, old_space, old_mm, new_space);
             return Err(err);
         }
     };
@@ -222,9 +269,7 @@ pub fn exec_into_current(
                     interp_path,
                     err
                 );
-                task.space = old_space;
-                unsafe { old_space.switch_to() };
-                new_space.destroy();
+                abandon_exec(&mut task, old_space, old_mm, new_space);
                 return Err(Errno::ENOENT);
             }
         }
@@ -233,9 +278,7 @@ pub fn exec_into_current(
     let sp = match task::build_user_stack(&mut task, &image, &argv, &envp, &exec_path, interp_base) {
         Ok(sp) => sp,
         Err(err) => {
-            task.space = old_space;
-            unsafe { old_space.switch_to() };
-            new_space.destroy();
+            abandon_exec(&mut task, old_space, old_mm, new_space);
             return Err(err);
         }
     };

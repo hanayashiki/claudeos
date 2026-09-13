@@ -67,16 +67,12 @@ pub fn refresh_dir(node: &crate::fs::NodeRef) {
         None => return,
     };
     let mut children = alloc::collections::BTreeMap::new();
-    for (fd, entry) in task.fds.entries.iter().enumerate() {
-        let file = match entry {
-            Some(file) => file,
-            None => continue,
-        };
+    for (fd, file) in task.fds.snapshot() {
         // The entry stands for the descriptor itself: opening it opens that
         // descriptor rather than reopening whatever it is attached to, which
         // is what makes /dev/stdout work when stdout is a pipe. Reading the
         // link gives the file's name, or the label a pipe carries instead.
-        let entry = Node::new(NodeKind::Fd(pid, fd as i32), crate::abi::S_IFLNK | 0o777);
+        let entry = Node::new(NodeKind::Fd(pid, fd), crate::abi::S_IFLNK | 0o777);
         let target = if file.path.is_empty() {
             format!("anon_inode:[{}]", fd)
         } else {

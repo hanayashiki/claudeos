@@ -6,6 +6,14 @@
 //!
 //! Nothing here knows it is running on claudeos: this is `std::net` making the
 //! same system calls it would make on Linux.
+//!
+//! The memory checks ride along here rather than in a suite of their own: the
+//! harness boots the machine once per suite and reads one summary line out of
+//! each, and these are things only a real process can ask about.
+
+mod memory;
+mod sys;
+mod threads;
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -36,6 +44,8 @@ fn main() {
             let count: usize = args.get(3).and_then(|c| c.parse().ok()).unwrap_or(usize::MAX);
             serve(port, count);
         }
+        // Started by the memory checks, in a process of its own.
+        Some("leave-a-thread") => memory::leave_a_thread_and_exec(),
         _ => test(),
     }
 }
@@ -57,6 +67,10 @@ fn test() {
     datagrams(&mut report);
     println!("-- an HTTP exchange --");
     http(&mut report);
+    println!("-- memory management --");
+    memory::run(&mut report);
+    println!("-- what threads share --");
+    threads::run(&mut report);
 
     println!();
     println!("=== {} passed, {} failed ===", report.passed, report.failed);

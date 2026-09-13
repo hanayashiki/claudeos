@@ -211,6 +211,13 @@ impl AddressSpace {
         Ok(table_at(table).add(index_of(virt, 0)))
     }
 
+    /// Map `frame` at `virt`. The descriptor holds the reference from here on,
+    /// and `unmap` or teardown gives it back.
+    ///
+    /// An address that already has a mapping is refused rather than replaced.
+    /// The descriptor is the only record of the reference the frame it names
+    /// holds, so writing over it would leave that frame with no owner and no
+    /// way back to the allocator.
     pub fn map(&self, virt: u64, frame: Frame, flags: u64) -> Result<(), MapError> {
         unsafe {
             let entry = self.entry_for(virt, true)?;
@@ -344,20 +351,28 @@ impl AddressSpace {
 
     /// Give this address space the same user mappings `src` has, shared and
     /// read-only so that the first write to either copy makes its own frame.
+    ///
+    /// A walk that stops partway has still taken write permission away from
+    /// every page it reached, so the flush belongs to both outcomes and is
+    /// done here where neither can get past it. What this address space has
+    /// collected by then is the caller's to release.
     pub fn clone_user_from(&self, src: &AddressSpace) -> Result<(), MapError> {
-        unsafe {
-            let from = table_at(src.root);
-            for i in 0..256usize {
-                let entry = *from.add(i);
-                if entry & PRESENT == 0 {
-                    continue;
-                }
-                let virt = (i as u64) << 39;
-                clone_table(self, src, entry & ADDR_MASK, virt, 3)?;
-            }
-        }
+        let result = unsafe { self.share_user_tables(src) };
         // The parent's write permissions just changed underneath it.
         flush_tlb_all();
+        result
+    }
+
+    unsafe fn share_user_tables(&self, src: &AddressSpace) -> Result<(), MapError> {
+        let from = table_at(src.root);
+        for i in 0..256usize {
+            let entry = *from.add(i);
+            if entry & PRESENT == 0 {
+                continue;
+            }
+            let virt = (i as u64) << 39;
+            clone_table(self, src, entry & ADDR_MASK, virt, 3)?;
+        }
         Ok(())
     }
 

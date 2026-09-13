@@ -245,6 +245,15 @@ pub fn run() -> bool {
 
     let mut report = Report { passed: 0, failed: 0 };
 
+    // Page tables and the frame allocator, which nothing above them can ask
+    // about. Counted into this summary because the harness reads one line per
+    // boot, and a second summary would let a failure here pass unnoticed.
+    crate::println!("mm: page tables and frames");
+    let mut memory = crate::mm::selftest::Report { passed: 0, failed: 0 };
+    crate::mm::selftest::run(&mut memory);
+    report.passed += memory.passed;
+    report.failed += memory.failed;
+
     crate::println!("net: checksums");
     checksums(&mut report);
     crate::println!("net: address resolution");

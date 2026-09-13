@@ -113,13 +113,16 @@ pub fn current_pgid() -> u32 {
     current().pgid
 }
 
-/// True when a task other than the current one is running on `space`.
+/// True when any task on the machine still names `space`.
+///
+/// A zombie counts. It has not been reaped, so the address space it ran in has
+/// not been handed back yet, and under `CLONE_VM` it is one of several tasks
+/// naming the same one. The caller counts too: a task that shares its address
+/// space with a child is the reason not to tear it down, not an exception to
+/// it. A caller that is about to stop naming the space asks after it has
+/// stopped.
 pub fn space_in_use(space: arch::paging::AddressSpace) -> bool {
-    let cur = unsafe { CURRENT };
-    let tasks = TASKS.lock();
-    tasks
-        .iter()
-        .any(|t| t.0 != cur && t.get().space == space && t.get().state != State::Zombie)
+    TASKS.lock().iter().any(|t| t.get().space == space)
 }
 
 fn pick_next() -> Option<*mut Task> {
@@ -330,8 +333,11 @@ pub fn exit_current(status: i32) -> ! {
             let _ = crate::uaccess::write_u32(address, 0);
             crate::futex::wake(crate::futex::futex_key(address), u32::MAX);
         }
-        task.fds.entries.clear();
-        task.fds.cloexec.clear();
+        // Under CLONE_FILES the table belongs to the whole process, so only
+        // the last task holding it may empty it here.
+        if task.fds.is_last_reference() {
+            task.fds.clear();
+        }
 
         // Threads share an address space and its region list; only the last
         // thread out may tear either of them down.
@@ -687,12 +693,9 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
     crate::fs::procfs::remove_process(pid);
     unsafe {
         let mut task = Box::from_raw(ptr);
-        let space = task.space;
-        let shared = {
-            let tasks = TASKS.lock();
-            tasks.iter().any(|t| t.get().space == space)
-        };
-        if !shared {
+        // The task being reaped is already out of the table, so this asks
+        // whether anything else still names the address space it ran in.
+        if !space_in_use(task.space) {
             task.space.destroy();
         }
         task.free_kernel_stack();

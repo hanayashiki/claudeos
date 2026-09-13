@@ -694,87 +694,178 @@ impl OpenFile {
     }
 }
 
-/// A process's file descriptor table.
-#[derive(Default)]
+/// A task's open descriptors.
+///
+/// The table sits behind a shared handle rather than in the task itself, so
+/// that threads can hold the same one. A `clone` with `CLONE_FILES` gives the
+/// child this value, and then a descriptor either of them opens is one both of
+/// them have; a fork takes a copy with `clone_table` instead, and the two
+/// tables go their separate ways from there.
+#[derive(Clone)]
 pub struct FdTable {
-    pub entries: Vec<Option<Arc<OpenFile>>>,
-    pub cloexec: Vec<bool>,
+    inner: Arc<Spinlock<FdInner>>,
+}
+
+struct FdInner {
+    entries: Vec<Option<Arc<OpenFile>>>,
+    cloexec: Vec<bool>,
 }
 
 pub const MAX_FDS: usize = 256;
 
-impl FdTable {
-    pub fn new() -> Self {
-        FdTable { entries: Vec::new(), cloexec: Vec::new() }
-    }
-
-    pub fn get(&self, fd: i32) -> Result<Arc<OpenFile>, Errno> {
-        if fd < 0 {
-            return Err(Errno::EBADF);
-        }
-        self.entries
-            .get(fd as usize)
-            .and_then(|slot| slot.clone())
-            .ok_or(Errno::EBADF)
-    }
-
+impl FdInner {
     fn ensure(&mut self, index: usize) {
         while self.entries.len() <= index {
             self.entries.push(None);
             self.cloexec.push(false);
         }
     }
+}
 
-    pub fn insert_at(&mut self, fd: usize, file: Arc<OpenFile>, cloexec: bool) {
-        self.ensure(fd);
-        self.entries[fd] = Some(file);
-        self.cloexec[fd] = cloexec;
+impl FdTable {
+    pub fn new() -> Self {
+        FdTable {
+            inner: Arc::new(Spinlock::new(FdInner { entries: Vec::new(), cloexec: Vec::new() })),
+        }
+    }
+
+    /// A second handle on the same table, for a thread that shares it.
+    pub fn share(&self) -> FdTable {
+        FdTable { inner: self.inner.clone() }
+    }
+
+    /// True when no other task holds this table.
+    pub fn is_last_reference(&self) -> bool {
+        Arc::strong_count(&self.inner) == 1
+    }
+
+    pub fn get(&self, fd: i32) -> Result<Arc<OpenFile>, Errno> {
+        if fd < 0 {
+            return Err(Errno::EBADF);
+        }
+        self.inner
+            .lock()
+            .entries
+            .get(fd as usize)
+            .and_then(|slot| slot.clone())
+            .ok_or(Errno::EBADF)
+    }
+
+    pub fn insert_at(&self, fd: usize, file: Arc<OpenFile>, cloexec: bool) {
+        let mut inner = self.inner.lock();
+        inner.ensure(fd);
+        inner.entries[fd] = Some(file);
+        inner.cloexec[fd] = cloexec;
     }
 
     /// Lowest free descriptor at or above `min`.
-    pub fn alloc_at_least(&mut self, min: usize, file: Arc<OpenFile>, cloexec: bool) -> Result<i32, Errno> {
+    pub fn alloc_at_least(&self, min: usize, file: Arc<OpenFile>, cloexec: bool) -> Result<i32, Errno> {
+        let mut inner = self.inner.lock();
         let mut fd = min;
         loop {
             if fd >= MAX_FDS {
                 return Err(Errno::EMFILE);
             }
-            if fd >= self.entries.len() {
-                self.ensure(fd);
+            if fd >= inner.entries.len() {
+                inner.ensure(fd);
             }
-            if self.entries[fd].is_none() {
-                self.entries[fd] = Some(file);
-                self.cloexec[fd] = cloexec;
+            if inner.entries[fd].is_none() {
+                inner.entries[fd] = Some(file);
+                inner.cloexec[fd] = cloexec;
                 return Ok(fd as i32);
             }
             fd += 1;
         }
     }
 
-    pub fn alloc(&mut self, file: Arc<OpenFile>, cloexec: bool) -> Result<i32, Errno> {
+    pub fn alloc(&self, file: Arc<OpenFile>, cloexec: bool) -> Result<i32, Errno> {
         self.alloc_at_least(0, file, cloexec)
     }
 
-    pub fn close(&mut self, fd: i32) -> Result<(), Errno> {
-        if fd < 0 || fd as usize >= self.entries.len() {
-            return Err(Errno::EBADF);
+    pub fn close(&self, fd: i32) -> Result<(), Errno> {
+        // The last reference to the file is let go after the lock is, because
+        // what happens then is a whole pipe or socket being taken down and
+        // that has no business running with this table held and interrupts
+        // off.
+        let closed = {
+            let mut inner = self.inner.lock();
+            if fd < 0 || fd as usize >= inner.entries.len() {
+                return Err(Errno::EBADF);
+            }
+            inner.entries[fd as usize].take()
+        };
+        match closed {
+            Some(file) => {
+                drop(file);
+                Ok(())
+            }
+            None => Err(Errno::EBADF),
         }
-        if self.entries[fd as usize].take().is_none() {
-            return Err(Errno::EBADF);
-        }
-        Ok(())
     }
 
+    pub fn is_cloexec(&self, fd: i32) -> bool {
+        if fd < 0 {
+            return false;
+        }
+        self.inner.lock().cloexec.get(fd as usize).copied().unwrap_or(false)
+    }
+
+    pub fn set_cloexec(&self, fd: i32, value: bool) {
+        if fd < 0 {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        if (fd as usize) < inner.cloexec.len() {
+            inner.cloexec[fd as usize] = value;
+        }
+    }
+
+    /// The descriptors open right now, for anything that has to walk them.
+    pub fn snapshot(&self) -> Vec<(i32, Arc<OpenFile>)> {
+        let inner = self.inner.lock();
+        inner
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(fd, slot)| slot.clone().map(|file| (fd as i32, file)))
+            .collect()
+    }
+
+    /// A table of its own holding the same descriptors, for a fork.
     pub fn clone_table(&self) -> FdTable {
-        FdTable { entries: self.entries.clone(), cloexec: self.cloexec.clone() }
+        let inner = self.inner.lock();
+        FdTable {
+            inner: Arc::new(Spinlock::new(FdInner {
+                entries: inner.entries.clone(),
+                cloexec: inner.cloexec.clone(),
+            })),
+        }
     }
 
     /// Drop descriptors marked close-on-exec.
-    pub fn close_on_exec(&mut self) {
-        for i in 0..self.entries.len() {
-            if self.cloexec[i] {
-                self.entries[i] = None;
-                self.cloexec[i] = false;
+    pub fn close_on_exec(&self) {
+        let dropped = self.take_matching(|inner, fd| inner.cloexec[fd]);
+        drop(dropped);
+    }
+
+    /// Drop every descriptor.
+    pub fn clear(&self) {
+        let dropped = self.take_matching(|_, _| true);
+        drop(dropped);
+    }
+
+    fn take_matching(&self, wanted: impl Fn(&FdInner, usize) -> bool) -> Vec<Arc<OpenFile>> {
+        let mut out = Vec::new();
+        let mut inner = self.inner.lock();
+        for fd in 0..inner.entries.len() {
+            if !wanted(&inner, fd) {
+                continue;
             }
+            if let Some(file) = inner.entries[fd].take() {
+                out.push(file);
+            }
+            inner.cloexec[fd] = false;
         }
+        out
     }
 }
