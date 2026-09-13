@@ -1,7 +1,7 @@
 //! Memory-related system calls.
 
 use crate::abi::*;
-use crate::arch::paging::{is_user_addr, NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::arch::paging::{is_user_addr, FreshPage, NO_EXECUTE, PRESENT, USER, WRITABLE};
 use crate::mm::{page_align_down, page_align_up, PAGE_SIZE_U64, USER_MMAP_BASE};
 use crate::sched;
 use crate::uaccess;
@@ -109,31 +109,76 @@ pub fn mmap(
         let file = sched::current().fds.get(fd as i32)?;
         let node = file.node().ok_or(Errno::ENODEV)?.clone();
         let task = sched::current();
-        task.add_vma(base, base + len, prot, flags);
 
-        // File-backed pages are populated up front from the file contents.
-        let mut page = base;
-        while page < base + len {
-            task.space()
-                .map_new(page, PRESENT | WRITABLE | USER)
-                .map_err(|_| Errno::ENOMEM)?;
-            page += PAGE_SIZE_U64;
+        if let Err(err) = populate_from_file(&node, base, len, offset, prot_to_flags(prot)) {
+            // Pages already published are reachable and pages not yet
+            // published are not, so a failure part of the way through leaves a
+            // range that is partly the file. Take back what this call put in,
+            // and record nothing: a mapping that fails leaves no mapping. What
+            // MAP_FIXED took away above is gone either way, because replacing
+            // a mapping destroys it before there is anything to put in its
+            // place.
+            let mut page = base;
+            while page < base + len {
+                drop(task.space().unmap(page));
+                page += PAGE_SIZE_U64;
+            }
+            return Err(err);
         }
-        let mut buf = alloc::vec![0u8; len as usize];
-        let n = node.read_at(offset, &mut buf)?;
-        unsafe {
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), base as *mut u8, n);
-        }
-        // Apply the requested protection now that the contents are in place.
-        let bits = prot_to_flags(prot);
-        let mut page = base;
-        while page < base + len {
-            task.space().set_flags(page, bits);
-            page += PAGE_SIZE_U64;
-        }
+        // Last, so that a thread sharing this address space that touches the
+        // range while the pages are going in finds no region rather than one
+        // whose pages are not there yet: a fault on the latter is served an
+        // anonymous page of zeroes, which is neither the file's contents nor
+        // something this call could then publish over.
+        task.add_vma(base, base + len, prot, flags);
     }
 
     Ok(base)
+}
+
+/// Fill `[base, base + len)` from the file at `offset` and publish each page
+/// with `bits`.
+///
+/// A page is read into a frame the allocator has just handed over, through the
+/// kernel's own view of memory, and goes into the address space once with the
+/// protection the caller asked for. The mapping is visible to every thread
+/// sharing the address space from the moment its first page goes in, so a page
+/// mapped wide enough to be written through and narrowed afterwards is one a
+/// sibling can read blank, and on aarch64, where execute permission is its own
+/// bit, run: for the length of the whole file read, not one page of it.
+///
+/// The file's lock is taken and let go once per page rather than held across
+/// the whole read, so the timer is held off by a page's copy at a time. What
+/// that costs is that the file can change between one page and the next, so a
+/// mapping can come out part old and part new. A page the file no longer
+/// reaches is read short and the rest of the frame stays zero, which is what a
+/// page of a mapping that arrives later from a fault already does.
+fn populate_from_file(
+    node: &crate::fs::NodeRef,
+    base: u64,
+    len: u64,
+    offset: u64,
+    bits: u64,
+) -> Result<(), Errno> {
+    let task = sched::current();
+    let mut page = base;
+    while page < base + len {
+        let mut fresh = FreshPage::new().ok_or(Errno::ENOMEM)?;
+        // The offset is the program's, and the release build wraps rather than
+        // trapping, so a sum that does not fit would name a place near the
+        // start of the file instead of one past its end.
+        let at = offset.checked_add(page - base).ok_or(Errno::EINVAL)?;
+        let n = node.read_at(at, fresh.bytes())?;
+        // These bytes were written through the direct map rather than the
+        // address they will be fetched from, and an executable mapping is
+        // what a program maps a shared library with.
+        if n > 0 && bits & NO_EXECUTE == 0 {
+            crate::arch::sync_instruction_cache(fresh.bytes().as_ptr() as u64, n);
+        }
+        task.space().publish(page, fresh, bits).map_err(|_| Errno::ENOMEM)?;
+        page += PAGE_SIZE_U64;
+    }
+    Ok(())
 }
 
 fn unmap_range(addr: u64, len: u64) {

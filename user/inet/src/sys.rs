@@ -114,6 +114,23 @@ pub fn mmap_fixed(addr: u64, len: u64) -> i64 {
     }
 }
 
+/// A private mapping of a file, at the address named rather than suggested, so
+/// a sibling thread knows where it will be before it is there.
+pub fn mmap_file_fixed(addr: u64, len: u64, prot: u64, fd: i32, offset: u64) -> i64 {
+    const MAP_FIXED: u64 = 0x10;
+    unsafe {
+        syscall(
+            SYS_MMAP,
+            addr,
+            len,
+            prot,
+            MAP_PRIVATE | MAP_FIXED,
+            fd as i64 as u64,
+            offset,
+        )
+    }
+}
+
 pub fn munmap(addr: u64, len: u64) -> i64 {
     unsafe { syscall(SYS_MUNMAP, addr, len, 0, 0, 0, 0) }
 }

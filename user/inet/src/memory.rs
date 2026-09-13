@@ -14,6 +14,7 @@ pub fn run(report: &mut Report) {
     pages_a_fork_shared_are_out_of_the_parents_reach(report);
     a_user_buffer_unmapped_while_the_kernel_reads_it(report);
     a_page_two_threads_reach_at_once(report);
+    a_file_mapping_read_while_it_is_made(report);
     exec_that_fails_keeps_the_memory_state(report);
     a_thread_left_unreaped_keeps_the_space(report);
     argument_blocks_larger_than_the_stack_is_mapped_with(report);
@@ -378,6 +379,133 @@ fn a_page_two_threads_reach_at_once(report: &mut Report) {
         blank == 0,
         format!("{} of {} reads came back zero", blank, COLD_PAGES * 2),
     );
+}
+
+/// A mapping of a file, read by a sibling thread while it is being made.
+///
+/// Making one mapped its whole range present, writable and user, read the file
+/// through those mappings and narrowed the range to the protection asked for
+/// afterwards, so for the length of the whole file read a thread sharing the
+/// address space could read pages that held the zeroes of fresh frames. On
+/// aarch64 those opening flags leave execute permission on as well, so the
+/// same window is one a sibling could run in.
+///
+/// The mapping is made at an address both threads agree on beforehand, since
+/// the address an ordinary mapping lands at is not known until the call that
+/// makes it has returned. The sibling reads it through a system call rather
+/// than by loading from it, so the stretch where the replacement has taken the
+/// old mapping away and not yet put the new one in comes back as a bad address
+/// instead of killing the program.
+///
+/// A smoke test: one processor runs one of the two threads at a time, so they
+/// overlap only when the timer lands inside the call. The proof was a widened
+/// window, where better than half the reads that landed came back blank.
+fn a_file_mapping_read_while_it_is_made(report: &mut Report) {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const PAGES: usize = 64;
+    const PAGE: usize = 4096;
+    const LEN: u64 = (PAGES * PAGE) as u64;
+    const SAMPLE: usize = 32;
+    const ROUNDS: usize = 3000;
+    const PATH: &str = "/tmp/mapped";
+    const O_RDONLY: u64 = 0;
+    const PROT_EXEC: u64 = 4;
+
+    // Every byte non-zero, so a read that comes back zero is a read of a page
+    // that does not hold the file's contents yet.
+    let body: Vec<u8> = (0..PAGES * PAGE).map(|i| (i % 251) as u8 + 1).collect();
+    let Ok(()) = std::fs::write(PATH, &body) else {
+        report.check("a file to map", false, format!("could not write {}", PATH));
+        return;
+    };
+    let fd = sys::open(PATH, O_RDONLY);
+    // A range of the right length, so that what the mapping does to it is a
+    // replacement at an address that was settled before either thread ran.
+    let base = sys::mmap_anon(0, LEN);
+    if fd < 0 || base <= 0 {
+        report.check(
+            "a file to map and somewhere to put it",
+            false,
+            format!("open returned {}, mmap returned {:#x}", fd, base),
+        );
+        if fd >= 0 {
+            sys::close(fd as i32);
+        }
+        let _ = std::fs::remove_file(PATH);
+        return;
+    }
+    let (fd, base) = (fd as i32, base as u64);
+    // The file goes in over the reservation before anything reads there, so
+    // that a read which comes back blank is a page of the mapping being made
+    // and not one of the anonymous pages that were holding the address.
+    let placed = sys::mmap_file_fixed(base, LEN, sys::PROT_READ | PROT_EXEC, fd, 0);
+    if placed != base as i64 {
+        report.check(
+            "the file mapped where it was asked for",
+            false,
+            format!("mmap returned {:#x}", placed),
+        );
+        sys::munmap(base, LEN);
+        sys::close(fd);
+        let _ = std::fs::remove_file(PATH);
+        return;
+    }
+
+    let Ok((mut source, sink)) = std::os::unix::net::UnixStream::pair() else {
+        report.check("somewhere to read the bytes back from", false, String::new());
+        sys::munmap(base, LEN);
+        sys::close(fd);
+        let _ = std::fs::remove_file(PATH);
+        return;
+    };
+    let sink = sink.as_raw_fd();
+
+    let stop = AtomicBool::new(false);
+    let blank = AtomicUsize::new(0);
+    let read = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            // Executable, which is how a program maps a shared library.
+            // Present, writable and user leaves the never-execute bit clear
+            // on aarch64, so a window opened with those is one a sibling
+            // could run in and not only read.
+            while !stop.load(Ordering::Relaxed) {
+                sys::mmap_file_fixed(base, LEN, sys::PROT_READ | PROT_EXEC, fd, 0);
+            }
+        });
+
+        let mut buf = [0u8; SAMPLE];
+        for round in 0..ROUNDS {
+            // Every page in turn, so a window that covers the pages the read
+            // has not reached yet is one this walks into.
+            let at = base + (round % PAGES) as u64 * PAGE as u64;
+            if sys::write_raw(sink, at, SAMPLE as u64) != SAMPLE as i64 {
+                continue;
+            }
+            if source.read_exact(&mut buf).is_err() {
+                break;
+            }
+            read.fetch_add(1, Ordering::Relaxed);
+            if buf.iter().any(|byte| *byte == 0) {
+                blank.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+    });
+
+    let (blank, read) = (blank.load(Ordering::Relaxed), read.load(Ordering::Relaxed));
+    report.check(
+        "a mapping of a file holds the file's bytes from the moment it can be read",
+        blank == 0,
+        format!("{} of {} reads that landed came back blank", blank, read),
+    );
+    sys::munmap(base, LEN);
+    sys::close(fd);
+    let _ = std::fs::remove_file(PATH);
 }
 
 /// A hint names where a mapping should start, and the mapping is as long as it
