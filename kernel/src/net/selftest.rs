@@ -1085,13 +1085,10 @@ impl Peer {
         self.stream.extend_from_slice(payload);
         self.receive_next = self.receive_next.wrapping_add(payload.len() as u32);
         // Whatever arrived early and now follows on.
-        loop {
-            let Some(index) = self.early.iter().position(|(start, data)| {
-                tcp::seq_le(*start, self.receive_next)
-                    && tcp::seq_gt(start.wrapping_add(data.len() as u32), self.receive_next)
-            }) else {
-                break;
-            };
+        while let Some(index) = self.early.iter().position(|(start, data)| {
+            tcp::seq_le(*start, self.receive_next)
+                && tcp::seq_gt(start.wrapping_add(data.len() as u32), self.receive_next)
+        }) {
             let (start, data) = self.early.remove(index);
             let skip = self.receive_next.wrapping_sub(start) as usize;
             self.stream.extend_from_slice(&data[skip..]);

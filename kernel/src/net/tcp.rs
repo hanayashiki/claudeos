@@ -638,7 +638,7 @@ impl Tcb {
     /// plus four times its variation, never less than the clock the timer
     /// runs on can measure, and bounded at both ends.
     fn estimated_rto(&self) -> u64 {
-        let granularity = 1_000_000 / crate::arch::TICK_HZ as u32;
+        let granularity = 1_000_000 / crate::arch::TICK_HZ;
         let slack = self.rttvar.saturating_mul(4).max(granularity);
         let microseconds = self.srtt.saturating_add(slack) as u64;
         crate::time::ns_to_ticks(microseconds * 1000).clamp(MIN_RTO, MAX_RTO)
@@ -1341,10 +1341,11 @@ impl Tcb {
 
     /// Keep a run that arrived before the bytes in front of it.
     fn hold(&mut self, sequence: u32, payload: &[u8]) {
-        // Everything held lies inside the window this end advertised, and
-        // that window is what is left of the receive buffer, so what one
-        // connection holds needs no bound of its own: the two together never
-        // exceed the buffer.
+        // Nothing past the right edge this end offered is kept, so everything
+        // held lies inside the window. The edge is never further out than the
+        // room left in the receive buffer, so what is held and what has been
+        // delivered never exceed the buffer between them, and what one
+        // connection holds needs no bound of its own.
         let right = self.receive_next.wrapping_add(self.advertised_window() as u32);
         if !seq_lt(sequence, right) {
             return;
