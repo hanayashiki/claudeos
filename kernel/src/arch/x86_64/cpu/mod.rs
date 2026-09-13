@@ -36,9 +36,14 @@ pub fn init_per_cpu() {
     msr::write(msr::IA32_GS_BASE, addr);
 }
 
+// Deliberately not `nomem`, for the same reason `cli` and `sti` are not. The
+// instruction touches no memory itself, and what it is for is to wait until an
+// interrupt handler has changed some: the idle loop halts and then asks the
+// scheduler what to run, and the answer is what the handler wrote. `nomem`
+// lets the compiler carry a value across the wait in a register.
 #[inline]
 pub fn halt() {
-    unsafe { asm!("hlt", options(nomem, nostack)) };
+    unsafe { asm!("hlt", options(nostack)) };
 }
 
 #[inline]

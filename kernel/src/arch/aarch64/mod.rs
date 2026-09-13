@@ -146,9 +146,16 @@ pub fn init_traps() {
 pub fn init_cpu() {}
 
 /// Stop the CPU until the next interrupt.
+///
+/// Deliberately not `nomem`, for the same reason `msr daifset` and `daifclr`
+/// are not. The instruction touches no memory itself, and what it is for is to
+/// wait until an interrupt handler has changed some: the idle loop halts and
+/// then asks the scheduler what to run, and the answer is what the handler
+/// wrote. `nomem` lets the compiler carry a value across the wait in a
+/// register.
 #[inline]
 pub fn halt() {
-    unsafe { asm!("wfi", options(nomem, nostack)) };
+    unsafe { asm!("wfi", options(nostack)) };
 }
 
 /// Make bytes the kernel has just written fetchable as instructions.
