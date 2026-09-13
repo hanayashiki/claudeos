@@ -1,16 +1,23 @@
 //! The flattened device tree, read far enough to describe the machine.
 //!
 //! This is how a board following the Linux AArch64 boot protocol says what it
-//! has: the firmware leaves a blob in memory and puts its address in x0. Only
-//! four things are taken from it here — where memory is, what the command line
-//! says, and where an initial ram disk was placed — because everything else
-//! this kernel needs it already knows.
+//! has: the firmware leaves a blob in memory and puts its address in x0.
+//! `parse` takes four things out of it at start-up — where memory is, what the
+//! command line says, and where an initial ram disk was placed — because
+//! everything else this kernel needs about the machine itself it already
+//! knows.
+//!
+//! `find_compatible` is the other half, and it is for devices rather than for
+//! the machine. A driver that is not on a bus it can enumerate has no way to
+//! discover its registers, its interrupt or its hardware address except by
+//! being told, and the tree is where the firmware writes all three.
 //!
 //! Every number in the blob is big-endian, and the strings are in a separate
 //! block indexed by offset, so nothing can be overlaid with a struct.
 
 use crate::boot::BootInfo;
 use crate::mm::phys_to_virt;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: u32 = 0xD00D_FEED;
 
@@ -29,9 +36,12 @@ unsafe fn be64(virt: u64) -> u64 {
 }
 
 /// A big-endian value of one, two or more cells, of which only the low two
-/// carry anything an address can hold.
+/// carry anything an address can hold. A count of zero is a real thing to say
+/// -- a bus whose children have addresses but no sizes says `#size-cells = 0`
+/// -- and it reads as nothing rather than walking backwards.
 unsafe fn cells(virt: u64, count: u32) -> u64 {
     match count {
+        0 => 0,
         1 => be32(virt) as u64,
         2 => be64(virt),
         _ => be64(virt + (count as u64 - 2) * 4),
@@ -60,12 +70,29 @@ pub fn present(phys: u64) -> bool {
     unsafe { be32(phys_to_virt(phys)) == MAGIC }
 }
 
+/// The blob `parse` accepted, if there was one. Devices are looked up long
+/// after start-up is over, so the address has to be kept rather than passed
+/// down.
+static BLOB: AtomicU64 = AtomicU64::new(0);
+
+/// Physical address of the device tree this machine was booted with, or
+/// nothing when it was booted without one. A board that hands over a tag list
+/// instead -- which is what QEMU's emulated Pi 4 does -- leaves this empty,
+/// and every device lookup then finds nothing.
+pub fn blob() -> Option<u64> {
+    match BLOB.load(Ordering::Relaxed) {
+        0 => None,
+        phys => Some(phys),
+    }
+}
+
 /// Read the blob at `phys` into `info`. Returns false if there is no device
 /// tree there, in which case `info` is untouched.
 pub fn parse(phys: u64, info: &mut BootInfo) -> bool {
     if !present(phys) {
         return false;
     }
+    BLOB.store(phys, Ordering::Relaxed);
     let base = phys_to_virt(phys);
     unsafe {
         let total_size = be32(base + 4) as u64;
@@ -179,4 +206,415 @@ pub fn parse(phys: u64, info: &mut BootInfo) -> bool {
         }
     }
     true
+}
+
+// ---------------------------------------------------------------------------
+// Looking a device up
+// ---------------------------------------------------------------------------
+//
+// A node says where its registers are with `reg`, but the numbers in it are
+// addresses on whatever bus the node hangs off, not addresses the processor
+// can use. Each bus node above it carries a `ranges` property saying how its
+// children's addresses map into its own parent's, and the mapping has to be
+// applied at every level on the way up. On this board that is not a
+// formality: the Ethernet controller's `reg` says 0x7d580000 and the bus above
+// it maps that region to 0xfd580000, which is where the processor finds it.
+// Taking the untranslated number would land in the middle of ordinary memory.
+//
+// How wide those numbers are is also a property of the parent rather than of
+// the node: `#address-cells` and `#size-cells` on the parent say how many
+// 32-bit cells each half of a `reg` entry takes.
+
+/// Ancestors tracked while walking. A node deeper than this is not resolved,
+/// rather than being resolved from a truncated chain; nothing this kernel
+/// looks for is anywhere near it.
+const MAX_DEPTH: usize = 12;
+/// `reg` entries kept. One is all any device here has.
+const MAX_REG: usize = 4;
+
+/// What one open node contributes to the addresses of the nodes inside it.
+#[derive(Clone, Copy)]
+struct Level {
+    /// Cells per address in this node's children's `reg`.
+    address_cells: u32,
+    /// Cells per size in the same.
+    size_cells: u32,
+    /// Where this node's `ranges` value is and how long it is, or zero for a
+    /// node that has none.
+    ranges: u64,
+    ranges_len: u64,
+}
+
+impl Level {
+    /// What the specification says to assume when a node says neither.
+    const DEFAULT: Level = Level { address_cells: 2, size_cells: 1, ranges: 0, ranges_len: 0 };
+}
+
+/// One entry of a node's `reg`.
+#[derive(Clone, Copy)]
+struct Reg {
+    /// The address as the bus the node hangs off names it.
+    bus: u64,
+    /// The same address as the processor names it, when every bus in between
+    /// said how to get there. A bus that is not memory at all -- the
+    /// management bus a PHY sits on, where `reg` is a five-bit station address
+    /// -- says nothing, and this is then nothing.
+    cpu: Option<u64>,
+    size: u64,
+}
+
+/// One node of the tree, found by what it says it is compatible with or by the
+/// handle other nodes refer to it with.
+///
+/// Its `reg` entries are resolved at the moment it is found, because resolving
+/// them needs the chain of buses above it and that chain only exists during
+/// the walk. Everything else is read out of the blob on demand.
+#[derive(Clone, Copy)]
+pub struct Node {
+    /// Where this node's first property token sits. Properties always precede
+    /// child nodes, so a scan from here that stops at the first `BEGIN_NODE`
+    /// or `END_NODE` has seen exactly this node's properties.
+    first_prop: u64,
+    strings: u64,
+    struct_end: u64,
+    reg: [Reg; MAX_REG],
+    reg_count: usize,
+}
+
+impl Node {
+    /// The value of one property, or nothing when the node does not have it.
+    pub fn property(&self, name: &[u8]) -> Option<&'static [u8]> {
+        unsafe {
+            let mut cursor = self.first_prop;
+            while cursor + 4 <= self.struct_end {
+                let token = be32(cursor);
+                cursor += 4;
+                match token {
+                    PROP => {
+                        let length = be32(cursor) as u64;
+                        let this = cstr(self.strings + be32(cursor + 4) as u64);
+                        let value = cursor + 8;
+                        cursor = value + align4(length);
+                        if this == name {
+                            return Some(core::slice::from_raw_parts(
+                                value as *const u8,
+                                length as usize,
+                            ));
+                        }
+                    }
+                    NOP => {}
+                    // A child node has started, or this node has ended; either
+                    // way its own properties are all behind us.
+                    _ => return None,
+                }
+            }
+            None
+        }
+    }
+
+    /// Register block `index`: where the processor reaches it, and how big it
+    /// is. Already translated through every bus above the node, and nothing
+    /// when some bus in between does not map it.
+    pub fn reg(&self, index: usize) -> Option<(u64, u64)> {
+        if index >= self.reg_count {
+            return None;
+        }
+        Some((self.reg[index].cpu?, self.reg[index].size))
+    }
+
+    /// Entry `index` of `reg` as its own bus names it, untranslated. This is
+    /// what to ask for when the bus is not memory: a device on a management
+    /// bus is numbered on that bus and there is nothing to translate to.
+    pub fn bus_address(&self, index: usize) -> Option<u64> {
+        if index >= self.reg_count {
+            return None;
+        }
+        Some(self.reg[index].bus)
+    }
+
+    /// The value of a property that is a single 32-bit cell.
+    pub fn cell(&self, name: &[u8]) -> Option<u32> {
+        let value = self.property(name)?;
+        if value.len() < 4 {
+            return None;
+        }
+        Some(unsafe { be32(value.as_ptr() as u64) })
+    }
+
+    /// Whether the firmware left this device switched on. A node whose
+    /// `status` is anything but "okay" describes hardware that is in the tree
+    /// and not usable on the board. The Ethernet node in the upstream source
+    /// for this chip is disabled and each board's own file turns it on, so a
+    /// tree assembled differently can arrive with it still off.
+    pub fn enabled(&self) -> bool {
+        match self.property(b"status") {
+            None => true,
+            Some(status) => status.starts_with(b"okay") || status.starts_with(b"ok\0"),
+        }
+    }
+
+    /// Interrupt `index` as a line number the interrupt controller knows.
+    ///
+    /// Three cells to an entry, which is what a GIC uses and what everything
+    /// on this board is parented to: the kind, the number within that kind,
+    /// and how it is triggered. Shared peripheral interrupts are numbered from
+    /// 32 and per-core ones from 16, and the number in the tree counts from
+    /// the start of its own group.
+    pub fn interrupt(&self, index: usize) -> Option<u8> {
+        let value = self.property(b"interrupts")?;
+        let entry = index * 12;
+        if entry + 12 > value.len() {
+            return None;
+        }
+        let at = value.as_ptr() as u64 + entry as u64;
+        let (kind, number) = unsafe { (be32(at), be32(at + 4)) };
+        let line = match kind {
+            0 => number + 32,
+            1 => number + 16,
+            _ => return None,
+        };
+        if line > u8::MAX as u32 {
+            return None;
+        }
+        Some(line as u8)
+    }
+
+    /// Whether transfers this device makes are coherent with the caches, in
+    /// which case a buffer handed to it needs no cache maintenance. Absent
+    /// means they are not, which is the answer on this board.
+    pub fn dma_coherent(&self) -> bool {
+        self.property(b"dma-coherent").is_some()
+    }
+}
+
+/// What a node has to say about itself for the walk to stop at it.
+#[derive(Clone, Copy)]
+enum Want<'a> {
+    /// Its `compatible` names this.
+    Compatible(&'a [u8]),
+    /// Its `phandle` is this, which is how one node points at another.
+    Phandle(u32),
+}
+
+/// Find the first node compatible with `compatible` in the tree this machine
+/// was booted with. Nothing when there is no tree, or no such node.
+pub fn find_compatible(compatible: &[u8]) -> Option<Node> {
+    find_compatible_in(blob()?, compatible)
+}
+
+/// The same, against a blob named outright, which is how the boot-time check
+/// walks a tree it built itself.
+pub fn find_compatible_in(phys: u64, compatible: &[u8]) -> Option<Node> {
+    find(phys, Want::Compatible(compatible))
+}
+
+/// The node another node pointed at, by the handle it pointed with.
+pub fn find_phandle_in(phys: u64, phandle: u32) -> Option<Node> {
+    find(phys, Want::Phandle(phandle))
+}
+
+pub fn find_phandle(phandle: u32) -> Option<Node> {
+    find_phandle_in(blob()?, phandle)
+}
+
+fn find(phys: u64, want: Want) -> Option<Node> {
+    if !present(phys) {
+        return None;
+    }
+    let base = phys_to_virt(phys);
+    unsafe {
+        let struct_offset = be32(base + 8) as u64;
+        let strings = base + be32(base + 12) as u64;
+        let struct_size = be32(base + 36) as u64;
+
+        let mut cursor = base + struct_offset;
+        let end = cursor + struct_size;
+
+        // The node at depth d has its own entry at `levels[d - 1]`, and takes
+        // the width of its `reg` from its parent's, at `levels[d - 2]`.
+        let mut levels = [Level::DEFAULT; MAX_DEPTH];
+        let mut depth = 0usize;
+        // Depth of the node whose `compatible` matched, once one has; zero
+        // until then, which is a depth no node has.
+        let mut matched = 0usize;
+        let mut first_prop = 0u64;
+        let mut reg = 0u64;
+        let mut reg_len = 0u64;
+
+        while cursor + 4 <= end {
+            let token = be32(cursor);
+            cursor += 4;
+            match token {
+                BEGIN_NODE => {
+                    // A child starting means the matching node's properties
+                    // are all behind us.
+                    if matched != 0 {
+                        return resolve(&levels, matched, first_prop, strings, end, reg, reg_len);
+                    }
+                    let name = cstr(cursor);
+                    cursor += align4(name.len() as u64 + 1);
+                    depth += 1;
+                    if depth <= MAX_DEPTH {
+                        levels[depth - 1] = Level::DEFAULT;
+                    }
+                    first_prop = cursor;
+                    reg = 0;
+                    reg_len = 0;
+                }
+                END_NODE => {
+                    if matched != 0 && matched == depth {
+                        return resolve(&levels, matched, first_prop, strings, end, reg, reg_len);
+                    }
+                    depth = depth.saturating_sub(1);
+                }
+                PROP => {
+                    let length = be32(cursor) as u64;
+                    let name = cstr(strings + be32(cursor + 4) as u64);
+                    let value = cursor + 8;
+                    cursor = value + align4(length);
+                    if depth == 0 || depth > MAX_DEPTH {
+                        continue;
+                    }
+                    let level = &mut levels[depth - 1];
+                    if name == b"#address-cells" {
+                        level.address_cells = be32(value);
+                    } else if name == b"#size-cells" {
+                        level.size_cells = be32(value);
+                    } else if name == b"ranges" {
+                        // Zero is "no ranges property", so a property that is
+                        // there but empty has to be distinguishable from one
+                        // that is absent; the value pointer is never zero.
+                        level.ranges = value;
+                        level.ranges_len = length;
+                    } else if name == b"reg" {
+                        reg = value;
+                        reg_len = length;
+                    }
+                    let hit = match want {
+                        Want::Compatible(wanted) => {
+                            name == b"compatible" && compatible_with(value, length, wanted)
+                        }
+                        // `linux,phandle` is the older spelling of the same
+                        // property and some firmware still writes both.
+                        Want::Phandle(wanted) => {
+                            (name == b"phandle" || name == b"linux,phandle")
+                                && length >= 4
+                                && be32(value) == wanted
+                        }
+                    };
+                    if hit {
+                        matched = depth;
+                    }
+                }
+                NOP => {}
+                END => break,
+                _ => break,
+            }
+        }
+    }
+    None
+}
+
+/// Does a `compatible` value, which is a run of strings one after another,
+/// contain `wanted`?
+unsafe fn compatible_with(value: u64, length: u64, wanted: &[u8]) -> bool {
+    let mut at = value;
+    let end = value + length;
+    while at < end {
+        let entry = cstr(at);
+        if entry == wanted {
+            return true;
+        }
+        at += entry.len() as u64 + 1;
+    }
+    false
+}
+
+/// Turn a found node's `reg` into addresses the processor can use.
+unsafe fn resolve(
+    levels: &[Level; MAX_DEPTH],
+    depth: usize,
+    first_prop: u64,
+    strings: u64,
+    struct_end: u64,
+    reg: u64,
+    reg_len: u64,
+) -> Option<Node> {
+    let empty = Reg { bus: 0, cpu: None, size: 0 };
+    let mut node = Node { first_prop, strings, struct_end, reg: [empty; MAX_REG], reg_count: 0 };
+    // The root has no parent to take cell counts from, and nothing is looked
+    // up there. A node with no `reg` is still a node: the caller may only want
+    // a property off it.
+    if depth < 2 || depth > MAX_DEPTH || reg == 0 {
+        return Some(node);
+    }
+    let parent = depth - 2;
+    let address_cells = levels[parent].address_cells;
+    let size_cells = levels[parent].size_cells;
+    if address_cells == 0 || address_cells > 4 || size_cells > 4 {
+        return Some(node);
+    }
+
+    let stride = (address_cells + size_cells) as u64 * 4;
+    let mut at = reg;
+    while at + stride <= reg + reg_len && node.reg_count < MAX_REG {
+        let bus = cells(at, address_cells);
+        let size = cells(at + address_cells as u64 * 4, size_cells);
+        at += stride;
+
+        // Up through every bus between this node and the processor. A bus
+        // that does not map the address gives up and the entry keeps only the
+        // number its own bus knows it by.
+        let mut address = Some(bus);
+        let mut child_cells = address_cells;
+        let mut level = parent;
+        while level >= 1 {
+            let parent_cells = levels[level - 1].address_cells;
+            address = address.and_then(|a| translate(&levels[level], child_cells, parent_cells, a));
+            child_cells = parent_cells;
+            level -= 1;
+        }
+
+        node.reg[node.reg_count] = Reg { bus, cpu: address, size };
+        node.reg_count += 1;
+    }
+    Some(node)
+}
+
+/// Put one address through a bus node's `ranges`, giving the address its
+/// parent knows it by. Nothing when no entry covers it, which means the tree
+/// says the processor cannot reach it at all.
+unsafe fn translate(
+    level: &Level,
+    child_cells: u32,
+    parent_cells: u32,
+    address: u64,
+) -> Option<u64> {
+    // No `ranges` at all means this bus's addresses are not the parent's
+    // addresses and there is no way to turn one into the other. That is the
+    // honest answer for the management bus the Ethernet PHY sits on, where a
+    // node's `reg` is a five-bit station number. An empty `ranges` is a
+    // different statement: the addresses pass through unchanged.
+    if level.ranges == 0 {
+        return None;
+    }
+    if level.ranges_len == 0 {
+        return Some(address);
+    }
+    let stride = (child_cells + parent_cells + level.size_cells) as u64 * 4;
+    if stride == 0 {
+        return Some(address);
+    }
+    let mut at = level.ranges;
+    let end = level.ranges + level.ranges_len;
+    while at + stride <= end {
+        let child_base = cells(at, child_cells);
+        let parent_base = cells(at + child_cells as u64 * 4, parent_cells);
+        let span = cells(at + (child_cells + parent_cells) as u64 * 4, level.size_cells);
+        if address >= child_base && address - child_base < span {
+            return Some(parent_base + (address - child_base));
+        }
+        at += stride;
+    }
+    None
 }

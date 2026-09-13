@@ -2,15 +2,15 @@
 //!
 //! The submodules below are private: everything the portable half of the
 //! kernel is allowed to reach is re-exported from here, so this file answers
-//! `arch/x86_64/mod.rs` name for name. The two exceptions are `paging` and
-//! `nr`, which are namespaces rather than single names.
+//! `arch/x86_64/mod.rs` name for name. The exceptions are `paging` and `nr`,
+//! which are namespaces rather than single names, and `fdt`, which is one too
+//! and which only a driver that exists on this machine alone reaches.
 
 use core::arch::asm;
 use core::arch::global_asm;
 
 mod atags;
 mod clock;
-mod fdt;
 mod gic;
 mod signal_frame;
 mod syscall;
@@ -18,6 +18,7 @@ mod task;
 mod trap;
 mod uart;
 
+pub mod fdt;
 pub mod nr;
 pub mod paging;
 
@@ -28,7 +29,7 @@ global_asm!(include_str!("switch.s"));
 // Some of these name a part of the interface without being called from the
 // portable half today; they are listed here because this file is the contract.
 #[allow(unused_imports)]
-pub use clock::{cycle_counter, read_wall_clock, WallClock};
+pub use clock::{counter_frequency, cycle_counter, read_wall_clock, WallClock};
 pub use signal_frame::{enter_signal_handler, leave_signal_handler};
 pub use syscall::{
     arch_prctl, clone_args, fork_child_frame, init_syscall_entry, set_syscall_result, syscall_args,
@@ -73,6 +74,11 @@ pub const HHDM_BASE: u64 = 0xFFFF_8000_0000_0000;
 /// Size of the region the boot code direct-maps: four 1 GiB blocks, which on
 /// this board is memory and then the peripherals.
 pub const HHDM_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+/// Where the direct map stops covering memory and starts covering registers.
+/// The boot code gives the last of its four blocks device attributes, so
+/// anything from here up is already reachable uncached through `phys_to_virt`
+/// and a device found there needs no mapping of its own.
+pub const DEVICE_PHYS_BASE: u64 = 3 * 1024 * 1024 * 1024;
 
 /// Virtual base the kernel image is linked at.
 pub const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;
@@ -178,6 +184,104 @@ pub fn sync_instruction_cache(start: u64, len: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Handing memory to a device that reads and writes it itself
+// ---------------------------------------------------------------------------
+//
+// A device fetching a packet out of memory is not a processor and does not
+// look in the processor's caches. Nothing on this board promises otherwise:
+// the device tree says which blocks are coherent with the caches, and the
+// Ethernet controller on a Pi 4 is not one of them. So a buffer the kernel has
+// written has to be pushed out of the cache before the device is told to read
+// it, and a buffer the device has written has to be dropped from the cache
+// before the kernel reads it, or the read is answered from a line fetched
+// before the transfer.
+//
+// "Point of coherency" is the level at which the processor and everything else
+// that reaches memory agree on what is there, which is what `dc cvac`,
+// `dc ivac` and `dc civac` operate to. The barrier at the end of each is
+// `dsb sy`, not the `dsb ish` the instruction-side one uses, because the
+// observer being waited for is outside the inner shareable domain.
+//
+// Cache maintenance works on whole lines, so a range that does not start and
+// end on a line boundary shares its first and last line with whatever is
+// next to it in memory. Plain invalidation of those two would throw away a
+// neighbour's unwritten data, so they are cleaned as well as invalidated and
+// the neighbour's bytes go to memory instead of being lost. This is what
+// Linux's `__pi_dcache_inval_poc` does, and the boot-time check exercises it.
+
+/// Line length of the data cache, from CTR_EL0, whose field holds the log2 of
+/// the length in words.
+#[inline]
+fn data_cache_line() -> u64 {
+    let ctr: u64;
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
+    4u64 << ((ctr >> 16) & 0xF)
+}
+
+/// Push the kernel's writes over `start..start+len` out to where a device
+/// reading memory will see them. Call before handing the range to a device.
+pub fn clean_data_cache(start: u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let line = data_cache_line();
+    let end = start + len as u64;
+    let mut at = start & !(line - 1);
+    while at < end {
+        unsafe { asm!("dc cvac, {}", in(reg) at, options(nostack, preserves_flags)) };
+        at += line;
+    }
+    unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
+}
+
+/// Throw away anything cached over `start..start+len`, so a read afterwards
+/// fetches what a device wrote there. Call after the device has finished.
+///
+/// A partial line at either end is cleaned as well as invalidated, so that a
+/// neighbour sharing that line keeps its data.
+pub fn invalidate_data_cache(start: u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let line = data_cache_line();
+    let end = start + len as u64;
+    let first = start & !(line - 1);
+    // One past the last line the range touches.
+    let last = (end + line - 1) & !(line - 1);
+
+    let mut at = first;
+    while at < last {
+        let partial = (at == first && start != first) || (at + line == last && end != last);
+        unsafe {
+            if partial {
+                asm!("dc civac, {}", in(reg) at, options(nostack, preserves_flags));
+            } else {
+                asm!("dc ivac, {}", in(reg) at, options(nostack, preserves_flags));
+            }
+        }
+        at += line;
+    }
+    unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
+}
+
+/// Both at once: the kernel's writes go out, and nothing stale is left behind.
+/// This is what a buffer wants when it has just been filled in and is about to
+/// be lent to a device that will overwrite it.
+pub fn flush_data_cache(start: u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let line = data_cache_line();
+    let end = start + len as u64;
+    let mut at = start & !(line - 1);
+    while at < end {
+        unsafe { asm!("dc civac, {}", in(reg) at, options(nostack, preserves_flags)) };
+        at += line;
+    }
+    unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
+}
+
+// ---------------------------------------------------------------------------
 // Interrupt enable state
 // ---------------------------------------------------------------------------
 
@@ -202,6 +306,10 @@ pub fn enable_interrupts() {
 // ---------------------------------------------------------------------------
 // The debug console
 // ---------------------------------------------------------------------------
+
+/// Where the console's registers are. Named out here so that a check can hold
+/// the tree's answer up against the kernel's own.
+pub const CONSOLE_PHYS: u64 = uart::UART0;
 
 pub fn console_init() {
     uart::init();
