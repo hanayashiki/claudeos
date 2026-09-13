@@ -129,6 +129,41 @@ pub enum MapError {
     AlreadyMapped,
 }
 
+/// A page on its way in: a frame the allocator has just handed over, zeroed,
+/// and mapped nowhere yet.
+///
+/// This is the only thing `publish` takes, and it consumes it. A caller with
+/// contents to put in a page therefore puts them in here, through the direct
+/// map, while the page is somewhere no program can reach; once it is published
+/// there is nothing left to write through. The other order -- map the page
+/// wide enough to write through, write, then narrow it to what it should have
+/// been -- has no spelling, and it is the order that leaves a page a sibling
+/// thread can read blank, or run, before it holds anything.
+///
+/// Only the allocator makes one, so this is not a way to move a frame that
+/// another mapping is holding: taking a mapping away and putting the same
+/// frame back somewhere else still cannot be written.
+pub struct FreshPage(Frame);
+
+impl FreshPage {
+    /// A zeroed frame, or `None` when there is none to be had.
+    pub fn new() -> Option<FreshPage> {
+        frame::alloc_zeroed().map(FreshPage)
+    }
+
+    /// The page's bytes, through the direct map. The address is also what a
+    /// cache maintenance operation on these bytes has to name, since it is the
+    /// one they were written through.
+    pub fn bytes(&mut self) -> &mut [u8] {
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                phys_to_virt(self.0.addr()) as *mut u8,
+                PAGE_SIZE_U64 as usize,
+            )
+        }
+    }
+}
+
 /// A page table hierarchy, identified by the physical address of its PML4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AddressSpace {
@@ -240,12 +275,29 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Allocate a frame and map it at `virt`.
-    pub fn map_new(&self, virt: u64, flags: u64) -> Result<u64, MapError> {
-        let frame = frame::alloc_zeroed().ok_or(MapError::OutOfMemory)?;
+    /// Put `page` in at `virt` with `flags`, giving back where it is. The entry
+    /// holds the page's reference from here on, and `unmap` or teardown gives
+    /// it back.
+    ///
+    /// The one way a page with contents in it becomes reachable. It takes the
+    /// page by value, so what goes in was finished beforehand: there is no
+    /// moment when the address has something at it that is not what it is going
+    /// to hold, and none when it is reachable with permissions it is not going
+    /// to keep.
+    ///
+    /// The store that writes the entry carries the ordering, so nothing has to
+    /// order the contents against it by hand.
+    pub fn publish(&self, virt: u64, page: FreshPage, flags: u64) -> Result<u64, MapError> {
+        let frame = page.0;
         let phys = frame.addr();
         self.map(virt, frame, flags)?;
         Ok(phys)
+    }
+
+    /// Map a page whose finished contents are zero, which a fresh frame already
+    /// is: the heap, and anonymous memory.
+    pub fn map_new(&self, virt: u64, flags: u64) -> Result<u64, MapError> {
+        self.publish(virt, FreshPage::new().ok_or(MapError::OutOfMemory)?, flags)
     }
 
     /// Print the walk of `virt` through this hierarchy, entry by entry.

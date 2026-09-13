@@ -13,6 +13,7 @@ pub fn run(report: &mut Report) {
     pages_shared_by_a_fork_written_from_two_threads(report);
     pages_a_fork_shared_are_out_of_the_parents_reach(report);
     a_user_buffer_unmapped_while_the_kernel_reads_it(report);
+    a_page_two_threads_reach_at_once(report);
     exec_that_fails_keeps_the_memory_state(report);
     a_thread_left_unreaped_keeps_the_space(report);
     argument_blocks_larger_than_the_stack_is_mapped_with(report);
@@ -310,6 +311,73 @@ fn a_user_buffer_unmapped_while_the_kernel_reads_it(report: &mut Report) {
     );
     sys::munmap(base, LEN);
     sys::close(sink as i32);
+}
+
+/// How much of the program's own read-only data this check reaches into. A page
+/// of it is untouched until the check asks for it, because nothing else reads
+/// it, and it is file-backed, so the first touch is a page filled from the
+/// executable.
+const COLD_PAGES: usize = 48;
+const COLD_PAGE: usize = 4096;
+
+/// Every byte non-zero, so a read that comes back zero is a read of a page
+/// whose contents are not there yet rather than a read of the file's bytes.
+static COLD: [u8; COLD_PAGES * COLD_PAGE] = {
+    let mut out = [0u8; COLD_PAGES * COLD_PAGE];
+    let mut i = 0;
+    while i < COLD_PAGES * COLD_PAGE {
+        out[i] = (i % 251) as u8 + 1;
+        i += 1;
+    }
+    out
+};
+
+/// Two threads reaching one untouched page at the same moment.
+///
+/// Filling a page from the file mapped it first, read the contents into it
+/// through that mapping, and gave it the segment's protection afterwards, so
+/// between the first and the last it was reachable by a sibling holding the
+/// zeroes of a fresh frame. And the handler read a page a sibling had already
+/// put in as a fault it could not repair, which killed the task with a
+/// segmentation fault at an address that is mapped.
+///
+/// A smoke test: one processor runs one of the two threads at a time, so they
+/// only overlap if the timer lands inside the handler. The proof was a widened
+/// window, where both of these were every page rather than none.
+fn a_page_two_threads_reach_at_once(report: &mut Report) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+
+    let blank = AtomicUsize::new(0);
+    let barrier = Barrier::new(2);
+    // Through an opaque pointer, so the read below is a load from the page and
+    // not a constant the compiler read out of the program at build time.
+    let base = std::hint::black_box(COLD.as_ptr()) as usize;
+
+    let sweep = |base: usize, barrier: &Barrier, blank: &AtomicUsize| {
+        for page in 0..COLD_PAGES {
+            // Both threads are let go at the same point, so the one that
+            // faults second walks into whatever the first is in the middle of.
+            barrier.wait();
+            let byte =
+                unsafe { std::ptr::read_volatile((base + page * COLD_PAGE) as *const u8) };
+            if byte == 0 {
+                blank.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    };
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| sweep(base, &barrier, &blank));
+        sweep(base, &barrier, &blank);
+    });
+
+    let blank = blank.load(Ordering::Relaxed);
+    report.check(
+        "a page two threads reach at once holds what the file put in it",
+        blank == 0,
+        format!("{} of {} reads came back zero", blank, COLD_PAGES * 2),
+    );
 }
 
 /// A hint names where a mapping should start, and the mapping is as long as it

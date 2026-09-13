@@ -6,7 +6,7 @@
 //! to hold across a context switch.
 
 use crate::abi::*;
-use crate::arch::paging::{AddressSpace, NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::arch::paging::{AddressSpace, FreshPage, NO_EXECUTE, PRESENT, USER, WRITABLE};
 use crate::arch::{self, TaskContext, TrapFrame};
 use crate::fs::{FdTable, OpenFile};
 use crate::mm::{page_align_down, page_align_up, PAGE_SIZE_U64, USER_MMAP_BASE, USER_STACK_TOP};
@@ -482,35 +482,31 @@ impl Task {
             return self.space.map_new(page, vma.page_flags()).is_ok();
         };
 
-        // A page of an executable: map it writable, fill it from the file,
-        // then give it the protection the segment asked for. A fresh frame is
+        // A page of an executable is filled before it is published, and goes
+        // in once with the protection its segment asked for. A fresh frame is
         // already zero, so the part past the file's contents needs nothing.
-        if self.space.map_new(page, PRESENT | WRITABLE | USER).is_err() {
+        let Some(mut fresh) = FreshPage::new() else {
             return false;
-        }
+        };
+        let flags = vma.page_flags();
         let into = page - vma.start;
         if into < file.length {
             let want = (file.length - into).min(PAGE_SIZE_U64) as usize;
             let from = (file.offset + into) as usize;
-            let data = file.node.inner.lock();
-            let available = data.data.len().saturating_sub(from).min(want);
-            if available > 0 {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        data.data.as_ptr().add(from),
-                        page as *mut u8,
-                        available,
-                    );
-                }
-                // A text page arrives this way, so these bytes may be the
-                // next thing the program executes.
-                if vma.page_flags() & NO_EXECUTE == 0 {
-                    crate::arch::sync_instruction_cache(page, available);
-                }
+            let filled = {
+                let data = file.node.inner.lock();
+                let available = data.data.len().saturating_sub(from).min(want);
+                fresh.bytes()[..available].copy_from_slice(&data.data[from..from + available]);
+                available
+            };
+            // A text page arrives this way, and these bytes have just been
+            // written through a different address than the one they will be
+            // fetched from.
+            if filled > 0 && flags & NO_EXECUTE == 0 {
+                crate::arch::sync_instruction_cache(fresh.bytes().as_ptr() as u64, filled);
             }
         }
-        self.space.set_flags(page, vma.page_flags());
-        true
+        self.space.publish(page, fresh, flags).is_ok()
     }
 
     pub fn free_kernel_stack(&mut self) {
@@ -721,6 +717,16 @@ pub fn build_user_stack(
     task.add_vma(stack_low, USER_STACK_TOP, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
 
     // Map the top of the stack eagerly; the rest grows in on demand.
+    //
+    // These pages are written through their user addresses below rather than
+    // filled before they are published, which is the one caller here outside
+    // that rule. What makes it safe is not the rule: the pages go in with the
+    // protection they keep, so nothing is ever reachable with more permission
+    // than it ends with, and the address space belongs to the one task
+    // building it until the exec that is building it finishes, so there is no
+    // sibling to see a page before its contents are there. The writes go
+    // through the checked path on purpose, because a block longer than what is
+    // mapped here has to grow the stack rather than fault in the kernel.
     let prefault_from = USER_STACK_TOP - STACK_PREFAULT;
     let mut page = prefault_from;
     while page < USER_STACK_TOP {
