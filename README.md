@@ -277,10 +277,23 @@ interrupts masked would hold off the timer for as long as it ran. Above that
 sit Ethernet, address resolution with a cache, IPv4, ICMP, UDP and TCP, and the
 `AF_INET` socket calls, which report readiness through the same machinery
 `poll`, `select` and `epoll` already used. TCP does a passive and an active
-open, in-order data with acknowledgements, retransmission on a timer, and an
-orderly close. It is correct on a quiet link. There is no reassembly queue, no
-fast retransmit and no round-trip estimator, so it is not correct on a lossy
-one.
+open, data with acknowledgements, and an orderly close, and it is written for
+a link that loses packets rather than one that does not.
+
+A segment that arrives before the bytes in front of it is held until they come
+rather than thrown away, so one packet taking a different route costs nothing.
+What is held is bounded by the window every held byte lies inside, by a count
+of separate runs, and by a count every connection shares, so nobody can make
+the kernel hold memory without end by opening connections and leaving a gap in
+each; a gap that never fills is given up on and what was behind it released.
+The retransmission timeout is RFC 6298's estimator over round trips that were
+measured, with Karn's rule deciding which of them may be: a segment sent twice
+tells you nothing, because its acknowledgement does not say which copy it
+answers. A segment lost out of the middle of a stream is sent again on the
+third acknowledgement that repeats rather than when the clock runs out, with
+RFC 5681's congestion response beside it and RFC 6582's handling of a second
+loss inside the same window. Eight megabytes each way, over a link losing one
+frame in twenty in each direction, arrive byte for byte in a few seconds.
 
 The Pi's wired port is the other driver under the same seam. Its controller is
 not on a bus that can be enumerated, so the device tree is what says where it
@@ -386,6 +399,22 @@ failures.
   past the end of the table, every one of which has to answer ENOSYS. Two of
   them run a thread alongside a sibling failing an exec over and over, which is
   a smoke test for a race rather than proof of its absence.
+- The **network protocols** run against a card that only records what it is
+  asked to send: **139 checks** with frames handed in by hand and frames out
+  compared byte for byte. Above that sits a peer with a link in each direction
+  that is told before the run what to do with each segment -- lose this one,
+  hold that one back behind the next, deliver the one after twice, damage the
+  one after that -- so the behaviour that only shows when packets go missing is
+  checked against the same packet going missing every time. What it says: a
+  reordered segment costs nothing and the sender is never asked to send it
+  again; a duplicate is taken once; a damaged segment is neither taken nor
+  answered; a gap that never fills is given up on and its memory given back;
+  128 connections each holding a segment past a gap hold no more between them
+  than one does at full stretch; the timeout comes down from its opening guess
+  once a round trip has been measured and stays doubled after one that was not;
+  and a segment lost out of the middle of a 32 KiB stream is recovered by the
+  third acknowledgement that repeats, with the clock never waited out. On
+  aarch64 the same run adds the Pi's own Ethernet driver, for 210.
 - `tests/busybox.sh` runs **39 checks** against an upstream busybox binary that
   this project did not build: `awk`, `sed`, `tar` create and extract, `find`,
   `md5sum` and `sha256sum` (whose digests are compared against the ones the
@@ -450,6 +479,8 @@ tools/mkcpio.py       initramfs builder
 tools/drive.py        drives the console over a socket, rendering as a terminal
 scripts/reap-stale.sh clears QEMU instances an earlier run left behind
 scripts/mkcard.sh     assembles the boot partition for a Pi, and writes a card
+scripts/lossy-transfer.sh
+                      megabytes each way through the card over a lossy link
 tests/suite.sh        in-OS shell and userland test suite
 tests/busybox.sh      in-OS suite driving an upstream busybox
 tests/alpine.sh       in-OS suite run inside an Alpine root filesystem
@@ -469,7 +500,25 @@ which is where the USB controller is -- is out of reach. There is nothing on
 the board that remembers the time across a power cycle, so the clock starts
 from the newest date on the ram disk rather than from the real one.
 
-The TCP is correct on a quiet link and not on a lossy one: no reassembly queue,
-no fast retransmit, no round-trip estimator. There is no DHCP and no resolver,
-so addresses come from the kernel command line. IPv4 only, and fragments are
-dropped rather than reassembled.
+The TCP has no selective acknowledgement. A lost segment is found by the
+acknowledgements repeating, which finds one loss per round trip, rather than by
+the other end naming what it holds; on a link that loses several segments out
+of one window that is slower than a modern stack, and it is still correct. It
+has no window scaling, so 64 KiB is the most it can offer and throughput is
+bounded on any link whose delay and bandwidth multiply out past that, and no
+timestamps, so nothing guards against a sequence number wrapping and only one
+round trip at a time is being measured. There is no Nagle and no delayed
+acknowledgement: every segment goes as soon as there is a window for it and is
+answered as soon as it arrives. There is no DHCP and no resolver, so addresses
+come from the kernel command line. IPv4 only, and fragments are dropped rather
+than reassembled.
+
+QEMU cannot be asked to lose a packet -- its netfilters delay, dump, mirror,
+redirect and rewrite, and none of them drops one, nor is there a knob for it on
+the user mode network -- so `netloss=N` on the kernel command line throws one
+frame in N away in each direction, below the protocols and above the card.
+`scripts/lossy-transfer.sh` is what the end-to-end figures come from. At one
+frame in ten in each direction, 8 MiB out of the machine still arrives whole in
+four seconds; the same amount into it does not finish, and what the captures
+show stalling there is the sending end's own retransmission timer on the host
+rather than anything this end sends.
