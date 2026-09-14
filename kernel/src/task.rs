@@ -203,6 +203,10 @@ pub struct Task {
     /// handlers writing over each other, so a `CLONE_VM` child starts without
     /// one and installs its own. Empty means none is installed.
     pub sig_stack: Cell<crate::abi::SigAltStack>,
+    /// The interval timers `setitimer` arms. They belong to the process, so
+    /// every thread in it holds the same ones, and a fork's child is given
+    /// its own.
+    pub itimers: Arc<Spinlock<crate::itimer::IntervalTimers>>,
 
     /// Pid this task is waiting for, if it is in wait4.
     pub waiting_for: Cell<Option<i32>>,
@@ -282,6 +286,7 @@ impl Task {
             signal_actions: Cell::new([crate::signal::SigAction::default(); 64]),
             signal_mask: Cell::new(0),
             sig_stack: Cell::new(crate::abi::SigAltStack::default()),
+            itimers: Arc::new(Spinlock::new(crate::itimer::IntervalTimers::default())),
             wake_at: Cell::new(0),
             waiting_for: Cell::new(None),
             umask: Cell::new(0o022),

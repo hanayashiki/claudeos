@@ -263,6 +263,9 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         }
         nr::NANOSLEEP => proc::nanosleep(args[0], args[1]),
         nr::CLOCK_NANOSLEEP => proc::nanosleep(args[2], args[3]),
+        nr::SETITIMER => proc::setitimer(args[0] as i32, args[1], args[2]),
+        nr::GETITIMER => proc::getitimer(args[0] as i32, args[1]),
+        nr::ALARM => proc::alarm(args[0] as u32),
         nr::PAUSE => {
             sched::sleep_ticks(u64::MAX / 2);
             Err(Errno::EINTR)
@@ -450,6 +453,9 @@ pub fn name_of(number: u64) -> &'static str {
         nr::RECVMSG => "recvmsg",
         nr::SENDMMSG => "sendmmsg",
         nr::RECVMMSG => "recvmmsg",
+        nr::SETITIMER => "setitimer",
+        nr::GETITIMER => "getitimer",
+        nr::ALARM => "alarm",
         nr::SOCKETPAIR => "socketpair",
         nr::PPOLL => "ppoll",
         nr::PSELECT6 => "pselect6",

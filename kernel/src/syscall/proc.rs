@@ -70,6 +70,11 @@ pub fn fork(
     } else {
         parent.fds.clone_table()
     };
+    // Interval timers belong to the process: a thread shares its process's,
+    // and a forked child keeps the none-armed set it was made with.
+    if is_thread {
+        child.itimers = parent.itimers.clone();
+    }
     child.set_exe_path(parent.exe_path());
     child.set_name(parent.name());
     child.umask.set(parent.umask.get());
@@ -684,6 +689,72 @@ pub fn nanosleep(req: u64, rem: u64) -> SysResult {
         uaccess::write_struct(rem, &Timespec::default())?;
     }
     Ok(0)
+}
+
+/// `struct itimerval`: the interval, then the value, each a `struct timeval`
+/// of two 64-bit words, seconds and microseconds.
+fn read_itimerval(addr: u64) -> Result<crate::itimer::Setting, Errno> {
+    let words: [i64; 4] = uaccess::read_struct(addr)?;
+    let nanos = |seconds: i64, micros: i64| -> Result<u64, Errno> {
+        if seconds < 0 || !(0..1_000_000).contains(&micros) {
+            return Err(Errno::EINVAL);
+        }
+        Ok((seconds as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(micros as u64 * 1_000))
+    };
+    Ok(crate::itimer::Setting {
+        interval_ns: nanos(words[0], words[1])?,
+        value_ns: nanos(words[2], words[3])?,
+    })
+}
+
+fn write_itimerval(addr: u64, setting: crate::itimer::Setting) -> Result<(), Errno> {
+    let seconds = |nanos: u64| (nanos / 1_000_000_000) as i64;
+    let micros = |nanos: u64| (nanos % 1_000_000_000 / 1_000) as i64;
+    let words: [i64; 4] = [
+        seconds(setting.interval_ns),
+        micros(setting.interval_ns),
+        seconds(setting.value_ns),
+        micros(setting.value_ns),
+    ];
+    uaccess::write_struct(addr, &words)
+}
+
+pub fn setitimer(which: i32, new: u64, old: u64) -> SysResult {
+    // Linux reads a missing new setting as one that disarms the timer.
+    let setting = if new == 0 {
+        crate::itimer::Setting::default()
+    } else {
+        read_itimerval(new)?
+    };
+    let previous = crate::itimer::set(which, setting)?;
+    if old != 0 {
+        write_itimerval(old, previous)?;
+    }
+    Ok(0)
+}
+
+pub fn getitimer(which: i32, out: u64) -> SysResult {
+    write_itimerval(out, crate::itimer::get(which)?)?;
+    Ok(0)
+}
+
+/// `alarm`: the real timer, set to whole seconds and firing once.
+///
+/// The answer is what was left of the timer it replaced, in seconds rounded to
+/// the nearest, and at least one while a timer was armed at all, because zero
+/// would say there was none. Linux rounds the same way.
+pub fn alarm(seconds: u32) -> SysResult {
+    let setting = crate::itimer::Setting {
+        value_ns: seconds as u64 * 1_000_000_000,
+        interval_ns: 0,
+    };
+    let previous = crate::itimer::set(crate::itimer::ITIMER_REAL, setting)?;
+    let whole = previous.value_ns / 1_000_000_000;
+    let part = previous.value_ns % 1_000_000_000;
+    let rounded = if (whole == 0 && part != 0) || part >= 500_000_000 { whole + 1 } else { whole };
+    Ok(rounded)
 }
 
 pub fn getrandom(buf: u64, len: usize) -> SysResult {
