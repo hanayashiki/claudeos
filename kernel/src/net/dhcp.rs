@@ -547,13 +547,13 @@ impl Client {
         // As many as the socket can hold, so a socket whose read side somebody
         // shut down, which reads as empty for ever, cannot hold this here.
         for _ in 0..64 {
-            let Ok((length, from)) = self.socket.receive_into(&mut self.buffer, false) else {
+            let Ok(received) = self.socket.receive_into(&mut self.buffer, false) else {
                 break;
             };
-            if from.port != SERVER_PORT {
+            if received.from.map(|from| from.port) != Some(SERVER_PORT) {
                 continue;
             }
-            if let Some(reply) = Reply::parse(&self.buffer[..length]) {
+            if let Some(reply) = Reply::parse(&self.buffer[..received.taken]) {
                 self.on_reply(&reply, now, &mut effects);
             }
         }

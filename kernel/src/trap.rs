@@ -34,6 +34,9 @@ fn timer(frame: &mut TrapFrame) {
     // new thing the random number generator gets to see.
     crate::rng::observe(arch::TIMER_IRQ as u64);
     arch::end_of_interrupt(arch::TIMER_IRQ);
+    // Before the pending signals are looked at below, so that a timer this
+    // tick makes due reaches a task spinning in user mode on this same tick.
+    crate::itimer::on_tick(frame.from_user());
     // A task killed while spinning in user mode notices here.
     if frame.from_user() {
         crate::sched::check_signals();

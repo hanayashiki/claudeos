@@ -15,6 +15,7 @@ mod console;
 mod elf;
 mod fs;
 mod futex;
+mod itimer;
 mod mm;
 mod net;
 mod pci;

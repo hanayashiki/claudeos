@@ -78,6 +78,8 @@ pub const SIGTSTP: Signal = Signal(20);
 pub const SIGTTIN: Signal = Signal(21);
 pub const SIGTTOU: Signal = Signal(22);
 pub const SIGURG: Signal = Signal(23);
+pub const SIGVTALRM: Signal = Signal(26);
+pub const SIGPROF: Signal = Signal(27);
 pub const SIGWINCH: Signal = Signal(28);
 
 pub const SA_SIGINFO: u64 = 0x0000_0004;

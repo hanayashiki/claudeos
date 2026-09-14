@@ -670,7 +670,7 @@ fn connection(report: &mut Report, nic: &FakeNic) {
 
     let mut buf = [0u8; 256];
     match accepted.receive_into(&mut buf, false) {
-        Ok((n, _)) => {
+        Ok(socket::Received { taken: n, .. }) => {
             report.bytes("the request, as the socket reads it", &buf[..n], request);
         }
         Err(_) => report.check("the request, as the socket reads it", false),
@@ -1654,7 +1654,7 @@ fn reassembly(report: &mut Report, nic: &'static FakeNic) {
     report.check("and nothing is held any more", tcp::held_bytes() == 0);
     let mut buf = [0u8; 64];
     match peer.socket.receive_into(&mut buf, false) {
-        Ok((n, _)) => report.bytes(
+        Ok(socket::Received { taken: n, .. }) => report.bytes(
             "the stream reads in order",
             &buf[..n],
             b"1234567890abcdefghij",
@@ -1709,7 +1709,7 @@ fn reassembly(report: &mut Report, nic: &'static FakeNic) {
     }
     let mut arrived = Vec::new();
     let mut buf = [0u8; 2048];
-    while let Ok((n, _)) = peer.socket.receive_into(&mut buf, false) {
+    while let Ok(socket::Received { taken: n, .. }) = peer.socket.receive_into(&mut buf, false) {
         if n == 0 {
             break;
         }
@@ -2138,7 +2138,7 @@ fn foreign_addresses(report: &mut Report, nic: &FakeNic) {
     );
     let mut buf = [0u8; 64];
     match socket.receive_into(&mut buf, false) {
-        Ok((n, _)) => report.bytes("a broadcast datagram still arrives", &buf[..n], b"to everyone"),
+        Ok(socket::Received { taken: n, .. }) => report.bytes("a broadcast datagram still arrives", &buf[..n], b"to everyone"),
         Err(_) => report.check("a broadcast datagram still arrives", false),
     }
     socket::close(&socket);
@@ -2243,9 +2243,12 @@ fn datagrams(report: &mut Report, nic: &FakeNic) {
     );
     let mut buf = [0u8; 64];
     match socket.receive_into(&mut buf, false) {
-        Ok((n, from)) => {
+        Ok(socket::Received { taken: n, from, .. }) => {
             report.bytes("the datagram that arrived", &buf[..n], b"ping");
-            report.check("from the right place", from == Endpoint::new(PEER_IP, REMOTE_PORT));
+            report.check(
+                "from the right place",
+                from == Some(Endpoint::new(PEER_IP, REMOTE_PORT)),
+            );
         }
         Err(_) => report.check("the datagram that arrived", false),
     }
@@ -2296,7 +2299,7 @@ fn datagrams(report: &mut Report, nic: &FakeNic) {
     report.check("what was queued is accounted for", held == 29);
     report.check("and shutting the read side down gives it back", queued_bytes_of(&socket) == 0);
     match socket.receive_into(&mut buf, false) {
-        Ok((n, _)) => report.check("a receive afterwards reports the end", n == 0),
+        Ok(socket::Received { taken: n, .. }) => report.check("a receive afterwards reports the end", n == 0),
         Err(_) => report.check("a receive afterwards reports the end", false),
     }
     // What arrives next is the only thing held, rather than the last of a

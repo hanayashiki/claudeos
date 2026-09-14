@@ -1174,35 +1174,9 @@ pub fn sendto(fd: i32, buf: u64, len: usize, addr: u64) -> SysResult {
 
 pub fn recvfrom(fd: i32, buf: u64, len: usize, addr: u64, addrlen: u64) -> SysResult {
     let n = read(fd, buf, len as u64)?;
-    if addr != 0 && addrlen != 0 {
-        uaccess::write_u32(addrlen, 0)?;
+    if addr != 0 {
+        super::net::put_name(&[], addr, addrlen)?;
     }
-    Ok(n)
-}
-
-/// The offsets inside `struct msghdr`. The same on every 64-bit Linux: the
-/// structure is asm-generic and holds only pointers, ints and sizes.
-const MSG_IOV: u64 = 16;
-const MSG_IOVLEN: u64 = 24;
-const MSG_CONTROLLEN: u64 = 40;
-const MSG_FLAGS: u64 = 48;
-
-pub fn sendmsg(fd: i32, msg: u64) -> SysResult {
-    let iov = uaccess::read_u64(msg + MSG_IOV)?;
-    let count = uaccess::read_u64(msg + MSG_IOVLEN)? as usize;
-    // File descriptors cannot be passed: there is no control message handling.
-    if uaccess::read_u64(msg + MSG_CONTROLLEN)? != 0 {
-        return Err(Errno::EOPNOTSUPP);
-    }
-    writev(fd, iov, count)
-}
-
-pub fn recvmsg(fd: i32, msg: u64) -> SysResult {
-    let iov = uaccess::read_u64(msg + MSG_IOV)?;
-    let count = uaccess::read_u64(msg + MSG_IOVLEN)? as usize;
-    let n = readv(fd, iov, count)?;
-    uaccess::write_u32(msg + MSG_CONTROLLEN, 0)?;
-    uaccess::write_u32(msg + MSG_FLAGS, 0)?;
     Ok(n)
 }
 
@@ -1234,12 +1208,7 @@ pub fn getsockname(fd: i32, addr: u64, addrlen: u64) -> SysResult {
     if !matches!(file.backing, FileBacking::Socket(_)) {
         return Err(Errno::ENOTSOCK);
     }
-    if addr != 0 {
-        uaccess::write_bytes(addr, &AF_UNIX.to_le_bytes())?;
-    }
-    if addrlen != 0 {
-        uaccess::write_u32(addrlen, 2)?;
-    }
+    super::net::put_name(&AF_UNIX.to_le_bytes(), addr, addrlen)?;
     Ok(0)
 }
 

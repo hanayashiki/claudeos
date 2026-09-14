@@ -1198,6 +1198,365 @@ fn timer_under_load(report: &mut Report) {
     );
 }
 
+// ---- interval timers ------------------------------------------------------
+
+const SIGALRM: i32 = 14;
+const SIGVTALRM: i32 = 26;
+const SIGPROF: i32 = 27;
+const SIG_DFL: usize = 0;
+const ITIMER_REAL: i32 = 0;
+const ITIMER_VIRTUAL: i32 = 1;
+const ITIMER_PROF: i32 = 2;
+
+/// `struct itimerval`: the interval, then the value, each in seconds and
+/// microseconds.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct ItimerVal {
+    interval_sec: i64,
+    interval_usec: i64,
+    value_sec: i64,
+    value_usec: i64,
+}
+
+impl ItimerVal {
+    fn new(value: Duration, interval: Duration) -> ItimerVal {
+        ItimerVal {
+            interval_sec: interval.as_secs() as i64,
+            interval_usec: interval.subsec_micros() as i64,
+            value_sec: value.as_secs() as i64,
+            value_usec: value.subsec_micros() as i64,
+        }
+    }
+
+    fn value(&self) -> Duration {
+        Duration::from_secs(self.value_sec as u64) + Duration::from_micros(self.value_usec as u64)
+    }
+
+    fn interval(&self) -> Duration {
+        Duration::from_secs(self.interval_sec as u64)
+            + Duration::from_micros(self.interval_usec as u64)
+    }
+}
+
+extern "C" {
+    fn setitimer(which: i32, new: *const ItimerVal, old: *mut ItimerVal) -> i32;
+    fn getitimer(which: i32, out: *mut ItimerVal) -> i32;
+    fn alarm(seconds: u32) -> u32;
+}
+
+static REAL_ALARMS: AtomicUsize = AtomicUsize::new(0);
+static VIRTUAL_ALARMS: AtomicUsize = AtomicUsize::new(0);
+static PROFILE_ALARMS: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn count_timer_signal(signum: i32) {
+    let counter = match signum {
+        SIGALRM => &REAL_ALARMS,
+        SIGVTALRM => &VIRTUAL_ALARMS,
+        _ => &PROFILE_ALARMS,
+    };
+    counter.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Set a timer; the call's result, and the setting it replaced.
+fn arm_timer(which: i32, value: Duration, interval: Duration) -> (i32, ItimerVal) {
+    let new = ItimerVal::new(value, interval);
+    let mut old = ItimerVal::default();
+    let rc = unsafe { setitimer(which, &new, &mut old) };
+    (rc, old)
+}
+
+fn read_timer(which: i32) -> (i32, ItimerVal) {
+    let mut now = ItimerVal::default();
+    let rc = unsafe { getitimer(which, &mut now) };
+    (rc, now)
+}
+
+/// Wait for a child, killing it if it has not finished within `limit`, so a
+/// kernel that never delivers what the child is waiting for fails the check
+/// instead of hanging the suite.
+fn wait_or_kill(child: i64, limit: Duration) -> (i64, i32) {
+    use crate::sys;
+    const WNOHANG: u64 = 1;
+    const SIGKILL: i32 = 9;
+    let started = Instant::now();
+    loop {
+        let (pid, status) = sys::wait4(child as i32, WNOHANG);
+        if pid != 0 {
+            return (pid, status);
+        }
+        if started.elapsed() > limit {
+            sys::kill(child as i32, SIGKILL);
+            return sys::wait4(child as i32, 0);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Run in user mode until `counter` moves off `before` or `limit` has passed,
+/// and say for how long.
+fn spin_until(counter: &AtomicUsize, before: usize, limit: Duration) -> Duration {
+    let started = Instant::now();
+    let mut turns = 0u64;
+    loop {
+        for _ in 0..100_000 {
+            turns = std::hint::black_box(turns.wrapping_add(1));
+        }
+        if counter.load(Ordering::SeqCst) != before || started.elapsed() > limit {
+            return started.elapsed();
+        }
+    }
+}
+
+/// setitimer, getitimer and alarm. BusyBox wget bounds each step of a fetch
+/// with alarm, and the call used to be missing.
+fn interval_timers(report: &mut Report) {
+    use crate::sys;
+    unsafe {
+        let handler = count_timer_signal as extern "C" fn(i32) as usize;
+        signal(SIGALRM, handler);
+        signal(SIGVTALRM, handler);
+        signal(SIGPROF, handler);
+    }
+
+    let before = REAL_ALARMS.load(Ordering::SeqCst);
+    let started = Instant::now();
+    let (rc, _) = arm_timer(ITIMER_REAL, Duration::from_millis(150), Duration::ZERO);
+    while REAL_ALARMS.load(Ordering::SeqCst) == before && started.elapsed() < Duration::from_secs(2)
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let waited = started.elapsed();
+    std::thread::sleep(Duration::from_millis(250));
+    let fired = REAL_ALARMS.load(Ordering::SeqCst) - before;
+    report.check(
+        "setitimer raises SIGALRM once, after its time has passed",
+        rc == 0
+            && fired == 1
+            && waited >= Duration::from_millis(150)
+            && waited < Duration::from_secs(1),
+        format!("setitimer returned {}; {} signals, the first seen after {:?}", rc, fired, waited),
+    );
+
+    let (armed, _) = arm_timer(ITIMER_REAL, Duration::from_secs(10), Duration::from_secs(3));
+    let (asked, now) = read_timer(ITIMER_REAL);
+    report.check(
+        "getitimer reports the time left and the interval",
+        armed == 0
+            && asked == 0
+            && now.value() > Duration::from_secs(9)
+            && now.value() <= Duration::from_secs(10)
+            && now.interval() == Duration::from_secs(3),
+        format!("{:?}", now),
+    );
+    let (disarmed, replaced) = arm_timer(ITIMER_REAL, Duration::ZERO, Duration::ZERO);
+    let (_, after) = read_timer(ITIMER_REAL);
+    report.check(
+        "disarming answers with the setting it replaced and leaves nothing armed",
+        disarmed == 0
+            && replaced.value() > Duration::from_secs(9)
+            && replaced.interval() == Duration::from_secs(3)
+            && after == ItimerVal::default(),
+        format!("replaced {:?}, then {:?}", replaced, after),
+    );
+
+    arm_timer(ITIMER_REAL, Duration::from_secs(10), Duration::ZERO);
+    let seen = std::thread::spawn(|| read_timer(ITIMER_REAL).1).join().unwrap_or_default();
+    arm_timer(ITIMER_REAL, Duration::ZERO, Duration::ZERO);
+    report.check(
+        "a thread sees the timer its process armed",
+        seen.value() > Duration::from_secs(9),
+        format!("{:?}", seen),
+    );
+
+    let before = REAL_ALARMS.load(Ordering::SeqCst);
+    let (rc, _) = arm_timer(ITIMER_REAL, Duration::from_millis(50), Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(525));
+    arm_timer(ITIMER_REAL, Duration::ZERO, Duration::ZERO);
+    let fired = REAL_ALARMS.load(Ordering::SeqCst) - before;
+    std::thread::sleep(Duration::from_millis(150));
+    let later = REAL_ALARMS.load(Ordering::SeqCst) - before;
+    report.check(
+        "an interval timer fires every interval until it is disarmed",
+        // Ten is what a sleep that ends on time sees. A stall on the host
+        // lengthens the sleep, which lets one more fire, and makes a tick late,
+        // which skips an interval rather than firing it twice.
+        rc == 0 && (5..=12).contains(&fired) && later == fired,
+        format!("{} signals in 525 ms, {} after disarming", fired, later),
+    );
+
+    let first = unsafe { alarm(7) };
+    let second = unsafe { alarm(0) };
+    report.check(
+        "alarm answers with the seconds left on the alarm it replaced",
+        first == 0 && second == 7,
+        format!("{} and then {}", first, second),
+    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        let first = sys::alarm_call(3);
+        let second = sys::alarm_call(0);
+        report.check(
+            "and so does the alarm system call x86-64 has of its own",
+            first == 0 && second == 3,
+            format!("{} and then {}", first, second),
+        );
+    }
+
+    let child = sys::fork();
+    if child == 0 {
+        unsafe { signal(SIGALRM, SIG_DFL) };
+        let Ok((read_end, _write_end)) = sys::pipe() else {
+            sys::exit_group(2)
+        };
+        arm_timer(ITIMER_REAL, Duration::from_millis(100), Duration::ZERO);
+        // The write end is open in this process, so nothing ends this read
+        // but a signal.
+        let mut byte = [0u8; 1];
+        sys::read(read_end, &mut byte);
+        sys::exit_group(3);
+    }
+    let started = Instant::now();
+    let (pid, status) = wait_or_kill(child, Duration::from_secs(3));
+    let waited = started.elapsed();
+    report.check(
+        "SIGALRM ends a process blocked in a read when nothing handles it",
+        pid == child && status & 0x7F == SIGALRM && waited < Duration::from_millis(1500),
+        format!("reaped {} with status {:#x} after {:?}", pid, status, waited),
+    );
+
+    arm_timer(ITIMER_REAL, Duration::from_secs(10), Duration::ZERO);
+    let child = sys::fork();
+    if child == 0 {
+        let (rc, now) = read_timer(ITIMER_REAL);
+        sys::exit_group(if rc == 0 && now == ItimerVal::default() { 0 } else { 1 });
+    }
+    let (pid, status) = wait_or_kill(child, Duration::from_secs(3));
+    let (_, parent) = arm_timer(ITIMER_REAL, Duration::ZERO, Duration::ZERO);
+    report.check(
+        "a forked child starts with no timer armed, and its parent keeps its own",
+        pid == child && status == 0 && parent.value() > Duration::from_secs(9),
+        format!("child status {:#x}; the parent's had {:?} left", status, parent.value()),
+    );
+
+    let before = VIRTUAL_ALARMS.load(Ordering::SeqCst);
+    let (rc, _) = arm_timer(ITIMER_VIRTUAL, Duration::from_millis(50), Duration::ZERO);
+    std::thread::sleep(Duration::from_millis(300));
+    let while_asleep = VIRTUAL_ALARMS.load(Ordering::SeqCst) - before;
+    let spun = spin_until(&VIRTUAL_ALARMS, before, Duration::from_secs(3));
+    let fired = VIRTUAL_ALARMS.load(Ordering::SeqCst) - before;
+    report.check(
+        "a virtual timer counts time spent running, not time asleep",
+        rc == 0 && while_asleep == 0 && fired == 1,
+        format!(
+            "setitimer returned {}; {} signals while asleep, {} after running for {:?}",
+            rc, while_asleep, fired, spun
+        ),
+    );
+
+    let before = PROFILE_ALARMS.load(Ordering::SeqCst);
+    let (rc, _) = arm_timer(ITIMER_PROF, Duration::from_millis(50), Duration::ZERO);
+    let spun = spin_until(&PROFILE_ALARMS, before, Duration::from_secs(3));
+    let fired = PROFILE_ALARMS.load(Ordering::SeqCst) - before;
+    report.check(
+        "a profiling timer counts time spent running",
+        rc == 0 && fired == 1,
+        format!("setitimer returned {}; {} signals after running for {:?}", rc, fired, spun),
+    );
+
+    let quiet = ItimerVal::default();
+    let no_such = unsafe { setitimer(3, &quiet, std::ptr::null_mut()) };
+    let no_such_errno = std::io::Error::last_os_error().raw_os_error();
+    let too_many = ItimerVal { value_usec: 1_000_000, ..ItimerVal::default() };
+    let bad = unsafe { setitimer(ITIMER_REAL, &too_many, std::ptr::null_mut()) };
+    let bad_errno = std::io::Error::last_os_error().raw_os_error();
+    report.check(
+        "setitimer refuses a timer that does not exist, and a second's worth of microseconds",
+        no_such == -1 && no_such_errno == Some(22) && bad == -1 && bad_errno == Some(22),
+        format!("{} ({:?}) and {} ({:?})", no_such, no_such_errno, bad, bad_errno),
+    );
+
+    unsafe {
+        signal(SIGALRM, SIG_DFL);
+        signal(SIGVTALRM, SIG_DFL);
+        signal(SIGPROF, SIG_DFL);
+    }
+}
+
+static STRESS_PROFILE: AtomicUsize = AtomicUsize::new(0);
+static STRESS_RAISED: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn count_stress_signal(signum: i32) {
+    if signum == SIGPROF {
+        STRESS_PROFILE.fetch_add(1, Ordering::SeqCst);
+    } else {
+        STRESS_RAISED.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A signal the timer tick raises, arriving while the same process raises and
+/// takes another signal as fast as it can.
+///
+/// The tick adds its signal to the pending set from an interrupt, and a system
+/// call on its way out takes signals off the same set. When the set was changed
+/// by reading it, changing the copy and writing the copy back, a tick between
+/// the read and the write had its signal written over and lost. With the
+/// profiling timer at its shortest, every tick this process runs through raises
+/// SIGPROF once, so the tick count says how many to expect; the ticks other
+/// tasks take are the allowance. `raise` takes SIGUSR2 through three system
+/// calls, each of which takes pending signals on its way out.
+///
+/// An emulator that looks for interrupts only between the blocks of code it
+/// translates cannot put a tick between two instructions with no branch between
+/// them, which is what the old read and write were, so there this passes with
+/// the old code as well. A processor takes an interrupt between any two.
+fn signals_raised_while_others_are_taken(report: &mut Report) {
+    use crate::sys;
+    // The handlers in place before are put back afterwards: checks further on
+    // raise SIGUSR2 in a forked child and count on the handler installed at
+    // the start.
+    let (earlier_profile, earlier_user) = unsafe {
+        let handler = count_stress_signal as extern "C" fn(i32) as usize;
+        (signal(SIGPROF, handler), signal(SIGUSR2, handler))
+    };
+    let profile_before = STRESS_PROFILE.load(Ordering::SeqCst);
+    let taken_before = STRESS_RAISED.load(Ordering::SeqCst);
+    let first_tick = sys::tick_count();
+    arm_timer(ITIMER_PROF, Duration::from_millis(1), Duration::from_millis(1));
+    let started = Instant::now();
+    let mut raised = 0usize;
+    while started.elapsed() < Duration::from_secs(2) {
+        for _ in 0..64 {
+            unsafe { raise(SIGUSR2) };
+            raised += 1;
+        }
+    }
+    arm_timer(ITIMER_PROF, Duration::ZERO, Duration::ZERO);
+    let last_tick = sys::tick_count();
+    unsafe {
+        signal(SIGPROF, earlier_profile);
+        signal(SIGUSR2, earlier_user);
+    }
+    let taken = STRESS_RAISED.load(Ordering::SeqCst) - taken_before;
+    let profiled = STRESS_PROFILE.load(Ordering::SeqCst) - profile_before;
+    let ticks = last_tick.saturating_sub(first_tick) as usize;
+    println!("      {} raised, {} taken; {} ticks, {} SIGPROF", raised, taken, ticks, profiled);
+    report.check(
+        "every signal raised is taken once while the tick raises another",
+        taken == raised,
+        format!("{} raised, {} taken", raised, taken),
+    );
+    report.check(
+        "and every tick the process ran through raised SIGPROF",
+        // The ticks between reading the count and arming the timer, and
+        // between disarming it and reading the count again, raise nothing.
+        // A tick another task is running through raises nothing either; in
+        // the runs this was written against that was none of them.
+        profiled <= ticks && profiled + 3 >= ticks,
+        format!("{} ticks, {} SIGPROF", ticks, profiled),
+    );
+}
+
 pub fn main(_args: &[String]) -> i32 {
     let mut report = Report { passed: 0, failed: 0 };
     println!("=== Rust standard library on claudeos ===");
@@ -1435,6 +1794,11 @@ pub fn main(_args: &[String]) -> i32 {
         SIGNAL_TOTAL.load(Ordering::SeqCst) - before == (SIGUSR1 + SIGUSR2) as usize,
         "handler ran while ignored".into(),
     );
+
+    println!();
+    println!("-- interval timers --");
+    interval_timers(&mut report);
+    signals_raised_while_others_are_taken(&mut report);
 
     println!();
     println!("-- time and environment --");

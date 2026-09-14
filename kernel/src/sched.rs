@@ -534,7 +534,7 @@ fn stop_current(signal: Signal) {
         // again here, where nothing else can run, it is a continue that beat
         // the stop, and stopping now would park the task with a continue
         // pending that nothing would ever act on.
-        if task.pending_signals.get() & SIGCONT.bit() != 0 {
+        if task.pending() & SIGCONT.bit() != 0 {
             return false;
         }
         task.stop(signal, table);
@@ -584,7 +584,7 @@ pub fn stop_for_signal(signal: Signal) {
 pub fn stop_if_requested() -> bool {
     let task = current();
     for signal in [SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU] {
-        if task.pending_signals.get() & signal.bit() == 0 {
+        if task.pending() & signal.bit() == 0 {
             continue;
         }
         if signal != SIGSTOP && task.action(signal).handler != crate::signal::SIG_DFL {
@@ -633,8 +633,8 @@ pub fn has_pending_signal_except(ignore: u64) -> bool {
         return false;
     }
     let task = current();
-    let waiting = task.pending_signals.get() & !ignore;
-    let mut pending = waiting & !task.signal_mask.get();
+    let waiting = task.pending() & !ignore;
+    let mut pending = waiting & !task.blocked();
     // Neither of these can be blocked.
     pending |= waiting & (SIGKILL.bit() | SIGSTOP.bit());
     if pending == 0 {
@@ -663,20 +663,24 @@ pub fn check_signals() {
         return;
     }
     let task = current();
-    if task.pending_signals.get() == 0 {
+    if task.pending() == 0 {
         return;
     }
 
     for signal in Signal::all() {
         let bit = signal.bit();
-        if task.pending_signals.get() & bit == 0 {
+        if task.pending() & bit == 0 {
             continue;
         }
-        let blocked = task.signal_mask.get() & bit != 0;
+        let blocked = task.blocked() & bit != 0;
         if blocked && signal != SIGKILL && signal != SIGSTOP {
             continue;
         }
-        task.drop_pending(bit);
+        // Taken rather than dropped: only a take that finds the bit still set
+        // goes on to act on the signal.
+        if task.take_pending(bit) == 0 {
+            continue;
+        }
 
         if signal == SIGKILL {
             exit_current(signal.number());

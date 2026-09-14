@@ -175,7 +175,7 @@ pub fn enter_signal_handler(
     put64(&mut buf, m + SC_EFLAGS, frame.rflags);
     buf[m + SC_CS..m + SC_CS + 2].copy_from_slice(&(frame.cs as u16).to_le_bytes());
 
-    put64(&mut buf, UC_SIGMASK, task.signal_mask.get());
+    put64(&mut buf, UC_SIGMASK, task.blocked());
 
     // The handler runs on the same registers the interrupted code was using,
     // and nothing else would put the floating point and vector ones back.
@@ -195,9 +195,9 @@ pub fn enter_signal_handler(
     }
 
     // Block this signal for the duration of the handler unless asked not to.
-    task.signal_mask.set(task.signal_mask.get() | action.mask);
+    task.block(action.mask);
     if action.flags & SA_NODEFER == 0 {
-        task.signal_mask.set(task.signal_mask.get() | signal.bit());
+        task.block(signal.bit());
     }
 
     frame.rip = action.handler;
@@ -240,7 +240,7 @@ pub fn leave_signal_handler(task: &Task, frame: &mut TrapFrame) -> SysResult {
     let flags = get64(&buf, m + SC_EFLAGS);
     frame.rflags = (flags & 0x0000_08D5) | 0x202;
 
-    task.signal_mask.set(get64(&buf, UC_SIGMASK));
+    task.set_blocked(get64(&buf, UC_SIGMASK));
     restore_alt_stack(task, &buf, base);
 
     // Put the interrupted code's floating point and vector registers back.

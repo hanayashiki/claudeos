@@ -14,6 +14,7 @@
 
 mod loader;
 mod memory;
+mod names;
 mod rename;
 mod sys;
 mod threads;
@@ -68,6 +69,8 @@ fn test() {
     refusals(&mut report);
     println!("-- datagrams --");
     datagrams(&mut report);
+    println!("-- names a socket call reports --");
+    names::run(&mut report);
     println!("-- an HTTP exchange --");
     http(&mut report);
     println!("-- memory management --");
