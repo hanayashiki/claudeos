@@ -436,6 +436,14 @@ impl InetSocket {
         }
     }
 
+    /// Tear a stream connection down now, and tell the other end so with a
+    /// reset rather than a finish.
+    pub fn abort(&self) {
+        if let Protocol::Tcp(tcb) = &mut *self.inner.lock() {
+            tcb.abort();
+        }
+    }
+
     pub fn shutdown(&self, read: bool, write: bool) -> Result<(), Errno> {
         match &mut *self.inner.lock() {
             Protocol::Tcp(tcb) => {
