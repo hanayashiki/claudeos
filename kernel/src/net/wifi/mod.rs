@@ -93,6 +93,8 @@ const DCMD_SMLEN: usize = 256;
 const SCAN_TIMEOUT_MS: u64 = 15_000;
 /// `sizeof(struct brcmf_rev_info_le)`: seventeen words.
 const REVINFO_LEN: usize = 68;
+/// `MAX_CAPS_BUFFER_SIZE` in `feature.c`: room for the "cap" string.
+const CAPS_LEN: usize = 768;
 /// Frames waiting for the task. The same depth as the wired driver's queue.
 const TX_QUEUE_DEPTH: usize = 64;
 /// WL_ON is read back after each change during the first power cycle, which
@@ -105,6 +107,9 @@ const DATA_CREDIT_WAIT_MS: u64 = 100;
 /// brcmfmac does this, because a supplicant in user space decides there; here
 /// the kernel is the only thing that would.
 const JOIN_RETRY_MS: u64 = 30_000;
+/// `DEFAULT_EAPOL_KEY_PACKET_TIMEOUT` in WHD's `whd_wifi_api.c`: how long the
+/// firmware's supplicant waits for handshake message 1 or 3.
+const EAPOL_KEY_TIMEOUT_MS: u32 = 3000;
 
 // ---------------------------------------------------------------------------
 // What the stack sees
@@ -125,6 +130,42 @@ static RX_ERRORS: AtomicU64 = AtomicU64::new(0);
 static TX_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Glommed frames received, which this driver does not take apart.
 static GLOMS: AtomicU64 = AtomicU64::new(0);
+/// Data frames that arrived while the link was down, which are dropped.
+static EARLY_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// How many of those are described in the log.
+const EARLY_FRAMES_LOGGED: u64 = 8;
+/// `ETH_P_PAE` in Linux's `if_ether.h`: IEEE 802.1X, which carries the WPA2
+/// handshake.
+const ETHERTYPE_EAPOL: u16 = 0x888E;
+
+/// Describe one of the first frames to arrive before the link is up. With the
+/// firmware doing the handshake, an EAPOL-Key frame should never reach the
+/// host, so one here says the firmware passed the access point's message on
+/// instead of answering it. Only the type, the length and the EAPOL-Key
+/// information field are printed, and none of them is key material.
+fn note_early_frame(frame: &[u8]) {
+    let n = EARLY_FRAMES.fetch_add(1, Ordering::Relaxed);
+    if n >= EARLY_FRAMES_LOGGED || frame.len() < 14 {
+        return;
+    }
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    let body = &frame[14..];
+    if ethertype == ETHERTYPE_EAPOL && body.len() >= 7 {
+        // IEEE 802.1X-2004 section 7.5: protocol version, packet type and body
+        // length; then IEEE 802.11-2016 section 12.7.2: descriptor type and the
+        // key information field, big-endian.
+        crate::println!(
+            "wifi: before the link, an EAPOL frame of {} bytes: version {}, packet type {}, descriptor {}, key information {:#06x}",
+            frame.len(),
+            body[0],
+            body[1],
+            body[4],
+            u16::from_be_bytes([body[5], body[6]])
+        );
+    } else {
+        crate::println!("wifi: before the link, a frame of {} bytes with ethertype {:#06x}", frame.len(), ethertype);
+    }
+}
 
 impl Interface for WifiCard {
     /// The firmware's own address, which is zero until bring-up has asked
@@ -526,6 +567,9 @@ fn bring_up(mut found: Found) -> Result<Dongle, String> {
         }
     );
 
+    if let Some(tag) = build_line(&firmware) {
+        crate::println!("wifi: firmware build: {}", tag);
+    }
     chip::download(&mut bp, &chip, &firmware, &nvram)?;
     drop(firmware);
     let save_restore = chip::start(&mut bp, &chip, device)?;
@@ -621,6 +665,9 @@ pub struct Dongle {
     keys_installed: bool,
     /// When the last join was asked for, while the link has not come up.
     joining_since: Option<u64>,
+    /// Every BSSID the scan saw carrying the configured network's name, so an
+    /// event's address can be checked against them without printing either.
+    configured_bssids: Vec<[u8; 6]>,
 }
 
 impl Dongle {
@@ -649,6 +696,21 @@ impl Dongle {
             associated: false,
             keys_installed: false,
             joining_since: None,
+            configured_bssids: Vec::new(),
+        }
+    }
+
+    /// Whether an event came from one of the configured network's access
+    /// points, said without naming the address.
+    fn event_source(&self, event: &Event) -> &'static str {
+        if event.addr == [0; 6] {
+            ""
+        } else if self.configured_bssids.contains(&event.addr) {
+            ", from a BSSID the scan saw for the configured network"
+        } else if event.addr[0] & 0x02 != 0 {
+            ", from a locally administered address the scan did not see"
+        } else {
+            ", from an address the scan did not see for the configured network"
         }
     }
 
@@ -818,6 +880,8 @@ impl Dongle {
                         RECEIVED.fetch_add(1, Ordering::Relaxed);
                         if CARD.link.load(Ordering::Relaxed) {
                             crate::net::receive(frame);
+                        } else {
+                            note_early_frame(frame);
                         }
                     }
                 }
@@ -1044,7 +1108,25 @@ impl Dongle {
                 pieces += 1;
             }
             match failed {
-                None => crate::println!("wifi: CLM blob loaded, {} bytes in {} pieces", clm.len(), pieces),
+                None => {
+                    // `brcmf_c_process_clm_blob` reads the status only after a
+                    // failure. It is read here as well, because the blob and the
+                    // firmware come from different releases; zero means the
+                    // firmware took the blob. Without its regulatory data the
+                    // radio must not join anything, so any other value stops
+                    // bring-up.
+                    match self.get_iovar_u32("clmload_status") {
+                        Ok(0) => crate::println!(
+                            "wifi: CLM blob loaded, {} bytes in {} pieces; clmload_status 0",
+                            clm.len(),
+                            pieces
+                        ),
+                        Ok(status) => {
+                            return Err(format!("the firmware took the CLM blob but reports clmload_status {}", status))
+                        }
+                        Err(error) => return Err(format!("the CLM blob was sent, but clmload_status: {}", error)),
+                    }
+                }
                 Some(error) => {
                     let status = self.get_iovar_u32("clmload_status");
                     return Err(format!(
@@ -1067,6 +1149,12 @@ impl Dongle {
             Ok(clmver) => crate::println!("wifi: CLM: {}", first_line(&clmver)),
             Err(error) => crate::println!("wifi: clmver: {}", error),
         }
+        // `brcmf_feat_firmware_capabilities`: the features the firmware says
+        // it has, space-separated.
+        match self.get_iovar("cap", CAPS_LEN) {
+            Ok(caps) => crate::println!("wifi: firmware capabilities: {}", first_line(&caps).trim_end()),
+            Err(error) => crate::println!("wifi: cap: {}", error),
+        }
         if let Err(error) = self.set_iovar_u32("mpc", 1) {
             crate::println!("wifi: mpc: {}", error);
         }
@@ -1075,19 +1163,21 @@ impl Dongle {
 
     /// The country, the events to be told about, and the interface up.
     fn configure(&mut self, country: config::Country) -> Result<(), String> {
-        match self.set_iovar("country", &protocol::country(country.0)) {
-            Ok(()) => match self.get_iovar("country", 12) {
-                Ok(answer) if answer.len() >= 12 => crate::println!(
-                    "wifi: country set to {}; the firmware reports {}{} revision {}",
-                    country,
-                    answer[8] as char,
-                    answer[9] as char,
-                    i32::from_le_bytes([answer[4], answer[5], answer[6], answer[7]])
-                ),
-                _ => crate::println!("wifi: country set to {}", country),
-            },
-            Err(error) => crate::println!("wifi: the firmware refused country {}: {}", country, error),
+        // The country decides which channels and powers the CLM data allows.
+        // If the firmware does not take it, nothing further is done.
+        self.set_iovar("country", &protocol::country(country.0))
+            .map_err(|e| format!("the firmware refused country {}: {}", country, e))?;
+        let answer = self.get_iovar("country", 12)?;
+        if answer.len() < 12 || answer[8..10] != country.0 {
+            return Err(format!("country {} was set, but the firmware does not report it back", country));
         }
+        crate::println!(
+            "wifi: country set to {}; the firmware reports {}{} revision {}",
+            country,
+            answer[8] as char,
+            answer[9] as char,
+            i32::from_le_bytes([answer[4], answer[5], answer[6], answer[7]])
+        );
 
         // `brcmf_fweh_activate_events`: the extended form first, then the
         // plain mask.
@@ -1115,6 +1205,23 @@ impl Dongle {
         // `brcmf_config_dongle` sends it with zero.
         self.set_u32(protocol::C_UP, 0)?;
         crate::println!("wifi: interface up");
+
+        // `brcmf_config_dongle` then sets the interface's type through
+        // `brcmf_cfg80211_change_iface`, which for a station is infrastructure
+        // mode, 1; 0 would make a join create or join an ad hoc network, where
+        // no access point starts a handshake. WHD's `whd_wifi_prepare_join` and
+        // cyw43's `Control::join` set it too. What the firmware had before is
+        // printed.
+        let before = self.ioctl(protocol::C_GET_INFRA, false, 4, &[0; 4]);
+        self.set_u32(protocol::C_SET_INFRA, 1)?;
+        match before {
+            Ok(data) if data.len() >= 4 => crate::println!(
+                "wifi: infrastructure mode set; it was {}",
+                u32::from_le_bytes([data[0], data[1], data[2], data[3]])
+            ),
+            Ok(_) => crate::println!("wifi: infrastructure mode set; reading it before gave a short answer"),
+            Err(error) => crate::println!("wifi: infrastructure mode set; reading it before failed: {}", error),
+        }
         Ok(())
     }
 
@@ -1164,6 +1271,9 @@ impl Dongle {
             GLOMS.load(Ordering::Relaxed)
         );
         if let Some(config) = config {
+            let bssids: Vec<[u8; 6]> =
+                self.scan.iter().filter(|bss| config.ssid.matches(bss.ssid())).map(|bss| bss.bssid).collect();
+            self.configured_bssids = bssids;
             match self.scan.iter().filter(|bss| config.ssid.matches(bss.ssid())).max_by_key(|bss| bss.rssi) {
                 Some(bss) => {
                     crate::println!("wifi: found the configured network on channel {}", bss.channel);
@@ -1214,8 +1324,26 @@ impl Dongle {
         // RSN element it is handed, and this network advertises neither MFP
         // bit, so "mfp" is left as it is.
         self.set_iovar_u32("wpa_auth", protocol::WPA2_AUTH_PSK).map_err(|e| format!("wpa_auth: {}", e))?;
-        // `BRCMF_PROFILE_FWSUP_PSK`: the firmware's supplicant.
+        // `BRCMF_PROFILE_FWSUP_PSK`: the firmware's supplicant. Only a
+        // firmware built with "idsup" has one; any other refuses this.
         self.set_iovar_u32("sup_wpa", 1).map_err(|e| format!("sup_wpa: {}", e))?;
+        match self.get_iovar_u32("sup_wpa") {
+            Ok(value) => crate::println!("wifi: sup_wpa accepted; it reads back {}", value),
+            Err(error) => crate::println!("wifi: sup_wpa accepted, but reading it back failed: {}", error),
+        }
+        // `whd_wifi_prepare_join`, Infineon's driver for firmware with this
+        // supplicant, sets two more that brcmfmac does not: the EAPOL version
+        // "to whatever the AP is using (-1)", and how long to wait for the
+        // access point's first and third handshake messages,
+        // `DEFAULT_EAPOL_KEY_PACKET_TIMEOUT`. Without the timeout a stalled
+        // handshake never ends in a PSK_SUP event. WHD carries on if either is
+        // refused, and so does this.
+        if let Err(error) = self.set_iovar_u32("sup_wpa2_eapver", u32::MAX) {
+            crate::println!("wifi: sup_wpa2_eapver refused: {}", error);
+        }
+        if let Err(error) = self.set_iovar_u32("sup_wpa_tmo", EAPOL_KEY_TIMEOUT_MS) {
+            crate::println!("wifi: sup_wpa_tmo refused: {}", error);
+        }
         // The passphrase, flagged so the firmware derives the key itself, as
         // embassy's cyw43 hands it over.
         let mut pmk = protocol::wsec_pmk(config.passphrase.len(), protocol::WSEC_PASSPHRASE, |key| {
@@ -1312,6 +1440,22 @@ impl Dongle {
     }
 }
 
+/// The build line Broadcom's firmware images carry, such as
+/// `43455c0-roml/43455_sdio-pno-...-idsup-idauth Version: 7.45.241 ...`: the
+/// chip, the features compiled in, the version and the date. brcmfmac does
+/// not read it. It is printed so the log shows which features the loaded
+/// build has, the supplicant among them.
+fn build_line(image: &[u8]) -> Option<String> {
+    const MARK: &[u8] = b"-roml/";
+    let at = image.windows(MARK.len()).position(|w| w == MARK)?;
+    let start = image[..at].iter().rposition(|&b| b == 0).map(|i| i + 1).unwrap_or(0);
+    let end = at + image[at..].iter().position(|&b| b == 0)?;
+    if end - start > 512 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&image[start..end]).into_owned())
+}
+
 fn first_line(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0 || b == b'\n').unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
@@ -1336,12 +1480,14 @@ fn run(mut dongle: Dongle) -> ! {
         }
         while let Some(event) = dongle.events.pop_front() {
             crate::println!(
-                "wifi: event {} status {} reason {} flags {:#x} auth type {}",
+                "wifi: event {} {} status {} reason {} flags {:#x} auth type {}{}",
+                protocol::event_name(event.event_type),
                 event.event_type,
                 event.status,
                 event.reason,
                 event.flags,
-                event.auth_type
+                event.auth_type,
+                dongle.event_source(&event)
             );
             dongle.link_event(&event);
         }

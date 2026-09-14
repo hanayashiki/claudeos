@@ -293,6 +293,7 @@ pub fn strip_bcdc(payload: &[u8]) -> Option<(u8, &[u8])> {
 // ---------------------------------------------------------------------------
 
 pub const C_UP: u32 = 2;
+pub const C_GET_INFRA: u32 = 19;
 pub const C_SET_INFRA: u32 = 20;
 pub const C_SET_AUTH: u32 = 22;
 pub const C_SET_SSID: u32 = 26;
@@ -422,6 +423,26 @@ pub const E_PRUNE: u32 = 23;
 pub const E_IF: u32 = 54;
 pub const E_PSK_SUP: u32 = 46;
 pub const E_ESCAN_RESULT: u32 = 69;
+
+/// The name `fweh.h` gives an event this driver asks for, for the log.
+pub fn event_name(event_type: u32) -> &'static str {
+    match event_type {
+        E_SET_SSID => "SET_SSID",
+        E_AUTH => "AUTH",
+        E_DEAUTH => "DEAUTH",
+        E_DEAUTH_IND => "DEAUTH_IND",
+        E_ASSOC => "ASSOC",
+        E_REASSOC => "REASSOC",
+        E_DISASSOC => "DISASSOC",
+        E_DISASSOC_IND => "DISASSOC_IND",
+        E_LINK => "LINK",
+        E_PRUNE => "PRUNE",
+        E_PSK_SUP => "PSK_SUP",
+        E_IF => "IF",
+        E_ESCAN_RESULT => "ESCAN_RESULT",
+        _ => "other",
+    }
+}
 /// `BRCMF_E_LAST`.
 pub const E_LAST: u32 = 191;
 /// `BRCMF_EVENTING_MASK_LEN`.
