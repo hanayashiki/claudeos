@@ -30,10 +30,17 @@ impl Console {
     /// A `Chunk` rather than a slice, so that no caller can hold the lock
     /// across a buffer whose length a program chose. Private, so `Chunk` is
     /// the only way in.
+    ///
+    /// The same bytes are copied to the telnet console's connection here,
+    /// under the same hold, so the connection is sent the console's output in
+    /// the order the port sends it. `&mut self` can only be had through the
+    /// lock, which is what makes that order hold for every writer.
     fn write_chunk(&mut self, chunk: &Chunk) {
-        for &byte in &chunk.bytes[..chunk.len] {
+        let bytes = &chunk.bytes[..chunk.len];
+        for &byte in bytes {
             put(byte);
         }
+        crate::console::telnet::copy(bytes, chunk.logged_at);
     }
 }
 
@@ -97,11 +104,23 @@ const CHUNK: usize = 32;
 pub struct Chunk {
     bytes: [u8; CHUNK],
     len: usize,
+    /// For part of a kernel message, the kernel log's count of bytes ever
+    /// pushed, taken just after the message went in. `None` for a program's
+    /// output, which is not in the log. The telnet console sends a connection
+    /// the log when it attaches, and this is how the copy to that connection
+    /// tells a message it has already sent in the log from one it has not.
+    logged_at: Option<u64>,
 }
 
 impl Chunk {
+    /// For a program's output.
     pub const fn new() -> Self {
-        Chunk { bytes: [0; CHUNK], len: 0 }
+        Chunk { bytes: [0; CHUNK], len: 0, logged_at: None }
+    }
+
+    /// For a kernel message that the log took in at `position`.
+    pub const fn logged(position: u64) -> Self {
+        Chunk { bytes: [0; CHUNK], len: 0, logged_at: Some(position) }
     }
 
     /// Add a byte, writing out what has gathered if there is no room for it.
@@ -140,10 +159,14 @@ pub const LOG_CAPACITY: usize = 16 * 1024;
 pub struct KernelLog {
     data: [u8; LOG_CAPACITY],
     len: usize,
+    /// Bytes ever pushed. Dropping the oldest half and clearing do not take
+    /// this back, so it names a point in everything the kernel has printed.
+    pushed: u64,
 }
 
 impl KernelLog {
-    fn push(&mut self, bytes: &[u8]) {
+    /// Returns the count of bytes ever pushed, with these included.
+    fn push(&mut self, bytes: &[u8]) -> u64 {
         for &byte in bytes {
             if self.len == LOG_CAPACITY {
                 // Full: drop the oldest half rather than the newest message.
@@ -154,6 +177,12 @@ impl KernelLog {
             self.data[self.len] = byte;
             self.len += 1;
         }
+        self.pushed += bytes.len() as u64;
+        self.pushed
+    }
+
+    pub fn pushed(&self) -> u64 {
+        self.pushed
     }
 
     pub fn len(&self) -> usize {
@@ -169,17 +198,22 @@ impl KernelLog {
     }
 }
 
-pub static LOG: Spinlock<KernelLog> = Spinlock::new(KernelLog { data: [0; LOG_CAPACITY], len: 0 });
+pub static LOG: Spinlock<KernelLog> =
+    Spinlock::new(KernelLog { data: [0; LOG_CAPACITY], len: 0, pushed: 0 });
 
 /// Writes to the console and records what was written.
 struct Logged;
 
 impl Write for Logged {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        // Through the console, because that is where a line ending is decided.
-        // What goes in the log is what was printed, before that.
-        crate::console::write_kernel(s.as_bytes());
-        LOG.lock().push(s.as_bytes());
+        // What goes in the log is what was printed, before the console decides
+        // its line endings. It goes in first, and the console is handed the
+        // position it went in at, for the telnet console: a connection that
+        // attaches is sent the log as it stands, and a task preempted between
+        // the two steps would otherwise print a message that is neither in the
+        // log that connection was sent nor copied to it live.
+        let position = LOG.lock().push(s.as_bytes());
+        crate::console::write_kernel(s.as_bytes(), position);
         Ok(())
     }
 }
@@ -201,6 +235,7 @@ pub fn init() {
 pub unsafe fn force_release() {
     SERIAL.force_unlock();
     LOG.force_unlock();
+    crate::console::telnet::force_release();
 }
 
 #[doc(hidden)]

@@ -1,5 +1,8 @@
 //! Console: serial and PS/2 keyboard input with a line discipline, and
-//! serial output.
+//! serial output. The telnet console is one more input and one more output of
+//! the same terminal.
+
+pub mod telnet;
 
 use crate::abi::{Errno, Termios, ECHO, ICANON, ONLCR, OPOST};
 use crate::serial::{Chunk, SERIAL};
@@ -130,7 +133,7 @@ pub fn write(buf: &[u8]) {
         let termios = TERMIOS.lock();
         termios.c_oflag & OPOST != 0 && termios.c_oflag & ONLCR != 0
     };
-    emit(buf, onlcr);
+    emit(buf, onlcr, Chunk::new());
 }
 
 /// Write a kernel message.
@@ -141,8 +144,11 @@ pub fn write(buf: &[u8]) {
 /// printed before any program exists, has no settings to consult anyway. A
 /// terminal reading a bare line feed as a line feed and nothing else is what
 /// makes a boot log walk down the right margin.
-pub fn write_kernel(bytes: &[u8]) {
-    emit(bytes, true);
+///
+/// `logged_at` is where the kernel log took the message in, which the telnet
+/// console's copy of the output reads.
+pub fn write_kernel(bytes: &[u8], logged_at: u64) {
+    emit(bytes, true, Chunk::logged(logged_at));
 }
 
 /// Put bytes on the wire.
@@ -156,8 +162,7 @@ pub fn write_kernel(bytes: &[u8]) {
 /// port waits for the transmitter between bytes, so a hold that covered the
 /// whole buffer would be interrupts masked for as long as the write takes. On
 /// the board that is 86.8 microseconds a byte.
-fn emit(bytes: &[u8], onlcr: bool) {
-    let mut out = Chunk::new();
+fn emit(bytes: &[u8], onlcr: bool, mut out: Chunk) {
     for &byte in bytes {
         if onlcr && byte == b'\n' {
             out.push(b'\r');
