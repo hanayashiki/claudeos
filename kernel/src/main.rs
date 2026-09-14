@@ -39,8 +39,8 @@ struct BootOptions {
     /// what comes back. Off unless the word `nettest` is on the command line,
     /// so the ordinary suites never see it.
     nettest: bool,
-    /// The addresses the protocol stack uses, and whether to run its own
-    /// checks instead of booting.
+    /// The words that say where the protocol stack's address comes from, and
+    /// whether to run its own checks instead of booting.
     net: NetWords,
     net_test: bool,
     /// Throw one frame in this many away in each direction, so what the
@@ -90,21 +90,13 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
         } else if let Some(value) = word.strip_prefix("netloss=") {
             options.net_loss = value.parse().unwrap_or(0);
         } else if let Some(value) = word.strip_prefix("ip=") {
-            if let Some(address) = address_word(word, value) {
-                options.net.address = address;
-            }
+            options.net.ip = Some(value.to_string());
         } else if let Some(value) = word.strip_prefix("netmask=") {
-            if let Some(address) = address_word(word, value) {
-                options.net.netmask = address;
-            }
+            options.net.netmask = address_word(word, value);
         } else if let Some(value) = word.strip_prefix("gateway=") {
-            if let Some(address) = address_word(word, value) {
-                options.net.gateway = address;
-            }
+            options.net.gateway = address_word(word, value);
         } else if let Some(value) = word.strip_prefix("nameserver=") {
-            if let Some(address) = address_word(word, value) {
-                options.net.nameserver = address;
-            }
+            options.net.nameserver = address_word(word, value);
         } else if let Some((name, _)) = word.split_once('=') {
             // A setting the kernel does not use. Linux puts these in init's
             // environment and ignores names with a dot, which are settings
@@ -125,23 +117,62 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
     options
 }
 
-/// The `ip=`, `netmask=`, `gateway=` and `nameserver=` words, starting from
-/// what QEMU's user mode network hands out: the guest is 10.0.2.15 on a /24,
-/// the gateway is 10.0.2.2 and the name server 10.0.2.3.
+/// The `ip=`, `netmask=`, `gateway=` and `nameserver=` words, as given.
+#[derive(Default)]
 struct NetWords {
-    address: net::ip::Ipv4Addr,
-    netmask: net::ip::Ipv4Addr,
-    gateway: net::ip::Ipv4Addr,
-    nameserver: net::ip::Ipv4Addr,
+    ip: Option<String>,
+    netmask: Option<net::ip::Ipv4Addr>,
+    gateway: Option<net::ip::Ipv4Addr>,
+    nameserver: Option<net::ip::Ipv4Addr>,
 }
 
-impl Default for NetWords {
-    fn default() -> NetWords {
-        NetWords {
-            address: net::ip::Ipv4Addr::new(10, 0, 2, 15),
-            netmask: net::ip::Ipv4Addr::new(255, 255, 255, 0),
-            gateway: net::ip::Ipv4Addr::new(10, 0, 2, 2),
-            nameserver: net::ip::Ipv4Addr::new(10, 0, 2, 3),
+/// Where this machine's address comes from.
+enum Addressing {
+    /// `ip=` named an address and the words beside it the rest. DHCP does
+    /// not run.
+    Fixed(net::Config),
+    /// No `ip=`, or `ip=dhcp`: ask the network. `nameserver=` still takes the
+    /// place of the name servers the lease names.
+    Dhcp { nameserver: Option<net::ip::Ipv4Addr> },
+    /// `ip=off`, or an `ip=` that cannot be used: no address, and nothing asks
+    /// for one.
+    Off,
+}
+
+impl NetWords {
+    /// The words taken together.
+    ///
+    /// An `ip=` that names an address wins over DHCP, as it does on Linux, and
+    /// one that cannot be used leaves the machine with no address rather than
+    /// quietly asking the network for a different one. `netmask=` and
+    /// `gateway=` describe the address `ip=` names, so without it they are
+    /// reported and ignored. With it, a netmask left out is the one the
+    /// address's class implies and a gateway left out is none, which is what
+    /// Linux does with the same words missing.
+    fn addressing(&self) -> Addressing {
+        match self.ip.as_deref() {
+            None | Some("dhcp") => {
+                if self.netmask.is_some() || self.gateway.is_some() {
+                    println!("net: netmask= and gateway= mean nothing without ip=, so they are ignored");
+                }
+                Addressing::Dhcp { nameserver: self.nameserver }
+            }
+            Some("off") | Some("none") => Addressing::Off,
+            Some(value) => {
+                let Some(address) = net::ip::parse_address(value) else {
+                    println!("net: ip={} is not an address, dhcp or off", value);
+                    return Addressing::Off;
+                };
+                let netmask = self.netmask.unwrap_or_else(|| net::Config::class_netmask(address));
+                let nameservers: Vec<net::ip::Ipv4Addr> = self.nameserver.into_iter().collect();
+                match net::Config::new(address, netmask, self.gateway, &nameservers) {
+                    Ok(config) => Addressing::Fixed(config),
+                    Err(reason) => {
+                        println!("net: ip={} netmask={} cannot be used: {}", address, netmask, reason);
+                        Addressing::Off
+                    }
+                }
+            }
         }
     }
 }
@@ -153,6 +184,33 @@ fn address_word(word: &str, value: &str) -> Option<net::ip::Ipv4Addr> {
         println!("net: {} is not an address, so it is ignored", word);
     }
     address
+}
+
+/// How long init is held back for a DHCP lease, in seconds.
+///
+/// Init starts once there is an address, so what it runs straight away finds
+/// the network configured. A machine with no cable, or on a network with no
+/// DHCP server, has to boot all the same, so the wait ends. On the Pi 4 the
+/// link took several seconds to negotiate, and a server may check that the
+/// address it means to offer is not in use before offering it, which can take
+/// a few seconds more; fifteen covers both with a retransmission to spare.
+const ADDRESS_WAIT_SECONDS: u64 = 15;
+
+/// Let the network task run, holding init back, until there is an address or
+/// the wait is over. Interrupts are on while it waits, which is what lets the
+/// timer drive the network task, and off again afterwards.
+fn wait_for_address(init: &str) {
+    println!(
+        "dhcp: waiting up to {} s for an address before starting {}",
+        ADDRESS_WAIT_SECONDS, init
+    );
+    let deadline = trap::ticks() + ADDRESS_WAIT_SECONDS * arch::TICK_HZ as u64;
+    if !sched::idle_until(deadline, || net::config().is_some()) {
+        println!(
+            "dhcp: no address after {} s; starting {} without one, and the lease is taken when it comes",
+            ADDRESS_WAIT_SECONDS, init
+        );
+    }
 }
 
 /// Where every architecture's entry code arrives, once it has a console to
@@ -215,20 +273,6 @@ pub fn start(boot: &boot::BootInfo) -> ! {
     // card is the ordinary outcome on a machine booted without one.
     let nic = net::probe();
 
-    // The protocol stack takes its addresses from here rather than naming any
-    // of its own; a driver that attaches later does not change them. Words
-    // that do not make a configuration leave the machine with no address.
-    let words = &options.net;
-    match net::Config::new(words.address, words.netmask, Some(words.gateway), &[words.nameserver]) {
-        Ok(config) => {
-            net::configure(Some(config));
-            println!("net: {}", config);
-        }
-        Err(reason) => println!(
-            "net: {} netmask {} gateway {} cannot be used: {}",
-            words.address, words.netmask, words.gateway, reason
-        ),
-    }
     if options.net_loss != 0 {
         net::set_loss(options.net_loss);
         println!("net: losing one frame in {} in each direction", options.net_loss);
@@ -248,8 +292,49 @@ pub fn start(boot: &boot::BootInfo) -> ! {
     argv.extend(options.args.iter().cloned());
     let envp = options.env.clone();
 
-    match task::spawn(&options.init, argv, envp, 0) {
-        Ok(pid) => {
+    // Init is built now, so it takes pid 1 before the network task takes the
+    // next one: a good deal of the system takes pid 1 to be init. It is not
+    // started until the network has had its chance to configure itself.
+    let init = task::prepare(&options.init, argv, envp, 0);
+
+    // The protocol stack takes its addresses from here rather than naming any
+    // of its own.
+    let asking = match options.net.addressing() {
+        Addressing::Fixed(config) => {
+            net::configure(Some(config));
+            println!("net: {}, from the command line", config);
+            false
+        }
+        Addressing::Dhcp { nameserver } if nic => {
+            net::dhcp::start(nameserver);
+            true
+        }
+        Addressing::Dhcp { .. } => {
+            println!("net: no network card, so no address");
+            false
+        }
+        Addressing::Off => {
+            println!("net: no address");
+            false
+        }
+    };
+
+    // After init's pid, because the scheduler hands out process ids in order
+    // and a good deal of the system takes pid 1 to be init.
+    if nic {
+        net::start_task();
+        if options.nettest {
+            net::arptest::start();
+        }
+    }
+
+    if asking && init.is_ok() {
+        wait_for_address(&options.init);
+    }
+
+    match init {
+        Ok(task) => {
+            let pid = sched::register(task);
             sched::set_foreground(pid);
             println!("claudeos: starting {} as pid {}", options.init, pid);
         }
@@ -257,15 +342,6 @@ pub fn start(boot: &boot::BootInfo) -> ! {
             println!("claudeos: cannot start {}: {:?}", options.init, err);
             println!("claudeos: filesystem contents:");
             syscall::file::dump_tree("/", 1);
-        }
-    }
-
-    // After init, because the scheduler hands out process ids in order and a
-    // good deal of the system takes pid 1 to be init.
-    if nic {
-        net::start_task();
-        if options.nettest {
-            net::arptest::start();
         }
     }
 

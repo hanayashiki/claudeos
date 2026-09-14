@@ -428,6 +428,31 @@ after it writes one, because nothing on that chip snoops; and its link is a
 separate chip on a management bus, which has to negotiate before anything can
 be sent and has to be asked what it settled on.
 
+**Addresses.** With no `ip=` on the command line the kernel asks the network.
+An RFC 2131 DHCP client in the network task sends DISCOVER and REQUEST, takes
+the ACK, renews with the server that granted the lease at T1 and with any
+server at T2, and gives the address up when the lease runs out. It talks
+through an ordinary UDP socket on port 68; what lets that work before there is
+an address is that a machine with none may send a broadcast from 0.0.0.0, and
+takes nothing off the card but broadcasts. Init is held back until the first
+lease or for fifteen seconds, whichever comes first, so what it starts finds
+the network configured and a machine with no cable or no server still boots.
+The configuration -- address, netmask, gateway, name servers -- is replaced
+whole, and a machine without one holds none rather than an address of 0.0.0.0:
+a socket that needs an address before then gets ENETUNREACH. The name servers
+are written to `/etc/resolv.conf`.
+
+```
+dhcp: waiting up to 15 s for an address before starting /bin/init
+dhcp: 10.0.2.15/24 gateway 10.0.2.2 dns 10.0.2.3, lease 86400 s from 10.0.2.2
+```
+
+`ip=192.168.86.57` sets the address instead, and DHCP does not run. `netmask=`,
+`gateway=` and `nameserver=` go with it; a netmask left out is the one the
+address's class implies, as on Linux, and a gateway or name server left out is
+none. `nameserver=` without `ip=` replaces the name servers a lease names.
+`ip=off` leaves the machine with no address and nothing asking for one.
+
 ```
 $ ./scripts/run.sh --hostfwd tcp::8080-:8080 --initrd build/initramfs.cpio \
       --append 'init=/bin/inet serve 8080'
@@ -568,7 +593,7 @@ failures.
   them run a thread alongside a sibling failing an exec over and over, which is
   a smoke test for a race rather than proof of its absence.
 - The **network protocols** run against a card that only records what it is
-  asked to send: **145 checks** with frames handed in by hand and frames out
+  asked to send: **216 checks** with frames handed in by hand and frames out
   compared byte for byte. Above that sits a peer with a link in each direction
   that is told before the run what to do with each segment -- lose this one,
   hold that one back behind the next, deliver the one after twice, damage the
@@ -581,8 +606,14 @@ failures.
   than one does at full stretch; the timeout comes down from its opening guess
   once a round trip has been measured and stays doubled after one that was not;
   and a segment lost out of the middle of a 32 KiB stream is recovered by the
-  third acknowledgement that repeats, with the clock never waited out. On
-  aarch64 the same run adds the Pi's own Ethernet driver, for 216.
+  third acknowledgement that repeats, with the clock never waited out. The DHCP
+  client runs against the same card with its clock driven by hand: a lease
+  taken, renewed with its server at T1, rebound with everyone at T2 and given
+  up when it runs out, each message compared byte for byte; a NAK to a request
+  and to a renewal; offers whose option lengths are wrong in eight different
+  ways, none of them taken; and a parser fed every truncation of a good message
+  and every value of every length byte in it. On aarch64 the same run adds the
+  Pi's own Ethernet driver, for 287.
 - `tests/busybox.sh` runs **39 checks** against an upstream busybox binary that
   this project did not build: `awk`, `sed`, `tar` create and extract, `find`,
   `md5sum` and `sha256sum` (whose digests are compared against the ones the
@@ -695,9 +726,15 @@ bounded on any link whose delay and bandwidth multiply out past that, and no
 timestamps, so nothing guards against a sequence number wrapping and only one
 round trip at a time is being measured. There is no Nagle and no delayed
 acknowledgement: every segment goes as soon as there is a window for it and is
-answered as soon as it arrives. There is no DHCP and no resolver, so addresses
-come from the kernel command line. IPv4 only, and fragments are dropped rather
+answered as soon as it arrives. IPv4 only, and fragments are dropped rather
 than reassembled.
+
+Nothing in the kernel resolves names: the name servers a lease or `nameserver=`
+names are written to `/etc/resolv.conf` for programs with a resolver of their
+own. The DHCP client does not probe an offered address with ARP before taking
+it, does not reuse a lease after a reboot, and does not release its lease when
+the machine stops. A lease is kept while the link is down, so a cable moved to
+another network keeps the old address until the lease comes up for renewal.
 
 `sendmsg` drops the address a message names and sends on the descriptor
 instead, so it reaches a connected socket and nothing else: a datagram sent

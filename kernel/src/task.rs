@@ -1130,13 +1130,19 @@ pub extern "C" fn user_bootstrap() -> ! {
     unsafe { arch::return_to_user(task.trap_frame()) }
 }
 
-/// Create a task that will run `path` once scheduled.
-pub fn spawn(
+/// Build a task that will run `path`. Its pid is taken now; handing it to
+/// `sched::register` is what starts it, and a task built here has to be, or
+/// its address space and kernel stack are never given back.
+///
+/// The two are apart so the pid order and the start order can differ: init
+/// has to be pid 1, and at boot it is held back while the network task, which
+/// is pid 2, asks for an address.
+pub fn prepare(
     path: &str,
     argv: Vec<String>,
     envp: Vec<String>,
     parent_pid: u32,
-) -> Result<u32, Errno> {
+) -> Result<alloc::boxed::Box<Task>, Errno> {
     // Nothing owns the address space or the kernel stack until the task is
     // registered, so anything that goes wrong before then hands them back here
     // or they are held by nobody: dropping the task frees neither.
@@ -1155,7 +1161,7 @@ pub fn spawn(
     }
     task.set_pending_exec((path.to_string(), argv, envp));
     task.prepare_kernel_frame(user_bootstrap as extern "C" fn() -> ! as usize as u64);
-    Ok(crate::sched::register(task))
+    Ok(task)
 }
 
 pub struct TaskPtr(pub *mut Task);
