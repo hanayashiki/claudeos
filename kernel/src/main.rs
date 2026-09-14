@@ -76,6 +76,9 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
         }
         if let Some(value) = word.strip_prefix("init=") {
             options.init = value.to_string();
+        } else if word.starts_with("watchdog=") {
+            // The kernel's, and read by `reboot::configure` at the start of
+            // boot, before there is a heap; not a setting for init.
         } else if let Some(value) = word.strip_prefix("trace=") {
             options.trace = if value == "all" {
                 syscall::TRACE_ALL
@@ -131,6 +134,8 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
 pub fn start(boot: &boot::BootInfo) -> ! {
     println!();
     println!("claudeos: booting");
+    // First, so that the watchdog covers as much of boot as it can.
+    reboot::configure(boot.cmdline());
 
     arch::init_traps();
     trap::init();

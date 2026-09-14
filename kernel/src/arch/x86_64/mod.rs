@@ -484,3 +484,21 @@ unsafe fn settle() {
         io::io_wait();
     }
 }
+
+// ---------------------------------------------------------------------------
+// The watchdog
+// ---------------------------------------------------------------------------
+//
+// QEMU is not given a watchdog device for this machine, so there is nothing to
+// start, feed or stop. These are here because the portable half calls them on
+// every machine, and the board's are what they answer to.
+
+/// Start the machine's watchdog. There is none, which is the `None`.
+pub fn watchdog_start() -> Option<u32> {
+    None
+}
+
+#[inline]
+pub fn watchdog_feed() {}
+
+pub fn watchdog_stop() {}

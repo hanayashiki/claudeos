@@ -471,7 +471,7 @@ pub fn qemu_exit(_code: u32) -> ! {
 /// write to it for the write to count.
 ///
 /// Every register named below is the one Linux's `bcm2835_wdt.c` drives, and
-/// the reset and the halt below follow what that driver does.
+/// the reset, the halt and the watchdog below follow what that driver does.
 const POWER_MANAGEMENT: u64 = PERIPHERAL_BASE + 0x10_0000;
 const PM_PASSWORD: u32 = 0x5A00_0000;
 /// Which partition to come back up in, six bits spread over the even bits 0
@@ -480,14 +480,32 @@ const PM_PASSWORD: u32 = 0x5A00_0000;
 const PM_RSTS: u64 = 0x20;
 const RSTS_PARTITION_BOOT: u32 = 0;
 const RSTS_PARTITION_HALT: u32 = 0x555;
-/// The watchdog's countdown, in ticks of a 65 kHz clock.
+/// The watchdog's countdown, in ticks of a clock running at 65536 Hz. The
+/// field is the low twenty bits, so the longest countdown is just under
+/// sixteen seconds.
 const PM_WDOG: u64 = 0x24;
+const WDOG_TIME_MASK: u32 = 0x000F_FFFF;
+const WDOG_TICKS_PER_SECOND: u32 = 1 << 16;
 /// Reset control. Asking for a full reset here is how anything on this board
-/// restarts it; there is no way to cut the power from software.
+/// restarts it; there is no way to cut the power from software. The same
+/// setting is what makes the countdown above end in a reset, and writing
+/// `RSTC_RESET` in its place is how Linux stops the watchdog.
 const PM_RSTC: u64 = 0x1C;
 const RSTC_FULL_RESET: u32 = 0x20;
+const RSTC_RESET: u32 = 0x102;
 const RSTC_CONFIG_MASK: u32 = 0xFFFF_FFCF;
 const RSTS_PARTITION_MASK: u32 = 0xFFFF_FAAA;
+
+/// How long the watchdog waits without a feed before it resets the board.
+/// Fifteen seconds fits the twenty-bit countdown, and is long enough that no
+/// section of this kernel that masks interrupts on purpose comes near it.
+const WATCHDOG_SECONDS: u32 = 15;
+
+const _: () = assert!(WATCHDOG_SECONDS * WDOG_TICKS_PER_SECOND <= WDOG_TIME_MASK);
+
+/// Whether the watchdog was started, so that a feed never writes a countdown
+/// into a watchdog that `watchdog=off` or a stopped panic left alone.
+static WATCHDOG_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// The address of one of the power management registers.
 fn power_management(offset: u64) -> *mut u32 {
@@ -507,11 +525,16 @@ fn set_reset_partition(partition: u32) {
 
 /// Reset the board into `partition`, 150 microseconds from now.
 ///
-/// The partition is written first. A countdown already running when this is
-/// reached, and ending between two of these writes, resets into whatever
-/// partition the register holds at that moment; with the partition written
-/// first, that is the one asked for, so a halt cannot come back up as a
-/// restart or a restart stay halted.
+/// The partition is written first. The watchdog may already be counting down
+/// from its last feed when this is reached, and a countdown that ends between
+/// two of these writes resets into whatever partition the register holds at
+/// that moment; with the partition written first, that is the one asked for,
+/// so a halt cannot come back up as a restart or a restart stay halted.
+///
+/// Nothing can feed the watchdog after the countdown below is set, which would
+/// put the reset off by the length of a feed: interrupts are masked before the
+/// first write and never unmasked again, and a feed only comes from the timer
+/// interrupt or from the panic path that ends here.
 fn reset_into(partition: u32) -> ! {
     // The reset follows the request by 150 microseconds, and the port may
     // still hold up to 2.8 ms of the last line printed.
@@ -544,4 +567,72 @@ pub fn power_off() -> ! {
 /// again from wherever it came from.
 pub fn restart() -> ! {
     reset_into(RSTS_PARTITION_BOOT)
+}
+
+/// Start the board's watchdog, and say how many seconds without a feed it
+/// allows before it resets the board.
+///
+/// What it is fed from is the periodic timer interrupt, so what it catches is
+/// the kernel no longer taking that interrupt: stuck with interrupts masked on
+/// a lock nothing will release, looping inside the trap path, or stopped in a
+/// panic that did not reach its own restart. It does not catch a kernel that
+/// still takes the tick and gets nothing done, such as a scheduler that never
+/// picks the task that would make progress, or a shell that is wedged; the
+/// tick still arrives there, and the tick is all a feed is evidence of.
+///
+/// The expiry resets into the ordinary partition, so a board the watchdog
+/// restarts boots again rather than staying halted. The partition is written
+/// here because a halt leaves the halt partition in the register, and nothing
+/// promises that what the firmware does next clears it.
+///
+/// Started only when the device tree describes it, and nothing when there is
+/// no tree. The board's firmware always hands one over, and it has the node.
+/// QEMU's emulated Pi 4 hands over a tag list instead, and QEMU 11.1.1 does
+/// not count the watchdog down at all: it resets the machine on the write to
+/// reset control that starts it, so starting it there would restart every boot
+/// at this line. QEMU's development tree counts it down from commit
+/// 21fcfb604608, which the 11.1.1 stable release does not contain.
+pub fn watchdog_start() -> Option<u32> {
+    let node = fdt::find_compatible(b"brcm,bcm2835-pm-wdt")?;
+    if !node.enabled() {
+        return None;
+    }
+    set_reset_partition(RSTS_PARTITION_BOOT);
+    WATCHDOG_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+    watchdog_feed();
+    unsafe {
+        let control = core::ptr::read_volatile(power_management(PM_RSTC)) & RSTC_CONFIG_MASK;
+        core::ptr::write_volatile(
+            power_management(PM_RSTC),
+            PM_PASSWORD | control | RSTC_FULL_RESET,
+        );
+    }
+    Some(WATCHDOG_SECONDS)
+}
+
+/// Put the watchdog's countdown back to its full length. Does nothing if the
+/// watchdog was never started or has been stopped.
+///
+/// One register write, so there is nothing for an interrupt to split.
+#[inline]
+pub fn watchdog_feed() {
+    if !WATCHDOG_ARMED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    unsafe {
+        core::ptr::write_volatile(
+            power_management(PM_WDOG),
+            PM_PASSWORD | (WATCHDOG_SECONDS * WDOG_TICKS_PER_SECOND),
+        );
+    }
+}
+
+/// Stop the watchdog, whoever started it: this kernel, or firmware that left
+/// it running. For a debugger that holds the processor still, and for a panic
+/// that is meant to stay stopped.
+pub fn watchdog_stop() {
+    WATCHDOG_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        core::ptr::write_volatile(power_management(PM_RSTC), PM_PASSWORD | RSTC_RESET);
+    }
 }

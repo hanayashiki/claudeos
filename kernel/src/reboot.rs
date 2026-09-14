@@ -1,7 +1,42 @@
-//! Stopping and restarting the machine: the `reboot` system call.
+//! Stopping and restarting the machine: the `reboot` system call and the
+//! machine's watchdog.
+//!
+//! One word on the command line is read here. `watchdog=off` leaves the
+//! machine's watchdog stopped, which is what a processor held still in a
+//! debugger needs.
 
 use crate::abi::*;
 use crate::arch;
+
+/// Read `watchdog=` off the command line, and start the watchdog unless the
+/// line says not to.
+///
+/// Called first thing in boot, before there is a heap. That is why this reads
+/// the line itself rather than taking the result of `parse_cmdline`: the
+/// earlier the watchdog starts, the more of boot it covers.
+pub fn configure(cmdline: &str) {
+    let mut watchdog = true;
+    for word in cmdline.split_whitespace() {
+        // Every word after this one is init's.
+        if word == "--" {
+            break;
+        }
+        if word == "watchdog=off" {
+            watchdog = false;
+        }
+    }
+
+    if !watchdog {
+        // Stopped rather than only not started, in case whatever ran before
+        // this kernel left it running.
+        arch::watchdog_stop();
+        println!("watchdog: off");
+    } else if let Some(seconds) = arch::watchdog_start() {
+        println!("watchdog: resets the machine after {} s without a timer interrupt", seconds);
+    } else {
+        println!("watchdog: none found");
+    }
+}
 
 /// `reboot`: restart or stop the machine.
 ///

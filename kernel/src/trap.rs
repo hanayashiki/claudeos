@@ -23,6 +23,11 @@ pub fn ticks() -> u64 {
 }
 
 fn timer(frame: &mut TrapFrame) {
+    // While the kernel runs normally, this is the only place the machine's
+    // watchdog is fed, so the watchdog resets the machine when this interrupt
+    // stops arriving. `arch::watchdog_start` says what that does and does not
+    // catch.
+    arch::watchdog_feed();
     TICKS.fetch_add(1, Ordering::Relaxed);
     // When a tick is delivered varies by however long interrupts happened to
     // have been off, and on a machine with nothing else to do it is the only
