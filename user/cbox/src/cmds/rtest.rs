@@ -232,6 +232,38 @@ fn absent_numbers(report: &mut Report) {
     );
 }
 
+/// `reboot` with magic numbers it does not know, and with a command it does
+/// not know, is refused with EINVAL; the two commands that change nothing
+/// here are taken.
+///
+/// Every call carries a command that leaves the machine running even if the
+/// check it is there for were missing, because the machine is where this runs:
+/// a missing check shows as a zero where EINVAL was due.
+fn reboot_refuses_what_it_does_not_know(report: &mut Report) {
+    use crate::sys;
+    const EINVAL: i64 = -22;
+    const CAD_ON: u32 = 0x89ABCDEF;
+    const CAD_OFF: u32 = 0;
+    const MAGIC2C: u32 = 537993216;
+
+    let first = sys::reboot(0xfee1_dea0, sys::REBOOT_MAGIC2, CAD_OFF);
+    let second = sys::reboot(sys::REBOOT_MAGIC1, 0x1234_5678, CAD_OFF);
+    report.check(
+        "reboot refuses magic numbers it does not know",
+        first == EINVAL && second == EINVAL,
+        format!("wrong first {}, wrong second {}", first, second),
+    );
+
+    let unknown = sys::reboot(sys::REBOOT_MAGIC1, sys::REBOOT_MAGIC2, 0xDEAD_BEEF);
+    let on = sys::reboot(sys::REBOOT_MAGIC1, MAGIC2C, CAD_ON);
+    let off = sys::reboot(sys::REBOOT_MAGIC1, sys::REBOOT_MAGIC2, CAD_OFF);
+    report.check(
+        "reboot refuses a command it does not know and takes one it does",
+        unknown == EINVAL && on == 0 && off == 0,
+        format!("unknown {}, ctrl-alt-del on {}, off {}", unknown, on, off),
+    );
+}
+
 /// A thread of a child process is not a child of this one. It is given its
 /// process's parent as its own so that an orphan is adopted the same way, and
 /// a wait that matches on that alone hands back a task id this process never
@@ -1425,6 +1457,7 @@ pub fn main(_args: &[String]) -> i32 {
     println!();
     println!("-- system call numbers --");
     absent_numbers(&mut report);
+    reboot_refuses_what_it_does_not_know(&mut report);
 
     println!();
     println!("-- waiting on several things at once --");

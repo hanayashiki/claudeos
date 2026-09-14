@@ -56,6 +56,7 @@ mod numbers {
     pub const SYS_STATFS: u64 = 137;
     pub const SYS_TIMES: u64 = 100;
     pub const SYS_CLOCK_GETRES: u64 = 229;
+    pub const SYS_REBOOT: u64 = 169;
 
     /// `struct epoll_event` is declared packed on x86-64, so the 8-byte data
     /// word follows the 4-byte mask with no gap.
@@ -94,6 +95,7 @@ mod numbers {
     pub const SYS_STATFS: u64 = 43;
     pub const SYS_TIMES: u64 = 153;
     pub const SYS_CLOCK_GETRES: u64 = 114;
+    pub const SYS_REBOOT: u64 = 142;
 
     /// `struct epoll_event` is not packed here, so the data word is aligned to
     /// 8 and the structure is 16 bytes.
@@ -389,6 +391,20 @@ pub fn epoll_wait(epfd: i32, events: &mut [u8], timeout_ms: i64) -> i64 {
 
 pub fn sync() {
     unsafe { syscall0(SYS_SYNC) };
+}
+
+/// The first magic number `reboot` has to be given, and the first of the four
+/// second ones it accepts.
+pub const REBOOT_MAGIC1: u32 = 0xfee1dead;
+pub const REBOOT_MAGIC2: u32 = 672274793;
+pub const REBOOT_CMD_RESTART: u32 = 0x01234567;
+pub const REBOOT_CMD_HALT: u32 = 0xCDEF0123;
+pub const REBOOT_CMD_POWER_OFF: u32 = 0x4321FEDC;
+
+/// `reboot`, with the magic numbers as the caller gives them, so that a caller
+/// can hand the kernel ones it should refuse. Returns only when refused.
+pub fn reboot(magic1: u32, magic2: u32, command: u32) -> i64 {
+    unsafe { syscall3(SYS_REBOOT, magic1 as u64, magic2 as u64, command as u64) }
 }
 
 /// Wait for a child. Returns (pid, wait status).
