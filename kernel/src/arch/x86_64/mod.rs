@@ -423,3 +423,64 @@ pub fn power_off() -> ! {
         halt();
     }
 }
+
+/// The chipset's reset control register, on every Intel south bridge from the
+/// PIIX3 in QEMU's `pc` machine onwards. Bit 1 asks for a hard reset rather
+/// than a processor-only one; setting bit 2 is what starts it.
+const RESET_CONTROL: u16 = 0xCF9;
+/// The keyboard controller's command and status port. Status bit 1 is set
+/// while its input buffer holds a byte it has not taken yet, and command 0xFE
+/// pulses the line that resets the machine.
+const KEYBOARD_CONTROLLER: u16 = 0x64;
+
+/// Restart the machine.
+///
+/// Three ways, each reached only if the one before did not reset the machine.
+/// The reset control register is first: it is the chipset's own reset and asks
+/// nothing of any other device. The keyboard controller's reset line is next,
+/// because it is older and nearly universal on a PC, but it is a command to a
+/// controller that has to be idle to take it. A triple fault is last: a
+/// processor that faults while it cannot deliver the fault stops, and the
+/// board resets a stopped processor, so it needs nothing from the chipset, but
+/// it is the processor's reset rather than a request to the board's.
+///
+/// QEMU's `pc` machine answers each of the three with the same system reset,
+/// and `-no-reboot` turns that reset into QEMU exiting. The first is the one
+/// that does it there: the PIIX3 it emulates acts on bit 2 of 0xCF9 at once.
+pub fn restart() -> ! {
+    crate::serial::drain();
+    disable_interrupts();
+    unsafe {
+        io::outb(RESET_CONTROL, 0x02);
+        settle();
+        io::outb(RESET_CONTROL, 0x06);
+        settle();
+
+        for _ in 0..100_000 {
+            if io::inb(KEYBOARD_CONTROLLER) & 0x02 == 0 {
+                break;
+            }
+        }
+        io::outb(KEYBOARD_CONTROLLER, 0xFE);
+        settle();
+
+        // An interrupt table with no room for any entry. The breakpoint cannot
+        // be delivered through it, nor the general protection fault that says
+        // so, nor the double fault after that, and the third is a shutdown.
+        let empty = [0u8; 10];
+        asm!("lidt [{}]", "int3", in(reg) empty.as_ptr());
+    }
+    loop {
+        halt();
+    }
+}
+
+/// About fifty milliseconds on a real machine, for a reset request to take
+/// effect before the next one is tried. A write to port 0x80, the power-on
+/// self-test port, costs about a microsecond on a real bus and nothing listens
+/// to it.
+unsafe fn settle() {
+    for _ in 0..50_000 {
+        io::io_wait();
+    }
+}

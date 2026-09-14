@@ -469,12 +469,16 @@ pub fn qemu_exit(_code: u32) -> ! {
 
 /// The power management block, and the word that has to be in the top of every
 /// write to it for the write to count.
+///
+/// Every register named below is the one Linux's `bcm2835_wdt.c` drives, and
+/// the reset and the halt below follow what that driver does.
 const POWER_MANAGEMENT: u64 = PERIPHERAL_BASE + 0x10_0000;
 const PM_PASSWORD: u32 = 0x5A00_0000;
 /// Which partition to come back up in, six bits spread over the even bits 0
 /// to 10. Zero is the ordinary one and boots this kernel again. 63, all six
 /// bits set, is the one the board's boot firmware takes as "stay halted".
 const PM_RSTS: u64 = 0x20;
+const RSTS_PARTITION_BOOT: u32 = 0;
 const RSTS_PARTITION_HALT: u32 = 0x555;
 /// The watchdog's countdown, in ticks of a 65 kHz clock.
 const PM_WDOG: u64 = 0x24;
@@ -485,24 +489,59 @@ const RSTC_FULL_RESET: u32 = 0x20;
 const RSTC_CONFIG_MASK: u32 = 0xFFFF_FFCF;
 const RSTS_PARTITION_MASK: u32 = 0xFFFF_FAAA;
 
+/// The address of one of the power management registers.
+fn power_management(offset: u64) -> *mut u32 {
+    crate::mm::phys_to_virt(POWER_MANAGEMENT + offset) as *mut u32
+}
+
+/// Set the partition the next reset of any kind comes back up in.
+///
+/// Read and written back rather than written outright, because the rest of
+/// the register is status the firmware reads after the reset.
+fn set_reset_partition(partition: u32) {
+    unsafe {
+        let status = core::ptr::read_volatile(power_management(PM_RSTS)) & RSTS_PARTITION_MASK;
+        core::ptr::write_volatile(power_management(PM_RSTS), PM_PASSWORD | status | partition);
+    }
+}
+
+/// Reset the board into `partition`, 150 microseconds from now.
+///
+/// The partition is written first. A countdown already running when this is
+/// reached, and ending between two of these writes, resets into whatever
+/// partition the register holds at that moment; with the partition written
+/// first, that is the one asked for, so a halt cannot come back up as a
+/// restart or a restart stay halted.
+fn reset_into(partition: u32) -> ! {
+    // The reset follows the request by 150 microseconds, and the port may
+    // still hold up to 2.8 ms of the last line printed.
+    crate::serial::drain();
+    disable_interrupts();
+    set_reset_partition(partition);
+    unsafe {
+        core::ptr::write_volatile(power_management(PM_WDOG), PM_PASSWORD | 10);
+        let control = core::ptr::read_volatile(power_management(PM_RSTC)) & RSTC_CONFIG_MASK;
+        core::ptr::write_volatile(
+            power_management(PM_RSTC),
+            PM_PASSWORD | control | RSTC_FULL_RESET,
+        );
+    }
+    loop {
+        halt();
+    }
+}
+
 /// Stop the machine, by asking the watchdog for a reset into the halt
 /// partition, which the board's boot firmware takes as "stay stopped". There
 /// is no way to cut the power from software. This is what Linux does on every
 /// Raspberry Pi.
 pub fn power_off() -> ! {
-    // The reset follows the request by 150 microseconds, and the port may
-    // still hold up to 2.8 ms of the last line printed.
-    crate::serial::drain();
-    disable_interrupts();
-    unsafe {
-        let at = |offset: u64| crate::mm::phys_to_virt(POWER_MANAGEMENT + offset) as *mut u32;
-        let status = core::ptr::read_volatile(at(PM_RSTS)) & RSTS_PARTITION_MASK;
-        core::ptr::write_volatile(at(PM_RSTS), PM_PASSWORD | status | RSTS_PARTITION_HALT);
-        core::ptr::write_volatile(at(PM_WDOG), PM_PASSWORD | 10);
-        let control = core::ptr::read_volatile(at(PM_RSTC)) & RSTC_CONFIG_MASK;
-        core::ptr::write_volatile(at(PM_RSTC), PM_PASSWORD | control | RSTC_FULL_RESET);
-    }
-    loop {
-        halt();
-    }
+    reset_into(RSTS_PARTITION_HALT)
+}
+
+/// Restart the machine: the same reset as `power_off`, into the partition the
+/// firmware boots normally, which on this board fetches and starts a kernel
+/// again from wherever it came from.
+pub fn restart() -> ! {
+    reset_into(RSTS_PARTITION_BOOT)
 }
