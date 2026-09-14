@@ -301,6 +301,29 @@ pub fn sync(_args: &[String]) -> i32 {
     0
 }
 
+/// `reboot`, `halt` and `poweroff` ask the kernel directly. A Linux system's
+/// versions ask init to shut down first unless given `-f`; init here has
+/// nothing to shut down, so options are accepted and make no difference.
+pub fn reboot(args: &[String]) -> i32 {
+    ask_kernel(args, sys::REBOOT_CMD_RESTART)
+}
+
+pub fn halt(args: &[String]) -> i32 {
+    ask_kernel(args, sys::REBOOT_CMD_HALT)
+}
+
+pub fn poweroff(args: &[String]) -> i32 {
+    ask_kernel(args, sys::REBOOT_CMD_POWER_OFF)
+}
+
+fn ask_kernel(args: &[String], command: u32) -> i32 {
+    let rc = sys::reboot(sys::REBOOT_MAGIC1, sys::REBOOT_MAGIC2, command);
+    let program = args.first().map(|name| name.rsplit('/').next().unwrap_or(name));
+    let err = std::io::Error::from_raw_os_error((-rc) as i32);
+    eprintln!("{}: {}", program.unwrap_or("reboot"), super::describe(&err));
+    1
+}
+
 pub fn clear(_args: &[String]) -> i32 {
     print!("\x1b[2J\x1b[H");
     use std::io::Write;

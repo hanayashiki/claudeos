@@ -18,6 +18,7 @@ mod futex;
 mod mm;
 mod net;
 mod pci;
+mod reboot;
 mod rng;
 mod sched;
 mod signal;
@@ -75,6 +76,9 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
         }
         if let Some(value) = word.strip_prefix("init=") {
             options.init = value.to_string();
+        } else if word.starts_with("panic=") || word.starts_with("watchdog=") {
+            // The kernel's, and read by `reboot::configure` at the start of
+            // boot, before there is a heap; not a setting for init.
         } else if let Some(value) = word.strip_prefix("trace=") {
             options.trace = if value == "all" {
                 syscall::TRACE_ALL
@@ -130,6 +134,9 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
 pub fn start(boot: &boot::BootInfo) -> ! {
     println!();
     println!("claudeos: booting");
+    // First, so that the watchdog covers as much of boot as it can, and a
+    // panic from here on restarts the way the command line says.
+    reboot::configure(boot.cmdline());
 
     arch::init_traps();
     trap::init();
@@ -260,9 +267,21 @@ fn mount_initramfs(boot: &boot::BootInfo) {
     }
 }
 
+/// Set by the first panic.
+static PANICKING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     sync::disable_interrupts();
+    // A second panic is one raised by the code below, reporting the first.
+    // Running that code again would raise it again, so this one stops where
+    // it is, and on a machine with a watchdog the watchdog, which nothing
+    // feeds any more, restarts it.
+    if PANICKING.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        loop {
+            arch::halt();
+        }
+    }
     // Before the first print, because a panic reached while the console lock
     // or the log lock was held would otherwise spin for ever on it with
     // interrupts off and print nothing at all.
@@ -275,7 +294,5 @@ fn panic(info: &PanicInfo) -> ! {
         // places this could hang before it has said anything.
         println!("  in pid {}", sched::current().pid);
     }
-    loop {
-        arch::halt();
-    }
+    reboot::after_panic()
 }

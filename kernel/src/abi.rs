@@ -430,6 +430,19 @@ pub struct SysInfo {
     pub padding: [u8; 4],
 }
 
+// reboot(2): the two magic numbers every call has to carry, any one of the
+// four second ones, and the commands. From include/uapi/linux/reboot.h.
+pub const LINUX_REBOOT_MAGIC1: u32 = 0xfee1dead;
+pub const LINUX_REBOOT_MAGIC2: u32 = 672274793;
+pub const LINUX_REBOOT_MAGIC2A: u32 = 85072278;
+pub const LINUX_REBOOT_MAGIC2B: u32 = 369367448;
+pub const LINUX_REBOOT_MAGIC2C: u32 = 537993216;
+pub const LINUX_REBOOT_CMD_RESTART: u32 = 0x01234567;
+pub const LINUX_REBOOT_CMD_HALT: u32 = 0xCDEF0123;
+pub const LINUX_REBOOT_CMD_CAD_ON: u32 = 0x89ABCDEF;
+pub const LINUX_REBOOT_CMD_CAD_OFF: u32 = 0x00000000;
+pub const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321FEDC;
+
 // ---------------------------------------------------------------------------
 // The layouts and flag values the architecture chooses
 //

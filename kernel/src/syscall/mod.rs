@@ -230,6 +230,9 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::RSEQ => Err(Errno::ENOSYS),
         nr::PRCTL => Ok(0),
         nr::UNAME => proc::uname(args[0]),
+        // The arguments are `int`s, so only the low half of each register is
+        // the value, as on Linux.
+        nr::REBOOT => crate::reboot::reboot(args[0] as u32, args[1] as u32, args[2] as u32),
         nr::SYSINFO => proc::sysinfo(args[0]),
         nr::GETRLIMIT => proc::getrlimit(args[0], args[1]),
         nr::SETRLIMIT => Ok(0),
@@ -450,6 +453,7 @@ pub fn name_of(number: u64) -> &'static str {
         nr::FSTATFS => "fstatfs",
         nr::SYSINFO => "sysinfo",
         nr::GETRUSAGE => "getrusage",
+        nr::REBOOT => "reboot",
         _ => "?",
     }
 }
