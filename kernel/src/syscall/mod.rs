@@ -305,8 +305,12 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
             args[4],
             args[5],
         ),
-        nr::SENDMSG => file::sendmsg(args[0] as i32, args[1]),
-        nr::RECVMSG => file::recvmsg(args[0] as i32, args[1]),
+        nr::SENDMSG => net::sendmsg(args[0] as i32, args[1], args[2] as u32),
+        nr::RECVMSG => net::recvmsg(args[0] as i32, args[1], args[2] as u32),
+        nr::SENDMMSG => net::sendmmsg(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
+        nr::RECVMMSG => {
+            net::recvmmsg(args[0] as i32, args[1], args[2] as u32, args[3] as u32, args[4])
+        }
         nr::SHUTDOWN => net::shutdown(args[0] as i32, args[1] as u32),
         nr::SETSOCKOPT => net::setsockopt(
             args[0] as i32,
@@ -444,6 +448,8 @@ pub fn name_of(number: u64) -> &'static str {
         nr::CLOCK_NANOSLEEP => "clock_nanosleep",
         nr::SENDMSG => "sendmsg",
         nr::RECVMSG => "recvmsg",
+        nr::SENDMMSG => "sendmmsg",
+        nr::RECVMMSG => "recvmmsg",
         nr::SOCKETPAIR => "socketpair",
         nr::PPOLL => "ppoll",
         nr::PSELECT6 => "pselect6",

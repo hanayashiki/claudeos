@@ -63,7 +63,7 @@ use numbers::*;
 // clobbers nothing else.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn syscall(n: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> i64 {
+pub unsafe fn syscall(n: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> i64 {
     let ret: i64;
     asm!("syscall", inlateout("rax") n as i64 => ret, in("rdi") a, in("rsi") b,
          in("rdx") c, in("r10") d, in("r8") e, in("r9") f,
@@ -73,7 +73,7 @@ unsafe fn syscall(n: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> i64
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn syscall(n: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> i64 {
+pub unsafe fn syscall(n: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> i64 {
     let ret: i64;
     asm!("svc #0", in("x8") n, inlateout("x0") a => ret, in("x1") b, in("x2") c,
          in("x3") d, in("x4") e, in("x5") f, options(nostack));

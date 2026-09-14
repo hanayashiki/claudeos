@@ -42,6 +42,19 @@ impl core::fmt::Display for Endpoint {
     }
 }
 
+/// What one receive took from a socket.
+pub struct Received {
+    /// Bytes copied into the buffer.
+    pub taken: usize,
+    /// How long what they were taken from was. For a datagram this is its
+    /// whole length, more than `taken` when the buffer was too small and the
+    /// rest was discarded; for a stream it is `taken`.
+    pub length: usize,
+    /// Who sent a datagram. A stream's bytes come from the other end of its
+    /// connection, and a receive on one names nobody, as on Linux.
+    pub from: Option<Endpoint>,
+}
+
 pub enum Protocol {
     Tcp(Tcb),
     Udp(UdpState),
@@ -333,13 +346,12 @@ impl InetSocket {
         }
     }
 
-    /// Returns the bytes taken and, for a datagram socket, where they came
-    /// from.
-    pub fn receive_into(&self, buf: &mut [u8], peek: bool) -> Result<(usize, Endpoint), Errno> {
+    /// Take what there is to read into `buf`, and say what was taken and, for
+    /// a datagram, who sent it.
+    pub fn receive_into(&self, buf: &mut [u8], peek: bool) -> Result<Received, Errno> {
         match &mut *self.inner.lock() {
             Protocol::Tcp(tcb) => {
-                let remote = tcb.remote;
-                tcb.read(buf, peek).map(|n| (n, remote))
+                tcb.read(buf, peek).map(|n| Received { taken: n, length: n, from: None })
             }
             Protocol::Udp(state) => state.receive(buf, peek),
         }
@@ -379,7 +391,7 @@ impl InetSocket {
         buf: &mut [u8],
         nonblock: bool,
         peek: bool,
-    ) -> Result<(usize, Endpoint), Errno> {
+    ) -> Result<Received, Errno> {
         super::poll();
         loop {
             match self.receive_into(buf, peek) {

@@ -1,7 +1,7 @@
 //! UDP: ports over IPv4, and one queue of whole datagrams per socket.
 
 use super::ip::{self, Ipv4Addr};
-use super::socket::Endpoint;
+use super::socket::{Endpoint, Received};
 use crate::abi::Errno;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -63,24 +63,26 @@ impl UdpState {
     }
 
     /// One whole datagram, truncated to the buffer offered. What does not fit
-    /// is discarded, which is what a datagram socket does.
-    pub fn receive(&mut self, buf: &mut [u8], peek: bool) -> Result<(usize, Endpoint), Errno> {
+    /// is discarded, which is what a datagram socket does; the length the
+    /// datagram had is reported all the same, so the caller can say it was cut
+    /// short.
+    pub fn receive(&mut self, buf: &mut [u8], peek: bool) -> Result<Received, Errno> {
         let Some((from, data)) = self.queue.front() else {
             if self.read_shutdown {
                 // Linux reports the end here rather than waiting for a
                 // datagram that nobody would be able to read.
-                return Ok((0, Endpoint::UNSPECIFIED));
+                return Ok(Received { taken: 0, length: 0, from: None });
             }
             return Err(Errno::EAGAIN);
         };
         let n = buf.len().min(data.len());
         buf[..n].copy_from_slice(&data[..n]);
-        let from = *from;
+        let received = Received { taken: n, length: data.len(), from: Some(*from) };
         if !peek {
             let (_, data) = self.queue.pop_front().expect("checked above");
             self.queued_bytes -= data.len();
         }
-        Ok((n, from))
+        Ok(received)
     }
 
     pub fn send(&mut self, buf: &[u8], to: Option<Endpoint>) -> Result<usize, Errno> {

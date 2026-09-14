@@ -828,7 +828,7 @@ impl OpenFile {
             FileBacking::Inet(handle) => handle
                 .socket
                 .read_blocking(buf, self.flags() & O_NONBLOCK != 0, false)
-                .map(|(n, _)| n),
+                .map(|received| received.taken),
             FileBacking::Epoll(_) => Err(Errno::EINVAL),
         }
     }
