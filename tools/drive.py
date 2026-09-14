@@ -68,6 +68,12 @@ class Screen:
                 self.column = 0
             elif byte == 0x08:
                 self.column = max(0, self.column - 1)
+            elif byte == 0x09:
+                # A tab moves the cursor to the next stop, every eight columns,
+                # without writing over what it passes, as a terminal does. It
+                # was drawn as a '.' before, so output such as nslookup's
+                # "Name:<tab>example.com" never matched a pattern with a space.
+                self.column = (self.column // 8 + 1) * 8
             elif byte == 0x07:
                 pass
             else:

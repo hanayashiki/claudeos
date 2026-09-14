@@ -27,8 +27,10 @@ TEXT takes backslash escapes: \x03 is Ctrl-C and \x7f is backspace. --log also
 prints the kernel log sent on connect, and --timestamps puts the seconds since
 connecting in front of every line.
 
-HOST is the board's address. Without one, the Mac's ARP table is searched for
-a Raspberry Pi's hardware address, which begins dc:a6:32.
+HOST is the board's address. Without one, every Raspberry Pi in the Mac's ARP
+table, a hardware address beginning dc:a6:32, is tried at once, and the first
+that accepts a connection is used. The table can hold a stale entry for an
+address the board no longer has, such as its Ethernet one while it is on WiFi.
 
 Exit status: 0 when every step finished; 1 when an --until timed out; 2 when
 there was no host to connect to; 3 when the console was busy; 4 when the
@@ -94,19 +96,60 @@ def raspberry_pis(arp_output):
     return found
 
 
-def discover():
+def discover(port, receive_buffer):
+    """Connect to the Raspberry Pi in the ARP table that answers on `port`, and
+    return its address and the connected socket.
+
+    The table can hold more than one entry for the same board: one for each
+    network card it has had an address on, such as its Ethernet and its WiFi,
+    and an entry outlives the address it records by many minutes. So every
+    candidate is tried at once, and the first that accepts a connection is the
+    one kept. The connection made here is the session's own, rather than a
+    probe closed and then made again, because the console takes one connection
+    at a time and a probe's close might not have reached the board when the
+    second connection arrives, which would then be turned away as busy.
+    """
     try:
         output = subprocess.run(["arp", "-an"], capture_output=True, text=True,
                                 timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
         output = ""
     pis = raspberry_pis(output)
-    if len(pis) == 1:
-        address, hardware = pis[0]
-        sys.stderr.write("console.py: the Raspberry Pi in the ARP table is %s (%s)\n"
-                         % (address, hardware))
-        return address
-    if not pis:
+    if pis:
+        attempts = []
+        for address, hardware in pis:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if receive_buffer:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
+            sock.setblocking(False)
+            sock.connect_ex((address, port))
+            attempts.append((sock, address, hardware))
+        pending = list(attempts)
+        chosen = None
+        deadline = time.time() + 5
+        while pending and chosen is None and time.time() < deadline:
+            writable = select.select([], [a[0] for a in pending], [],
+                                     max(deadline - time.time(), 0))[1]
+            for attempt in [a for a in pending if a[0] in writable]:
+                pending.remove(attempt)
+                if attempt[0].getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
+                    chosen = attempt
+                    break
+        for attempt in attempts:
+            if attempt is not chosen:
+                attempt[0].close()
+        if chosen is not None:
+            sock, address, hardware = chosen
+            sock.setblocking(True)
+            sys.stderr.write("console.py: the Raspberry Pi answering on port %d is %s (%s)\n"
+                             % (port, address, hardware))
+            return address, sock
+        fail(2, "none of the Raspberry Pis in this Mac's ARP table answers on port %d: %s\n"
+                "Give the board's address instead: scripts/console.py 192.168.1.23\n"
+                "The board prints it on the serial console at boot, on the line "
+                "beginning 'telnet: the console is on'."
+                % (port, ", ".join("%s (%s)" % pi for pi in pis)))
+    else:
         fail(2, "no Raspberry Pi, a hardware address beginning dc:a6:32, is in this "
                 "Mac's ARP table.\n"
                 "Give the board's address instead: scripts/console.py 192.168.1.23\n"
@@ -115,8 +158,6 @@ def discover():
                 "among its leases. The ARP table holds the board only after this Mac "
                 "has exchanged packets with it, so pinging that address also puts it "
                 "there.")
-    fail(2, "more than one Raspberry Pi is in the ARP table; give one of these "
-            "addresses: " + ", ".join("%s (%s)" % pi for pi in pis))
 
 
 # ---- the protocol -----------------------------------------------------------
@@ -433,8 +474,10 @@ def main():
     parser.set_defaults(steps=[])
     args = parser.parse_args()
 
-    host = args.host or discover()
-    sock = connect(host, args.port, args.receive_buffer)
+    if args.host:
+        host, sock = args.host, connect(args.host, args.port, args.receive_buffer)
+    else:
+        host, sock = discover(args.port, args.receive_buffer)
     telnet = Telnet(sock)
     if args.steps:
         return scripted(sock, telnet, args)
