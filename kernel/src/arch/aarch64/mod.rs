@@ -365,6 +365,11 @@ pub fn console_try_write_byte(byte: u8) -> bool {
     uart::try_write_byte(byte)
 }
 
+/// Whether every byte written has left the transmitter.
+pub fn console_tx_idle() -> bool {
+    uart::tx_idle()
+}
+
 pub fn console_read_byte() -> Option<u8> {
     uart::read_byte()
 }
@@ -466,8 +471,11 @@ pub fn qemu_exit(_code: u32) -> ! {
 /// write to it for the write to count.
 const POWER_MANAGEMENT: u64 = PERIPHERAL_BASE + 0x10_0000;
 const PM_PASSWORD: u32 = 0x5A00_0000;
-/// Which partition to come back up in; zero is the ordinary one.
+/// Which partition to come back up in, six bits spread over the even bits 0
+/// to 10. Zero is the ordinary one and boots this kernel again. 63, all six
+/// bits set, is the one the board's boot firmware takes as "stay halted".
 const PM_RSTS: u64 = 0x20;
+const RSTS_PARTITION_HALT: u32 = 0x555;
 /// The watchdog's countdown, in ticks of a 65 kHz clock.
 const PM_WDOG: u64 = 0x24;
 /// Reset control. Asking for a full reset here is how anything on this board
@@ -477,15 +485,19 @@ const RSTC_FULL_RESET: u32 = 0x20;
 const RSTC_CONFIG_MASK: u32 = 0xFFFF_FFCF;
 const RSTS_PARTITION_MASK: u32 = 0xFFFF_FAAA;
 
-/// Stop the machine, by asking the watchdog to restart it and then not being
-/// there when it does. A board told not to reboot stops instead, which is what
-/// a finished test wants.
+/// Stop the machine, by asking the watchdog for a reset into the halt
+/// partition, which the board's boot firmware takes as "stay stopped". There
+/// is no way to cut the power from software. This is what Linux does on every
+/// Raspberry Pi.
 pub fn power_off() -> ! {
+    // The reset follows the request by 150 microseconds, and the port may
+    // still hold up to 2.8 ms of the last line printed.
+    crate::serial::drain();
     disable_interrupts();
     unsafe {
         let at = |offset: u64| crate::mm::phys_to_virt(POWER_MANAGEMENT + offset) as *mut u32;
-        let partition = core::ptr::read_volatile(at(PM_RSTS)) & RSTS_PARTITION_MASK;
-        core::ptr::write_volatile(at(PM_RSTS), PM_PASSWORD | partition);
+        let status = core::ptr::read_volatile(at(PM_RSTS)) & RSTS_PARTITION_MASK;
+        core::ptr::write_volatile(at(PM_RSTS), PM_PASSWORD | status | RSTS_PARTITION_HALT);
         core::ptr::write_volatile(at(PM_WDOG), PM_PASSWORD | 10);
         let control = core::ptr::read_volatile(at(PM_RSTC)) & RSTC_CONFIG_MASK;
         core::ptr::write_volatile(at(PM_RSTC), PM_PASSWORD | control | RSTC_FULL_RESET);

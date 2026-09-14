@@ -61,6 +61,23 @@ fn put(byte: u8) {
 
 pub static SERIAL: Spinlock<Console> = Spinlock::new(Console);
 
+/// Wait for what has been written to leave the port, for at most as long as
+/// `CHUNK` bytes that each wait the full `TX_ATTEMPTS`.
+///
+/// For the moment before the machine stops. A write only puts bytes in the
+/// port's own buffer. The board resets 150 microseconds after it is asked to,
+/// and a full buffer takes 2.8 ms to send, so without this the last line
+/// printed before a power off is cut off partway through.
+pub fn drain() {
+    let _console = SERIAL.lock();
+    for _ in 0..TX_ATTEMPTS * CHUNK as u32 {
+        if crate::arch::console_tx_idle() {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// The most bytes written under one hold of the console lock.
 ///
 /// The lock masks interrupts for as long as it is held, and the port waits for

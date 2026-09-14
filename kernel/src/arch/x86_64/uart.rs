@@ -48,6 +48,12 @@ pub fn try_write_byte(byte: u8) -> bool {
     true
 }
 
+/// Say whether every byte handed to the transmitter has left on the wire: the
+/// holding register and the shift register behind it are both empty.
+pub fn tx_idle() -> bool {
+    unsafe { inb(COM1 + 5) & 0x40 != 0 }
+}
+
 fn data_ready() -> bool {
     unsafe { inb(COM1 + 5) & 1 != 0 }
 }

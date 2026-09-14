@@ -13,7 +13,8 @@ use crate::mm::phys_to_virt;
 pub const UART0: u64 = PERIPHERAL_BASE + 0x20_1000;
 
 const DR: u64 = 0x00;
-/// Flags: bit 4 is "nothing to read", bit 5 is "no room to write".
+/// Flags: bit 3 is "still sending", bit 4 is "nothing to read", bit 5 is "no
+/// room to write", bit 7 is "nothing waiting to send".
 const FR: u64 = 0x18;
 const IBRD: u64 = 0x24;
 const FBRD: u64 = 0x28;
@@ -22,8 +23,10 @@ const CR: u64 = 0x30;
 const IMSC: u64 = 0x38;
 const ICR: u64 = 0x44;
 
+const TX_BUSY: u32 = 1 << 3;
 const RX_EMPTY: u32 = 1 << 4;
 const TX_FULL: u32 = 1 << 5;
+const TX_EMPTY: u32 = 1 << 7;
 
 /// The pin controller.
 const GPIO: u64 = PERIPHERAL_BASE + 0x20_0000;
@@ -114,6 +117,15 @@ pub fn try_write_byte(byte: u8) -> bool {
         write(DR, byte as u32);
     }
     true
+}
+
+/// Say whether every byte handed to the transmitter has left on the wire.
+/// "Nothing waiting to send" alone is not enough: the byte being shifted out
+/// has already left the FIFO, and "still sending" stays set until its stop
+/// bit is done.
+pub fn tx_idle() -> bool {
+    let flags = unsafe { read(FR) };
+    flags & TX_EMPTY != 0 && flags & TX_BUSY == 0
 }
 
 pub fn read_byte() -> Option<u8> {

@@ -13,7 +13,8 @@ pub fn main(args: &[String]) -> i32 {
     }
     let _ = std::env::set_current_dir("/root");
 
-    // Anything after "--" on the kernel command line is run instead of a shell.
+    // An argument from the kernel command line names a script to run instead
+    // of a shell.
     let script: Option<&String> = args.iter().skip(1).find(|a| !a.starts_with('-'));
 
     let mut restarts = 0;

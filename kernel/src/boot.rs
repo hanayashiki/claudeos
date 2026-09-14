@@ -48,9 +48,10 @@ impl Module {
 pub const MAX_REGIONS: usize = 32;
 pub const MAX_MODULES: usize = 8;
 pub const MAX_RESERVED: usize = 16;
-/// Long enough for a loader that puts the kernel's own path in front of the
-/// arguments, which is what multiboot does.
-pub const CMDLINE_MAX: usize = 512;
+/// The same length Linux accepts on arm64. The Raspberry Pi firmware puts a
+/// few hundred bytes of its own settings in front of cmdline.txt, so a shorter
+/// limit cuts off the end of the line, which is the part that came from us.
+pub const CMDLINE_MAX: usize = 2048;
 
 pub struct BootInfo {
     regions: [MemRegion; MAX_REGIONS],

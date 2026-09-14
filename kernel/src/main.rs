@@ -47,7 +47,11 @@ struct BootOptions {
     /// protocols do about loss can be seen on the real card path. Zero is
     /// off, and it is zero unless the command line says otherwise.
     net_loss: u32,
+    /// Arguments for init, after its own path.
     args: Vec<String>,
+    /// Init's environment: a fixed set, with any `name=value` word the kernel
+    /// does not use added or replacing the entry of the same name.
+    env: Vec<String>,
 }
 
 fn parse_cmdline(cmdline: &str) -> BootOptions {
@@ -59,8 +63,16 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
         net_test: false,
         net_loss: 0,
         args: Vec::new(),
+        env: ["PATH=/bin:/usr/bin", "HOME=/root", "TERM=linux", "USER=root", "PWD=/"]
+            .iter()
+            .map(|entry| entry.to_string())
+            .collect(),
     };
-    for word in cmdline.split_whitespace() {
+    let mut words = cmdline.split_whitespace();
+    for word in words.by_ref() {
+        if word == "--" {
+            break;
+        }
         if let Some(value) = word.strip_prefix("init=") {
             options.init = value.to_string();
         } else if let Some(value) = word.strip_prefix("trace=") {
@@ -93,11 +105,23 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
             if let Some(address) = net::ip::parse_address(value) {
                 options.net.nameserver = address;
             }
+        } else if let Some((name, _)) = word.split_once('=') {
+            // A setting the kernel does not use. Linux puts these in init's
+            // environment and ignores names with a dot, which are settings
+            // for its own modules. The Raspberry Pi firmware puts several of
+            // both in front of cmdline.txt, such as coherent_pool=1M and
+            // 8250.nr_uarts=1, and none of them is meant for init.
+            if !name.is_empty() && !name.contains('.') {
+                let prefix = alloc::format!("{}=", name);
+                options.env.retain(|entry| !entry.starts_with(&prefix));
+                options.env.push(word.to_string());
+            }
         } else {
-            // Anything else is handed to the init process as an argument.
             options.args.push(word.to_string());
         }
     }
+    // After "--" every word is an argument to init, whatever it looks like.
+    options.args.extend(words.map(|word| word.to_string()));
     options
 }
 
@@ -122,6 +146,9 @@ pub fn start(boot: &boot::BootInfo) -> ! {
     );
 
     // Parsing needs the heap, so it cannot happen any earlier than this.
+    // Printed whole, because on the board most of it is written by the
+    // firmware and this is the only place it can be seen.
+    println!("command line: {}", boot.cmdline());
     let options = parse_cmdline(boot.cmdline());
 
     arch::init_interrupt_controller();
@@ -182,13 +209,7 @@ pub fn start(boot: &boot::BootInfo) -> ! {
 
     let mut argv = alloc::vec![options.init.clone()];
     argv.extend(options.args.iter().cloned());
-    let envp = alloc::vec![
-        "PATH=/bin:/usr/bin".to_string(),
-        "HOME=/root".to_string(),
-        "TERM=linux".to_string(),
-        "USER=root".to_string(),
-        "PWD=/".to_string(),
-    ];
+    let envp = options.env.clone();
 
     match task::spawn(&options.init, argv, envp, 0) {
         Ok(pid) => {

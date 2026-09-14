@@ -251,6 +251,11 @@ pub fn console_try_write_byte(byte: u8) -> bool {
     uart::try_write_byte(byte)
 }
 
+/// Whether every byte written has left the transmitter.
+pub fn console_tx_idle() -> bool {
+    uart::tx_idle()
+}
+
 pub fn console_read_byte() -> Option<u8> {
     uart::read_byte()
 }
@@ -406,6 +411,7 @@ pub fn qemu_exit(code: u32) -> ! {
 /// Shut the machine down. Tries the ACPI sleep register QEMU exposes, then the
 /// debug-exit device, then simply stops.
 pub fn power_off() -> ! {
+    crate::serial::drain();
     unsafe {
         io::outw(0x604, 0x2000); // QEMU / modern ACPI
         io::outw(0xB004, 0x2000); // older QEMU
