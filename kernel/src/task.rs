@@ -23,7 +23,7 @@ use crate::sync::{NoInterrupts, Spinlock};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::Cell;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const KERNEL_STACK_SIZE: usize = 32 * 1024;
 
@@ -184,7 +184,16 @@ pub struct Task {
     pub set_child_tid: Cell<u64>,
     pub robust_list: Cell<u64>,
 
-    pub pending_signals: Cell<u64>,
+    /// Signals raised on this task and not yet taken, one bit each.
+    ///
+    /// An atomic rather than a cell, and private, so that the only changes
+    /// are a single `fetch_or` or `fetch_and`. Interrupts raise signals: the
+    /// tick for an interval timer, the console for the interrupt key. They can
+    /// land in the middle of a system call that is taking a signal off the
+    /// same set. When a change was a read, an or or an and, and a write, an
+    /// interrupt between the read and the write had its signal written over
+    /// with the copy that was read before it arrived, and the signal was lost.
+    pending_signals: AtomicU64,
     /// The scheduling nice value. Round robin does not act on it, but a
     /// program that sets it reads it back.
     pub nice: Cell<i32>,
@@ -197,7 +206,10 @@ pub struct Task {
     /// entry each, so that a fork copies it in one move the way the plain
     /// field did. `as_slice_of_cells` gives the entries back one at a time.
     signal_actions: Cell<[crate::signal::SigAction; 64]>,
-    pub signal_mask: Cell<u64>,
+    /// The signals this task blocks. Atomic and private for the same reason as
+    /// the pending set: delivering a handler from the timer tick blocks
+    /// signals, and so does the task in its own system calls.
+    blocked_signals: AtomicU64,
     /// The stack a handler whose disposition says `SA_ONSTACK` runs on.
     /// Per-thread: a thread that shares its siblings' stack would have two
     /// handlers writing over each other, so a `CLONE_VM` child starts without
@@ -278,13 +290,13 @@ impl Task {
             clear_child_tid: Cell::new(0),
             set_child_tid: Cell::new(0),
             robust_list: Cell::new(0),
-            pending_signals: Cell::new(0),
+            pending_signals: AtomicU64::new(0),
             nice: Cell::new(0),
             stop_signal: Cell::new(None),
             report_stop: Cell::new(false),
             report_continue: Cell::new(false),
             signal_actions: Cell::new([crate::signal::SigAction::default(); 64]),
-            signal_mask: Cell::new(0),
+            blocked_signals: AtomicU64::new(0),
             sig_stack: Cell::new(crate::abi::SigAltStack::default()),
             itimers: Arc::new(Spinlock::new(crate::itimer::IntervalTimers::default())),
             wake_at: Cell::new(0),
@@ -353,17 +365,51 @@ impl Task {
         self.sig_stack.set(crate::abi::SigAltStack::default());
     }
 
-    /// Add and remove signals from the pending set. Every caller is a read,
-    /// an or or an and, and a write, which is what the plain field was.
+    /// The signals pending on this task, as one reading.
+    pub fn pending(&self) -> u64 {
+        self.pending_signals.load(Ordering::Acquire)
+    }
+
+    /// Add signals to the pending set, in one step.
     pub fn add_pending(&self, signals: u64) {
-        self.pending_signals.set(self.pending_signals.get() | signals);
+        self.pending_signals.fetch_or(signals, Ordering::AcqRel);
     }
 
+    /// Remove signals from the pending set, in one step.
     pub fn drop_pending(&self, signals: u64) {
-        self.pending_signals.set(self.pending_signals.get() & !signals);
+        self.pending_signals.fetch_and(!signals, Ordering::AcqRel);
     }
 
-    /// Run `f` on the registers a context switch carries by hand.
+    /// Remove `signals` from the pending set and return which of them were in
+    /// it, in one step. A delivery takes its signal this way, so that two
+    /// deliveries cannot both find the same bit and both act on it, and a bit
+    /// raised again after the take stays raised.
+    pub fn take_pending(&self, signals: u64) -> u64 {
+        self.pending_signals.fetch_and(!signals, Ordering::AcqRel) & signals
+    }
+
+    /// The signals this task blocks, as one reading.
+    pub fn blocked(&self) -> u64 {
+        self.blocked_signals.load(Ordering::Acquire)
+    }
+
+    /// Block more signals, in one step.
+    pub fn block(&self, signals: u64) {
+        self.blocked_signals.fetch_or(signals, Ordering::AcqRel);
+    }
+
+    /// Unblock signals, in one step.
+    pub fn unblock(&self, signals: u64) {
+        self.blocked_signals.fetch_and(!signals, Ordering::AcqRel);
+    }
+
+    /// Replace the blocked set.
+    pub fn set_blocked(&self, signals: u64) {
+        self.blocked_signals.store(signals, Ordering::Release);
+    }
+
+    /// Run `f` on the registers a context switch carries by hand, with
+    /// interrupts off.
     ///
     /// Reached through the cell's own pointer rather than by copying the value
     /// out and back: on one of the two machines this is half a kilobyte of
@@ -371,8 +417,15 @@ impl Task {
     /// what a shared reference to a cell yields for exactly this, and nothing
     /// holds a reference into this one -- the field is private and this is the
     /// only way to reach it.
+    ///
+    /// Interrupts are off because a switch away from the running task copies
+    /// the processor's registers into this record. Several callers change the
+    /// record and then load it into the processor: exec clearing the registers
+    /// for the new program, sigreturn putting back the ones a handler
+    /// interrupted. A tick between the two copied the old registers over the
+    /// record that had just been changed, and they were what got loaded.
     pub fn with_cpu<R>(&self, f: impl FnOnce(&mut TaskContext) -> R) -> R {
-        f(unsafe { &mut *self.cpu.as_ptr() })
+        crate::sync::without_interrupts(|_| f(unsafe { &mut *self.cpu.as_ptr() }))
     }
 
     /// Record that the task has been switched away from at least once, so it

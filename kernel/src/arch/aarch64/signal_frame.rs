@@ -215,7 +215,7 @@ pub fn enter_signal_handler(
     put64(&mut buf, UC_STACK, alt.ss_sp);
     put64(&mut buf, UC_STACK + 8, alt.flags_at(frame.sp) as u32 as u64);
     put64(&mut buf, UC_STACK + 16, alt.ss_size);
-    put64(&mut buf, UC_SIGMASK, task.signal_mask.get());
+    put64(&mut buf, UC_SIGMASK, task.blocked());
 
     put64(&mut buf, SC_FAULT_ADDRESS, frame.far);
     for (i, value) in frame.x.iter().enumerate() {
@@ -252,9 +252,9 @@ pub fn enter_signal_handler(
     }
 
     // Block this signal for the duration of the handler unless asked not to.
-    task.signal_mask.set(task.signal_mask.get() | action.mask);
+    task.block(action.mask);
     if action.flags & SA_NODEFER == 0 {
-        task.signal_mask.set(task.signal_mask.get() | signal.bit());
+        task.block(signal.bit());
     }
 
     frame.elr = action.handler;
@@ -291,7 +291,7 @@ pub fn leave_signal_handler(task: &Task, frame: &mut TrapFrame) -> SysResult {
     // exceptions are masked, and neither is a program's to choose.
     frame.spsr = get64(&buf, SC_PSTATE) & 0xF000_0000;
 
-    task.signal_mask.set(get64(&buf, UC_SIGMASK));
+    task.set_blocked(get64(&buf, UC_SIGMASK));
     restore_alt_stack(task, &buf, base);
 
     // Put the interrupted code's vector registers back, if the record saying

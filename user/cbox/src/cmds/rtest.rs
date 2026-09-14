@@ -1483,6 +1483,80 @@ fn interval_timers(report: &mut Report) {
     }
 }
 
+static STRESS_PROFILE: AtomicUsize = AtomicUsize::new(0);
+static STRESS_RAISED: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn count_stress_signal(signum: i32) {
+    if signum == SIGPROF {
+        STRESS_PROFILE.fetch_add(1, Ordering::SeqCst);
+    } else {
+        STRESS_RAISED.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A signal the timer tick raises, arriving while the same process raises and
+/// takes another signal as fast as it can.
+///
+/// The tick adds its signal to the pending set from an interrupt, and a system
+/// call on its way out takes signals off the same set. When the set was changed
+/// by reading it, changing the copy and writing the copy back, a tick between
+/// the read and the write had its signal written over and lost. With the
+/// profiling timer at its shortest, every tick this process runs through raises
+/// SIGPROF once, so the tick count says how many to expect; the ticks other
+/// tasks take are the allowance. `raise` takes SIGUSR2 through three system
+/// calls, each of which takes pending signals on its way out.
+///
+/// An emulator that looks for interrupts only between the blocks of code it
+/// translates cannot put a tick between two instructions with no branch between
+/// them, which is what the old read and write were, so there this passes with
+/// the old code as well. A processor takes an interrupt between any two.
+fn signals_raised_while_others_are_taken(report: &mut Report) {
+    use crate::sys;
+    // The handlers in place before are put back afterwards: checks further on
+    // raise SIGUSR2 in a forked child and count on the handler installed at
+    // the start.
+    let (earlier_profile, earlier_user) = unsafe {
+        let handler = count_stress_signal as extern "C" fn(i32) as usize;
+        (signal(SIGPROF, handler), signal(SIGUSR2, handler))
+    };
+    let profile_before = STRESS_PROFILE.load(Ordering::SeqCst);
+    let taken_before = STRESS_RAISED.load(Ordering::SeqCst);
+    let first_tick = sys::tick_count();
+    arm_timer(ITIMER_PROF, Duration::from_millis(1), Duration::from_millis(1));
+    let started = Instant::now();
+    let mut raised = 0usize;
+    while started.elapsed() < Duration::from_secs(2) {
+        for _ in 0..64 {
+            unsafe { raise(SIGUSR2) };
+            raised += 1;
+        }
+    }
+    arm_timer(ITIMER_PROF, Duration::ZERO, Duration::ZERO);
+    let last_tick = sys::tick_count();
+    unsafe {
+        signal(SIGPROF, earlier_profile);
+        signal(SIGUSR2, earlier_user);
+    }
+    let taken = STRESS_RAISED.load(Ordering::SeqCst) - taken_before;
+    let profiled = STRESS_PROFILE.load(Ordering::SeqCst) - profile_before;
+    let ticks = last_tick.saturating_sub(first_tick) as usize;
+    println!("      {} raised, {} taken; {} ticks, {} SIGPROF", raised, taken, ticks, profiled);
+    report.check(
+        "every signal raised is taken once while the tick raises another",
+        taken == raised,
+        format!("{} raised, {} taken", raised, taken),
+    );
+    report.check(
+        "and every tick the process ran through raised SIGPROF",
+        // The ticks between reading the count and arming the timer, and
+        // between disarming it and reading the count again, raise nothing.
+        // A tick another task is running through raises nothing either; in
+        // the runs this was written against that was none of them.
+        profiled <= ticks && profiled + 3 >= ticks,
+        format!("{} ticks, {} SIGPROF", ticks, profiled),
+    );
+}
+
 pub fn main(_args: &[String]) -> i32 {
     let mut report = Report { passed: 0, failed: 0 };
     println!("=== Rust standard library on claudeos ===");
@@ -1724,6 +1798,7 @@ pub fn main(_args: &[String]) -> i32 {
     println!();
     println!("-- interval timers --");
     interval_timers(&mut report);
+    signals_raised_while_others_are_taken(&mut report);
 
     println!();
     println!("-- time and environment --");

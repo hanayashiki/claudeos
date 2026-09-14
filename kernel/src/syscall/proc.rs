@@ -856,15 +856,15 @@ pub fn rt_sigreturn(frame: &mut TrapFrame) -> SysResult {
 pub fn rt_sigprocmask(how: u32, set: u64, old: u64) -> SysResult {
     let task = sched::current();
     if old != 0 {
-        uaccess::write_u64_in(&task, old, task.signal_mask.get())?;
+        uaccess::write_u64_in(&task, old, task.blocked())?;
     }
     if set != 0 {
         let value = uaccess::read_u64_in(&task, set)?;
-        task.signal_mask.set(match how {
-            0 => task.signal_mask.get() | value,  // SIG_BLOCK
-            1 => task.signal_mask.get() & !value, // SIG_UNBLOCK
-            _ => value,                           // SIG_SETMASK
-        });
+        match how {
+            0 => task.block(value),       // SIG_BLOCK
+            1 => task.unblock(value),     // SIG_UNBLOCK
+            _ => task.set_blocked(value), // SIG_SETMASK
+        }
     }
     Ok(0)
 }

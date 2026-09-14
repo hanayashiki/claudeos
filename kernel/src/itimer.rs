@@ -236,7 +236,7 @@ fn fire_real_timers(now: u64) {
         // that does not, and which of them takes it is known only after looking
         // at both.
         table.for_each(|task| {
-            let blocks = task.signal_mask.get() & SIGALRM.bit() != 0;
+            let blocks = task.blocked() & SIGALRM.bit() != 0;
             if task.state() != State::Zombie && !blocks && take_if_due(task, now) {
                 sched::post_signal(task, SIGALRM, table);
             }
