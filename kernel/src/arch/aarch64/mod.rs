@@ -3,8 +3,9 @@
 //! The submodules below are private: everything the portable half of the
 //! kernel is allowed to reach is re-exported from here, so this file answers
 //! `arch/x86_64/mod.rs` name for name. The exceptions are `paging` and `nr`,
-//! which are namespaces rather than single names, and `fdt`, which is one too
-//! and which only a driver that exists on this machine alone reaches.
+//! which are namespaces rather than single names, and `fdt` and `mailbox`,
+//! which are namespaces too and which only a driver that exists on this
+//! machine alone reaches.
 
 use core::arch::asm;
 use core::arch::global_asm;
@@ -19,6 +20,7 @@ mod trap;
 mod uart;
 
 pub mod fdt;
+pub mod mailbox;
 pub mod nr;
 pub mod paging;
 

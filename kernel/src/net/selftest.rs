@@ -338,6 +338,13 @@ pub fn run() -> bool {
         super::genettest::run(&mut genet);
         report.passed += genet.passed;
         report.failed += genet.failed;
+
+        // The board's WiFi, which nothing emulates either.
+        crate::println!("net: the board's own wifi");
+        let mut wifi = super::wifi::test::Report { passed: 0, failed: 0 };
+        super::wifi::test::run(&mut wifi);
+        report.passed += wifi.passed;
+        report.failed += wifi.failed;
     }
 
     socket::reset();

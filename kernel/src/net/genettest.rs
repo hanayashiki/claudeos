@@ -30,7 +30,7 @@ pub struct Report {
 }
 
 impl Report {
-    fn check(&mut self, name: &str, holds: bool) {
+    pub(crate) fn check(&mut self, name: &str, holds: bool) {
         if holds {
             self.passed += 1;
             crate::println!("  ok    {}", name);
@@ -40,7 +40,7 @@ impl Report {
         }
     }
 
-    fn value(&mut self, name: &str, actual: u64, expected: u64) {
+    pub(crate) fn value(&mut self, name: &str, actual: u64, expected: u64) {
         if actual == expected {
             self.passed += 1;
             crate::println!("  ok    {} = {:#x}", name, actual);
@@ -73,23 +73,23 @@ const LAST_COMPATIBLE_VERSION: u32 = 16;
 /// compared against what `dtc` compiles from the equivalent source text. The
 /// two are byte for byte the same, which makes the tree below a real one and
 /// not a private encoding that only this kernel can read.
-struct Builder {
+pub(crate) struct Builder {
     structure: Vec<u8>,
     strings: Vec<u8>,
 }
 
 impl Builder {
-    fn new() -> Builder {
+    pub(crate) fn new() -> Builder {
         Builder { structure: Vec::new(), strings: Vec::new() }
     }
 
-    fn be32(&mut self, value: u32) {
+    pub(crate) fn be32(&mut self, value: u32) {
         self.structure.extend_from_slice(&value.to_be_bytes());
     }
 
     /// Pad the token stream out to the next four-byte boundary, which every
     /// token has to start on.
-    fn pad(&mut self) {
+    pub(crate) fn pad(&mut self) {
         while self.structure.len() % 4 != 0 {
             self.structure.push(0);
         }
@@ -97,7 +97,7 @@ impl Builder {
 
     /// Where `name` sits in the string table, adding it if it is not there
     /// already.
-    fn intern(&mut self, name: &str) -> u32 {
+    pub(crate) fn intern(&mut self, name: &str) -> u32 {
         let wanted = name.as_bytes();
         let mut at = 0usize;
         while at < self.strings.len() {
@@ -113,18 +113,18 @@ impl Builder {
         offset
     }
 
-    fn begin_node(&mut self, name: &str) {
+    pub(crate) fn begin_node(&mut self, name: &str) {
         self.be32(BEGIN_NODE);
         self.structure.extend_from_slice(name.as_bytes());
         self.structure.push(0);
         self.pad();
     }
 
-    fn end_node(&mut self) {
+    pub(crate) fn end_node(&mut self) {
         self.be32(END_NODE);
     }
 
-    fn prop(&mut self, name: &str, value: &[u8]) {
+    pub(crate) fn prop(&mut self, name: &str, value: &[u8]) {
         let offset = self.intern(name);
         self.be32(PROP);
         self.be32(value.len() as u32);
@@ -133,7 +133,7 @@ impl Builder {
         self.pad();
     }
 
-    fn prop_cells(&mut self, name: &str, cells: &[u32]) {
+    pub(crate) fn prop_cells(&mut self, name: &str, cells: &[u32]) {
         let mut bytes = Vec::with_capacity(cells.len() * 4);
         for cell in cells {
             bytes.extend_from_slice(&cell.to_be_bytes());
@@ -141,12 +141,12 @@ impl Builder {
         self.prop(name, &bytes);
     }
 
-    fn prop_u32(&mut self, name: &str, value: u32) {
+    pub(crate) fn prop_u32(&mut self, name: &str, value: u32) {
         self.prop_cells(name, &[value]);
     }
 
     /// A property whose value is text. The terminator is part of the value.
-    fn prop_str(&mut self, name: &str, value: &str) {
+    pub(crate) fn prop_str(&mut self, name: &str, value: &str) {
         let mut bytes = Vec::with_capacity(value.len() + 1);
         bytes.extend_from_slice(value.as_bytes());
         bytes.push(0);
@@ -154,7 +154,7 @@ impl Builder {
     }
 
     /// Wrap the two blocks in a header and an empty reserved-memory list.
-    fn finish(mut self) -> Vec<u8> {
+    pub(crate) fn finish(mut self) -> Vec<u8> {
         self.be32(END);
         let header = 40usize;
         // The reserved-memory list is eight-byte aligned and ends with an
@@ -258,7 +258,7 @@ fn sample_tree(status: &str, with_ethernet: bool) -> Vec<u8> {
 /// The reader takes a physical address and walks upwards from it, so the blob
 /// has to be contiguous in physical memory; a heap allocation is contiguous in
 /// virtual memory and need not be. One page is more than any of these needs.
-fn place(blob: &[u8]) -> Option<u64> {
+pub(crate) fn place(blob: &[u8]) -> Option<u64> {
     if blob.len() > PAGE_SIZE {
         return None;
     }

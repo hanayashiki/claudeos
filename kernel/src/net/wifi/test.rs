@@ -1,0 +1,449 @@
+//! What can be checked about the WiFi driver with no WiFi chip present.
+//!
+//! QEMU's Pi 4 has no CYW43455, so everything that is arithmetic on bytes is
+//! checked here against values worked out by hand from the reference driver's
+//! layouts: how the NVRAM text becomes the blob the firmware reads, how SDPCM
+//! frames and BCDC messages are framed and padded, how events and scan results
+//! are taken apart, the SDIO command arguments, the clock divisor, the voltage
+//! choice, the credentials file, and the two device tree lookups the driver
+//! added.
+//!
+//! Run with `net=test` on the kernel command line, alongside the protocol
+//! checks.
+
+use super::config;
+use super::nvram;
+use super::protocol::{self, HeaderError};
+use super::sdhci;
+use super::sdio;
+use crate::arch;
+use crate::net::genettest::{place, Builder};
+use alloc::vec::Vec;
+
+pub struct Report {
+    pub passed: usize,
+    pub failed: usize,
+}
+
+impl Report {
+    fn check(&mut self, name: &str, holds: bool) {
+        if holds {
+            self.passed += 1;
+            crate::println!("  ok    {}", name);
+        } else {
+            self.failed += 1;
+            crate::println!("  FAIL  {}", name);
+        }
+    }
+
+    fn value(&mut self, name: &str, actual: u64, expected: u64) {
+        if actual == expected {
+            self.passed += 1;
+            crate::println!("  ok    {} = {:#x}", name, actual);
+        } else {
+            self.failed += 1;
+            crate::println!("  FAIL  {}: got {:#x}, wanted {:#x}", name, actual, expected);
+        }
+    }
+}
+
+pub fn run(report: &mut Report) {
+    nvram_text(report);
+    control_frames(report);
+    headers(report);
+    padding(report);
+    control_responses(report);
+    events(report);
+    scan_results(report);
+    requests(report);
+    sdio_arguments(report);
+    clock(report);
+    voltage(report);
+    credentials(report);
+    device_tree(report);
+}
+
+fn nvram_text(report: &mut Report) {
+    // A comment, a CRLF line, a blank line, leading spaces, a key with a
+    // space in it (skipped), a RAW1 line (skipped), and a value containing a
+    // space (kept).
+    let text = b"# comment\nkey1=value1\r\n\n  key2=value 2\nbad key=x\nRAW1=zzz\nboardrev=0x1304\nlast=1\n";
+    let mut expected: Vec<u8> = Vec::new();
+    expected.extend_from_slice(b"key1=value1\0key2=value 2\0boardrev=0x1304\0last=1\0");
+    // 48 bytes, rounded up past at least one NUL to 52: thirteen words.
+    expected.extend_from_slice(&[0, 0, 0, 0]);
+    expected.extend_from_slice(&0xFFF2_000Du32.to_le_bytes());
+    match nvram::strip(text) {
+        Ok(blob) => report.check("nvram: lines kept, comments and bad keys dropped, length word", blob == expected),
+        Err(_) => report.check("nvram: lines kept, comments and bad keys dropped, length word", false),
+    }
+
+    // No boardrev: the default is added. A last line with no newline is not
+    // taken, which is what the reference's loop bound does.
+    let mut expected: Vec<u8> = Vec::new();
+    expected.extend_from_slice(b"a=1\0boardrev=0xff\0");
+    expected.extend_from_slice(&[0, 0]);
+    expected.extend_from_slice(&((!5u32 << 16) | 5).to_le_bytes());
+    match nvram::strip(b"a=1\nb=2") {
+        Ok(blob) => report.check("nvram: boardrev added, an unterminated last line left out", blob == expected),
+        Err(_) => report.check("nvram: boardrev added, an unterminated last line left out", false),
+    }
+    report.check(
+        "nvram: a file for several PCIe devices is refused",
+        nvram::strip(b"devpath0=pcie/1/4/\n0:x=1\n") == Err(nvram::Error::MultipleDevices),
+    );
+    report.check("nvram: nothing but comments is refused", nvram::strip(b"# only\n\n") == Err(nvram::Error::Empty));
+}
+
+fn control_frames(report: &mut Report) {
+    // "ver" as `brcmf_c_preinit_dcmds` asks for it: GET_VAR, the name and 256
+    // bytes of room, the first request on a fresh bus.
+    let request = protocol::iovar("ver", &[0u8; 256]);
+    let mut frame = Vec::new();
+    protocol::control_frame(&mut frame, 255, 1, protocol::C_GET_VAR, false, 0, request.len(), &request);
+    report.value("control: 12 + 16 + 260 bytes, no padding", frame.len() as u64, 288);
+    report.check("control: length and its complement", frame[0..4] == [0x20, 0x01, 0xDF, 0xFE]);
+    report.check("control: sequence 255, channel 0, data offset 12", frame[4..8] == [0xFF, 0x00, 0x00, 0x0C]);
+    report.check("control: a zero word", frame[8..12] == [0, 0, 0, 0]);
+    report.check("control: GET_VAR", frame[12..16] == [0x06, 0x01, 0, 0]);
+    report.check("control: buffer length 260", frame[16..20] == [0x04, 0x01, 0, 0]);
+    report.check("control: request id 1 in the top half, a get", frame[20..24] == [0, 0, 1, 0]);
+    report.check("control: the name follows", &frame[28..32] == b"ver\0");
+
+    // A CLM chunk as a set: 1448 bytes, padded to the next 512-byte block.
+    let chunk = protocol::clm_chunk(protocol::DL_BEGIN, &[0xAA; 1400]);
+    let request = protocol::iovar("clmload", &chunk);
+    protocol::control_frame(&mut frame, 7, 0x1234, protocol::C_SET_VAR, true, 0, request.len(), &request);
+    report.value("control: a 1448-byte request padded to 1536", frame.len() as u64, 1536);
+    report.value("control: its header length excludes the padding", u16::from_le_bytes([frame[0], frame[1]]) as u64, 1448);
+    report.check("control: a set, request id 0x1234", frame[20..24] == [0x02, 0, 0x34, 0x12]);
+}
+
+fn headers(report: &mut Report) {
+    report.check("header: all zero is no data", protocol::parse_header(&[0u8; 12]) == Err(HeaderError::NoData));
+    let mut bytes = [0u8; 12];
+    protocol::pack_header(&mut bytes, 100, 9, protocol::CHANNEL_EVENT, 12);
+    bytes[8] = 0x5A; // flow control
+    bytes[9] = 0x21; // window
+    match protocol::parse_header(&bytes) {
+        Ok(h) => report.check(
+            "header: what was packed comes back",
+            h.len == 100 && h.seq == 9 && h.channel == protocol::CHANNEL_EVENT && h.data_offset == 12 && h.flow_control == 0x5A && h.window == 0x21,
+        ),
+        Err(_) => report.check("header: what was packed comes back", false),
+    }
+    let mut bad = bytes;
+    bad[2] ^= 1;
+    report.check("header: a wrong complement is refused", protocol::parse_header(&bad) == Err(HeaderError::Checksum));
+    let mut bad = [0u8; 12];
+    protocol::pack_header(&mut bad, 20, 0, protocol::CHANNEL_DATA, 24);
+    report.check("header: a data offset past the frame is refused", protocol::parse_header(&bad) == Err(HeaderError::BadDataOffset));
+    let mut long = [0u8; 12];
+    protocol::pack_header(&mut long, 3000, 0, protocol::CHANNEL_DATA, 12);
+    report.check("header: a data frame over 2048 bytes is refused", protocol::parse_header(&long) == Err(HeaderError::TooLong));
+    let mut control = [0u8; 12];
+    protocol::pack_header(&mut control, 3000, 0, protocol::CHANNEL_CONTROL, 12);
+    report.check("header: a control frame over 2048 bytes is not", protocol::parse_header(&control).is_ok());
+}
+
+fn padding(report: &mut Report) {
+    report.value("tx pad: 288 is aligned", protocol::tx_pad(288) as u64, 0);
+    report.value("tx pad: 289 to eight", protocol::tx_pad(289) as u64, 7);
+    report.value("tx pad: 512 is aligned", protocol::tx_pad(512) as u64, 0);
+    report.value("tx pad: 513 to a block", protocol::tx_pad(513) as u64, 511);
+    report.value("tx pad: 1024 is a block", protocol::tx_pad(1024) as u64, 0);
+    report.value("rx rest: a 64-byte frame", protocol::rx_remaining(64) as u64, 0);
+    report.value("rx rest: 100 bytes, 36 left, to eight", protocol::rx_remaining(100) as u64, 40);
+    report.value("rx rest: 600 bytes, 536 left, to a block", protocol::rx_remaining(600) as u64, 1024);
+    report.value("rx rest: 2000 bytes, a block would pass 2048", protocol::rx_remaining(2000) as u64, 1936);
+    report.value("control rest: 600 bytes, to a block", protocol::control_remaining(600) as u64, 1024);
+}
+
+fn control_responses(report: &mut Report) {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&262u32.to_le_bytes());
+    payload.extend_from_slice(&8u32.to_le_bytes());
+    payload.extend_from_slice(&((5u32 << 16) | 0x01).to_le_bytes());
+    payload.extend_from_slice(&(-23i32).to_le_bytes());
+    payload.extend_from_slice(b"answer!!");
+    match protocol::parse_dcmd(&payload) {
+        Some((response, data)) => report.check(
+            "dcmd: id 5, an error of -23, the data after the header",
+            response.id == 5 && response.error == Some(-23) && response.cmd == 262 && data == b"answer!!",
+        ),
+        None => report.check("dcmd: id 5, an error of -23, the data after the header", false),
+    }
+
+    let frame = [0x20, 0, 0x01, 1, 0xEE, 0xEE, 0xEE, 0xEE, 1, 2, 3];
+    match protocol::strip_bcdc(&frame) {
+        Some((ifidx, data)) => report.check("bcdc: interface 1, one word of signals skipped", ifidx == 1 && data == [1, 2, 3]),
+        None => report.check("bcdc: interface 1, one word of signals skipped", false),
+    }
+    report.check("bcdc: version 1 is refused", protocol::strip_bcdc(&[0x10, 0, 0, 0, 1]).is_none());
+}
+
+/// An event packet as the firmware sends it.
+fn event_packet(event_type: u32, status: u32, flags: u16, data: &[u8]) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&[0xFF; 6]);
+    p.extend_from_slice(&[0x02, 0, 0, 0, 0, 1]);
+    p.extend_from_slice(&0x886Cu16.to_be_bytes());
+    p.extend_from_slice(&32769u16.to_be_bytes());
+    p.extend_from_slice(&((10 + 48 + data.len()) as u16).to_be_bytes());
+    p.push(0);
+    p.extend_from_slice(&[0x00, 0x10, 0x18]);
+    p.extend_from_slice(&1u16.to_be_bytes());
+    p.extend_from_slice(&2u16.to_be_bytes());
+    p.extend_from_slice(&flags.to_be_bytes());
+    p.extend_from_slice(&event_type.to_be_bytes());
+    p.extend_from_slice(&status.to_be_bytes());
+    p.extend_from_slice(&7u32.to_be_bytes()); // reason
+    p.extend_from_slice(&0u32.to_be_bytes()); // auth type
+    p.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    p.extend_from_slice(&[0x10, 0x20, 0x30, 0x40, 0x50, 0x60]);
+    p.extend_from_slice(&[0u8; 16]);
+    p.push(0);
+    p.push(0);
+    p.extend_from_slice(data);
+    p
+}
+
+fn events(report: &mut Report) {
+    let packet = event_packet(protocol::E_LINK, 0, protocol::EVENT_MSG_LINK, &[9, 9]);
+    report.value("event: a packet with two bytes of data", packet.len() as u64, 74);
+    match protocol::parse_event(&packet) {
+        Some((event, data)) => report.check(
+            "event: big-endian fields, the address, the data",
+            event.event_type == protocol::E_LINK
+                && event.flags == protocol::EVENT_MSG_LINK
+                && event.reason == 7
+                && event.addr == [0x10, 0x20, 0x30, 0x40, 0x50, 0x60]
+                && data == [9, 9],
+        ),
+        None => report.check("event: big-endian fields, the address, the data", false),
+    }
+    let mut wrong = packet.clone();
+    wrong[12] = 0x08;
+    report.check("event: another ethertype is not an event", protocol::parse_event(&wrong).is_none());
+    let mut short = packet.clone();
+    short.truncate(73);
+    report.check("event: data shorter than it says is refused", protocol::parse_event(&short).is_none());
+    let mask = protocol::event_mask(&[protocol::E_ESCAN_RESULT, protocol::E_SET_SSID]);
+    report.check("event mask: 69 is byte 8 bit 5, 0 is byte 0 bit 0", mask[8] == 0x20 && mask[0] == 0x01);
+    report.value("event mask: 24 bytes for 191 events", protocol::EVENTING_MASK_LEN as u64, 24);
+}
+
+/// An escan result holding one BSS, laid out as `struct brcmf_bss_info_le`.
+fn escan_result(ssid: &[u8], chanspec: u16, ctl_ch: u8, rssi: i16) -> Vec<u8> {
+    let bss_len = 128usize;
+    let mut r = Vec::new();
+    r.extend_from_slice(&((12 + bss_len) as u32).to_le_bytes());
+    r.extend_from_slice(&109u32.to_le_bytes());
+    r.extend_from_slice(&0x1234u16.to_le_bytes());
+    r.extend_from_slice(&1u16.to_le_bytes());
+    let mut bss = alloc::vec![0u8; bss_len];
+    bss[0..4].copy_from_slice(&109u32.to_le_bytes());
+    bss[4..8].copy_from_slice(&(bss_len as u32).to_le_bytes());
+    bss[8..14].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0x01, 0x02, 0x03]);
+    bss[16..18].copy_from_slice(&0x0411u16.to_le_bytes());
+    bss[18] = ssid.len() as u8;
+    bss[19..19 + ssid.len()].copy_from_slice(ssid);
+    bss[72..74].copy_from_slice(&chanspec.to_le_bytes());
+    bss[78..80].copy_from_slice(&rssi.to_le_bytes());
+    bss[88] = ctl_ch;
+    r.extend_from_slice(&bss);
+    r
+}
+
+fn scan_results(report: &mut Report) {
+    let data = escan_result(b"network", 0xD02A, 36, -61);
+    match protocol::parse_escan_result(&data) {
+        Some(bss) => report.check(
+            "escan: the name, the control channel, the signal",
+            bss.ssid() == b"network" && bss.channel == 36 && bss.rssi == -61 && bss.bssid[5] == 3,
+        ),
+        None => report.check("escan: the name, the control channel, the signal", false),
+    }
+    let data = escan_result(b"x", 0x1006, 0, -40);
+    match protocol::parse_escan_result(&data) {
+        Some(bss) => report.value("escan: no ctl_ch, the chanspec's channel", bss.channel as u64, 6),
+        None => report.check("escan: no ctl_ch, the chanspec's channel", false),
+    }
+    let mut two = escan_result(b"x", 0x1006, 6, -40);
+    two[10] = 2;
+    report.check("escan: more than one BSS in an event is refused", protocol::parse_escan_result(&two).is_none());
+    let mut lying = escan_result(b"x", 0x1006, 6, -40);
+    lying[12 + 4] = 100;
+    report.check("escan: a BSS length that does not fit is refused", protocol::parse_escan_result(&lying).is_none());
+    security(report);
+}
+
+/// An RSN element after the fixed part: version 1, CCMP group, one CCMP
+/// pairwise suite, PSK and SAE, and capabilities with MFP capable set.
+fn security(report: &mut Report) {
+    // Version 2 bytes, group 4, pairwise count 2 and one suite 4, AKM count
+    // 2 and two suites 8, capabilities 2: a body of 24.
+    let rsn: [u8; 26] = [
+        48, 24, 1, 0, 0x00, 0x0F, 0xAC, 0x04, 1, 0, 0x00, 0x0F, 0xAC, 0x04, 2, 0, 0x00, 0x0F, 0xAC,
+        0x02, 0x00, 0x0F, 0xAC, 0x08, 0x80, 0x00,
+    ];
+    let mut ies = alloc::vec![0x00, 3, b'a', b'b', b'c'];
+    ies.extend_from_slice(&rsn);
+    ies.extend_from_slice(&[0xDD, 4, 0x00, 0x50, 0xF2, 0x01]);
+    let s = protocol::parse_security(&ies);
+    report.check(
+        "rsn: CCMP group and pairwise, PSK and SAE, MFP capable not required, and a WPA element",
+        s.rsn
+            && s.wpa
+            && s.group == protocol::SUITE_CCMP
+            && s.pairwise_count == 1
+            && s.pairwise[0] == protocol::SUITE_CCMP
+            && s.akm_count == 2
+            && s.akm[0] == protocol::AKM_PSK
+            && s.akm[1] == protocol::AKM_SAE
+            && s.capabilities == Some(protocol::RSN_CAP_MFPC),
+    );
+    let cut = protocol::parse_security(&[48, 6, 1, 0, 0x00, 0x0F, 0xAC, 0x04]);
+    report.check("rsn: an element that stops after the group suite", cut.rsn && cut.group == protocol::SUITE_CCMP && cut.akm_count == 0);
+    report.check("rsn: an element longer than what is left is not read", !protocol::parse_security(&[48, 40, 1, 0]).rsn);
+
+    let mut data = escan_result(b"x", 0x1006, 6, -40);
+    let bss_len = 128 + ies.len();
+    data[0..4].copy_from_slice(&((12 + bss_len) as u32).to_le_bytes());
+    data[12 + 4..12 + 8].copy_from_slice(&(bss_len as u32).to_le_bytes());
+    data[12 + 116..12 + 118].copy_from_slice(&128u16.to_le_bytes());
+    data[12 + 120..12 + 124].copy_from_slice(&(ies.len() as u32).to_le_bytes());
+    data.extend_from_slice(&ies);
+    match protocol::parse_escan_result(&data) {
+        Some(bss) => report.check("escan: the elements after the fixed part are read", bss.security.rsn && bss.security.akm_count == 2),
+        None => report.check("escan: the elements after the fixed part are read", false),
+    }
+}
+
+fn requests(report: &mut Report) {
+    let escan = protocol::escan_request(0x1234);
+    report.value("escan request: 8 + 64 bytes", escan.len() as u64, 72);
+    report.check(
+        "escan request: version 1, start, sync id, broadcast, any type, active",
+        escan[0..8] == [1, 0, 0, 0, 1, 0, 0x34, 0x12] && escan[44..50] == [0xFF; 6] && escan[50] == 2 && escan[51] == 0,
+    );
+    report.check("escan request: -1 for the four timings", escan[52..68].iter().all(|&b| b == 0xFF));
+    report.check("country: JP as abbreviation and code, revision 0", protocol::country(*b"JP") == *b"JP\0\0\0\0\0\0JP\0\0");
+    let begin = protocol::clm_chunk(protocol::DL_BEGIN, &[1, 2, 3]);
+    report.check("clm: begin with handler version 1, type 2, length 3", begin[0..12] == [0x02, 0x10, 0x02, 0, 3, 0, 0, 0, 0, 0, 0, 0]);
+    let end = protocol::clm_chunk(protocol::DL_END, &[1]);
+    report.check("clm: end", end[0..2] == [0x04, 0x10]);
+}
+
+fn sdio_arguments(report: &mut Report) {
+    report.value("CMD52 read of CCCR abort", sdio::direct_argument(false, 0, 0x06, 0) as u64, 0x0000_0C00);
+    report.value("CMD52 write of ChipClkCSR", sdio::direct_argument(true, 1, 0x1000E, 0x28) as u64, 0x9200_1C28);
+    report.value("CMD53 four bytes from the backplane", sdio::extended_argument(false, 1, 0x8000, true, 0, 4) as u64, 0x1500_0004);
+    report.value("CMD53 three blocks to function 2", sdio::extended_argument(true, 2, 0x8000, true, 3, 512) as u64, 0xAD00_0003);
+    report.value("CMD53 512 bytes in byte mode is a count of 0", sdio::extended_argument(false, 2, 0x8000, false, 0, 512) as u64, 0x2100_0000);
+}
+
+fn clock(report: &mut Report) {
+    let (bits, actual) = sdhci::clock_divider(250_000_000, 400_000);
+    report.value("divider: 250 MHz to 400 kHz is 626", bits as u64, 0x3940);
+    report.value("divider: which gives", actual as u64, 399_361);
+    let (bits, actual) = sdhci::clock_divider(250_000_000, 50_000_000);
+    report.check("divider: 250 MHz to 50 MHz is 6, 41.7 MHz", bits == 0x0300 && actual == 41_666_666);
+    let (bits, actual) = sdhci::clock_divider(25_000_000, 50_000_000);
+    report.check("divider: a slow base clock is used undivided", bits == 0 && actual == 25_000_000);
+}
+
+fn voltage(report: &mut Report) {
+    report.value("OCR: 2.7 to 3.6 V leaves 3.2 to 3.4 V", sdio::select_voltage(0x00FF_8000) as u64, 0x0030_0000);
+    report.value("OCR: 3.2 to 3.3 V alone", sdio::select_voltage(0x0010_0000) as u64, 0x0010_0000);
+    report.value("OCR: nothing the host has", sdio::select_voltage(0x000F_0000) as u64, 0);
+}
+
+fn credentials(report: &mut Report) {
+    match config::parse(b"ssid=home net\npsk=correct horse\ncountry=GB\n") {
+        Ok(c) => report.check(
+            "wifi.conf: all three",
+            c.ssid.matches(b"home net") && !c.ssid.matches(b"home") && c.passphrase.len() == 13 && c.country.0 == *b"GB",
+        ),
+        Err(_) => report.check("wifi.conf: all three", false),
+    }
+    match config::parse(b"ssid=a\r\npsk=12345678\r\n") {
+        Ok(c) => report.check("wifi.conf: CRLF, and no country means JP", c.ssid.matches(b"a") && c.country.0 == *b"JP"),
+        Err(_) => report.check("wifi.conf: CRLF, and no country means JP", false),
+    }
+    report.check("wifi.conf: a seven-character psk is refused", matches!(config::parse(b"ssid=a\npsk=1234567\n"), Err(config::Error::PassphraseLength)));
+    report.check("wifi.conf: a missing psk is refused", matches!(config::parse(b"ssid=a\n"), Err(config::Error::NoPassphrase)));
+    report.check("wifi.conf: another key is refused", matches!(config::parse(b"ssid=a\npsk=12345678\nkey=x\n"), Err(config::Error::UnknownKey(3))));
+    report.check("wifi.conf: a lower-case country is refused", matches!(config::parse(b"ssid=a\npsk=12345678\ncountry=jp\n"), Err(config::Error::Country)));
+}
+
+/// A tree shaped like the part of a Pi 4's the driver reads: a `soc` bus with
+/// the board's `dma-ranges`, two controller nodes at the same address with
+/// the same compatible, the first disabled, and a mailbox.
+fn sample_tree() -> Vec<u8> {
+    let mut tree = Builder::new();
+    tree.begin_node("");
+    tree.prop_u32("#address-cells", 2);
+    tree.prop_u32("#size-cells", 1);
+    tree.begin_node("soc");
+    tree.prop_u32("#address-cells", 1);
+    tree.prop_u32("#size-cells", 1);
+    tree.prop_cells("ranges", &[0x7e00_0000, 0x0, 0xfe00_0000, 0x0180_0000]);
+    tree.prop_cells("dma-ranges", &[0xc000_0000, 0x0, 0x0, 0x4000_0000]);
+
+    tree.begin_node("mailbox@7e00b880");
+    tree.prop_str("compatible", "brcm,bcm2835-mbox");
+    tree.prop_cells("reg", &[0x7e00_b880, 0x40]);
+    tree.end_node();
+
+    tree.begin_node("mmc@7e300000");
+    tree.prop_str("compatible", "brcm,bcm2835-sdhci");
+    tree.prop_cells("reg", &[0x7e30_0000, 0x100]);
+    tree.prop_str("status", "disabled");
+    tree.prop_u32("bus-width", 1);
+    tree.end_node();
+
+    tree.begin_node("mmcnr@7e300000");
+    tree.prop_str("compatible", "brcm,bcm2835-sdhci");
+    tree.prop_cells("reg", &[0x7e30_0000, 0x100]);
+    tree.prop_str("status", "okay");
+    tree.prop_u32("bus-width", 4);
+    tree.begin_node("wifi@1");
+    tree.prop_u32("reg", 1);
+    tree.prop_str("compatible", "brcm,bcm4329-fmac");
+    tree.end_node();
+    tree.end_node();
+
+    tree.end_node();
+    tree.end_node();
+    tree.finish()
+}
+
+fn device_tree(report: &mut Report) {
+    let Some(phys) = place(&sample_tree()) else {
+        report.check("a tree to walk", false);
+        return;
+    };
+    match arch::fdt::find_enabled_compatible_in(phys, b"brcm,bcm2835-sdhci") {
+        Some(node) => {
+            report.value("the enabled controller, not the first", node.cell(b"bus-width").unwrap_or(0) as u64, 4);
+            report.value("at the translated address", node.reg(0).map(|r| r.0).unwrap_or(0), 0xFE30_0000);
+        }
+        None => report.check("the enabled controller, not the first", false),
+    }
+    match arch::fdt::find_compatible_in(phys, b"brcm,bcm2835-sdhci") {
+        Some(node) => report.value("the plain lookup still finds the first", node.cell(b"bus-width").unwrap_or(0) as u64, 1),
+        None => report.check("the plain lookup still finds the first", false),
+    }
+    match arch::fdt::find_enabled_compatible_in(phys, b"brcm,bcm2835-mbox") {
+        Some(node) => {
+            report.value("memory at 0x1000 as a device on soc sees it", node.dma_address(0x1000).unwrap_or(0), 0xC000_1000);
+            report.check("memory past the first gigabyte is not visible", node.dma_address(0x4000_0000).is_none());
+        }
+        None => report.check("memory at 0x1000 as a device on soc sees it", false),
+    }
+    report.check(
+        "a compatible nothing has",
+        arch::fdt::find_enabled_compatible_in(phys, b"brcm,nonesuch").is_none(),
+    );
+}

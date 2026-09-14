@@ -26,6 +26,9 @@ pub mod selftest;
 pub mod socket;
 pub mod tcp;
 pub mod udp;
+/// The Raspberry Pi 4's WiFi, which exists on one machine only.
+#[cfg(target_arch = "aarch64")]
+pub mod wifi;
 
 use crate::abi::Errno;
 use crate::sync::Spinlock;
@@ -33,6 +36,17 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 use ip::Ipv4Addr;
+
+/// Which cards `probe` may bring up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Cards {
+    /// The first that answers: an emulated Intel card, then the Pi's wired
+    /// Ethernet, then its WiFi.
+    Any,
+    /// The WiFi alone, which is what `net=wifi` asks for: with the wired
+    /// cards left alone, whatever reaches the network went over the air.
+    WifiOnly,
+}
 
 /// A network card the stack can send through.
 pub trait Interface: Sync {
@@ -56,12 +70,18 @@ pub trait Interface: Sync {
 /// nothing is the ordinary outcome rather than an error: a machine booted
 /// without a card boots without a network. The first one that answers is the
 /// one the stack gets, because the stack holds one interface.
-pub fn probe() -> bool {
-    if e1000::probe() {
-        return true;
+pub fn probe(cards: Cards) -> bool {
+    if cards == Cards::Any {
+        if e1000::probe() {
+            return true;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if genet::probe() {
+            return true;
+        }
     }
     #[cfg(target_arch = "aarch64")]
-    if genet::probe() {
+    if wifi::probe() {
         return true;
     }
     false
@@ -77,6 +97,11 @@ pub fn start_task() {
     #[cfg(target_arch = "aarch64")]
     if genet::device().is_some() {
         genet::start_task();
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if wifi::attached() {
+        wifi::start_task();
     }
 }
 
@@ -93,6 +118,10 @@ pub fn counters() -> (u64, u64, u64) {
     #[cfg(target_arch = "aarch64")]
     if genet::device().is_some() {
         return (genet::interrupts(), genet::overruns(), genet::dropped());
+    }
+    #[cfg(target_arch = "aarch64")]
+    if wifi::attached() {
+        return wifi::counters();
     }
     (e1000::interrupts(), e1000::overruns(), e1000::dropped())
 }
