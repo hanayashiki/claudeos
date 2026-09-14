@@ -5,6 +5,17 @@ edition = "2021"
 
 [dependencies]
 
+# The WPA2 handshake the WiFi driver runs needs SHA-1, HMAC, PBKDF2, AES and
+# AES key wrap. The driver exists only on aarch64, so these are compiled only
+# there, and the x86-64 kernel has no dependencies. Versions are pinned
+# exactly; Cargo.lock pins what they depend on.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+sha1 = { version = "=0.10.7", default-features = false }
+hmac = { version = "=0.12.1", default-features = false }
+pbkdf2 = { version = "=0.12.2", default-features = false, features = ["hmac"] }
+aes = { version = "=0.8.4", default-features = false, features = ["zeroize"] }
+aes-kw = { version = "=0.2.1", default-features = false }
+
 [profile.dev]
 panic = "abort"
 opt-level = 1

@@ -45,6 +45,8 @@ struct BootOptions {
     /// whether to run its own checks instead of booting.
     net: NetWords,
     net_test: bool,
+    /// Which cards the network may use: any, or with `net=wifi` the WiFi alone.
+    cards: net::Cards,
     /// Throw one frame in this many away in each direction, so what the
     /// protocols do about loss can be seen on the real card path. Zero is
     /// off, and it is zero unless the command line says otherwise.
@@ -66,6 +68,7 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
         nettest: false,
         net: NetWords::default(),
         net_test: false,
+        cards: net::Cards::Any,
         net_loss: 0,
         telnet: true,
         args: Vec::new(),
@@ -93,9 +96,14 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
         } else if word == "nettest" {
             options.nettest = true;
         } else if let Some(value) = word.strip_prefix("net=") {
-            // The protocols against a card that only records what it is
-            // asked to send, in place of booting anything.
+            // `net=test`: the protocols against a card that only records what
+            // it is asked to send, in place of booting anything. `net=wifi`:
+            // the wired cards left alone and the WiFi used, so that what
+            // reaches the network is known to have gone over the air.
             options.net_test = value == "test";
+            if value == "wifi" {
+                options.cards = net::Cards::WifiOnly;
+            }
         } else if let Some(value) = word.strip_prefix("netloss=") {
             options.net_loss = value.parse().unwrap_or(0);
         } else if let Some(value) = word.strip_prefix("telnet=") {
@@ -289,7 +297,7 @@ pub fn start(boot: &boot::BootInfo) -> ! {
     // address space copies the kernel half as it stands at the moment it is
     // created, so a mapping made later would be missing from it. Finding no
     // card is the ordinary outcome on a machine booted without one.
-    let nic = net::probe();
+    let nic = net::probe(options.cards);
 
     if options.net_loss != 0 {
         net::set_loss(options.net_loss);

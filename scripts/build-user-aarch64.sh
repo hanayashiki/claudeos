@@ -94,6 +94,20 @@ if [ -x "$ROOT/build/thirdparty/cloudflared-aarch64" ]; then
   chmod +x "$RFS/bin/cloudflared"
 fi
 
+# The Pi 4 WiFi chip's firmware, NVRAM and regulatory data, if
+# scripts/fetch-wifi-firmware.sh has fetched them, under the names and the
+# directory Linux's brcmfmac uses. And the network to join, if build/wifi.conf
+# exists: it holds a passphrase, so it is copied and never printed, and the
+# kernel removes it from the running system once it has read it.
+if [ -d "$ROOT/build/thirdparty/wifi-firmware" ]; then
+  mkdir -p "$RFS/lib/firmware/brcm"
+  cp "$ROOT/build/thirdparty/wifi-firmware"/brcmfmac43455-sdio.* "$RFS/lib/firmware/brcm/"
+fi
+if [ -f "$ROOT/build/wifi.conf" ]; then
+  cp "$ROOT/build/wifi.conf" "$RFS/etc/wifi.conf"
+  chmod 600 "$RFS/etc/wifi.conf"
+fi
+
 # No /etc/resolv.conf: the kernel writes it once it has a network
 # configuration, from `nameserver=` or from the DHCP lease, so a fixed one here
 # would name a server the machine may not be able to reach.

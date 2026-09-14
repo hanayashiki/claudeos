@@ -241,6 +241,9 @@ pub fn read_into(phys: u64, info: &mut BootInfo) -> bool {
 const MAX_DEPTH: usize = 12;
 /// `reg` entries kept. One is all any device here has.
 const MAX_REG: usize = 4;
+/// Buses between the root and a device that may say how the device sees
+/// memory. On this board one does: `soc`.
+const MAX_DMA: usize = 4;
 
 /// What one open node contributes to the addresses of the nodes inside it.
 #[derive(Clone, Copy)]
@@ -253,11 +256,34 @@ struct Level {
     /// node that has none.
     ranges: u64,
     ranges_len: u64,
+    /// The same for `dma-ranges`, which runs the other way: it says where
+    /// memory the parent addresses appears to a device on this bus.
+    dma_ranges: u64,
+    dma_ranges_len: u64,
 }
 
 impl Level {
     /// What the specification says to assume when a node says neither.
-    const DEFAULT: Level = Level { address_cells: 2, size_cells: 1, ranges: 0, ranges_len: 0 };
+    const DEFAULT: Level = Level {
+        address_cells: 2,
+        size_cells: 1,
+        ranges: 0,
+        ranges_len: 0,
+        dma_ranges: 0,
+        dma_ranges_len: 0,
+    };
+}
+
+/// One bus's `dma-ranges`, with the cell counts needed to read it: its own
+/// address cells for the bus side, its parent's for the other side, and its
+/// own size cells.
+#[derive(Clone, Copy)]
+struct DmaWindow {
+    ranges: u64,
+    ranges_len: u64,
+    child_cells: u32,
+    parent_cells: u32,
+    size_cells: u32,
 }
 
 /// One entry of a node's `reg`.
@@ -289,9 +315,40 @@ pub struct Node {
     struct_end: u64,
     reg: [Reg; MAX_REG],
     reg_count: usize,
+    /// The `dma-ranges` of every bus above the node that has one, from the
+    /// one nearest the root down to the node's parent. Like `reg` these need
+    /// the chain of buses and are captured during the walk.
+    dma: [DmaWindow; MAX_DMA],
+    dma_count: usize,
+    /// A bus above the node declared more windows than `dma` holds, so no
+    /// translation through them can be trusted.
+    dma_overflow: bool,
 }
 
 impl Node {
+    /// The address a device described by this node uses to reach physical
+    /// memory at `phys`, which is the address to hand the device for a buffer.
+    ///
+    /// Every bus between the root and the node that has a `dma-ranges` moves
+    /// the address, and they are applied from the root down. A bus without the
+    /// property passes addresses through unchanged, which is how Linux's
+    /// `of_dma_get_range` treats one. Nothing when a window says the device
+    /// cannot see that memory at all.
+    ///
+    /// On a Pi 4 the `soc` bus says `<0xc0000000 0x0 0x0 0x40000000>`: the
+    /// first gigabyte of memory appears to its devices at 0xc0000000, and
+    /// nothing above it appears at all.
+    pub fn dma_address(&self, phys: u64) -> Option<u64> {
+        if self.dma_overflow {
+            return None;
+        }
+        let mut address = phys;
+        for window in &self.dma[..self.dma_count] {
+            address = unsafe { dma_translate(window, address)? };
+        }
+        Some(address)
+    }
+
     /// The value of one property, or nothing when the node does not have it.
     pub fn property(&self, name: &[u8]) -> Option<&'static [u8]> {
         unsafe {
@@ -402,6 +459,8 @@ impl Node {
 enum Want<'a> {
     /// Its `compatible` names this.
     Compatible(&'a [u8]),
+    /// Its `compatible` names this and its `status` does not switch it off.
+    EnabledCompatible(&'a [u8]),
     /// Its `phandle` is this, which is how one node points at another.
     Phandle(u32),
 }
@@ -416,6 +475,21 @@ pub fn find_compatible(compatible: &[u8]) -> Option<Node> {
 /// walks a tree it built itself.
 pub fn find_compatible_in(phys: u64, compatible: &[u8]) -> Option<Node> {
     find(phys, Want::Compatible(compatible))
+}
+
+/// The first node compatible with `compatible` that is switched on, passing
+/// over any that are not.
+///
+/// A tree can describe one block twice. The Pi 4 firmware's tree has two
+/// nodes at 0x7e300000 with the same `compatible`: `mmc@7e300000`, disabled,
+/// and `mmcnr@7e300000`, enabled, which is the one wired to the WiFi chip. The
+/// first match is the disabled one.
+pub fn find_enabled_compatible(compatible: &[u8]) -> Option<Node> {
+    find_enabled_compatible_in(blob()?, compatible)
+}
+
+pub fn find_enabled_compatible_in(phys: u64, compatible: &[u8]) -> Option<Node> {
+    find(phys, Want::EnabledCompatible(compatible))
 }
 
 /// The node another node pointed at, by the handle it pointed with.
@@ -459,7 +533,13 @@ fn find(phys: u64, want: Want) -> Option<Node> {
                     // A child starting means the matching node's properties
                     // are all behind us.
                     if matched != 0 {
-                        return resolve(&levels, matched, first_prop, strings, end, reg, reg_len);
+                        let node = resolve(&levels, matched, first_prop, strings, end, reg, reg_len);
+                        if accepted(want, &node) {
+                            return node;
+                        }
+                        // Passed over: the walk carries on into this child
+                        // as though nothing had matched.
+                        matched = 0;
                     }
                     let name = cstr(cursor);
                     cursor += align4(name.len() as u64 + 1);
@@ -473,7 +553,11 @@ fn find(phys: u64, want: Want) -> Option<Node> {
                 }
                 END_NODE => {
                     if matched != 0 && matched == depth {
-                        return resolve(&levels, matched, first_prop, strings, end, reg, reg_len);
+                        let node = resolve(&levels, matched, first_prop, strings, end, reg, reg_len);
+                        if accepted(want, &node) {
+                            return node;
+                        }
+                        matched = 0;
                     }
                     depth = depth.saturating_sub(1);
                 }
@@ -496,12 +580,15 @@ fn find(phys: u64, want: Want) -> Option<Node> {
                         // that is absent; the value pointer is never zero.
                         level.ranges = value;
                         level.ranges_len = length;
+                    } else if name == b"dma-ranges" {
+                        level.dma_ranges = value;
+                        level.dma_ranges_len = length;
                     } else if name == b"reg" {
                         reg = value;
                         reg_len = length;
                     }
                     let hit = match want {
-                        Want::Compatible(wanted) => {
+                        Want::Compatible(wanted) | Want::EnabledCompatible(wanted) => {
                             name == b"compatible" && compatible_with(value, length, wanted)
                         }
                         // `linux,phandle` is the older spelling of the same
@@ -540,6 +627,41 @@ unsafe fn compatible_with(value: u64, length: u64, wanted: &[u8]) -> bool {
     false
 }
 
+/// Whether a node the walk stopped at is the one asked for. Only the enabled
+/// lookup has anything further to check, and it can only check once every
+/// property of the node, `status` among them, has been passed.
+fn accepted(want: Want, node: &Option<Node>) -> bool {
+    match want {
+        Want::EnabledCompatible(_) => node.as_ref().is_some_and(|node| node.enabled()),
+        Want::Compatible(_) | Want::Phandle(_) => true,
+    }
+}
+
+/// Where memory the bus's parent addresses as `address` appears to a device
+/// on the bus. An entry is the device-side base, the parent-side base and a
+/// length; an empty property passes everything through.
+unsafe fn dma_translate(window: &DmaWindow, address: u64) -> Option<u64> {
+    if window.ranges_len == 0 {
+        return Some(address);
+    }
+    let stride = (window.child_cells + window.parent_cells + window.size_cells) as u64 * 4;
+    if stride == 0 {
+        return Some(address);
+    }
+    let mut at = window.ranges;
+    let end = window.ranges + window.ranges_len;
+    while at + stride <= end {
+        let child_base = cells(at, window.child_cells);
+        let parent_base = cells(at + window.child_cells as u64 * 4, window.parent_cells);
+        let span = cells(at + (window.child_cells + window.parent_cells) as u64 * 4, window.size_cells);
+        if address >= parent_base && address - parent_base < span {
+            return Some(child_base + (address - parent_base));
+        }
+        at += stride;
+    }
+    None
+}
+
 /// Turn a found node's `reg` into addresses the processor can use.
 unsafe fn resolve(
     levels: &[Level; MAX_DEPTH],
@@ -551,7 +673,43 @@ unsafe fn resolve(
     reg_len: u64,
 ) -> Option<Node> {
     let empty = Reg { bus: 0, cpu: None, size: 0 };
-    let mut node = Node { first_prop, strings, struct_end, reg: [empty; MAX_REG], reg_count: 0 };
+    let no_window =
+        DmaWindow { ranges: 0, ranges_len: 0, child_cells: 0, parent_cells: 0, size_cells: 0 };
+    let mut node = Node {
+        first_prop,
+        strings,
+        struct_end,
+        reg: [empty; MAX_REG],
+        reg_count: 0,
+        dma: [no_window; MAX_DMA],
+        dma_count: 0,
+        dma_overflow: false,
+    };
+    // The buses above the node that say how their devices see memory, from
+    // the one nearest the root down to the parent. The node at depth d has
+    // its parent at `levels[d - 2]`; the root, at `levels[0]`, has nothing
+    // above it to map to and is left out. Each bus reads its entries with its
+    // own address cells on the device side and its parent's on the other.
+    if (2..=MAX_DEPTH).contains(&depth) {
+        for index in 1..depth - 1 {
+            let bus = &levels[index];
+            if bus.dma_ranges == 0 {
+                continue;
+            }
+            if node.dma_count == MAX_DMA {
+                node.dma_overflow = true;
+                break;
+            }
+            node.dma[node.dma_count] = DmaWindow {
+                ranges: bus.dma_ranges,
+                ranges_len: bus.dma_ranges_len,
+                child_cells: bus.address_cells,
+                parent_cells: levels[index - 1].address_cells,
+                size_cells: bus.size_cells,
+            };
+            node.dma_count += 1;
+        }
+    }
     // The root has no parent to take cell counts from, and nothing is looked
     // up there. A node with no `reg` is still a node: the caller may only want
     // a property off it.
