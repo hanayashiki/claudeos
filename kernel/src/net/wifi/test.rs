@@ -16,6 +16,7 @@ use super::nvram;
 use super::protocol::{self, HeaderError};
 use super::sdhci;
 use super::sdio;
+use super::wpa;
 use crate::arch;
 use crate::net::genettest::{place, Builder};
 use alloc::vec::Vec;
@@ -61,6 +62,273 @@ pub fn run(report: &mut Report) {
     voltage(report);
     credentials(report);
     device_tree(report);
+    supplicant_vectors(report);
+    induction_handshake(report);
+    group_rekey(report);
+    key_layout(report);
+}
+
+fn hex(text: &str) -> Vec<u8> {
+    let digits: Vec<u8> = text.bytes().filter(|b| b.is_ascii_hexdigit()).collect();
+    digits
+        .chunks(2)
+        .map(|pair| {
+            let value = |d: u8| if d.is_ascii_digit() { d - b'0' } else { (d | 0x20) - b'a' + 10 };
+            (value(pair[0]) << 4) | value(pair[1])
+        })
+        .collect()
+}
+
+/// Published vectors for the primitives: the SHA-1 PRF and the passphrase to
+/// PSK mapping as hostap's `src/crypto/crypto_module_tests.c` checks them
+/// (IEEE 802.11 Annex J), and RFC 3394 test vector 4.1 for key wrap.
+fn supplicant_vectors(report: &mut Report) {
+    let mut out = [0u8; 64];
+    wpa::prf_sha1(&[0x0b; 20], b"prefix", b"Hi There", &mut out);
+    report.check(
+        "prf-sha1: key 0x0b x 20, \"Hi There\"",
+        out[..] == hex("bcd4c650b30b96849518 29e0d75f9d54b862175ed9f00606e17d8da35402ffee75df78c3d31e0f889f012120c0862beb67753e7439ae242edb8373698356cf5a")[..],
+    );
+    wpa::prf_sha1(b"Jefe", b"prefix", b"what do ya want for nothing?", &mut out);
+    report.check(
+        "prf-sha1: key \"Jefe\"",
+        out[..] == hex("51f4de5b33f249adf81aeb713a3c20f4fe631446fabdfa58244759ae58ef9009a99abf4eac2ca5fa87e692c440eb40023e7babb206d61de7b92f41529092b8fc")[..],
+    );
+    wpa::prf_sha1(&[0xaa; 20], b"prefix", &[0xdd; 50], &mut out);
+    report.check(
+        "prf-sha1: key 0xaa x 20, 0xdd x 50",
+        out[..] == hex("e1ac546ec4cb636f9976487be5c86be17a0252ca5d8d8df12cfb0473525249ce9dd8d177ead710bc9b590547239107aef7b4abd43d87f0a68f1cbd9e2b6f7607")[..],
+    );
+
+    let psk = [
+        ("password", "IEEE", "f42c6fc52df0ebef9ebb4b90b38a5f902e83fe1b135a70e23aed762e9710a12e"),
+        ("ThisIsAPassword", "ThisIsASSID", "0dc0d6eb90555ed6419756b9a15ec3e3209b63df707dd508d14581f8982721af"),
+        (
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+            "becb93866bb8c3832cb777c2f559807c8c59afcb6eae734885001300a981cc62",
+        ),
+    ];
+    for (passphrase, ssid, expected) in psk {
+        let pmk = wpa::Pmk::from_passphrase(passphrase.as_bytes(), ssid.as_bytes());
+        report.check("pbkdf2: an 802.11 Annex J passphrase", pmk.equals(&hex(expected)));
+    }
+
+    let kek: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    let plain = hex("00112233445566778899AABBCCDDEEFF");
+    let wrapped = hex("1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5");
+    let mut out = [0u8; 24];
+    report.check("aes key wrap: RFC 3394 4.1", wpa::aes_wrap(&kek, &plain, &mut out) && out[..] == wrapped[..]);
+    let mut back = [0u8; 16];
+    report.check("aes key unwrap: RFC 3394 4.1", wpa::aes_unwrap(&kek, &wrapped, &mut back) && back[..] == plain[..]);
+    let mut bad = wrapped.clone();
+    bad[23] ^= 1;
+    report.check("aes key unwrap: a changed byte fails the integrity check", !wpa::aes_unwrap(&kek, &bad, &mut back));
+}
+
+// Wireshark's published wpa-Induction.pcap: SSID "Coherer", passphrase
+// "Induction", access point 00:0c:41:82:b2:55, station 00:0d:93:82:36:3a.
+// The four EAPOL frames, frames 87, 89, 92 and 94, from the 802.1X header on.
+const INDUCTION_M1: &str = "0203007502008a001000000000000000003e8e967dacd960324cac5b6aa721235bf57b949771c867989f49d04ed47c69330000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000016dd14000fac04592da88096c461da246c69001e877f3d";
+const INDUCTION_M2: &str = "0203007502010a00100000000000000000cdf405ceb9d889ef3dec42609828fae546b7add7baecbb1a394eac5214b1d3860000000000000000000000000000000000000000000000000000000000000000a462a7029ad5ba30b6af0df391988e45001630140100000fac020100000fac040100000fac020000";
+const INDUCTION_M3: &str = "020300af0213ca001000000000000000013e8e967dacd960324cac5b6aa721235bf57b949771c867989f49d04ed47c6933f57b949771c867989f49d04ed47c6934cf0200000000000000000000000000007d0af6df51e99cde7a187453f0f935370050cfa72cde35b2c1e2319255806ab364179fd9673041b9a5939fa1a2010d2ac794e25168055f794ddc1fdfae3521f4446bfd11da98345f543df6ce199df8fe48f8cdd17adca87bf45711183c496d41aa0c";
+const INDUCTION_M4: &str = "0203005f02030a001000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010bba3bdfbcfde2bc537509d71f2ecd10000";
+/// The beacon's RSN element (frame 1) and the station's, from its association
+/// request (frame 82).
+const INDUCTION_AP_RSN: &str = "30180100000fac020200000fac04000fac020100000fac020000";
+const INDUCTION_STA_RSN: &str = "30140100000fac020100000fac040100000fac020000";
+/// The PMK for "Induction" and "Coherer", worked out separately with Python's
+/// `hashlib.pbkdf2_hmac`; with it the capture's own MICs on messages 2, 3 and
+/// 4 check, which is what shows it is right.
+const INDUCTION_PMK: &str = "a288fcf0caaacda9a9f58633ff35e8992a01d9c10ba5e02efdf8cb5d730ce7bc";
+
+/// The station's SNonce from message 2, in place of the generator.
+fn induction_snonce(buf: &mut [u8]) {
+    buf.copy_from_slice(&hex(INDUCTION_M2)[17..49]);
+}
+
+fn induction_supplicant(passphrase: &str, ap_rsn: &str) -> wpa::Supplicant {
+    let association = wpa::Association {
+        own: [0x00, 0x0d, 0x93, 0x82, 0x36, 0x3a],
+        aa: [0x00, 0x0c, 0x41, 0x82, 0xb2, 0x55],
+        own_rsn: hex(INDUCTION_STA_RSN),
+        ap_rsn: Some(hex(ap_rsn)),
+        ap_rsnx: None,
+        // The beacon's group suite, 00-0F-AC:2: this access point sends group
+        // traffic with TKIP, so its GTK is 32 bytes.
+        group_cipher: wpa::SUITE_TKIP,
+        // The captured station sent version 2; the driver sends hostap's 1.
+        eapol_version: 2,
+    };
+    wpa::Supplicant::new(association, wpa::Pmk::from_passphrase(passphrase.as_bytes(), b"Coherer"), induction_snonce)
+}
+
+/// Our frame with the Key Length field the captured station wrote, signed
+/// again, so it can be compared with the capture whole. The station in the
+/// capture (2006) wrote 16 in messages 2 and 4; hostap and IEEE 802.11-2020
+/// write 0, which is what this supplicant sends.
+fn with_key_length_16(s: &wpa::Supplicant, frame: &[u8]) -> Option<Vec<u8>> {
+    let mut copy = frame.to_vec();
+    copy[7..9].copy_from_slice(&16u16.to_be_bytes());
+    let mic = s.mic_under_current_key(&copy)?;
+    copy[81..97].copy_from_slice(&mic);
+    Some(copy)
+}
+
+fn induction_handshake(report: &mut Report) {
+    report.check("induction: the PMK", wpa::Pmk::from_passphrase(b"Induction", b"Coherer").equals(&hex(INDUCTION_PMK)));
+    let (m1, m2, m3, m4) = (hex(INDUCTION_M1), hex(INDUCTION_M2), hex(INDUCTION_M3), hex(INDUCTION_M4));
+
+    let mut s = induction_supplicant("Induction", INDUCTION_AP_RSN);
+    match s.receive(&m1) {
+        Ok(out) => {
+            report.check("induction: message 1 gives message 2", out.step == wpa::Step::Message1 && out.pairwise.is_none() && out.group.is_none());
+            report.check("induction: message 2 has key length 0", out.reply.len() == m2.len() && out.reply[7..9] == [0, 0]);
+            report.check(
+                "induction: the MIC of the captured message 2 under our PTK is the captured MIC",
+                s.mic_under_current_key(&m2).map(|m| m[..] == m2[81..97]).unwrap_or(false),
+            );
+            report.check(
+                "induction: message 2 is the captured one, byte for byte, given the capture's key length",
+                with_key_length_16(&s, &out.reply).map(|f| f == m2).unwrap_or(false),
+            );
+        }
+        Err(e) => report.check(&alloc::format!("induction: message 1 refused: {}", e), false),
+    }
+    match s.receive(&m3) {
+        Ok(out) => {
+            report.check("induction: message 3 verified, gives message 4", out.step == wpa::Step::Message3 && s.completed());
+            report.check("induction: message 4 has key length 0", out.reply.len() == m4.len() && out.reply[7..9] == [0, 0]);
+            report.check(
+                "induction: message 4 is the captured one, byte for byte, given the capture's key length",
+                with_key_length_16(&s, &out.reply).map(|f| f == m4).unwrap_or(false),
+            );
+            report.check("induction: a pairwise key of 16 bytes", out.pairwise.as_ref().map(|k| k.key().len()) == Some(16));
+            report.check(
+                "induction: a TKIP group key of 32 bytes, index 1 to 3, RSC cf 02",
+                out.group
+                    .as_ref()
+                    .map(|g| g.key().len() == 32 && (1..=3).contains(&g.index()) && g.rsc() == [0xcf, 0x02, 0, 0, 0, 0])
+                    .unwrap_or(false),
+            );
+        }
+        Err(e) => report.check(&alloc::format!("induction: message 3 refused: {}", e), false),
+    }
+    report.check("induction: message 3 again is a replay", matches!(s.receive(&m3), Err(wpa::Error::ReplayCounterNotIncreased)));
+    report.check("induction: message 1 again is a replay", matches!(s.receive(&m1), Err(wpa::Error::ReplayCounterNotIncreased)));
+
+    let mut s = induction_supplicant("Induction", INDUCTION_AP_RSN);
+    let _ = s.receive(&m1);
+    let mut changed = m3.clone();
+    changed[120] ^= 0x01;
+    report.check("induction: a changed byte in message 3 fails the MIC", matches!(s.receive(&changed), Err(wpa::Error::MicMismatch) | Err(wpa::Error::NoKeyForMic)));
+    report.check("induction: the unchanged message 3 is still taken after that", s.receive(&m3).is_ok());
+
+    let mut s = induction_supplicant("InductioN", INDUCTION_AP_RSN);
+    let _ = s.receive(&m1);
+    report.check("induction: the wrong passphrase fails message 3's MIC", matches!(s.receive(&m3), Err(wpa::Error::NoKeyForMic) | Err(wpa::Error::MicMismatch)));
+
+    let mut s = induction_supplicant("Induction", INDUCTION_STA_RSN);
+    let _ = s.receive(&m1);
+    let result = s.receive(&m3);
+    report.check(
+        "induction: an RSN element other than the beacon's fails, with reason 17",
+        matches!(result, Err(wpa::Error::RsnElementDiffers)) && result.err().and_then(|e| e.deauthenticate()) == Some(17),
+    );
+
+    let mut s = induction_supplicant("Induction", INDUCTION_AP_RSN);
+    report.check("induction: message 3 before message 1 has no key to check", matches!(s.receive(&m3), Err(wpa::Error::NoKeyForMic)));
+
+    // The same capture with the group cipher taken as CCMP: the 32-byte GTK
+    // does not fit, and hostap deauthenticates.
+    let association = wpa::Association {
+        own: [0x00, 0x0d, 0x93, 0x82, 0x36, 0x3a],
+        aa: [0x00, 0x0c, 0x41, 0x82, 0xb2, 0x55],
+        own_rsn: hex(INDUCTION_STA_RSN),
+        ap_rsn: Some(hex(INDUCTION_AP_RSN)),
+        ap_rsnx: None,
+        group_cipher: wpa::SUITE_CCMP,
+        eapol_version: 2,
+    };
+    let mut s = wpa::Supplicant::new(association, wpa::Pmk::from_passphrase(b"Induction", b"Coherer"), induction_snonce);
+    let _ = s.receive(&m1);
+    let result = s.receive(&m3);
+    report.check(
+        "induction: a group key of the wrong length for the cipher fails, with reason 1",
+        matches!(result, Err(wpa::Error::GtkLength)) && result.err().and_then(|e| e.deauthenticate()) == Some(1) && !s.completed(),
+    );
+    report.check("induction: a frame too short is refused", matches!(s.receive(&m1[..98]), Err(wpa::Error::TooShort)));
+}
+
+/// A rekey after the captured handshake. No published capture has one, so
+/// the group message is built with the supplicant's own PTK; this checks the
+/// parsing, the reply's layout and the replay and reinstall rules.
+fn group_rekey(report: &mut Report) {
+    let mut s = induction_supplicant("Induction", INDUCTION_AP_RSN);
+    let _ = s.receive(&hex(INDUCTION_M1));
+    let _ = s.receive(&hex(INDUCTION_M3));
+    let gtk = [0x11u8; 32];
+    let rsc = [5, 0, 0, 0, 0, 0, 0, 0];
+    let Some(g1) = s.group_message_for_test([0, 0, 0, 0, 0, 0, 0, 2], 2, &gtk, rsc) else {
+        report.check("group: message 1 built", false);
+        return;
+    };
+    match s.receive(&g1) {
+        Ok(out) => {
+            report.check(
+                "group: message 1 gives message 2 and key index 2 with RSC 5",
+                out.step == wpa::Step::GroupMessage1
+                    && out.group.as_ref().map(|g| g.index() == 2 && g.key() == &gtk[..] && g.rsc() == [5, 0, 0, 0, 0, 0]).unwrap_or(false),
+            );
+            report.check(
+                "group: message 2 is key information 0x0322, replay 2, no key data",
+                out.reply.len() == 99 && out.reply[5..7] == [0x03, 0x22] && out.reply[16] == 2 && out.reply[97..99] == [0, 0],
+            );
+            report.check(
+                "group: message 2's MIC is under the PTK",
+                s.mic_under_current_key(&out.reply).map(|m| m[..] == out.reply[81..97]).unwrap_or(false),
+            );
+        }
+        Err(e) => report.check(&alloc::format!("group: message 1 refused: {}", e), false),
+    }
+    report.check("group: the same message again is a replay", matches!(s.receive(&g1), Err(wpa::Error::ReplayCounterNotIncreased)));
+    if let Some(again) = s.group_message_for_test([0, 0, 0, 0, 0, 0, 0, 3], 2, &gtk, rsc) {
+        report.check("group: the same key under a new counter is not installed twice", s.receive(&again).map(|o| o.group.is_none()).unwrap_or(false));
+    }
+    let fresh = induction_supplicant("Induction", INDUCTION_AP_RSN);
+    report.check("group: no group message is built before a PTK", fresh.group_message_for_test([0; 8], 1, &gtk, rsc).is_none());
+}
+
+/// `struct brcmf_wsec_key_le` for the two keys the supplicant installs, and
+/// the station's RSN element as `wpa_gen_wpa_ie_rsn` writes it.
+fn key_layout(report: &mut Report) {
+    report.check(
+        "station rsn: CCMP group, one CCMP pairwise, one PSK AKM, 16 replay counters with WMM",
+        wpa::station_rsn_element(true) == hex("30140100000fac040100000fac040100000fac020c00"),
+    );
+    report.check("station rsn: no capabilities without WMM", wpa::station_rsn_element(false) == hex("30140100000fac040100000fac040100000fac020000"));
+    report.check("disassoc: the reason and the address in 12 bytes", protocol::scb_val(1, [1, 2, 3, 4, 5, 6]) == [1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 0, 0]);
+    let peer = [0x00, 0x0c, 0x41, 0x82, 0xb2, 0x55];
+    let pairwise = protocol::wsec_key(0, 16, Some(peer), [0; 6], |field| field.copy_from_slice(&[0xAB; 16]));
+    report.check(
+        "wsec_key pairwise: index 0, length 16, the key, CCMP, no flags, IV initialized, the peer at 156",
+        pairwise.len() == 164
+            && pairwise[0..8] == [0, 0, 0, 0, 16, 0, 0, 0]
+            && pairwise[8..24] == [0xAB; 16]
+            && pairwise[24..112].iter().all(|&b| b == 0)
+            && pairwise[112..120] == [4, 0, 0, 0, 0, 0, 0, 0]
+            && pairwise[132..136] == [1, 0, 0, 0]
+            && pairwise[156..162] == peer,
+    );
+    let group = protocol::wsec_key(2, 16, None, [0xcf, 0x02, 0x03, 0x04, 0x05, 0x06], |field| field.copy_from_slice(&[0xCD; 16]));
+    report.check(
+        "wsec_key group: index 2, the primary flag, the RSC as IV high 0x06050403 and low 0x02cf, no address",
+        group[0..4] == [2, 0, 0, 0]
+            && group[116..120] == [2, 0, 0, 0]
+            && group[140..144] == [0x03, 0x04, 0x05, 0x06]
+            && group[144..146] == [0xcf, 0x02]
+            && group[156..162] == [0; 6],
+    );
 }
 
 fn nvram_text(report: &mut Report) {

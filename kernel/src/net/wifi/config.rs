@@ -127,6 +127,18 @@ impl core::fmt::Display for Error {
     }
 }
 
+impl Config {
+    /// The network's PMK, derived from the passphrase with the name as the
+    /// salt. This is the third way the bytes are used, and like the other two
+    /// it hands none of them out.
+    pub fn pmk(&self) -> super::wpa::Pmk {
+        super::wpa::Pmk::from_passphrase(
+            &self.passphrase.bytes[..self.passphrase.len],
+            &self.ssid.bytes[..self.ssid.len],
+        )
+    }
+}
+
 /// Parse the file's text.
 pub fn parse(text: &[u8]) -> Result<Config, Error> {
     let mut ssid: Option<Ssid> = None;

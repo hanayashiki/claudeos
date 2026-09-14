@@ -26,11 +26,15 @@
 //! the card and the chip outright; nothing else in the kernel can reach them.
 //! Other tasks hand it frames through a queue.
 //!
-//! **Joining.** The firmware's own supplicant does the WPA2 handshake: the
-//! driver sets the security, hands over the passphrase and asks to join, the
-//! way brcmfmac's `brcmf_cfg80211_connect` does with its firmware supplicant
-//! profile, and the link is up once the firmware reports both the
-//! association and the keys.
+//! **Joining.** The chip's standard firmware has no supplicant, so the WPA2
+//! handshake runs in the kernel, in `wpa`, the way Raspberry Pi OS runs
+//! wpa_supplicant beside brcmfmac. The driver sets the security and the
+//! station's RSN element and asks to join, as `brcmf_cfg80211_connect` does
+//! without a firmware supplicant. Once the firmware reports the association,
+//! EAPOL frames from the access point go to the supplicant, its replies go out
+//! as ordinary data frames, and the keys it produces are installed with the
+//! "wsec_key" iovar. The link the stack sees is up only once the pairwise and
+//! group keys are in.
 //!
 //! **Nothing is signalled by interrupt yet.** The chip is polled once a
 //! timer tick and whenever a frame is queued, the way brcmfmac runs a bus in
@@ -44,6 +48,7 @@ pub mod protocol;
 pub mod sdhci;
 pub mod sdio;
 pub mod test;
+pub mod wpa;
 
 use crate::abi::Errno;
 use crate::arch;
@@ -107,9 +112,9 @@ const DATA_CREDIT_WAIT_MS: u64 = 100;
 /// brcmfmac does this, because a supplicant in user space decides there; here
 /// the kernel is the only thing that would.
 const JOIN_RETRY_MS: u64 = 30_000;
-/// `DEFAULT_EAPOL_KEY_PACKET_TIMEOUT` in WHD's `whd_wifi_api.c`: how long the
-/// firmware's supplicant waits for handshake message 1 or 3.
-const EAPOL_KEY_TIMEOUT_MS: u32 = 3000;
+/// EAPOL frames waiting for the task's loop. A handshake is four frames and a
+/// rekey two, so a few is plenty; more than that is dropped.
+const EAPOL_QUEUE_DEPTH: usize = 8;
 
 // ---------------------------------------------------------------------------
 // What the stack sees
@@ -659,10 +664,17 @@ pub struct Dongle {
     mac: [u8; 6],
     config: Option<config::Config>,
     announced_ready: bool,
-    /// `BRCMF_VIF_STATUS_ASSOC_SUCCESS` and `BRCMF_VIF_STATUS_EAP_SUCCESS`:
-    /// the firmware has associated, and its supplicant has finished.
+    /// `BRCMF_VIF_STATUS_ASSOC_SUCCESS`: the firmware has associated.
     associated: bool,
-    keys_installed: bool,
+    /// The access point associated with, from the SET_SSID event.
+    /// `profile->bssid`.
+    aa: Option<[u8; 6]>,
+    /// The RSN element the last join put in the association request.
+    own_rsn: Vec<u8>,
+    /// The handshake with the access point, from the association on.
+    supplicant: Option<wpa::Supplicant>,
+    /// EAPOL frames read from the chip and not yet given to the supplicant.
+    eapol: VecDeque<Vec<u8>>,
     /// When the last join was asked for, while the link has not come up.
     joining_since: Option<u64>,
     /// Every BSSID the scan saw carrying the configured network's name, so an
@@ -694,7 +706,10 @@ impl Dongle {
             config: None,
             announced_ready: false,
             associated: false,
-            keys_installed: false,
+            aa: None,
+            own_rsn: Vec::new(),
+            supplicant: None,
+            eapol: VecDeque::new(),
             joining_since: None,
             configured_bssids: Vec::new(),
         }
@@ -878,7 +893,15 @@ impl Dongle {
                 protocol::CHANNEL_DATA => {
                     if let Some((_, frame)) = protocol::strip_bcdc(payload) {
                         RECEIVED.fetch_add(1, Ordering::Relaxed);
-                        if CARD.link.load(Ordering::Relaxed) {
+                        let ethertype = frame.get(12..14).map(|t| u16::from_be_bytes([t[0], t[1]]));
+                        if ethertype == Some(ETHERTYPE_EAPOL) {
+                            // The handshake is the loop's to run, after the
+                            // events read with this frame, since the
+                            // association event can arrive in the same read.
+                            if self.eapol.len() < EAPOL_QUEUE_DEPTH {
+                                self.eapol.push_back(frame.to_vec());
+                            }
+                        } else if CARD.link.load(Ordering::Relaxed) {
                             crate::net::receive(frame);
                         } else {
                             note_early_frame(frame);
@@ -1311,8 +1334,30 @@ impl Dongle {
     }
 
     /// The security and the join, in the order `brcmf_cfg80211_connect` sets
-    /// them up for WPA2-PSK with CCMP and the firmware supplicant.
+    /// them up for WPA2-PSK with CCMP when the supplicant is on the host.
     fn join_with(&mut self, config: &config::Config) -> Result<(), String> {
+        // The network as the scan saw it: its strongest BSS with this name.
+        // Only what the supplicant can do is joined.
+        let Some(bss) = self.scan.iter().filter(|bss| config.ssid.matches(bss.ssid())).max_by_key(|bss| bss.rssi).cloned()
+        else {
+            return Err(String::from("the configured network was not in the scan"));
+        };
+        let s = bss.security;
+        let offers = s.rsn
+            && s.group == wpa::SUITE_CCMP
+            && s.pairwise[..s.pairwise_count].contains(&wpa::SUITE_CCMP)
+            && s.akm[..s.akm_count].contains(&protocol::AKM_PSK);
+        if !offers {
+            return Err(String::from("the network does not offer WPA2-PSK with CCMP for pairwise and group traffic"));
+        }
+        if s.capabilities.unwrap_or(0) & protocol::RSN_CAP_MFPR != 0 {
+            return Err(String::from("the network requires management frame protection, which this supplicant does not do"));
+        }
+        let own_rsn = wpa::station_rsn_element(bss.wmm);
+
+        // `brcmf_cfg80211_connect` hands the RSN element wpa_supplicant built
+        // to the firmware as "wpaie", which puts it in the association request.
+        self.set_iovar("wpaie", &own_rsn).map_err(|e| format!("wpaie: {}", e))?;
         // `brcmf_set_wpa_version`, WPA2.
         self.set_iovar_u32("wpa_auth", protocol::WPA2_AUTH_PSK | protocol::WPA2_AUTH_UNSPECIFIED)
             .map_err(|e| format!("wpa_auth: {}", e))?;
@@ -1320,41 +1365,19 @@ impl Dongle {
         self.set_iovar_u32("auth", 0).map_err(|e| format!("auth: {}", e))?;
         // `brcmf_set_wsec_mode`: CCMP for pairwise and group.
         self.set_iovar_u32("wsec", protocol::AES_ENABLED).map_err(|e| format!("wsec: {}", e))?;
-        // `brcmf_set_key_mgmt` for AKM 00-0F-AC:2. It sets "mfp" only from an
-        // RSN element it is handed, and this network advertises neither MFP
-        // bit, so "mfp" is left as it is.
+        // `brcmf_set_key_mgmt` for AKM 00-0F-AC:2. The firmware lists "mfp"
+        // in "cap", so brcmfmac has `BRCMF_FEAT_MFP` and sets "mfp" from the
+        // RSN element's capabilities, which have neither bit: `BRCMF_MFP_NONE`.
+        // brcmfmac does not look at the answer.
+        let _ = self.set_iovar_u32("mfp", 0);
         self.set_iovar_u32("wpa_auth", protocol::WPA2_AUTH_PSK).map_err(|e| format!("wpa_auth: {}", e))?;
-        // `BRCMF_PROFILE_FWSUP_PSK`: the firmware's supplicant. Only a
-        // firmware built with "idsup" has one; any other refuses this.
-        self.set_iovar_u32("sup_wpa", 1).map_err(|e| format!("sup_wpa: {}", e))?;
-        match self.get_iovar_u32("sup_wpa") {
-            Ok(value) => crate::println!("wifi: sup_wpa accepted; it reads back {}", value),
-            Err(error) => crate::println!("wifi: sup_wpa accepted, but reading it back failed: {}", error),
-        }
-        // `whd_wifi_prepare_join`, Infineon's driver for firmware with this
-        // supplicant, sets two more that brcmfmac does not: the EAPOL version
-        // "to whatever the AP is using (-1)", and how long to wait for the
-        // access point's first and third handshake messages,
-        // `DEFAULT_EAPOL_KEY_PACKET_TIMEOUT`. Without the timeout a stalled
-        // handshake never ends in a PSK_SUP event. WHD carries on if either is
-        // refused, and so does this.
-        if let Err(error) = self.set_iovar_u32("sup_wpa2_eapver", u32::MAX) {
-            crate::println!("wifi: sup_wpa2_eapver refused: {}", error);
-        }
-        if let Err(error) = self.set_iovar_u32("sup_wpa_tmo", EAPOL_KEY_TIMEOUT_MS) {
-            crate::println!("wifi: sup_wpa_tmo refused: {}", error);
-        }
-        // The passphrase, flagged so the firmware derives the key itself, as
-        // embassy's cyw43 hands it over.
-        let mut pmk = protocol::wsec_pmk(config.passphrase.len(), protocol::WSEC_PASSPHRASE, |key| {
-            config.passphrase.copy_into(key)
-        });
-        let set = self.ioctl_secret(protocol::C_SET_WSEC_PMK, &pmk);
-        pmk.fill(0);
-        set.map_err(|e| format!("handing over the passphrase: {}", e))?;
+        // Without `BRCMF_FEAT_FWSUP` brcmfmac leaves "sup_wpa" alone.
 
         self.associated = false;
-        self.keys_installed = false;
+        self.aa = None;
+        self.supplicant = None;
+        self.eapol.clear();
+        self.own_rsn = own_rsn;
         let mut join = protocol::ext_join_params(config.ssid.len(), |field| config.ssid.copy_into(field));
         let joined = self.set_iovar_secret("join", &join);
         join.fill(0);
@@ -1366,53 +1389,182 @@ impl Dongle {
             set.map_err(|e| format!("WLC_SET_SSID: {}", e))?;
         }
         self.joining_since = Some(now_us());
-        crate::println!("wifi: join requested");
+        crate::println!("wifi: join requested, the station's RSN element {} bytes, WMM {}", self.own_rsn.len(), bss.wmm);
         Ok(())
     }
 
-    /// `brcmf_is_linkup` and `brcmf_is_linkdown` for the firmware supplicant:
-    /// up once both the association and the key exchange have succeeded, in
-    /// either order; down on a deauthentication, a disassociation, or a link
-    /// event without the link flag.
+    /// `brcmf_is_linkup` and `brcmf_is_linkdown` without a firmware
+    /// supplicant: a successful SET_SSID is the association, and starts the
+    /// handshake; a deauthentication, a disassociation, or a link event
+    /// without the link flag ends it. The stack's link comes up in
+    /// `handshake`, once the keys are installed.
     fn link_event(&mut self, event: &Event) {
-        if event.event_type == protocol::E_PSK_SUP && event.status == protocol::E_STATUS_FWSUP_COMPLETED {
-            self.keys_installed = true;
-        }
         if event.event_type == protocol::E_SET_SSID {
             if event.status == protocol::E_STATUS_SUCCESS {
                 self.associated = true;
+                self.aa = Some(event.addr);
+                self.start_supplicant(event.addr);
             } else {
                 crate::println!("wifi: the join failed: SET_SSID status {} reason {}", event.status, event.reason);
             }
-        }
-        let up = CARD.link.load(Ordering::Relaxed);
-        if !up && self.associated && self.keys_installed {
-            self.associated = false;
-            self.keys_installed = false;
-            CARD.link.store(true, Ordering::Relaxed);
-            let took = self.joining_since.take().map(|t| (now_us() - t) / 1000).unwrap_or(0);
-            crate::println!(
-                "wifi: link up {} ms after the join request: associated, and the firmware's supplicant installed the keys",
-                took
-            );
             return;
         }
         let down = matches!(event.event_type, protocol::E_DEAUTH | protocol::E_DEAUTH_IND | protocol::E_DISASSOC_IND)
             || (event.event_type == protocol::E_LINK && event.flags & protocol::EVENT_MSG_LINK == 0);
         if down {
-            self.associated = false;
-            self.keys_installed = false;
-            if up {
-                CARD.link.store(false, Ordering::Relaxed);
-                self.joining_since = Some(now_us());
-                crate::println!(
-                    "wifi: link down: event {} status {} reason {}",
-                    event.event_type,
-                    event.status,
-                    event.reason
-                );
+            self.lose_association();
+            crate::println!(
+                "wifi: association ended: event {} status {} reason {}",
+                protocol::event_name(event.event_type),
+                event.status,
+                event.reason
+            );
+        }
+    }
+
+    /// The supplicant for a new association, with what `wpa_sm_set_assoc_wpa_ie`
+    /// and `wpa_sm_set_ap_rsn_ie` give hostap's: this station's element from
+    /// the join, and the access point's from the scan.
+    fn start_supplicant(&mut self, aa: [u8; 6]) {
+        let Some(config) = self.config.as_ref() else {
+            crate::println!("wifi: associated, but there is no configuration to derive a key from");
+            return;
+        };
+        let pmk = config.pmk();
+        let bss = self.scan.iter().find(|bss| bss.bssid == aa);
+        let association = wpa::Association {
+            own: self.mac,
+            aa,
+            own_rsn: self.own_rsn.clone(),
+            ap_rsn: bss.and_then(|bss| bss.rsn_element.clone()),
+            ap_rsnx: bss.and_then(|bss| bss.rsnx_element.clone()),
+            group_cipher: bss.map(|bss| bss.security.group).unwrap_or(wpa::SUITE_CCMP),
+            eapol_version: wpa::EAPOL_VERSION,
+        };
+        let seen = bss.is_some();
+        self.supplicant = Some(wpa::Supplicant::new(association, pmk, crate::rng::fill));
+        crate::println!(
+            "wifi: associated{}; the handshake can start",
+            if seen { "" } else { " with a BSS the scan did not see, so message 3 cannot be checked" }
+        );
+    }
+
+    /// Forget the association: the supplicant and its keys, and the stack's
+    /// link. A join is asked for again later.
+    fn lose_association(&mut self) {
+        self.associated = false;
+        self.aa = None;
+        self.supplicant = None;
+        self.eapol.clear();
+        if CARD.link.swap(false, Ordering::Relaxed) {
+            crate::println!("wifi: link down");
+        }
+        if self.joining_since.is_none() {
+            self.joining_since = Some(now_us());
+        }
+    }
+
+    /// `brcmf_cfg80211_disconnect`, which hostap's `wpa_sm_deauthenticate`
+    /// reaches through nl80211: WLC_DISASSOC with the reason and the access
+    /// point's address.
+    fn disassociate(&mut self, reason: u16) {
+        if let Some(aa) = self.aa {
+            let request = protocol::scb_val(reason as u32, aa);
+            if let Err(error) = self.ioctl(protocol::C_DISASSOC, true, request.len(), &request) {
+                crate::println!("wifi: WLC_DISASSOC: {}", error);
             }
         }
+        crate::println!("wifi: disassociated with reason {}", reason);
+        self.lose_association();
+    }
+
+    /// One EAPOL frame from the chip: to the supplicant, its reply to the
+    /// access point, then the keys to the chip, in that order.
+    fn handshake(&mut self, frame: &[u8]) {
+        if frame.len() < 14 {
+            return;
+        }
+        let mut source = [0u8; 6];
+        source.copy_from_slice(&frame[6..12]);
+        let (Some(aa), Some(supplicant)) = (self.aa, self.supplicant.as_mut()) else {
+            crate::println!("wifi: an EAPOL frame before the association; dropped");
+            return;
+        };
+        if source != aa {
+            crate::println!("wifi: an EAPOL frame from an address other than the access point's; dropped");
+            return;
+        }
+        let outcome = match supplicant.receive(&frame[14..]) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                crate::println!("wifi: handshake frame refused: {}", error);
+                if let Some(reason) = error.deauthenticate() {
+                    self.disassociate(reason);
+                }
+                return;
+            }
+        };
+        let (received, sent) = match outcome.step {
+            wpa::Step::Message1 => ("message 1 received", "message 2 sent"),
+            wpa::Step::Message3 => ("message 3 verified", "message 4 sent"),
+            wpa::Step::GroupMessage1 => ("group key message 1 verified", "group key message 2 sent"),
+        };
+        crate::println!("wifi: handshake: {}", received);
+
+        let mut ethernet = Vec::with_capacity(14 + outcome.reply.len());
+        ethernet.extend_from_slice(&aa);
+        ethernet.extend_from_slice(&self.mac);
+        ethernet.extend_from_slice(&ETHERTYPE_EAPOL.to_be_bytes());
+        ethernet.extend_from_slice(&outcome.reply);
+        if let Err(error) = self.send_data(&ethernet) {
+            crate::println!("wifi: handshake: the reply was not sent: {}", error);
+            return;
+        }
+        crate::println!("wifi: handshake: {}", sent);
+
+        if let Some(pairwise) = &outcome.pairwise {
+            // wpa_supplicant's nl80211 driver passes the access point's
+            // address and a sequence counter of zero for the PTK.
+            match self.install_key(0, pairwise.key(), Some(aa), [0; wpa::RSC_LEN]) {
+                Ok(()) => crate::println!("wifi: handshake: pairwise key installed"),
+                Err(error) => {
+                    crate::println!("wifi: handshake: installing the pairwise key failed: {}", error);
+                    self.disassociate(wpa::REASON_UNSPECIFIED);
+                    return;
+                }
+            }
+        }
+        if let Some(group) = &outcome.group {
+            match self.install_key(group.index() as u32, group.key(), None, group.rsc()) {
+                Ok(()) => crate::println!("wifi: handshake: group key installed, index {}", group.index()),
+                Err(error) => {
+                    crate::println!("wifi: handshake: installing the group key failed: {}", error);
+                    self.disassociate(wpa::REASON_UNSPECIFIED);
+                    return;
+                }
+            }
+        }
+        let completed = self.supplicant.as_ref().map(|s| s.completed()).unwrap_or(false);
+        if completed && !CARD.link.load(Ordering::Relaxed) {
+            CARD.link.store(true, Ordering::Relaxed);
+            let took = self.joining_since.take().map(|t| (now_us() - t) / 1000).unwrap_or(0);
+            crate::println!("wifi: link up {} ms after the join request: the 4-way handshake finished and the keys are installed", took);
+        }
+    }
+
+    /// `send_key_to_dongle` with the key `brcmf_cfg80211_add_key` builds. For a
+    /// key without a peer address it then adds `AES_ENABLED` to "wsec", as
+    /// add_key does for a key that is not an "ext_key".
+    fn install_key(&mut self, index: u32, key: &[u8], peer: Option<[u8; 6]>, rsc: [u8; wpa::RSC_LEN]) -> Result<(), IoctlError> {
+        let mut request = protocol::wsec_key(index, key.len(), peer, rsc, |field| field.copy_from_slice(key));
+        let result = self.set_iovar_secret("wsec_key", &request);
+        request.fill(0);
+        result?;
+        if peer.is_none() {
+            let wsec = self.get_iovar_u32("wsec")?;
+            self.set_iovar_u32("wsec", wsec | protocol::AES_ENABLED)?;
+        }
+        Ok(())
     }
 
     /// One Ethernet frame to the firmware, once its window allows.
@@ -1490,6 +1642,9 @@ fn run(mut dongle: Dongle) -> ! {
                 dongle.event_source(&event)
             );
             dongle.link_event(&event);
+        }
+        while let Some(frame) = dongle.eapol.pop_front() {
+            dongle.handshake(&frame);
         }
         loop {
             let next = TX.lock().pop_front();

@@ -398,6 +398,62 @@ pub fn ext_join_params(ssid_len: usize, fill: impl FnOnce(&mut [u8])) -> [u8; EX
     out
 }
 
+/// `BRCMF_C_DISASSOC` in `fwil.h`.
+pub const C_DISASSOC: u32 = 52;
+
+/// `struct brcmf_scb_val_le` as `brcmf_cfg80211_disconnect` fills it for
+/// WLC_DISASSOC: the reason code and the access point's address, padded to
+/// twelve bytes by the structure's alignment.
+pub fn scb_val(reason: u32, address: [u8; 6]) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    out[0..4].copy_from_slice(&reason.to_le_bytes());
+    out[4..10].copy_from_slice(&address);
+    out
+}
+
+/// `CRYPTO_ALGO_AES_CCM` in `brcmu_wifi.h`.
+pub const CRYPTO_ALGO_AES_CCM: u32 = 4;
+/// `BRCMF_PRIMARY_KEY` in `fwil_types.h`.
+pub const PRIMARY_KEY: u32 = 1 << 1;
+/// `sizeof(struct brcmf_wsec_key_le)`: index, length, 32 bytes of key, 72 of
+/// padding, algorithm, flags, 12 of padding, `iv_initialized`, 4 of padding,
+/// the receive IV as a 32-bit and a 16-bit field padded to 8, 8 of padding,
+/// and the peer address, padded to a multiple of 4. WHD's `wl_wsec_key_t` has
+/// the same offsets.
+pub const WSEC_KEY_LEN: usize = 164;
+
+/// The "wsec_key" iovar's data for a CCMP key, as `brcmf_cfg80211_add_key`
+/// fills `struct brcmf_wsec_key` and `convert_key_from_CPU` lays it out.
+/// wpa_supplicant's nl80211 driver names the access point for a pairwise key
+/// and no address for a group key, so a pairwise key is an "ext_key" with the
+/// peer's address and no flags, and a group key has `BRCMF_PRIMARY_KEY`. Both
+/// come with a six-byte sequence counter, which becomes the receive IV with
+/// `iv_initialized` set. `fill` writes the key into the data field.
+pub fn wsec_key(
+    index: u32,
+    key_len: usize,
+    peer: Option<[u8; 6]>,
+    rsc: [u8; 6],
+    fill: impl FnOnce(&mut [u8]),
+) -> [u8; WSEC_KEY_LEN] {
+    let mut out = [0u8; WSEC_KEY_LEN];
+    out[0..4].copy_from_slice(&index.to_le_bytes());
+    out[4..8].copy_from_slice(&(key_len as u32).to_le_bytes());
+    fill(&mut out[8..8 + key_len.min(32)]);
+    out[112..116].copy_from_slice(&CRYPTO_ALGO_AES_CCM.to_le_bytes());
+    let flags = if peer.is_some() { 0 } else { PRIMARY_KEY };
+    out[116..120].copy_from_slice(&flags.to_le_bytes());
+    out[132..136].copy_from_slice(&1u32.to_le_bytes());
+    let hi = u32::from_le_bytes([rsc[2], rsc[3], rsc[4], rsc[5]]);
+    let lo = u16::from_le_bytes([rsc[0], rsc[1]]);
+    out[140..144].copy_from_slice(&hi.to_le_bytes());
+    out[144..146].copy_from_slice(&lo.to_le_bytes());
+    if let Some(peer) = peer {
+        out[156..162].copy_from_slice(&peer);
+    }
+    out
+}
+
 /// The WLC_SET_SSID fallback's data: the SSID alone.
 pub fn ssid_le(ssid_len: usize, fill: impl FnOnce(&mut [u8])) -> [u8; SSID_LE_LEN] {
     let mut out = [0u8; SSID_LE_LEN];
@@ -644,7 +700,7 @@ pub fn parse_security(ies: &[u8]) -> Security {
 }
 
 /// One network from a scan.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Bss {
     pub bssid: [u8; 6],
     pub ssid: [u8; 32],
@@ -654,6 +710,41 @@ pub struct Bss {
     pub rssi: i16,
     pub capability: u16,
     pub security: Security,
+    /// The RSN and RSNX elements whole, header included, which the
+    /// supplicant compares with message 3's. `sm->ap_rsn_ie` and
+    /// `sm->ap_rsnxe`.
+    pub rsn_element: Option<Vec<u8>>,
+    pub rsnx_element: Option<Vec<u8>>,
+    /// Whether the network has a WMM element, which decides the replay
+    /// counters this station advertises.
+    pub wmm: bool,
+}
+
+/// `WLAN_EID_RSNX` in hostap's `ieee802_11_defs.h`.
+const WLAN_EID_RSNX: u8 = 244;
+/// `WMM_IE_VENDOR_TYPE`: Microsoft's OUI and type 2, any subtype, which
+/// `wpa_bss_get_vendor_ie` matches on.
+const WMM_OUI_TYPE: [u8; 4] = [0x00, 0x50, 0xF2, 0x02];
+
+/// The first RSN and RSNX elements whole, and whether there is a WMM element,
+/// in a run of information elements.
+pub fn find_elements(ies: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>, bool) {
+    let mut rsn = None;
+    let mut rsnx = None;
+    let mut wmm = false;
+    let mut at = 0;
+    while at + 2 <= ies.len() {
+        let len = ies[at + 1] as usize;
+        let Some(element) = ies.get(at..at + 2 + len) else { break };
+        match element[0] {
+            WLAN_EID_RSN if rsn.is_none() => rsn = Some(element.to_vec()),
+            WLAN_EID_RSNX if rsnx.is_none() => rsnx = Some(element.to_vec()),
+            WLAN_EID_VENDOR_SPECIFIC if element[2..].starts_with(&WMM_OUI_TYPE) => wmm = true,
+            _ => {}
+        }
+        at += 2 + len;
+    }
+    (rsn, rsnx, wmm)
 }
 
 impl Bss {
@@ -697,10 +788,11 @@ pub fn parse_escan_result(data: &[u8]) -> Option<Bss> {
     // not fit inside the event are not read.
     let ie_offset = le16(bss + 116) as usize;
     let ie_length = le32(bss + 120) as usize;
-    let security = match data.get(bss + ie_offset..(bss + ie_offset).saturating_add(ie_length)) {
-        Some(ies) if bss + ie_offset + ie_length <= buflen => parse_security(ies),
-        _ => Security::default(),
-    };
+    let (security, (rsn_element, rsnx_element, wmm)) =
+        match data.get(bss + ie_offset..(bss + ie_offset).saturating_add(ie_length)) {
+            Some(ies) if bss + ie_offset + ie_length <= buflen => (parse_security(ies), find_elements(ies)),
+            _ => (Security::default(), (None, None, false)),
+        };
     Some(Bss {
         bssid,
         ssid,
@@ -710,5 +802,8 @@ pub fn parse_escan_result(data: &[u8]) -> Option<Bss> {
         rssi: le16(bss + 78) as i16,
         capability: le16(bss + 16),
         security,
+        rsn_element,
+        rsnx_element,
+        wmm,
     })
 }
