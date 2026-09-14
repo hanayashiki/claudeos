@@ -215,6 +215,14 @@ pub fn probe(number: u64) -> i64 {
     unsafe { syscall3(number, 0, 0, 0) }
 }
 
+/// The `alarm` system call itself. Only x86-64 has one, and a C library makes
+/// its `alarm` out of `setitimer`, so this is the only way to reach it.
+#[cfg(target_arch = "x86_64")]
+pub fn alarm_call(seconds: u32) -> i64 {
+    const SYS_ALARM: u64 = 37;
+    unsafe { syscall1(SYS_ALARM, seconds as u64) }
+}
+
 #[cfg(target_arch = "x86_64")]
 pub fn fork() -> i64 {
     unsafe { syscall0(SYS_FORK) }

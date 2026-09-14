@@ -263,6 +263,9 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         }
         nr::NANOSLEEP => proc::nanosleep(args[0], args[1]),
         nr::CLOCK_NANOSLEEP => proc::nanosleep(args[2], args[3]),
+        nr::SETITIMER => proc::setitimer(args[0] as i32, args[1], args[2]),
+        nr::GETITIMER => proc::getitimer(args[0] as i32, args[1]),
+        nr::ALARM => proc::alarm(args[0] as u32),
         nr::PAUSE => {
             sched::sleep_ticks(u64::MAX / 2);
             Err(Errno::EINTR)
@@ -305,8 +308,12 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
             args[4],
             args[5],
         ),
-        nr::SENDMSG => file::sendmsg(args[0] as i32, args[1]),
-        nr::RECVMSG => file::recvmsg(args[0] as i32, args[1]),
+        nr::SENDMSG => net::sendmsg(args[0] as i32, args[1], args[2] as u32),
+        nr::RECVMSG => net::recvmsg(args[0] as i32, args[1], args[2] as u32),
+        nr::SENDMMSG => net::sendmmsg(args[0] as i32, args[1], args[2] as u32, args[3] as u32),
+        nr::RECVMMSG => {
+            net::recvmmsg(args[0] as i32, args[1], args[2] as u32, args[3] as u32, args[4])
+        }
         nr::SHUTDOWN => net::shutdown(args[0] as i32, args[1] as u32),
         nr::SETSOCKOPT => net::setsockopt(
             args[0] as i32,
@@ -444,6 +451,11 @@ pub fn name_of(number: u64) -> &'static str {
         nr::CLOCK_NANOSLEEP => "clock_nanosleep",
         nr::SENDMSG => "sendmsg",
         nr::RECVMSG => "recvmsg",
+        nr::SENDMMSG => "sendmmsg",
+        nr::RECVMMSG => "recvmmsg",
+        nr::SETITIMER => "setitimer",
+        nr::GETITIMER => "getitimer",
+        nr::ALARM => "alarm",
         nr::SOCKETPAIR => "socketpair",
         nr::PPOLL => "ppoll",
         nr::PSELECT6 => "pselect6",

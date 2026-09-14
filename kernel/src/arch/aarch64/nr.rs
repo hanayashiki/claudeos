@@ -47,6 +47,12 @@ pub const DUP: u64 = 23;
 pub const DUP2: u64 = ABSENT + 7;
 pub const PAUSE: u64 = ABSENT + 8;
 pub const NANOSLEEP: u64 = 101;
+pub const GETITIMER: u64 = 102;
+pub const SETITIMER: u64 = 103;
+/// There is no such call here: a C library makes `alarm` out of `setitimer`.
+pub const ALARM: u64 = ABSENT + 30;
+pub const RECVMMSG: u64 = 243;
+pub const SENDMMSG: u64 = 269;
 pub const GETPID: u64 = 172;
 pub const SENDFILE: u64 = 71;
 pub const SOCKET: u64 = 198;

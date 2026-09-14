@@ -242,8 +242,8 @@ pub fn render(kind: Generated) -> String {
             // signal blocked sigignore sigcatch wchan nswap cnswap
             out.push_str(&format!(
                 "{} {} 0 0 0 0 0 ",
-                task.pending_signals.get(),
-                task.signal_mask.get()
+                task.pending(),
+                task.blocked()
             ));
             // exit_signal processor rt_priority policy delayacct_blkio
             out.push_str("17 0 0 0 0 ");
@@ -275,8 +275,8 @@ pub fn render(kind: Generated) -> String {
                 task.virtual_size() / 1024,
                 task.resident_pages() * 4,
                 (task.brk().saturating_sub(task.brk_start())) / 1024,
-                task.pending_signals.get(),
-                task.signal_mask.get(),
+                task.pending(),
+                task.blocked(),
             )
         })
         .unwrap_or_default(),

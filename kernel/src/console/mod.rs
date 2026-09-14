@@ -193,7 +193,7 @@ fn claim_terminal() -> Result<(), Errno> {
         // by it, so the read fails outright rather than looping.
         let bit = crate::abi::SIGTTIN.bit();
         let action = task.action(crate::abi::SIGTTIN);
-        if task.signal_mask.get() & bit != 0 || action.handler == crate::signal::SIG_IGN {
+        if task.blocked() & bit != 0 || action.handler == crate::signal::SIG_IGN {
             return Err(Errno::EIO);
         }
         let pgid = task.pgid.get();
