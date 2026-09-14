@@ -78,11 +78,12 @@ ARCH=aarch64 ./scripts/run.sh --initrd build/initramfs-aarch64.cpio \
     --append 'init=/bin/init'
 ARCH=aarch64 make busybox                # an aarch64 busybox to test against
 ARCH=aarch64 make alpine                 # an aarch64 Alpine root filesystem
-ARCH=aarch64 ./scripts/test.sh           # all nine sections
+ARCH=aarch64 ./scripts/test.sh           # every section but the telnet console
 ```
 
 Both third-party images are fetched for the machine `ARCH` names, so the same
-nine sections run on either one. busybox.net has no aarch64 build among its
+nine sections run on either one. x86-64 runs a tenth, the telnet console, which
+needs the network card that QEMU's `raspi4b` does not emulate. busybox.net has no aarch64 build among its
 prebuilt binaries, so that one comes from Alpine's `busybox-static` package
 instead; `scripts/fetch-busybox.sh` refuses anything that is not a static ELF
 for the machine asked for, since a dynamically linked one has no interpreter to
@@ -179,6 +180,93 @@ command line change that:
 panic=N          restart N seconds after a panic; 0 stays stopped, below 0 restarts at once
 watchdog=off     leave the watchdog stopped, for a debugger holding the processor still
 ```
+
+## The telnet console
+
+The console the serial cable carries can also be reached over the network, on
+TCP port 23 of the board's address. It is the same terminal, not a second one.
+What is typed over the connection goes through the line discipline the serial
+port's input goes through, so echo, backspace and `Ctrl-C` behave as they do on
+the cable, and everything the console prints, kernel messages included, goes
+to the serial port and to the connection both. It is not a login service, and
+there are no pseudo-terminals.
+
+**It is an unauthenticated root shell for the first client on the network to
+connect.** Anyone who can reach port 23 on the board gets a root shell without
+a password. That was accepted for a home network. It is not safe on a network
+shared with anyone you do not trust. `telnet=off` on the kernel command line
+turns it off; without that word it is on.
+
+macOS ships no telnet client, so `scripts/console.py` is one. It needs only
+Python's standard library.
+
+```sh
+scripts/console.py                        # find the board, then an interactive terminal
+scripts/console.py 192.168.86.57          # the same, at the address given
+scripts/console.py 192.168.86.57 --send 'uname -a' --until '^Linux'
+```
+
+Without an address it looks in the Mac's ARP table for a Raspberry Pi hardware
+address, which begins `dc:a6:32`. The table holds the board once the Mac has
+exchanged packets with it, which netbooting it from the Mac does. When the
+board is not there the script says so and asks for the address, which the
+board prints on the serial console at boot:
+
+```
+dhcp: 192.168.86.57/24 gateway 192.168.86.1 dns 192.168.86.1, lease 86400 s from 192.168.86.1
+telnet: the console is on 192.168.86.57 port 23
+```
+
+With no steps it is interactive: the Mac's terminal is put in raw mode, every
+key goes to the board, `Ctrl-C` included, and `Ctrl-]` quits. With steps --
+`--send`, `--type`, `--until`, `--wait`, `--stall` -- it runs them in order and
+prints what the board prints meanwhile, so a script can run a command on the
+board and read the result. `--timestamps` puts the seconds since connecting in
+front of each line, and `--help` lists the rest.
+
+A connection is sent the kernel log first, which is what `dmesg` reads, so a
+client that connects long after boot still sees how the boot went. Then the
+kernel prints `telnet: console attached from` and the client's address, on the
+serial port and the connection both, and live output follows. No prompt is
+printed for the new connection; Enter gets one. Pushing a newline into the line
+discipline would have produced a prompt, but that newline is input like any
+other: at the shell it would run whatever half-typed line was on the serial
+side, and in any other program it would answer a read nobody typed.
+
+One connection at a time. Another that arrives while one is attached is sent
+`telnet console busy: in use from` and the attached client's address, and is
+closed. The attached connection is sent a telnet no-op at the same moment. If
+its client went away without closing, as a laptop that sleeps does, TCP gives
+up on it once the no-op's retransmissions run out, which on a local network
+is about thirty seconds, and the next attempt gets in.
+
+Nothing the network does can hold the console up. Output is copied to the
+connection where it is written to the serial port, with interrupts masked, so
+the copy only appends to a queue of 64 KiB, and the network task moves the
+queue into the TCP connection. A client that stops reading lets that queue and
+TCP's own 64 KiB fill. The connection is then reset rather than waited for, and
+the kernel logs one line saying so. A reset, rather than output quietly
+dropped, is what tells that client its output is incomplete.
+
+It listens once the network has a configuration, from DHCP or `ip=`, and only
+on a machine with a network card, so under QEMU's `raspi4b` it never starts.
+Under QEMU on x86-64 a port on the Mac can be forwarded to it:
+
+```sh
+./scripts/run.sh --timeout 3600 --hostfwd tcp:127.0.0.1:2323-:23 --initrd build/initramfs.cpio
+scripts/console.py 127.0.0.1 --port 2323
+```
+
+A kernel panic's message reaches the serial port and not the connection: the
+machine stops before the network task can send it.
+
+The protocol is RFC 854, with the echo option of RFC 857 and the suppressed
+go-ahead of RFC 858. The kernel offers both when a client connects, which puts
+the client in character mode with echo left to the board, and it parses and
+drops whatever the client sends about options, subnegotiation included. CR NUL
+and CR LF from the client reach the line discipline as the single CR that
+Enter is on the cable. In the output, a 0xFF byte is doubled and a CR on its
+own is sent as CR NUL.
 
 ## What the kernel does
 
@@ -525,7 +613,8 @@ there; what the page buys is that the program lives past its first signal.
 **Console.** A 16550 UART and a PS/2 keyboard feed one input ring. A line
 discipline implements canonical mode with echo, backspace, `Ctrl-C`, `Ctrl-D`
 and `Ctrl-U`, and honours the `termios` settings a program sets through
-`ioctl`, so raw-mode programs work too.
+`ioctl`, so raw-mode programs work too. The telnet console, described above,
+is one more input to that line discipline and one more copy of its output.
 
 ## What the userland is
 
@@ -667,6 +756,15 @@ failures.
   terminal in front of QEMU would have kept `Ctrl-C` for the host; this one
   interrupts a foreground `cat` and then a `while true` loop, and requires the
   prompt back and the next command run each time.
+- The **telnet console** boots x86-64 with a port on the host forwarded to the
+  guest's port 23 and drives it with `scripts/console.py`: the kernel log on a
+  connection made after boot, a command, backspace editing, `Ctrl-C` ending a
+  `sleep 100`, a second connection turned away as busy while the first carries
+  on, a reconnection, and a client that stops reading during `seq 1 200000`,
+  which has to be dropped while the output carries on to the serial port and
+  the next connection works. A second boot with `telnet=off` has to bring the
+  network up with nothing answering on port 23. It does not run on aarch64,
+  where QEMU emulates no network card.
 
 Every suite is an ordinary Linux program. Nothing in them is aware that they
 are not running on Linux.
@@ -695,7 +793,8 @@ kernel/src
   task.rs             task control block, user stack and auxiliary vector
   sched.rs            round-robin scheduler, exit and reaping
   uaccess.rs          validated copying between kernel and user memory
-  console.rs          input ring and terminal line discipline
+  console/mod.rs      input ring and terminal line discipline
+  console/telnet.rs   the same terminal over TCP port 23
   signal.rs           signal dispositions and default actions
   trap.rs             exception and interrupt handling
 
@@ -705,6 +804,7 @@ tools/mkcpio.py       initramfs builder
 tools/drive.py        drives the console over a socket, rendering as a terminal
 scripts/reap-stale.sh clears QEMU instances an earlier run left behind
 scripts/mkcard.sh     assembles the boot partition for a Pi, and writes a card
+scripts/console.py    a telnet client for the telnet console, interactive or scripted
 scripts/lossy-transfer.sh
                       megabytes each way through the card over a lossy link
 tests/suite.sh        in-OS shell and userland test suite

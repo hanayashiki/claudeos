@@ -48,6 +48,9 @@ struct BootOptions {
     /// protocols do about loss can be seen on the real card path. Zero is
     /// off, and it is zero unless the command line says otherwise.
     net_loss: u32,
+    /// Serve the console over TCP port 23 once the network has an address.
+    /// On unless the command line says `telnet=off`.
+    telnet: bool,
     /// Arguments for init, after its own path.
     args: Vec<String>,
     /// Init's environment: a fixed set, with any `name=value` word the kernel
@@ -63,6 +66,7 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
         net: NetWords::default(),
         net_test: false,
         net_loss: 0,
+        telnet: true,
         args: Vec::new(),
         env: ["PATH=/bin:/usr/bin", "HOME=/root", "TERM=linux", "USER=root", "PWD=/"]
             .iter()
@@ -93,6 +97,12 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
             options.net_test = value == "test";
         } else if let Some(value) = word.strip_prefix("netloss=") {
             options.net_loss = value.parse().unwrap_or(0);
+        } else if let Some(value) = word.strip_prefix("telnet=") {
+            match value {
+                "on" => options.telnet = true,
+                "off" => options.telnet = false,
+                _ => println!("telnet={} is neither on nor off, so it is ignored", value),
+            }
         } else if let Some(value) = word.strip_prefix("ip=") {
             options.net.ip = Some(value.to_string());
         } else if let Some(value) = word.strip_prefix("netmask=") {
@@ -329,6 +339,13 @@ pub fn start(boot: &boot::BootInfo) -> ! {
     // After init's pid, because the scheduler hands out process ids in order
     // and a good deal of the system takes pid 1 to be init.
     if nic {
+        // Before the network task, which is what runs it. Nothing listens
+        // until the network has a configuration.
+        if options.telnet {
+            console::telnet::enable();
+        } else {
+            println!("telnet: off, from the command line");
+        }
         net::start_task();
         if options.nettest {
             net::arptest::start();

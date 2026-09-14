@@ -508,6 +508,9 @@ pub fn tick() {
     arp::expire();
     tcp::on_tick();
     dhcp::on_tick();
+    // After the DHCP client, so the tick that publishes a configuration is
+    // the one that starts listening.
+    crate::console::telnet::on_tick();
     RUNNING.store(false, Ordering::Release);
 }
 
