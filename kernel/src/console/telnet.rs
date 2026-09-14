@@ -28,7 +28,7 @@
 
 use crate::abi::Errno;
 use crate::net::ip::Ipv4Addr;
-use crate::net::socket::{self, Endpoint, InetSocket};
+use crate::net::socket::{self, Endpoint, InetSocket, Received};
 use crate::net::tcp;
 use crate::serial::KernelLog;
 use crate::sync::Spinlock;
@@ -474,9 +474,9 @@ impl Connection {
     fn exchange(&mut self, scratch: &mut [u8]) -> Result<(), End> {
         loop {
             match self.socket.receive_into(scratch, false) {
-                Ok((0, _)) => return Err(End::Closed),
-                Ok((n, _)) => {
-                    for &byte in &scratch[..n] {
+                Ok(Received { taken: 0, .. }) => return Err(End::Closed),
+                Ok(Received { taken, .. }) => {
+                    for &byte in &scratch[..taken] {
                         if let Some(byte) = self.input.feed(byte) {
                             super::push_byte(byte);
                         }
@@ -553,8 +553,8 @@ fn refuse(socket: &Arc<InetSocket>, holder: Endpoint) {
     // rather than finished, and a reset can make the client's end discard the
     // line above before anything reads it.
     let mut discard = [0u8; 256];
-    while let Ok((n, _)) = socket.receive_into(&mut discard, false) {
-        if n == 0 {
+    while let Ok(Received { taken, .. }) = socket.receive_into(&mut discard, false) {
+        if taken == 0 {
             break;
         }
     }
