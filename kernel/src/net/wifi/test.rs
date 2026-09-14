@@ -333,6 +333,28 @@ fn requests(report: &mut Report) {
     report.check("clm: begin with handler version 1, type 2, length 3", begin[0..12] == [0x02, 0x10, 0x02, 0, 3, 0, 0, 0, 0, 0, 0, 0]);
     let end = protocol::clm_chunk(protocol::DL_END, &[1]);
     report.check("clm: end", end[0..2] == [0x04, 0x10]);
+    join_payloads(report);
+}
+
+fn join_payloads(report: &mut Report) {
+    let pmk = protocol::wsec_pmk(9, protocol::WSEC_PASSPHRASE, |key| key.copy_from_slice(b"abcdefghi"));
+    report.value("pmk: 132 bytes", pmk.len() as u64, 132);
+    report.check("pmk: length 9, the passphrase flag, the key, zeroes after", pmk[0..4] == [9, 0, 1, 0] && &pmk[4..13] == b"abcdefghi" && pmk[13..].iter().all(|&b| b == 0));
+
+    let join = protocol::ext_join_params(4, |field| field.copy_from_slice(b"home"));
+    report.value("join: 68 bytes", join.len() as u64, 68);
+    report.check("join: the SSID length and name", join[0..4] == [4, 0, 0, 0] && &join[4..8] == b"home" && join[8..36].iter().all(|&b| b == 0));
+    report.check("join: scan type -1, three bytes of padding", join[36] == 0xFF && join[37..40] == [0, 0, 0]);
+    report.check("join: nprobes, active, passive and home time -1", join[40..56].iter().all(|&b| b == 0xFF));
+    report.check("join: broadcast BSSID, padding, no chanspecs", join[56..62] == [0xFF; 6] && join[62..68] == [0; 6]);
+    let ssid = protocol::ssid_le(4, |field| field.copy_from_slice(b"home"));
+    report.check("set ssid: the SSID alone in 36 bytes", ssid.len() == 36 && ssid[0] == 4 && &ssid[4..8] == b"home");
+
+    let mut frame = Vec::new();
+    protocol::data_frame(&mut frame, 3, &[0x5A; 60]);
+    report.value("data: 12 + 2 + 4 + 60 bytes, rounded up to 80", frame.len() as u64, 80);
+    report.check("data: header length 78, channel 2, data offset 14", frame[0..2] == [78, 0] && frame[4..8] == [3, 2, 0, 14]);
+    report.check("data: a BCDC header of version 2 before the frame", frame[14..18] == [0x20, 0, 0, 0] && frame[18..78].iter().all(|&b| b == 0x5A));
 }
 
 fn sdio_arguments(report: &mut Report) {

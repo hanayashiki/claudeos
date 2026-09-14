@@ -12,8 +12,8 @@
 //! - `protocol`: SDPCM frames on function 2 and the BCDC control messages,
 //!   events and Ethernet frames inside them.
 //! - this file: finding the hardware in the device tree, the order of
-//!   bring-up, the request and response loop with the firmware, and the card
-//!   the network stack sends through.
+//!   bring-up, the request and response loop with the firmware, joining, and
+//!   the card the network stack sends through.
 //!
 //! **Why a task.** Bring-up uploads 600 KiB through a PIO data port, waits
 //! for clocks and for the firmware to boot, and scans for seconds. None of
@@ -25,6 +25,12 @@
 //! on and a long wait is an ordinary sleep. That task owns the controller,
 //! the card and the chip outright; nothing else in the kernel can reach them.
 //! Other tasks hand it frames through a queue.
+//!
+//! **Joining.** The firmware's own supplicant does the WPA2 handshake: the
+//! driver sets the security, hands over the passphrase and asks to join, the
+//! way brcmfmac's `brcmf_cfg80211_connect` does with its firmware supplicant
+//! profile, and the link is up once the firmware reports both the
+//! association and the keys.
 //!
 //! **Nothing is signalled by interrupt yet.** The chip is polled once a
 //! timer tick and whenever a frame is queued, the way brcmfmac runs a bus in
@@ -92,6 +98,13 @@ const TX_QUEUE_DEPTH: usize = 64;
 /// WL_ON is read back after each change during the first power cycle, which
 /// is two changes; a later cycle only happens when the first found no card.
 const WL_ON_LOGGED_CHANGES: u32 = 2;
+/// How long a data frame waits for the firmware's window before it is
+/// dropped, the way a full ring drops one.
+const DATA_CREDIT_WAIT_MS: u64 = 100;
+/// Without the link after this long, a join is asked for again. Nothing in
+/// brcmfmac does this, because a supplicant in user space decides there; here
+/// the kernel is the only thing that would.
+const JOIN_RETRY_MS: u64 = 30_000;
 
 // ---------------------------------------------------------------------------
 // What the stack sees
@@ -107,6 +120,7 @@ static TX: Spinlock<VecDeque<Vec<u8>>> = Spinlock::new(VecDeque::new());
 static WAKE: WaitQueue = WaitQueue::new();
 static ATTACHED: AtomicBool = AtomicBool::new(false);
 static RECEIVED: AtomicU64 = AtomicU64::new(0);
+static SENT: AtomicU64 = AtomicU64::new(0);
 static RX_ERRORS: AtomicU64 = AtomicU64::new(0);
 static TX_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Glommed frames received, which this driver does not take apart.
@@ -147,6 +161,7 @@ pub fn attached() -> bool {
     ATTACHED.load(Ordering::Relaxed)
 }
 
+/// Frames received, receive errors, and frames dropped on the way out.
 pub fn counters() -> (u64, u64, u64) {
     (RECEIVED.load(Ordering::Relaxed), RX_ERRORS.load(Ordering::Relaxed), TX_DROPPED.load(Ordering::Relaxed))
 }
@@ -600,6 +615,12 @@ pub struct Dongle {
     mac: [u8; 6],
     config: Option<config::Config>,
     announced_ready: bool,
+    /// `BRCMF_VIF_STATUS_ASSOC_SUCCESS` and `BRCMF_VIF_STATUS_EAP_SUCCESS`:
+    /// the firmware has associated, and its supplicant has finished.
+    associated: bool,
+    keys_installed: bool,
+    /// When the last join was asked for, while the link has not come up.
+    joining_since: Option<u64>,
 }
 
 impl Dongle {
@@ -625,6 +646,9 @@ impl Dongle {
             mac: [0; 6],
             config: None,
             announced_ready: false,
+            associated: false,
+            keys_installed: false,
+            joining_since: None,
         }
     }
 
@@ -893,6 +917,28 @@ impl Dongle {
         }
     }
 
+    /// The receive buffer still holds the last frame read, which for a set
+    /// request is the firmware's echo of what was sent. Every byte the buffer
+    /// has room for is overwritten, not only the ones in use.
+    fn forget_last_frame(&mut self) {
+        let capacity = self.rx.capacity();
+        self.rx.clear();
+        self.rx.resize(capacity, 0);
+        self.rx.clear();
+        if let Some((_, data)) = self.response.as_mut() {
+            data.fill(0);
+        }
+        self.response = None;
+    }
+
+    /// A control request whose payload is a secret: its echo is zeroed along
+    /// with every copy of the request.
+    fn ioctl_secret(&mut self, cmd: u32, payload: &[u8]) -> Result<(), IoctlError> {
+        let result = self.ioctl(cmd, true, payload.len(), payload);
+        self.forget_last_frame();
+        result.map(|mut data| data.fill(0))
+    }
+
     /// `brcmf_fil_iovar_data_get`: the name, then `len` bytes of room.
     fn get_iovar(&mut self, name: &str, len: usize) -> Result<Vec<u8>, IoctlError> {
         let request = protocol::iovar(name, &vec![0u8; len]);
@@ -904,6 +950,14 @@ impl Dongle {
     fn set_iovar(&mut self, name: &str, value: &[u8]) -> Result<(), IoctlError> {
         let request = protocol::iovar(name, value);
         self.ioctl(protocol::C_SET_VAR, true, request.len(), &request).map(|_| ())
+    }
+
+    /// `set_iovar` for a value that is a secret.
+    fn set_iovar_secret(&mut self, name: &str, value: &[u8]) -> Result<(), IoctlError> {
+        let mut request = protocol::iovar(name, value);
+        let result = self.ioctl_secret(protocol::C_SET_VAR, &request);
+        request.fill(0);
+        result
     }
 
     fn set_iovar_u32(&mut self, name: &str, value: u32) -> Result<(), IoctlError> {
@@ -1136,6 +1190,126 @@ impl Dongle {
         }
         Ok(())
     }
+
+    /// Join the configured network, if there is one.
+    fn join(&mut self) {
+        let Some(config) = self.config.take() else { return };
+        if let Err(why) = self.join_with(&config) {
+            crate::println!("wifi: asking to join failed: {}", why);
+        }
+        self.config = Some(config);
+    }
+
+    /// The security and the join, in the order `brcmf_cfg80211_connect` sets
+    /// them up for WPA2-PSK with CCMP and the firmware supplicant.
+    fn join_with(&mut self, config: &config::Config) -> Result<(), String> {
+        // `brcmf_set_wpa_version`, WPA2.
+        self.set_iovar_u32("wpa_auth", protocol::WPA2_AUTH_PSK | protocol::WPA2_AUTH_UNSPECIFIED)
+            .map_err(|e| format!("wpa_auth: {}", e))?;
+        // `brcmf_set_auth_type`, open system.
+        self.set_iovar_u32("auth", 0).map_err(|e| format!("auth: {}", e))?;
+        // `brcmf_set_wsec_mode`: CCMP for pairwise and group.
+        self.set_iovar_u32("wsec", protocol::AES_ENABLED).map_err(|e| format!("wsec: {}", e))?;
+        // `brcmf_set_key_mgmt` for AKM 00-0F-AC:2. It sets "mfp" only from an
+        // RSN element it is handed, and this network advertises neither MFP
+        // bit, so "mfp" is left as it is.
+        self.set_iovar_u32("wpa_auth", protocol::WPA2_AUTH_PSK).map_err(|e| format!("wpa_auth: {}", e))?;
+        // `BRCMF_PROFILE_FWSUP_PSK`: the firmware's supplicant.
+        self.set_iovar_u32("sup_wpa", 1).map_err(|e| format!("sup_wpa: {}", e))?;
+        // The passphrase, flagged so the firmware derives the key itself, as
+        // embassy's cyw43 hands it over.
+        let mut pmk = protocol::wsec_pmk(config.passphrase.len(), protocol::WSEC_PASSPHRASE, |key| {
+            config.passphrase.copy_into(key)
+        });
+        let set = self.ioctl_secret(protocol::C_SET_WSEC_PMK, &pmk);
+        pmk.fill(0);
+        set.map_err(|e| format!("handing over the passphrase: {}", e))?;
+
+        self.associated = false;
+        self.keys_installed = false;
+        let mut join = protocol::ext_join_params(config.ssid.len(), |field| config.ssid.copy_into(field));
+        let joined = self.set_iovar_secret("join", &join);
+        join.fill(0);
+        if let Err(error) = joined {
+            crate::println!("wifi: the join iovar was refused ({}); asking with WLC_SET_SSID", error);
+            let mut params = protocol::ssid_le(config.ssid.len(), |field| config.ssid.copy_into(field));
+            let set = self.ioctl_secret(protocol::C_SET_SSID, &params);
+            params.fill(0);
+            set.map_err(|e| format!("WLC_SET_SSID: {}", e))?;
+        }
+        self.joining_since = Some(now_us());
+        crate::println!("wifi: join requested");
+        Ok(())
+    }
+
+    /// `brcmf_is_linkup` and `brcmf_is_linkdown` for the firmware supplicant:
+    /// up once both the association and the key exchange have succeeded, in
+    /// either order; down on a deauthentication, a disassociation, or a link
+    /// event without the link flag.
+    fn link_event(&mut self, event: &Event) {
+        if event.event_type == protocol::E_PSK_SUP && event.status == protocol::E_STATUS_FWSUP_COMPLETED {
+            self.keys_installed = true;
+        }
+        if event.event_type == protocol::E_SET_SSID {
+            if event.status == protocol::E_STATUS_SUCCESS {
+                self.associated = true;
+            } else {
+                crate::println!("wifi: the join failed: SET_SSID status {} reason {}", event.status, event.reason);
+            }
+        }
+        let up = CARD.link.load(Ordering::Relaxed);
+        if !up && self.associated && self.keys_installed {
+            self.associated = false;
+            self.keys_installed = false;
+            CARD.link.store(true, Ordering::Relaxed);
+            let took = self.joining_since.take().map(|t| (now_us() - t) / 1000).unwrap_or(0);
+            crate::println!(
+                "wifi: link up {} ms after the join request: associated, and the firmware's supplicant installed the keys",
+                took
+            );
+            return;
+        }
+        let down = matches!(event.event_type, protocol::E_DEAUTH | protocol::E_DEAUTH_IND | protocol::E_DISASSOC_IND)
+            || (event.event_type == protocol::E_LINK && event.flags & protocol::EVENT_MSG_LINK == 0);
+        if down {
+            self.associated = false;
+            self.keys_installed = false;
+            if up {
+                CARD.link.store(false, Ordering::Relaxed);
+                self.joining_since = Some(now_us());
+                crate::println!(
+                    "wifi: link down: event {} status {} reason {}",
+                    event.event_type,
+                    event.status,
+                    event.reason
+                );
+            }
+        }
+    }
+
+    /// One Ethernet frame to the firmware, once its window allows.
+    /// `brcmf_sdio_txpkt` without glomming.
+    fn send_data(&mut self, frame: &[u8]) -> Result<(), IoctlError> {
+        let deadline = Deadline::after_ms(DATA_CREDIT_WAIT_MS);
+        while !self.has_credit() {
+            if deadline.expired() {
+                return Err(IoctlError::NoCredit);
+            }
+            self.poll()?;
+            spin_us(500);
+        }
+        protocol::data_frame(&mut self.frame, self.tx_seq, frame);
+        match self.bp.f2_write(&self.frame) {
+            Ok(()) => {
+                self.tx_seq = self.tx_seq.wrapping_add(1);
+                Ok(())
+            }
+            Err(error) => {
+                self.tx_fail();
+                Err(IoctlError::Bus(error))
+            }
+        }
+    }
 }
 
 fn first_line(bytes: &[u8]) -> String {
@@ -1148,8 +1322,10 @@ fn first_line(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 fn run(mut dongle: Dongle) -> ! {
+    dongle.join();
     let mut last_tick = crate::trap::ticks();
     let mut errors = 0u32;
+    let mut send_errors = 0u32;
     loop {
         WAKE.wait_until_or_at(last_tick + 1, || !TX.lock().is_empty());
         if let Err(error) = dongle.poll() {
@@ -1160,20 +1336,38 @@ fn run(mut dongle: Dongle) -> ! {
         }
         while let Some(event) = dongle.events.pop_front() {
             crate::println!(
-                "wifi: event {} status {} reason {} flags {:#x}",
+                "wifi: event {} status {} reason {} flags {:#x} auth type {}",
                 event.event_type,
                 event.status,
                 event.reason,
-                event.flags
+                event.flags,
+                event.auth_type
             );
+            dongle.link_event(&event);
         }
         loop {
             let next = TX.lock().pop_front();
             let Some(frame) = next else { break };
-            // Data frames are not sent yet; nothing queues one while the
-            // link is down.
-            drop(frame);
-            TX_DROPPED.fetch_add(1, Ordering::Relaxed);
+            match dongle.send_data(&frame) {
+                Ok(()) => {
+                    SENT.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    TX_DROPPED.fetch_add(1, Ordering::Relaxed);
+                    send_errors += 1;
+                    if send_errors <= 5 {
+                        crate::println!("wifi: a frame of {} bytes was not sent: {}", frame.len(), error);
+                    }
+                }
+            }
+        }
+        if !CARD.link.load(Ordering::Relaxed) {
+            if let Some(since) = dongle.joining_since {
+                if now_us() - since > JOIN_RETRY_MS * 1000 {
+                    crate::println!("wifi: no link {} s after asking to join; asking again", JOIN_RETRY_MS / 1000);
+                    dongle.join();
+                }
+            }
         }
         let now = crate::trap::ticks();
         if now != last_tick {

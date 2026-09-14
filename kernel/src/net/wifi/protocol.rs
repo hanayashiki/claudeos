@@ -226,11 +226,13 @@ pub fn control_frame(out: &mut Vec<u8>, seq: u8, reqid: u16, cmd: u32, set: bool
 }
 
 /// An Ethernet frame for the firmware to send: SDPCM header, two bytes, BCDC
-/// header, frame, padded.
+/// header, frame. `brcmf_sdio_txpkt` without glomming adds no padding at the
+/// tail; the only rounding is `brcmf_sdiod_skbuff_write`'s, up to four bytes,
+/// and the header's length leaves it out.
 pub fn data_frame(out: &mut Vec<u8>, seq: u8, frame: &[u8]) {
     let offset = HDRLEN + DATA_PAD;
     let len = offset + BCDC_HEADER_LEN + frame.len();
-    let pad = tx_pad(len);
+    let pad = (4 - len % 4) % 4;
     out.clear();
     out.resize(len + pad, 0);
     pack_header(out, len as u16, seq, CHANNEL_DATA, offset as u8);
@@ -342,6 +344,64 @@ pub fn country(code: [u8; 2]) -> [u8; 12] {
     out[1] = code[1];
     out[8] = code[0];
     out[9] = code[1];
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Joining, `brcmu_wifi.h`, `fwil_types.h` and `cfg80211.c`
+// ---------------------------------------------------------------------------
+
+/// `wpa_auth` values, `brcmu_wifi.h`.
+pub const WPA2_AUTH_UNSPECIFIED: u32 = 0x0040;
+pub const WPA2_AUTH_PSK: u32 = 0x0080;
+/// `wsec` for CCMP, `AES_ENABLED` in `brcmu_wifi.h`.
+pub const AES_ENABLED: u32 = 0x0004;
+/// `BRCMF_WSEC_PASSPHRASE` in `fwil_types.h`: the key field holds a
+/// passphrase for the firmware to derive the PMK from.
+pub const WSEC_PASSPHRASE: u16 = 1 << 0;
+/// `struct brcmf_wsec_pmk_le`: key length, flags, and
+/// `BRCMF_WSEC_MAX_SAE_PASSWORD_LEN` (128) bytes of key.
+pub const WSEC_PMK_LEN: usize = 4 + 128;
+/// `struct brcmf_ext_join_params_le` up to its chanspec list, which is what
+/// `brcmf_cfg80211_connect` sends when no channel is named.
+pub const EXT_JOIN_PARAMS_LEN: usize = 68;
+/// `struct brcmf_ssid_le`, which is what the WLC_SET_SSID fallback in
+/// `brcmf_cfg80211_connect` sends when no channel is named.
+pub const SSID_LE_LEN: usize = 36;
+
+/// A WLC_SET_WSEC_PMK request, as `brcmf_set_wsec` builds it. `fill` writes
+/// the key straight into the field, so this module never holds a copy; the
+/// caller zeroes the result once it is sent.
+pub fn wsec_pmk(key_len: usize, flags: u16, fill: impl FnOnce(&mut [u8])) -> [u8; WSEC_PMK_LEN] {
+    let mut out = [0u8; WSEC_PMK_LEN];
+    out[0..2].copy_from_slice(&(key_len as u16).to_le_bytes());
+    out[2..4].copy_from_slice(&flags.to_le_bytes());
+    fill(&mut out[4..4 + key_len.min(128)]);
+    out
+}
+
+/// The "join" iovar's data as `brcmf_cfg80211_connect` fills it with no BSSID
+/// and no channel: the SSID, a scan type of -1 and every timing -1, and a
+/// broadcast BSSID with no chanspecs. The offsets follow the structures'
+/// natural alignment: `scan_type` at 36 then three bytes of padding, the four
+/// timings from 40, the BSSID at 56 then two bytes, and `chanspec_num` at 64.
+pub fn ext_join_params(ssid_len: usize, fill: impl FnOnce(&mut [u8])) -> [u8; EXT_JOIN_PARAMS_LEN] {
+    let mut out = [0u8; EXT_JOIN_PARAMS_LEN];
+    out[0..4].copy_from_slice(&(ssid_len as u32).to_le_bytes());
+    fill(&mut out[4..4 + ssid_len.min(32)]);
+    out[36] = 0xFF;
+    for field in 0..4 {
+        out[40 + field * 4..44 + field * 4].copy_from_slice(&(-1i32).to_le_bytes());
+    }
+    out[56..62].copy_from_slice(&[0xFF; 6]);
+    out
+}
+
+/// The WLC_SET_SSID fallback's data: the SSID alone.
+pub fn ssid_le(ssid_len: usize, fill: impl FnOnce(&mut [u8])) -> [u8; SSID_LE_LEN] {
+    let mut out = [0u8; SSID_LE_LEN];
+    out[0..4].copy_from_slice(&(ssid_len as u32).to_le_bytes());
+    fill(&mut out[4..4 + ssid_len.min(32)]);
     out
 }
 
