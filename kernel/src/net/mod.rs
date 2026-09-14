@@ -12,6 +12,7 @@
 
 pub mod arp;
 pub mod arptest;
+pub mod dhcp;
 pub mod e1000;
 pub mod ether;
 /// The Raspberry Pi 4's wired Ethernet, which exists on one machine only.
@@ -41,6 +42,12 @@ pub trait Interface: Sync {
     /// Queue one complete Ethernet frame, headers included. Called from task
     /// context, and must not sleep.
     fn transmit(&self, frame: &[u8]) -> Result<(), Errno>;
+
+    /// Whether there is anything at the other end of the cable. The DHCP
+    /// client asks, because a request sent into a link that is down is lost,
+    /// and the moment the link comes up is the moment to ask again rather
+    /// than whenever the retransmission timer next says to.
+    fn link_up(&self) -> bool;
 }
 
 /// Bring up whatever card this machine has, before the first process exists.
@@ -151,6 +158,11 @@ pub fn mac() -> [u8; 6] {
     }
 }
 
+/// Whether the card has a link. No card has none.
+pub fn link_up() -> bool {
+    interface().is_some_and(|nic| nic.link_up())
+}
+
 // ---- the addresses this machine uses --------------------------------------
 
 /// As many name servers as a resolver reads: musl and Go both stop at three.
@@ -159,9 +171,10 @@ pub const MAX_NAMESERVERS: usize = 3;
 /// The addresses this machine uses on its link, which change together.
 ///
 /// The protocols read this rather than naming any address themselves. It comes
-/// from the kernel command line, and it is only ever replaced whole, through
-/// `configure`: a reader takes one copy and makes every decision about a
-/// packet from that copy, so nothing pairs a new address with an old netmask.
+/// from `ip=` on the kernel command line or from a DHCP lease, and it is only
+/// ever replaced whole, through `configure`: a reader takes one copy and makes
+/// every decision about a packet from that copy, so nothing pairs a new
+/// address with an old netmask.
 ///
 /// The fields are private and `new` is the only way to make one, so a value
 /// of this type is an address a host can hold, with a netmask that is a
@@ -323,8 +336,9 @@ static CONFIG: Spinlock<Option<Config>> = Spinlock::new(None);
 
 /// Replace the configuration, whole. `None` takes the address away.
 ///
-/// Called at boot with what the command line says, before there is anything
-/// else that could publish one at the same moment.
+/// Called at boot with what the command line says, and after that only by the
+/// DHCP client from inside `tick`, which never runs twice at once, so two
+/// configurations are never being published at the same moment.
 pub fn configure(config: Option<Config>) {
     let previous = core::mem::replace(&mut *CONFIG.lock(), config);
     if previous == config {
@@ -369,9 +383,8 @@ static PUBLISHED_NAMESERVERS: Spinlock<Option<Vec<Ipv4Addr>>> = Spinlock::new(No
 /// so that is where the name servers go. The file is replaced rather than
 /// rewritten in place, so a program opening it reads either the old one whole
 /// or the new one whole. A configuration being taken away leaves it alone:
-/// nothing can reach a name server without an address, and a configuration
-/// that comes back naming the same servers then changes nothing a resolver
-/// would reread.
+/// nothing can reach a name server without an address, and a lease that comes
+/// back naming the same servers then changes nothing a resolver would reread.
 fn publish_nameservers() {
     let Some(config) = config() else { return };
     let servers = config.nameservers();
@@ -478,8 +491,8 @@ pub fn receive(frame: &[u8]) {
     tick();
 }
 
-/// Anything that has come due: retransmissions, timeouts. Called once per
-/// timer tick from the network task.
+/// Anything that has come due: retransmissions, timeouts, the DHCP client's
+/// next message. Called once per timer tick from the network task.
 pub fn tick() {
     // Timers walk the socket table and lock what they find, so this must not
     // run inside anything that already holds one of those locks. Nothing
@@ -494,6 +507,7 @@ pub fn tick() {
     deliver_loopback();
     arp::expire();
     tcp::on_tick();
+    dhcp::on_tick();
     RUNNING.store(false, Ordering::Release);
 }
 
@@ -504,5 +518,5 @@ pub fn next_deadline() -> u64 {
         // Already due: something is waiting to be handed to a socket here.
         return crate::trap::ticks();
     }
-    arp::next_deadline().min(tcp::next_deadline())
+    arp::next_deadline().min(tcp::next_deadline()).min(dhcp::next_deadline())
 }
