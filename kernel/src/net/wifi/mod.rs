@@ -115,6 +115,10 @@ const JOIN_RETRY_MS: u64 = 30_000;
 /// EAPOL frames waiting for the task's loop. A handshake is four frames and a
 /// rekey two, so a few is plenty; more than that is dropped.
 const EAPOL_QUEUE_DEPTH: usize = 8;
+/// How old a frame held from before the association may be and still be
+/// handled: `wpa_supplicant_event_assoc` in hostap's `events.c` takes the
+/// pending frame when it is under 200 ms old.
+const PENDING_EAPOL_MAX_AGE_US: u64 = 200_000;
 
 // ---------------------------------------------------------------------------
 // What the stack sees
@@ -675,6 +679,9 @@ pub struct Dongle {
     supplicant: Option<wpa::Supplicant>,
     /// EAPOL frames read from the chip and not yet given to the supplicant.
     eapol: VecDeque<Vec<u8>>,
+    /// The last EAPOL frame that arrived before the association event, and
+    /// when. `pending_eapol_rx` and `pending_eapol_rx_time`.
+    pending_eapol: Option<(Vec<u8>, u64)>,
     /// When the last join was asked for, while the link has not come up.
     joining_since: Option<u64>,
     /// Every BSSID the scan saw carrying the configured network's name, so an
@@ -710,6 +717,7 @@ impl Dongle {
             own_rsn: Vec::new(),
             supplicant: None,
             eapol: VecDeque::new(),
+            pending_eapol: None,
             joining_since: None,
             configured_bssids: Vec::new(),
         }
@@ -1377,6 +1385,7 @@ impl Dongle {
         self.aa = None;
         self.supplicant = None;
         self.eapol.clear();
+        self.pending_eapol = None;
         self.own_rsn = own_rsn;
         let mut join = protocol::ext_join_params(config.ssid.len(), |field| config.ssid.copy_into(field));
         let joined = self.set_iovar_secret("join", &join);
@@ -1426,6 +1435,9 @@ impl Dongle {
     /// and `wpa_sm_set_ap_rsn_ie` give hostap's: this station's element from
     /// the join, and the access point's from the scan.
     fn start_supplicant(&mut self, aa: [u8; 6]) {
+        // The held frame's age is taken at the association event, before the
+        // PMK is derived, as hostap's is.
+        let associated_at = now_us();
         let Some(config) = self.config.as_ref() else {
             crate::println!("wifi: associated, but there is no configuration to derive a key from");
             return;
@@ -1447,6 +1459,24 @@ impl Dongle {
             "wifi: associated{}; the handshake can start",
             if seen { "" } else { " with a BSS the scan did not see, so message 3 cannot be checked" }
         );
+
+        // `wpa_supplicant_event_assoc`: the frame held from just before the
+        // association is handled if it is young enough and came from the
+        // access point, and forgotten either way.
+        if let Some((frame, at)) = self.pending_eapol.take() {
+            let age = associated_at.saturating_sub(at);
+            let from_aa = frame.get(6..12) == Some(&aa[..]);
+            if age < PENDING_EAPOL_MAX_AGE_US && from_aa {
+                crate::println!("wifi: handling the EAPOL frame that arrived {} ms before the association", age / 1000);
+                self.handshake(&frame);
+            } else {
+                crate::println!(
+                    "wifi: an EAPOL frame from before the association was forgotten: {} ms old, {}",
+                    age / 1000,
+                    if from_aa { "from the access point" } else { "from another address" }
+                );
+            }
+        }
     }
 
     /// Forget the association: the supplicant and its keys, and the stack's
@@ -1456,6 +1486,7 @@ impl Dongle {
         self.aa = None;
         self.supplicant = None;
         self.eapol.clear();
+        self.pending_eapol = None;
         if CARD.link.swap(false, Ordering::Relaxed) {
             crate::println!("wifi: link down");
         }
@@ -1486,8 +1517,15 @@ impl Dongle {
         }
         let mut source = [0u8; 6];
         source.copy_from_slice(&frame[6..12]);
+        if self.aa.is_none() || self.supplicant.is_none() {
+            // `wpa_supplicant_rx_eapol`: the association event and the frame
+            // come by different paths, so a frame ahead of the event is kept,
+            // the latest one only, until the event arrives.
+            crate::println!("wifi: an EAPOL frame before the association; held until it");
+            self.pending_eapol = Some((frame.to_vec(), now_us()));
+            return;
+        }
         let (Some(aa), Some(supplicant)) = (self.aa, self.supplicant.as_mut()) else {
-            crate::println!("wifi: an EAPOL frame before the association; dropped");
             return;
         };
         if source != aa {
