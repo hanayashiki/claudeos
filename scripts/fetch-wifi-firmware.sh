@@ -21,16 +21,6 @@
 # makes it an alternative between -standard.bin, at priority 50, and
 # -minimal.bin, at priority 10, so an installed system gets -standard. Those
 # are the real files fetched below, saved under the names brcmfmac asks for.
-#
-# This takes -minimal.bin, not the -standard.bin an installed system gets,
-# and it must not be "upgraded" back. The kernel joins a WPA2 network by
-# letting the firmware's own supplicant do the key exchange, and only
-# -minimal.bin has one. Its build line names "idsup" (the in-dongle
-# supplicant) and "idauth"; -standard.bin's build line has neither. On the
-# board, -standard.bin (7.45.265) answered setting "sup_wpa" to 1 with error
-# -23, BCME_UNSUPPORTED. -minimal.bin is the older 7.45.241, from November
-# 2021. Linux on Raspberry Pi OS uses -standard.bin and runs wpa_supplicant
-# on the host instead.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -40,7 +30,7 @@ CACHE="$ROOT/build/thirdparty/wifi-firmware"
 COMMIT="c91cd2804cf7463aab913e7247c176049f16bbd6"
 URL="https://raw.githubusercontent.com/RPi-Distro/firmware-nonfree/$COMMIT/debian/config/brcm80211"
 ARTIFACTS="
-cypress/cyfmac43455-sdio-minimal.bin   brcmfmac43455-sdio.bin       3075cb0bdc4b28ed4f08e01b1a216d0ebc70f4022d9d3272a4a43b3c90456e60
+cypress/cyfmac43455-sdio-standard.bin  brcmfmac43455-sdio.bin       d608f866582519c0a28d86db43040f4f1b98dd1d153e72e9752586546b4a36c3
 cypress/cyfmac43455-sdio.clm_blob      brcmfmac43455-sdio.clm_blob  9823842cae9fb9a5dd1e5fb31f595516ec7deee341354bef30bb3026eee29cc1
 brcm/brcmfmac43455-sdio.txt            brcmfmac43455-sdio.txt       ca709be81a78bdb6932936374f39943acbd7af07fae6151011127599a3ce9e3d
 "
