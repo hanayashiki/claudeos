@@ -167,6 +167,19 @@ on Linux.
 Nothing is written to the card at run time, so the machine comes up the same
 way every time and a bad experiment costs a rebuild rather than a reflash.
 
+`reboot` at the shell restarts the machine, and `poweroff` and `halt` stop it.
+On the board a restart goes back through the firmware, so a board that boots
+over the network fetches its kernel again. The board's watchdog is started at
+boot when the device tree describes it, and the timer interrupt feeds it, so a
+kernel stuck with interrupts masked is reset after 15 seconds. A kernel panic
+restarts the machine 10 seconds after its message. Two words on the kernel
+command line change that:
+
+```
+panic=N          restart N seconds after a panic; 0 stays stopped, below 0 restarts at once
+watchdog=off     leave the watchdog stopped, for a debugger holding the processor still
+```
+
 ## What the kernel does
 
 **Boot.** A multiboot1 header and a 32-bit trampoline build the initial page
@@ -532,7 +545,7 @@ runs, so the job owns the terminal.
 The coreutils cover the common set: `ls cat cp mv rm mkdir rmdir touch ln mkfifo
 chmod stat find du df echo wc head tail grep sed xargs sort uniq cut tr tee
 seq rev printf expr test ps free uptime dmesg date env id uname hostname mount
-kill sleep clear hexdump basename dirname yes true false`.
+kill sleep clear hexdump basename dirname yes true false reboot halt poweroff`.
 
 `grep` and `sed` share a backtracking regex engine written for them: anchors,
 `.`, character classes and `*`, with `-E` adding alternation, groups, `+` and
@@ -553,7 +566,7 @@ failures.
   subprocesses and `/proc`. The device checks include `/dev/urandom`: that two
   reads differ and that 4 KiB of it holds nearly all 256 byte values, which is
   a check that the generator is running and not a check that it is any good.
-- The `rtest` applet runs **57 checks** against the Rust standard library:
+- The `rtest` applet runs **66 checks** against the Rust standard library:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
   thread sleep against the monotonic clock, the tick measured against that same
@@ -564,7 +577,9 @@ failures.
   handlers running and returning, a `UnixStream` pair carrying bytes both ways,
   an epoll set woken by a counter and a socket, timing out when it should and
   waking promptly when a write arrives, and a walk of the system call numbers
-  past the end of the table, every one of which has to answer ENOSYS. Two of
+  past the end of the table, every one of which has to answer ENOSYS, and
+  `reboot` given magic numbers or a command it does not know, which has to
+  answer EINVAL. Two of
   them run a thread alongside a sibling failing an exec over and over, which is
   a smoke test for a race rather than proof of its absence.
 - The **network protocols** run against a card that only records what it is
