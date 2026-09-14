@@ -41,7 +41,7 @@ struct BootOptions {
     nettest: bool,
     /// The addresses the protocol stack uses, and whether to run its own
     /// checks instead of booting.
-    net: net::Config,
+    net: NetWords,
     net_test: bool,
     /// Throw one frame in this many away in each direction, so what the
     /// protocols do about loss can be seen on the real card path. Zero is
@@ -59,7 +59,7 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
         init: "/bin/init".to_string(),
         trace: syscall::TRACE_OFF,
         nettest: false,
-        net: net::Config::QEMU_USER,
+        net: NetWords::default(),
         net_test: false,
         net_loss: 0,
         args: Vec::new(),
@@ -90,19 +90,19 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
         } else if let Some(value) = word.strip_prefix("netloss=") {
             options.net_loss = value.parse().unwrap_or(0);
         } else if let Some(value) = word.strip_prefix("ip=") {
-            if let Some(address) = net::ip::parse_address(value) {
+            if let Some(address) = address_word(word, value) {
                 options.net.address = address;
             }
         } else if let Some(value) = word.strip_prefix("netmask=") {
-            if let Some(address) = net::ip::parse_address(value) {
+            if let Some(address) = address_word(word, value) {
                 options.net.netmask = address;
             }
         } else if let Some(value) = word.strip_prefix("gateway=") {
-            if let Some(address) = net::ip::parse_address(value) {
+            if let Some(address) = address_word(word, value) {
                 options.net.gateway = address;
             }
         } else if let Some(value) = word.strip_prefix("nameserver=") {
-            if let Some(address) = net::ip::parse_address(value) {
+            if let Some(address) = address_word(word, value) {
                 options.net.nameserver = address;
             }
         } else if let Some((name, _)) = word.split_once('=') {
@@ -123,6 +123,36 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
     // After "--" every word is an argument to init, whatever it looks like.
     options.args.extend(words.map(|word| word.to_string()));
     options
+}
+
+/// The `ip=`, `netmask=`, `gateway=` and `nameserver=` words, starting from
+/// what QEMU's user mode network hands out: the guest is 10.0.2.15 on a /24,
+/// the gateway is 10.0.2.2 and the name server 10.0.2.3.
+struct NetWords {
+    address: net::ip::Ipv4Addr,
+    netmask: net::ip::Ipv4Addr,
+    gateway: net::ip::Ipv4Addr,
+    nameserver: net::ip::Ipv4Addr,
+}
+
+impl Default for NetWords {
+    fn default() -> NetWords {
+        NetWords {
+            address: net::ip::Ipv4Addr::new(10, 0, 2, 15),
+            netmask: net::ip::Ipv4Addr::new(255, 255, 255, 0),
+            gateway: net::ip::Ipv4Addr::new(10, 0, 2, 2),
+            nameserver: net::ip::Ipv4Addr::new(10, 0, 2, 3),
+        }
+    }
+}
+
+/// The address an address word gives, or a line saying it gives none.
+fn address_word(word: &str, value: &str) -> Option<net::ip::Ipv4Addr> {
+    let address = net::ip::parse_address(value);
+    if address.is_none() {
+        println!("net: {} is not an address, so it is ignored", word);
+    }
+    address
 }
 
 /// Where every architecture's entry code arrives, once it has a console to
@@ -186,16 +216,23 @@ pub fn start(boot: &boot::BootInfo) -> ! {
     let nic = net::probe();
 
     // The protocol stack takes its addresses from here rather than naming any
-    // of its own; a driver that attaches later does not change them.
-    net::configure(options.net);
+    // of its own; a driver that attaches later does not change them. Words
+    // that do not make a configuration leave the machine with no address.
+    let words = &options.net;
+    match net::Config::new(words.address, words.netmask, Some(words.gateway), &[words.nameserver]) {
+        Ok(config) => {
+            net::configure(Some(config));
+            println!("net: {}", config);
+        }
+        Err(reason) => println!(
+            "net: {} netmask {} gateway {} cannot be used: {}",
+            words.address, words.netmask, words.gateway, reason
+        ),
+    }
     if options.net_loss != 0 {
         net::set_loss(options.net_loss);
         println!("net: losing one frame in {} in each direction", options.net_loss);
     }
-    println!(
-        "net: {} netmask {} gateway {}",
-        options.net.address, options.net.netmask, options.net.gateway
-    );
     if options.net_test {
         println!();
         let passed = net::selftest::run();

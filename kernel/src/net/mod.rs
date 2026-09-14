@@ -29,6 +29,7 @@ pub mod udp;
 use crate::abi::Errno;
 use crate::sync::Spinlock;
 use alloc::collections::VecDeque;
+use alloc::string::String;
 use alloc::vec::Vec;
 use ip::Ipv4Addr;
 
@@ -150,62 +151,246 @@ pub fn mac() -> [u8; 6] {
     }
 }
 
-/// The addresses this machine uses.
+// ---- the addresses this machine uses --------------------------------------
+
+/// As many name servers as a resolver reads: musl and Go both stop at three.
+pub const MAX_NAMESERVERS: usize = 3;
+
+/// The addresses this machine uses on its link, which change together.
 ///
-/// The protocols read this rather than naming any address themselves; what is
-/// in it comes from the kernel, which takes it from the command line or falls
-/// back to what QEMU's user mode network hands out.
-#[derive(Clone, Copy)]
+/// The protocols read this rather than naming any address themselves. It comes
+/// from the kernel command line, and it is only ever replaced whole, through
+/// `configure`: a reader takes one copy and makes every decision about a
+/// packet from that copy, so nothing pairs a new address with an old netmask.
+///
+/// The fields are private and `new` is the only way to make one, so a value
+/// of this type is an address a host can hold, with a netmask that is a
+/// netmask and a gateway on the same subnet. A machine with no address holds
+/// no `Config` at all, which is what `config` returning `None` says; there is
+/// no 0.0.0.0 standing in for an address, for a reader to take as one.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Config {
-    pub address: Ipv4Addr,
-    pub netmask: Ipv4Addr,
-    pub gateway: Ipv4Addr,
+    address: Ipv4Addr,
+    netmask: Ipv4Addr,
+    gateway: Option<Ipv4Addr>,
     /// Where a name would be looked up. Nothing in the kernel resolves names;
-    /// this is here so a program can be told.
-    pub nameserver: Ipv4Addr,
+    /// these are here so programs can be told, through /etc/resolv.conf. The
+    /// slots past `nameserver_count` are always zero, so two configurations
+    /// naming the same servers compare equal.
+    nameservers: [Ipv4Addr; MAX_NAMESERVERS],
+    nameserver_count: usize,
+}
+
+/// An address a host can have as its own. 0/8 means "this network" and
+/// 127/8 means "this machine" (RFC 1122 section 3.2.1.3), 224/4 is multicast,
+/// and 240/4 is reserved and includes the all-ones broadcast.
+fn is_host_address(address: Ipv4Addr) -> bool {
+    let first = address.0 >> 24;
+    first != 0 && first != 127 && first < 224
 }
 
 impl Config {
-    /// The default for QEMU's user mode network: the guest is 10.0.2.15 on a
-    /// /24, the gateway is 10.0.2.2 and the name server 10.0.2.3.
-    pub const QEMU_USER: Config = Config {
-        address: Ipv4Addr::new(10, 0, 2, 15),
-        netmask: Ipv4Addr::new(255, 255, 255, 0),
-        gateway: Ipv4Addr::new(10, 0, 2, 2),
-        nameserver: Ipv4Addr::new(10, 0, 2, 3),
-    };
+    /// A configuration, or the reason these addresses cannot be one.
+    ///
+    /// Name servers past the third are left out, and so is any entry nothing
+    /// could answer on -- zero, a broadcast, a multicast address -- rather
+    /// than refusing an otherwise usable lease over one bad entry.
+    pub fn new(
+        address: Ipv4Addr,
+        netmask: Ipv4Addr,
+        gateway: Option<Ipv4Addr>,
+        nameservers: &[Ipv4Addr],
+    ) -> Result<Config, &'static str> {
+        if !is_host_address(address) {
+            return Err("the address is not one a host can hold");
+        }
+        // A netmask is ones and then zeroes, which is what makes the host
+        // part plus one a power of two. All zeroes passes that test and would
+        // put every address in the world on the link, so it is refused.
+        let host_bits = !netmask.0;
+        if netmask.0 == 0 || host_bits & host_bits.wrapping_add(1) != 0 {
+            return Err("the netmask is not a run of ones followed by zeroes");
+        }
+        // A /31 or a /32 has no network or broadcast address (RFC 3021); on
+        // anything wider, those two are not addresses a host can hold.
+        if host_bits > 1 && (address.0 & host_bits == 0 || address.0 & host_bits == host_bits) {
+            return Err("the address is its subnet's network or broadcast address");
+        }
+        let mut config = Config {
+            address,
+            netmask,
+            gateway: None,
+            nameservers: [Ipv4Addr::UNSPECIFIED; MAX_NAMESERVERS],
+            nameserver_count: 0,
+        };
+        if let Some(gateway) = gateway {
+            if gateway == address || !is_host_address(gateway) || !config.on_link(gateway) {
+                return Err("the gateway is not another host on the address's subnet");
+            }
+            config.gateway = Some(gateway);
+        }
+        for &server in nameservers {
+            if config.nameserver_count == MAX_NAMESERVERS {
+                break;
+            }
+            // 127.0.0.1 is a name server a program can be told about, so only
+            // the addresses nothing answers on are left out.
+            if server.is_unspecified() || server.is_broadcast() || server.is_multicast() {
+                continue;
+            }
+            config.nameservers[config.nameserver_count] = server;
+            config.nameserver_count += 1;
+        }
+        Ok(config)
+    }
+
+    /// The netmask an address implies when nothing names one: the one its
+    /// class had before addresses were classless, which is what Linux assumes
+    /// for an `ip=` given without a netmask.
+    pub fn class_netmask(address: Ipv4Addr) -> Ipv4Addr {
+        match address.0 >> 24 {
+            0..=127 => Ipv4Addr::new(255, 0, 0, 0),
+            128..=191 => Ipv4Addr::new(255, 255, 0, 0),
+            _ => Ipv4Addr::new(255, 255, 255, 0),
+        }
+    }
+
+    pub fn address(&self) -> Ipv4Addr {
+        self.address
+    }
+
+    pub fn netmask(&self) -> Ipv4Addr {
+        self.netmask
+    }
+
+    pub fn gateway(&self) -> Option<Ipv4Addr> {
+        self.gateway
+    }
+
+    pub fn nameservers(&self) -> &[Ipv4Addr] {
+        &self.nameservers[..self.nameserver_count]
+    }
+
+    /// The netmask as a count of its ones, which is how it is printed.
+    pub fn prefix_len(&self) -> u32 {
+        self.netmask.0.leading_ones()
+    }
 
     /// True when `other` is on this machine's own subnet, so a datagram for it
     /// goes straight there rather than through the gateway.
     pub fn on_link(&self, other: Ipv4Addr) -> bool {
-        !self.netmask.is_unspecified()
-            && (other.0 & self.netmask.0) == (self.address.0 & self.netmask.0)
+        (other.0 & self.netmask.0) == (self.address.0 & self.netmask.0)
     }
 
     /// The address every host on this subnet answers to.
     pub fn broadcast(&self) -> Ipv4Addr {
         Ipv4Addr(self.address.0 | !self.netmask.0)
     }
+
+    /// The address a datagram for `destination` is handed to: the destination
+    /// itself when it is on this subnet or is a broadcast, the gateway when it
+    /// is anywhere else, and nobody when there is no gateway.
+    pub fn next_hop(&self, destination: Ipv4Addr) -> Option<Ipv4Addr> {
+        if destination.is_broadcast() || destination.is_multicast() || self.on_link(destination) {
+            Some(destination)
+        } else {
+            self.gateway
+        }
+    }
 }
 
-static CONFIG: Spinlock<Config> = Spinlock::new(Config::QEMU_USER);
+impl core::fmt::Display for Config {
+    /// `192.168.86.57/24 gateway 192.168.86.1 dns 192.168.86.1`, which is how
+    /// the boot log names a configuration.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}/{}", self.address, self.prefix_len())?;
+        match self.gateway {
+            Some(gateway) => write!(f, " gateway {}", gateway)?,
+            None => write!(f, " no gateway")?,
+        }
+        if self.nameservers().is_empty() {
+            return write!(f, " no dns");
+        }
+        write!(f, " dns")?;
+        for server in self.nameservers() {
+            write!(f, " {}", server)?;
+        }
+        Ok(())
+    }
+}
 
-pub fn configure(config: Config) {
-    *CONFIG.lock() = config;
+static CONFIG: Spinlock<Option<Config>> = Spinlock::new(None);
+
+/// Replace the configuration, whole. `None` takes the address away.
+///
+/// Called at boot with what the command line says, before there is anything
+/// else that could publish one at the same moment.
+pub fn configure(config: Option<Config>) {
+    let previous = core::mem::replace(&mut *CONFIG.lock(), config);
+    if previous == config {
+        return;
+    }
     // Anything learned under the old address is about a different network.
     arp::clear();
+    publish_nameservers();
 }
 
-pub fn config() -> Config {
+/// The configuration as it stands, or `None` while this machine has no
+/// address.
+pub fn config() -> Option<Config> {
     *CONFIG.lock()
 }
 
 /// The address to send from when talking to `destination`.
-pub fn source_for(destination: Ipv4Addr) -> Ipv4Addr {
+///
+/// With no address, the only thing that can be sent is a broadcast from
+/// 0.0.0.0: RFC 1122 section 3.2.1.3 allows that source only while a host is
+/// learning its own address, and a broadcast is the only destination that
+/// needs no route. Anything else has nowhere to go, which Linux reports as
+/// ENETUNREACH.
+pub fn source_for(destination: Ipv4Addr) -> Result<Ipv4Addr, Errno> {
     if destination.is_loopback() {
-        Ipv4Addr::new(127, 0, 0, 1)
-    } else {
-        config().address
+        return Ok(Ipv4Addr::new(127, 0, 0, 1));
+    }
+    match config() {
+        Some(config) => Ok(config.address()),
+        None if destination.is_broadcast() => Ok(Ipv4Addr::UNSPECIFIED),
+        None => Err(Errno::ENETUNREACH),
+    }
+}
+
+/// The name servers /etc/resolv.conf last named, so it is written only when
+/// that changes.
+static PUBLISHED_NAMESERVERS: Spinlock<Option<Vec<Ipv4Addr>>> = Spinlock::new(None);
+
+/// Tell programs where names are looked up.
+///
+/// Programs with their own resolver -- Go's, musl's -- read /etc/resolv.conf,
+/// so that is where the name servers go. The file is replaced rather than
+/// rewritten in place, so a program opening it reads either the old one whole
+/// or the new one whole. A configuration being taken away leaves it alone:
+/// nothing can reach a name server without an address, and a configuration
+/// that comes back naming the same servers then changes nothing a resolver
+/// would reread.
+fn publish_nameservers() {
+    let Some(config) = config() else { return };
+    let servers = config.nameservers();
+    {
+        let mut published = PUBLISHED_NAMESERVERS.lock();
+        if published.as_deref() == Some(servers) {
+            return;
+        }
+        *published = Some(servers.to_vec());
+    }
+    let mut text = String::from(
+        "# Written by the kernel from its network configuration, and written\n\
+         # again whenever that changes.\n",
+    );
+    for server in servers {
+        text.push_str(&alloc::format!("nameserver {}\n", server));
+    }
+    if let Err(err) = crate::fs::replace_file("/etc/resolv.conf", text.as_bytes(), 0o644) {
+        crate::println!("net: cannot write /etc/resolv.conf: {:?}", err);
     }
 }
 

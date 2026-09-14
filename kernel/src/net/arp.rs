@@ -60,8 +60,7 @@ pub fn learn(address: Ipv4Addr, mac: [u8; 6]) {
     // Someone else on the segment saying they hold this machine's address is
     // either a conflict or a lie. Believing it would send everything meant
     // for us to their card.
-    let ours = super::config().address;
-    if !ours.is_unspecified() && address == ours {
+    if super::config().is_some_and(|config| config.address() == address) {
         return;
     }
     let now = crate::trap::ticks();
@@ -181,13 +180,10 @@ pub fn build(
 
 /// Ask the segment who holds `address`.
 pub fn request(address: Ipv4Addr) -> Result<(), Errno> {
-    let packet = build(
-        OP_REQUEST,
-        super::mac(),
-        super::config().address,
-        [0u8; 6],
-        address,
-    );
+    // With no address of its own the request names 0.0.0.0 as its sender,
+    // which RFC 5227 calls a probe: nobody records that as a mapping.
+    let sender = super::config().map_or(Ipv4Addr::UNSPECIFIED, |config| config.address());
+    let packet = build(OP_REQUEST, super::mac(), sender, [0u8; 6], address);
     transmit_to(ether::BROADCAST, ether::ETHERTYPE_ARP, &packet)
 }
 
@@ -215,9 +211,10 @@ pub fn receive(bytes: &[u8]) {
     // remembering: a request is usually followed by traffic we have to answer.
     learn(sender_ip, sender_mac);
 
-    let ours = super::config().address;
-    if operation == OP_REQUEST && target_ip == ours && !ours.is_unspecified() {
-        let reply = build(OP_REPLY, super::mac(), ours, sender_mac, sender_ip);
+    // A machine with no address has no address to answer for.
+    let Some(config) = super::config() else { return };
+    if operation == OP_REQUEST && target_ip == config.address() {
+        let reply = build(OP_REPLY, super::mac(), config.address(), sender_mac, sender_ip);
         let _ = transmit_to(sender_mac, ether::ETHERTYPE_ARP, &reply);
     }
 }

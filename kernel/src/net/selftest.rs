@@ -30,6 +30,13 @@ const OUR_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 const PEER_MAC: [u8; 6] = [0x52, 0x55, 0x0A, 0x00, 0x02, 0x02];
 const OUR_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
+const NAMESERVER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
+
+/// The addresses the checks run with, all but the ones about having none.
+fn test_config() -> Config {
+    Config::new(OUR_IP, Ipv4Addr::new(255, 255, 255, 0), Some(PEER_IP), &[NAMESERVER_IP])
+        .expect("the addresses the checks run with")
+}
 
 /// A card that goes no further than remembering what it was handed.
 struct FakeNic {
@@ -247,12 +254,7 @@ fn deliver_ip_between(protocol: u8, payload: &[u8], source: Ipv4Addr, destinatio
 pub fn run() -> bool {
     let nic: &'static FakeNic = Box::leak(Box::new(FakeNic { sent: Spinlock::new(Vec::new()) }));
     super::attach(nic);
-    super::configure(Config {
-        address: OUR_IP,
-        netmask: Ipv4Addr::new(255, 255, 255, 0),
-        gateway: PEER_IP,
-        nameserver: Ipv4Addr::new(10, 0, 2, 3),
-    });
+    super::configure(Some(test_config()));
     socket::reset();
     nic.take();
 
@@ -303,6 +305,10 @@ pub fn run() -> bool {
     initial_sequence_numbers(&mut report, nic);
     crate::println!("net: datagrams");
     datagrams(&mut report, nic);
+    crate::println!("net: what makes a configuration");
+    configurations(&mut report);
+    crate::println!("net: a machine with no address");
+    no_address(&mut report, nic);
     // The driver for this board's own Ethernet, as far as it can be exercised
     // with no such Ethernet anywhere: nothing emulates it, so this is the only
     // thing that runs against it before it meets a board.
@@ -2276,4 +2282,211 @@ fn datagrams(report: &mut Report, nic: &FakeNic) {
     report.check("and the room is there for what comes next", queued_bytes_of(&socket) == 5);
 
     socket::close(&socket);
+}
+
+// ---- having no address, and asking for one --------------------------------
+
+const NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
+
+/// A frame from the peer to everyone.
+fn broadcast_frame(ethertype: u16, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0xFF; 6]);
+    out.extend_from_slice(&PEER_MAC);
+    out.extend_from_slice(&ethertype.to_be_bytes());
+    out.extend_from_slice(payload);
+    while out.len() < 60 {
+        out.push(0);
+    }
+    out
+}
+
+/// A frame as this stack should have broadcast it.
+fn expected_broadcast(ethertype: u16, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0xFF; 6]);
+    out.extend_from_slice(&OUR_MAC);
+    out.extend_from_slice(&ethertype.to_be_bytes());
+    out.extend_from_slice(payload);
+    while out.len() < 60 {
+        out.push(0);
+    }
+    out
+}
+
+/// An ARP packet from the peer, about the peer, to `target`.
+fn arp_from_peer(operation: u16, target_mac: [u8; 6], target: Ipv4Addr) -> Vec<u8> {
+    let mut packet = Vec::new();
+    packet.extend_from_slice(&[0x00, 0x01, 0x08, 0x00, 6, 4]); // ethernet, ipv4, lengths
+    packet.extend_from_slice(&operation.to_be_bytes());
+    packet.extend_from_slice(&PEER_MAC);
+    packet.extend_from_slice(&PEER_IP.to_be_bytes());
+    packet.extend_from_slice(&target_mac);
+    packet.extend_from_slice(&target.to_be_bytes());
+    packet
+}
+
+/// What `Config::new` takes and what it refuses.
+fn configurations(report: &mut Report) {
+    report.check(
+        "an address, a netmask, a gateway and a name server make a configuration",
+        Config::new(OUR_IP, NETMASK, Some(PEER_IP), &[NAMESERVER_IP]).is_ok(),
+    );
+    for (name, address) in [
+        ("0.0.0.0 is not an address a host holds", Ipv4Addr::UNSPECIFIED),
+        ("nor is the all-ones broadcast", Ipv4Addr::BROADCAST),
+        ("nor a loopback address", Ipv4Addr::new(127, 0, 0, 1)),
+        ("nor a multicast address", Ipv4Addr::new(224, 0, 0, 1)),
+        ("nor the subnet's own broadcast address", Ipv4Addr::new(10, 0, 2, 255)),
+        ("nor the subnet's network address", Ipv4Addr::new(10, 0, 2, 0)),
+    ] {
+        report.check(name, Config::new(address, NETMASK, None, &[]).is_err());
+    }
+    report.check(
+        "a netmask with a hole in it is refused",
+        Config::new(OUR_IP, Ipv4Addr::new(255, 0, 255, 0), None, &[]).is_err(),
+    );
+    report.check(
+        "and so is a netmask of nothing",
+        Config::new(OUR_IP, Ipv4Addr::UNSPECIFIED, None, &[]).is_err(),
+    );
+    report.check(
+        "a gateway off the subnet is refused",
+        Config::new(OUR_IP, NETMASK, Some(Ipv4Addr::new(10, 0, 3, 1)), &[]).is_err(),
+    );
+    report.check(
+        "and so is a gateway that is this machine",
+        Config::new(OUR_IP, NETMASK, Some(OUR_IP), &[]).is_err(),
+    );
+    let one = Ipv4Addr::new(1, 1, 1, 1);
+    let eight = Ipv4Addr::new(8, 8, 8, 8);
+    let servers = [Ipv4Addr::UNSPECIFIED, NAMESERVER_IP, one, eight, Ipv4Addr::new(9, 9, 9, 9)];
+    report.check(
+        "zero is left out of the name servers, and so is any past the third",
+        Config::new(OUR_IP, NETMASK, None, &servers)
+            .is_ok_and(|config| config.nameservers() == [NAMESERVER_IP, one, eight]),
+    );
+    report.check(
+        "a netmask left out is the one the address's class implies",
+        Config::class_netmask(Ipv4Addr::new(10, 1, 2, 3)) == Ipv4Addr::new(255, 0, 0, 0)
+            && Config::class_netmask(Ipv4Addr::new(172, 16, 0, 1)) == Ipv4Addr::new(255, 255, 0, 0)
+            && Config::class_netmask(Ipv4Addr::new(192, 168, 86, 57)) == NETMASK,
+    );
+}
+
+/// With no configuration, a socket reaches nothing but the broadcast address
+/// and nothing but a broadcast reaches it. A socket still holding an address
+/// the machine no longer has sends nothing from it.
+fn no_address(report: &mut Report, nic: &FakeNic) {
+    const PORT: u16 = 7790;
+    let subnet_broadcast = Ipv4Addr::new(10, 0, 2, 255);
+    socket::reset();
+    super::configure(None);
+    nic.take();
+
+    let socket = InetSocket::new(false);
+    if socket.bind(Endpoint::new(Ipv4Addr::UNSPECIFIED, PORT)).is_err() {
+        report.check("a datagram socket", false);
+        return;
+    }
+    report.check(
+        "a datagram to a host has nowhere to go",
+        matches!(
+            socket.send(b"hello", Some(Endpoint::new(PEER_IP, 5555))),
+            Err(Errno::ENETUNREACH)
+        ),
+    );
+    report.check(
+        "nor has a connection",
+        matches!(InetSocket::new(true).connect(Endpoint::new(PEER_IP, 80)), Err(Errno::ENETUNREACH)),
+    );
+    report.check(
+        "nor a connection to the broadcast address",
+        matches!(
+            InetSocket::new(true).connect(Endpoint::new(Ipv4Addr::BROADCAST, 80)),
+            Err(Errno::ENETUNREACH)
+        ),
+    );
+    report.check("and none of them put anything on the wire", nic.take().is_empty());
+    report.check(
+        "the address the machine used to have cannot be bound",
+        matches!(
+            InetSocket::new(false).bind(Endpoint::new(OUR_IP, PORT + 1)),
+            Err(Errno::EADDRNOTAVAIL)
+        ),
+    );
+
+    match socket.send(b"anyone?", Some(Endpoint::new(Ipv4Addr::BROADCAST, 5555))) {
+        Ok(n) => report.value("a broadcast can still be sent", n as u64, 7),
+        Err(_) => report.check("a broadcast can still be sent", false),
+    }
+    let sent = nic.take();
+    report.check("as one frame", sent.len() == 1);
+    if let [frame] = sent.as_slice() {
+        let expected = expected_broadcast(
+            ether::ETHERTYPE_IPV4,
+            &datagram(
+                identification_of(frame),
+                ip::PROTO_UDP,
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::BROADCAST,
+                &udp_datagram(PORT, 5555, b"anyone?", Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST),
+            ),
+        );
+        report.bytes("from 0.0.0.0, to everyone", frame, &expected);
+    }
+
+    deliver_ip(ip::PROTO_UDP, &udp_datagram(5555, PORT, b"to an address", PEER_IP, OUR_IP));
+    report.check(
+        "a datagram sent to an address is not taken by a machine with none",
+        queued_bytes_of(&socket) == 0,
+    );
+    deliver_ip_between(
+        ip::PROTO_UDP,
+        &udp_datagram(5555, PORT, b"to a subnet", PEER_IP, subnet_broadcast),
+        PEER_IP,
+        subnet_broadcast,
+    );
+    report.check(
+        "nor one sent to a subnet it is not known to be on",
+        queued_bytes_of(&socket) == 0,
+    );
+    deliver_ip_between(
+        ip::PROTO_UDP,
+        &udp_datagram(5555, PORT, b"to everyone", PEER_IP, Ipv4Addr::BROADCAST),
+        PEER_IP,
+        Ipv4Addr::BROADCAST,
+    );
+    report.check("but one sent to everyone is", queued_bytes_of(&socket) == 11);
+
+    deliver(ether::ETHERTYPE_ARP, &arp_from_peer(super::arp::OP_REQUEST, [0; 6], OUR_IP));
+    deliver_ip(ip::PROTO_ICMP, &echo_request());
+    report.check(
+        "the address it used to have is answered for by neither ARP nor ping",
+        nic.take().is_empty(),
+    );
+    socket::close(&socket);
+
+    // ---- an address taken away from under a socket ----
+    super::configure(Some(test_config()));
+    let bound = InetSocket::new(false);
+    if bound.bind(Endpoint::new(OUR_IP, PORT + 2)).is_err() {
+        report.check("a socket bound to the address", false);
+        return;
+    }
+    let other = Config::new(Ipv4Addr::new(10, 0, 2, 16), NETMASK, Some(PEER_IP), &[])
+        .expect("another address on the subnet");
+    super::configure(Some(other));
+    nic.take();
+    report.check(
+        "a socket bound to an address the machine no longer has cannot send from it",
+        matches!(
+            bound.send(b"stale", Some(Endpoint::new(PEER_IP, 5555))),
+            Err(Errno::EADDRNOTAVAIL)
+        ) && nic.take().is_empty(),
+    );
+    socket::close(&bound);
+    socket::reset();
+    super::configure(Some(test_config()));
+    nic.take();
 }

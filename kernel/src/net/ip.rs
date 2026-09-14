@@ -192,12 +192,19 @@ pub fn build(source: Ipv4Addr, destination: Ipv4Addr, protocol: u8, payload: &[u
     out
 }
 
-/// Send one datagram, choosing the next hop and resolving its hardware
-/// address on the way.
+/// Send one datagram from the address this machine would use for it.
 pub fn send(destination: Ipv4Addr, protocol: u8, payload: &[u8]) -> Result<(), Errno> {
-    send_from(super::config().address, destination, protocol, payload)
+    send_from(super::source_for(destination)?, destination, protocol, payload)
 }
 
+/// Send one datagram, choosing the next hop and resolving its hardware
+/// address on the way.
+///
+/// The source has to be an address this machine holds. A socket bound to the
+/// address a lease gave, still sending after the lease has gone, is refused
+/// here rather than putting an address that may now be somebody else's on the
+/// wire. The one source that is not held is 0.0.0.0, to the broadcast address,
+/// while this machine has no address at all, which is how it asks for one.
 pub fn send_from(
     source: Ipv4Addr,
     destination: Ipv4Addr,
@@ -208,26 +215,31 @@ pub fn send_from(
         // No fragmentation: the caller has to offer something that fits.
         return Err(Errno::EMSGSIZE);
     }
-    let datagram = build(source, destination, protocol, payload);
+    // One reading of the configuration for the whole decision, so a datagram
+    // is never checked against one configuration and routed by the next.
+    let config = super::config();
     // Anything addressed to this machine is handed back to this machine.
-    if destination.is_loopback() || destination == super::config().address {
-        super::loop_back(datagram);
+    if destination.is_loopback() || config.is_some_and(|config| destination == config.address()) {
+        super::loop_back(build(source, destination, protocol, payload));
         return Ok(());
     }
-    super::arp::send_datagram(next_hop(destination), datagram)
-}
-
-/// The default route: anything off the local subnet goes to the gateway.
-pub fn next_hop(destination: Ipv4Addr) -> Ipv4Addr {
-    let config = super::config();
-    if destination.is_broadcast() || destination.is_multicast() {
-        return destination;
-    }
-    if config.on_link(destination) {
-        destination
-    } else {
-        config.gateway
-    }
+    let next_hop = match config {
+        Some(config) => {
+            if source != config.address() {
+                return Err(Errno::EADDRNOTAVAIL);
+            }
+            // Off the subnet with no gateway is somewhere this machine has
+            // no way to reach.
+            config.next_hop(destination).ok_or(Errno::ENETUNREACH)?
+        }
+        None => {
+            if !(source.is_unspecified() && destination.is_broadcast()) {
+                return Err(Errno::ENETUNREACH);
+            }
+            destination
+        }
+    };
+    super::arp::send_datagram(next_hop, build(source, destination, protocol, payload))
 }
 
 /// Where a datagram came from: off a card, or from this machine talking to
@@ -244,26 +256,33 @@ pub fn receive(bytes: &[u8], source_mac: [u8; 6], origin: Origin) {
     let config = super::config();
     let for_us = match origin {
         Origin::Card => {
-            // A datagram off a card that claims this machine's own address is
-            // either a loop or a forgery, and 127/8 names whoever is asking,
-            // so it never crosses a link in either field.
-            if !config.address.is_unspecified() && header.source == config.address {
-                return;
-            }
+            // 127/8 names whoever is asking, so it never crosses a link in
+            // either field.
             if header.source.is_loopback() || header.destination.is_loopback() {
                 return;
             }
-            header.destination == config.address
-                || header.destination.is_broadcast()
-                || header.destination == config.broadcast()
-                // Before the address is configured, take whatever turns up:
-                // the alternative is to drop the very packets that would
-                // configure it.
-                || config.address.is_unspecified()
+            match config {
+                Some(config) => {
+                    // A datagram off a card that claims this machine's own
+                    // address is either a loop or a forgery.
+                    if header.source == config.address() {
+                        return;
+                    }
+                    header.destination == config.address()
+                        || header.destination.is_broadcast()
+                        || header.destination == config.broadcast()
+                }
+                // With no address, nothing sent to one can be for this
+                // machine, and the all-ones broadcast is how the answer that
+                // gives it one arrives: the DHCP client asks for its answers
+                // to be broadcast for exactly this reason.
+                None => header.destination.is_broadcast(),
+            }
         }
         // Built here for here; nothing else reaches the queue it came from.
         Origin::Loopback => {
-            header.destination.is_loopback() || header.destination == config.address
+            header.destination.is_loopback()
+                || config.is_some_and(|config| header.destination == config.address())
         }
     };
     if !for_us {
@@ -272,8 +291,8 @@ pub fn receive(bytes: &[u8], source_mac: [u8; 6], origin: Origin) {
     // A neighbour that talks to us has just proved which hardware address it
     // is at, which saves a request the next time we answer it.
     if origin == Origin::Card
-        && config.on_link(header.source)
         && !header.source.is_unspecified()
+        && config.is_some_and(|config| config.on_link(header.source))
     {
         super::arp::learn(header.source, source_mac);
     }
