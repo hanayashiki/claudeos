@@ -118,6 +118,7 @@ pub const PRCTL: u64 = 167;
 pub const ARCH_PRCTL: u64 = ABSENT + 24;
 pub const SETRLIMIT: u64 = 164;
 pub const SYNC: u64 = 81;
+pub const REBOOT: u64 = 142;
 pub const GETTID: u64 = 178;
 pub const TIME: u64 = ABSENT + 25;
 pub const FUTEX: u64 = 98;

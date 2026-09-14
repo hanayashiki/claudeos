@@ -18,6 +18,7 @@ mod futex;
 mod mm;
 mod net;
 mod pci;
+mod reboot;
 mod rng;
 mod sched;
 mod signal;

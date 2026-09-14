@@ -111,6 +111,7 @@ pub const PRCTL: u64 = 157;
 pub const ARCH_PRCTL: u64 = 158;
 pub const SETRLIMIT: u64 = 160;
 pub const SYNC: u64 = 162;
+pub const REBOOT: u64 = 169;
 pub const GETTID: u64 = 186;
 pub const TIME: u64 = 201;
 pub const FUTEX: u64 = 202;
