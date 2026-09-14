@@ -188,8 +188,8 @@ watchdog=off     leave the watchdog stopped, for a debugger holding the processo
 
 ### WiFi
 
-The board's WiFi is a Cypress CYW43455 on the SDIO bus of the second SD
-controller. The kernel brings it up itself: it powers the chip through the
+The board's WiFi is a Cypress CYW43455 on the SDIO bus of the Arasan SD host
+controller at 0x7e300000. The kernel brings it up itself: it powers the chip through the
 firmware's WL_ON line, enumerates the card, puts Cypress's firmware on the
 chip's own processor, loads the regulatory data, sets the country, scans,
 joins, and runs the WPA2 handshake. Only WPA2 with a passphrase and CCMP is
@@ -930,8 +930,10 @@ the board that remembers the time across a power cycle, so the clock starts
 from the newest date on the ram disk rather than from the real one.
 
 The WiFi joins one kind of network: WPA2 with a passphrase, CCMP for pairwise
-and group traffic, and management frame protection not required. WPA3, TKIP,
-enterprise authentication and open networks are not joined. It scans once at
+and group traffic, and management frame protection not required. A network
+that offers only WPA3's SAE, only TKIP, only enterprise authentication, or no
+security at all is not joined; one that offers PSK beside SAE is joined with
+PSK. It scans once at
 bring-up, joins the strongest access point with the configured name, and asks
 again every 30 seconds while there is no link; it does not roam or scan again.
 The chip is polled once a tick rather than taking its interrupt, and the
