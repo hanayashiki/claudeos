@@ -174,6 +174,184 @@ run_interrupt_key() {
   echo
 }
 
+# The telnet console: the same terminal over TCP port 23, driven with
+# scripts/console.py through a port on this machine that QEMU forwards to the
+# guest's port 23. One boot with it on, one with telnet=off. QEMU's raspi4b
+# emulates no network card, so on aarch64 the console never starts and there
+# is nothing here to drive.
+run_telnet() {
+  banner "telnet console"
+  if [ "$ARCH" != x86_64 ]; then
+    echo "   QEMU's raspi4b emulates no network card, so the telnet console never"
+    echo "   starts on this machine; the sections above ran without it."
+    echo ">> telnet console: not run on $ARCH"
+    echo
+    return
+  fi
+  local dir port serial qemu first ok=1 attached
+  dir="$(mktemp -d)"
+  serial="$dir/serial"
+  port="$(telnet_free_port)"
+  local console=(python3 "$ROOT/scripts/console.py" 127.0.0.1 --port "$port" --timeout 20)
+
+  # The forwarded port listens on this machine's loopback address only: what
+  # is behind it is a root shell with no password.
+  "$ROOT/scripts/run.sh" --timeout 150 --hostfwd "tcp:127.0.0.1:$port-:23" \
+      --initrd "$IMAGE" > "$serial" 2>&1 < /dev/null &
+  qemu=$!
+  if ! telnet_wait "$serial" "telnet: the console is on"; then
+    echo "   the kernel never said it was listening"
+    ok=0
+  fi
+
+  # Connected after boot: the kernel log first, then a command, then a line
+  # edited with backspace, which reads "abcZ" only if the two backspaces
+  # erased "XY".
+  telnet_client after-boot 0 --log --send 'echo telnet-works' --until '^telnet-works$' \
+      --send 'uname -a' --until '^Linux claudeos' \
+      --send 'echo abcXY\x7f\x7fZ' --until '^abcZ$' || ok=0
+  telnet_expect after-boot "claudeos: booting" "^dhcp: 10\.0\.2\.15" \
+      "^telnet: console attached from" "^telnet-works$" "^Linux claudeos" "^abcZ$" || ok=0
+
+  # The interrupt key from the connection. The session is over well inside
+  # the hundred seconds the sleep asks for, so the prompt coming back means
+  # the sleep was interrupted rather than finished.
+  telnet_client interrupt 0 --send 'sleep 100' --wait 1.5 --type '\x03' \
+      --send 'echo sleep-interrupted' --until '^sleep-interrupted$' || ok=0
+  telnet_expect interrupt "\^C" "^sleep-interrupted$" || ok=0
+
+  # A second connection while the first is up is told the console is busy,
+  # and the first carries on. The second is started once the serial port has
+  # said the first attached, so it cannot be the one that gets in.
+  attached=$(grep -c "telnet: console attached from" "$serial")
+  "${console[@]}" --wait 4 --send 'echo first-still-up' --until '^first-still-up$' \
+      > "$dir/first" 2>&1 &
+  first=$!
+  telnet_wait_count "$serial" "telnet: console attached from" $((attached + 1))
+  telnet_client second 3 --send 'echo second-got-in' --until '^second-got-in$' || ok=0
+  telnet_expect second "telnet console busy: in use from" || ok=0
+  if ! wait $first; then
+    echo "   the first connection did not carry on after the second was turned away"
+    ok=0
+  fi
+  echo "--- first"
+  tr -d '\r' < "$dir/first"
+  telnet_expect first "^first-still-up$" || ok=0
+
+  # Gone and back: a new connection after the last one closed.
+  telnet_client reconnect 0 --send 'echo reconnected' --until '^reconnected$' || ok=0
+  telnet_expect reconnect "^reconnected$" || ok=0
+
+  # A client that stops reading while the board prints a great deal. Its
+  # socket buffer is made small so the output backs up into the guest rather
+  # than into this machine. It has to be dropped, the kernel has to say so,
+  # the printing has to carry on to the serial port, and the next connection
+  # has to work.
+  telnet_client stalled 5 --receive-buffer 4096 --send 'seq 1 200000' --stall 10 --wait 5 || ok=0
+  if ! telnet_wait "$serial" "^200000"; then
+    echo "   the output stopped on the serial port as well"
+    ok=0
+  fi
+  if ! grep -q "telnet: dropped 10.0.2.2:[0-9]*, which fell more than" "$serial"; then
+    echo "   the kernel did not say it dropped the client that stopped reading"
+    ok=0
+  fi
+  telnet_client after-drop 0 --send 'echo after-drop' --until '^after-drop$' || ok=0
+  telnet_expect after-drop "^after-drop$" || ok=0
+
+  telnet_client leave 5 --send 'exit' --wait 5 > /dev/null
+  if ! telnet_wait "$serial" "powering off"; then
+    pkill -f "hostfwd=tcp:127.0.0.1:$port-:23"
+  fi
+  wait $qemu
+  echo "--- what the kernel said on the serial port"
+  grep "telnet:" "$serial" | tr -d '\r'
+  record_boot_id "$(cat "$serial")"
+
+  # telnet=off: the network comes up and nothing answers on port 23. Through
+  # QEMU's forwarding that is a connection closed before anything arrives.
+  serial="$dir/serial-off"
+  port="$(telnet_free_port)"
+  console=(python3 "$ROOT/scripts/console.py" 127.0.0.1 --port "$port" --timeout 20)
+  "$ROOT/scripts/run.sh" --timeout 60 --hostfwd "tcp:127.0.0.1:$port-:23" \
+      --initrd "$IMAGE" --append 'telnet=off' > "$serial" 2>&1 < /dev/null &
+  qemu=$!
+  telnet_wait "$serial" "claudeos shell"
+  telnet_client off 4 --send 'echo telnet-is-on' --until '^telnet-is-on$' || ok=0
+  pkill -f "hostfwd=tcp:127.0.0.1:$port-:23"
+  wait $qemu
+  echo "--- what the kernel said on the serial port"
+  grep "telnet\|dhcp:" "$serial" | tr -d '\r'
+  if ! grep -q "^telnet: off, from the command line" "$serial" \
+      || ! grep -q "^dhcp: 10\.0\.2\.15" "$serial" \
+      || grep -q "telnet: the console is on" "$serial"; then
+    echo "   with telnet=off the network has to come up and the console must not listen"
+    ok=0
+  fi
+  record_boot_id "$(cat "$serial")"
+  rm -rf "$dir"
+
+  if [ $ok -eq 1 ]; then
+    echo ">> telnet console: OK"
+  else
+    echo ">> telnet console: FAILED"
+    status=1
+  fi
+  echo
+}
+
+telnet_free_port() {
+  python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
+}
+
+# Wait up to a minute for a line matching $2 to appear in the file $1.
+telnet_wait() {
+  local i
+  for i in $(seq 1 120); do
+    if tr -d '\r' < "$1" | grep -q "$2"; then return 0; fi
+    sleep 0.5
+  done
+  return 1
+}
+
+# Wait up to twenty seconds for $3 lines matching $2 in the file $1.
+telnet_wait_count() {
+  local i
+  for i in $(seq 1 40); do
+    if [ "$(grep -c "$2" "$1")" -ge "$3" ]; then return 0; fi
+    sleep 0.5
+  done
+  return 1
+}
+
+# Run the client with the arguments after the first two, keep what it
+# printed under the name $1, print the end of it, and require exit status $2.
+telnet_client() {
+  local name="$1" expected="$2" code
+  shift 2
+  "${console[@]}" "$@" > "$dir/$name" 2>&1
+  code=$?
+  echo "--- $name (exit status $code)"
+  tr -d '\r' < "$dir/$name" | tail -n 40
+  if [ "$code" != "$expected" ]; then
+    echo "   expected exit status $expected"
+    return 1
+  fi
+}
+
+# Require every pattern after the first argument in what client $1 printed.
+telnet_expect() {
+  local name="$1" pattern missing=0
+  shift
+  for pattern in "$@"; do
+    if ! tr -d '\r' < "$dir/$name" | grep -q "$pattern"; then
+      echo "   $name: missing expected output: $pattern"
+      missing=1
+    fi
+  done
+  return $missing
+}
+
 # The boots above, compared against each other. Every one seeds its generator
 # from what it can observe of its own start-up, and the id says where that left
 # it; two the same would mean two machines produced one stream, which is the
@@ -227,6 +405,7 @@ else
 fi
 run_interactive
 run_interrupt_key
+run_telnet
 run_boot_ids
 
 if [ $status -ne 0 ]; then
