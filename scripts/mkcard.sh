@@ -4,6 +4,9 @@
 #
 #   scripts/mkcard.sh                 assemble build/boot and stop
 #   scripts/mkcard.sh /dev/disk4      assemble, then erase that card and write it
+#   scripts/mkcard.sh --dir DIR /dev/disk4
+#                                     erase that card and write DIR to it
+#                                     instead, without assembling anything
 #
 # A Pi 4 boots from a single FAT32 partition. Its bootloader lives in an EEPROM
 # on the board and can read nothing else, so everything it needs -- its own
@@ -174,7 +177,15 @@ write_card() {
 
 # ---------------------------------------------------------------------------
 
-if [ $# -ge 1 ]; then
+if [ "${1:-}" = "--dir" ]; then
+  # A directory something else prepared, such as the EEPROM update files from
+  # scripts/mkeeprom.sh, goes through the same checks and the same write.
+  [ $# -eq 3 ] || die "usage: $0 --dir DIR /dev/diskN"
+  require_removable "$3"
+  [ -d "$2" ] || die "$2 is not a directory"
+  BOOT="$(cd "$2" && pwd)"
+  write_card "$3"
+elif [ $# -ge 1 ]; then
   # Check the device before building anything, so a wrong one is refused at
   # once rather than after a page of output.
   require_removable "$1"
