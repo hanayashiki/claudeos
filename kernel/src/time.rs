@@ -112,6 +112,21 @@ pub fn monotonic_ns() -> u64 {
     (elapsed as u128 * 1_000_000_000u128 / per_second as u128) as u64
 }
 
+/// Cycle counter units in a second: the rate calibration settled on once it
+/// has run, and before that whatever the machine says when asked, which is
+/// zero if it cannot say.
+///
+/// For a wait that cannot use the tick, such as the one after a panic, which
+/// has interrupts masked and can come before calibration has run.
+pub fn counter_rate() -> u64 {
+    let calibrated = CYCLES_PER_SECOND.load(Ordering::Acquire);
+    if calibrated != 0 {
+        calibrated
+    } else {
+        counter_frequency()
+    }
+}
+
 pub fn monotonic_parts() -> (i64, i64) {
     let ns = monotonic_ns();
     ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)

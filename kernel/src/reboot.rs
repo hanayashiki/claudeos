@@ -1,19 +1,32 @@
-//! Stopping and restarting the machine: the `reboot` system call and the
-//! machine's watchdog.
+//! Stopping and restarting the machine: the `reboot` system call, the
+//! machine's watchdog, and what a kernel panic ends in.
 //!
-//! One word on the command line is read here. `watchdog=off` leaves the
-//! machine's watchdog stopped, which is what a processor held still in a
-//! debugger needs.
+//! Two words on the command line are read here. `panic=N` restarts the
+//! machine N seconds after a panic, at once when N is negative, and never when
+//! it is zero, which leaves the machine stopped with the message on the
+//! console. `watchdog=off` leaves the machine's watchdog stopped, which is
+//! what a processor held still in a debugger needs.
 
 use crate::abi::*;
 use crate::arch;
+use core::sync::atomic::{AtomicI64, Ordering};
 
-/// Read `watchdog=` off the command line, and start the watchdog unless the
-/// line says not to.
+/// Seconds from a panic to the restart, as `panic=` sets it.
+///
+/// Ten unless the command line says otherwise, which is the value Linux
+/// systems commonly boot with. On the board it means a panic is recovered from
+/// without anyone at the power supply. Under QEMU, which the scripts run with
+/// `-no-reboot`, the restart ends the run, so a suite whose kernel panics is
+/// reported ten seconds later rather than when its timeout runs out.
+static PANIC_RESTART_SECONDS: AtomicI64 = AtomicI64::new(10);
+
+/// Read `panic=` and `watchdog=` off the command line, and start the watchdog
+/// unless the line says not to.
 ///
 /// Called first thing in boot, before there is a heap. That is why this reads
 /// the line itself rather than taking the result of `parse_cmdline`: the
-/// earlier the watchdog starts, the more of boot it covers.
+/// earlier the watchdog starts, the more of boot it covers, and a panic in
+/// memory set-up is handled the way the line asked.
 pub fn configure(cmdline: &str) {
     let mut watchdog = true;
     for word in cmdline.split_whitespace() {
@@ -21,7 +34,11 @@ pub fn configure(cmdline: &str) {
         if word == "--" {
             break;
         }
-        if word == "watchdog=off" {
+        if let Some(value) = word.strip_prefix("panic=") {
+            if let Ok(seconds) = value.parse::<i64>() {
+                PANIC_RESTART_SECONDS.store(seconds, Ordering::Relaxed);
+            }
+        } else if word == "watchdog=off" {
             watchdog = false;
         }
     }
@@ -35,6 +52,14 @@ pub fn configure(cmdline: &str) {
         println!("watchdog: resets the machine after {} s without a timer interrupt", seconds);
     } else {
         println!("watchdog: none found");
+    }
+    let seconds = PANIC_RESTART_SECONDS.load(Ordering::Relaxed);
+    if seconds > 0 {
+        println!("panic: restart after {} s", seconds);
+    } else if seconds < 0 {
+        println!("panic: restart at once");
+    } else {
+        println!("panic: stay stopped");
     }
 }
 
@@ -76,5 +101,59 @@ pub fn reboot(magic1: u32, magic2: u32, command: u32) -> SysResult {
         // key here in either setting, so there is nothing to change.
         LINUX_REBOOT_CMD_CAD_ON | LINUX_REBOOT_CMD_CAD_OFF => Ok(0),
         _ => Err(Errno::EINVAL),
+    }
+}
+
+/// What a panic ends in, once its message has been printed.
+pub fn after_panic() -> ! {
+    let seconds = PANIC_RESTART_SECONDS.load(Ordering::Relaxed);
+    if seconds == 0 {
+        // The watchdog is no longer fed, and left running it would restart
+        // the machine that `panic=0` asked to stay stopped.
+        arch::watchdog_stop();
+        println!("claudeos: stopped; panic=0 leaves the machine this way");
+        crate::serial::drain();
+        loop {
+            arch::halt();
+        }
+    }
+    if seconds > 0 {
+        println!("claudeos: restarting in {} seconds", seconds);
+        // Out on the wire before the wait, in case the wait never ends and
+        // the watchdog is what restarts the machine.
+        crate::serial::drain();
+        wait_seconds(seconds as u64);
+    }
+    println!("claudeos: restarting");
+    arch::restart()
+}
+
+/// Spin for `seconds`, measured on the cycle counter, and feed the watchdog
+/// each time one of them has passed.
+///
+/// Interrupts are masked on the panic path, so the tick has stopped and cannot
+/// be what measures this; the counter runs whatever the interrupt mask is.
+///
+/// The watchdog is fed so that the restart at the end is this code's rather
+/// than the watchdog's, which matters for a wait longer than the watchdog's
+/// own time, and for a panic that came late in a long stretch with interrupts
+/// masked. It is fed once per second the counter says has passed rather than
+/// on every turn of the loop, so a counter that has stopped starves the
+/// watchdog, and the watchdog then restarts the machine this wait would have.
+///
+/// A machine whose counter has no known rate waits for nothing.
+fn wait_seconds(seconds: u64) {
+    let per_second = crate::time::counter_rate();
+    if per_second == 0 {
+        return;
+    }
+    arch::watchdog_feed();
+    let start = arch::cycle_counter();
+    for elapsed in 1..=seconds {
+        let due = per_second.saturating_mul(elapsed);
+        while arch::cycle_counter().wrapping_sub(start) < due {
+            core::hint::spin_loop();
+        }
+        arch::watchdog_feed();
     }
 }
