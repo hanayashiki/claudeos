@@ -94,12 +94,9 @@ if [ -x "$ROOT/build/thirdparty/cloudflared-aarch64" ]; then
   chmod +x "$RFS/bin/cloudflared"
 fi
 
-# What a program that resolves names itself reads to find a name server. The
-# address is the one QEMU's user-mode network answers on, which is also what
-# the kernel's own `nameserver=` defaults to.
-cat > "$RFS/etc/resolv.conf" <<'RESOLV'
-nameserver 10.0.2.3
-RESOLV
+# No /etc/resolv.conf: the kernel writes it once it has a network
+# configuration, from `nameserver=` or from the DHCP lease, so a fixed one here
+# would name a server the machine may not be able to reach.
 
 # A certificate store, so a program with its own TLS has roots to verify
 # against. Nothing here builds one; this is the bundle out of the Alpine root

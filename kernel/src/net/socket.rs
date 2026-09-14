@@ -187,12 +187,11 @@ impl InetSocket {
     // ---- binding ---------------------------------------------------------
 
     pub fn bind(self: &Arc<Self>, requested: Endpoint) -> Result<(), Errno> {
-        let config = super::config();
-        if !requested.address.is_unspecified()
-            && requested.address != config.address
-            && !requested.address.is_broadcast()
-            && !requested.address.is_loopback()
-        {
+        let held = requested.address.is_unspecified()
+            || requested.address.is_broadcast()
+            || requested.address.is_loopback()
+            || super::config().is_some_and(|config| config.address() == requested.address);
+        if !held {
             return Err(Errno::EADDRNOTAVAIL);
         }
         let mut local = requested;
@@ -297,6 +296,16 @@ impl InetSocket {
             }
             return Ok(());
         }
+        // A connection is with one host. While this machine has no address a
+        // broadcast is also the one destination `source_for` names 0.0.0.0
+        // for, and no connection may be opened from there.
+        if remote.address.is_broadcast() || remote.address.is_multicast() {
+            return Err(Errno::ENETUNREACH);
+        }
+        // Chosen before anything is sent, so a machine with no address
+        // refuses here with ENETUNREACH, which is what Linux reports for a
+        // destination it has no route to.
+        let source = super::source_for(remote.address)?;
         self.bind_ephemeral()?;
         let local = self.local_endpoint();
         self.with_tcp(|tcb| {
@@ -306,7 +315,7 @@ impl InetSocket {
                 tcp::State::Listen => return Err(Errno::EINVAL),
                 _ => return Err(Errno::EISCONN),
             }
-            tcb.local = Endpoint::new(super::source_for(remote.address), local.port);
+            tcb.local = Endpoint::new(source, local.port);
             tcb.remote = remote;
             tcb.open(false);
             Ok(())

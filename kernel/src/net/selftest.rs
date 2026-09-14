@@ -30,10 +30,20 @@ const OUR_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 const PEER_MAC: [u8; 6] = [0x52, 0x55, 0x0A, 0x00, 0x02, 0x02];
 const OUR_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
+const NAMESERVER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
+
+/// The addresses the checks run with, all but the ones about having none.
+fn test_config() -> Config {
+    Config::new(OUR_IP, Ipv4Addr::new(255, 255, 255, 0), Some(PEER_IP), &[NAMESERVER_IP])
+        .expect("the addresses the checks run with")
+}
 
 /// A card that goes no further than remembering what it was handed.
 struct FakeNic {
     sent: Spinlock<Vec<Vec<u8>>>,
+    /// Up unless a check takes it down, to see what the DHCP client does
+    /// when it comes back.
+    link: core::sync::atomic::AtomicBool,
 }
 
 impl Interface for FakeNic {
@@ -44,6 +54,10 @@ impl Interface for FakeNic {
     fn transmit(&self, frame: &[u8]) -> Result<(), Errno> {
         self.sent.lock().push(frame.to_vec());
         Ok(())
+    }
+
+    fn link_up(&self) -> bool {
+        self.link.load(core::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -245,14 +259,12 @@ fn deliver_ip_between(protocol: u8, payload: &[u8], source: Ipv4Addr, destinatio
 // ---- the tests ------------------------------------------------------------
 
 pub fn run() -> bool {
-    let nic: &'static FakeNic = Box::leak(Box::new(FakeNic { sent: Spinlock::new(Vec::new()) }));
+    let nic: &'static FakeNic = Box::leak(Box::new(FakeNic {
+        sent: Spinlock::new(Vec::new()),
+        link: core::sync::atomic::AtomicBool::new(true),
+    }));
     super::attach(nic);
-    super::configure(Config {
-        address: OUR_IP,
-        netmask: Ipv4Addr::new(255, 255, 255, 0),
-        gateway: PEER_IP,
-        nameserver: Ipv4Addr::new(10, 0, 2, 3),
-    });
+    super::configure(Some(test_config()));
     socket::reset();
     nic.take();
 
@@ -303,6 +315,19 @@ pub fn run() -> bool {
     initial_sequence_numbers(&mut report, nic);
     crate::println!("net: datagrams");
     datagrams(&mut report, nic);
+    crate::println!("net: what makes a configuration");
+    configurations(&mut report);
+    crate::println!("net: a machine with no address");
+    no_address(&mut report, nic);
+    crate::println!("net: dhcp, a lease taken, renewed, rebound and run out");
+    dhcp_exchange(&mut report, nic);
+    crate::println!("net: dhcp, refused");
+    dhcp_refusal(&mut report, nic);
+    crate::println!("net: dhcp, malformed messages");
+    dhcp_malformed(&mut report, nic);
+    crate::println!("net: dhcp, retransmission and the link coming up");
+    dhcp_retransmission(&mut report, nic);
+    super::configure(Some(test_config()));
     // The driver for this board's own Ethernet, as far as it can be exercised
     // with no such Ethernet anywhere: nothing emulates it, so this is the only
     // thing that runs against it before it meets a board.
@@ -2276,4 +2301,774 @@ fn datagrams(report: &mut Report, nic: &FakeNic) {
     report.check("and the room is there for what comes next", queued_bytes_of(&socket) == 5);
 
     socket::close(&socket);
+}
+
+// ---- having no address, and asking for one --------------------------------
+
+const NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
+/// The name server the DHCP checks' server hands out. It is not the one the
+/// other checks run with, so /etc/resolv.conf shows which of them wrote it.
+const LEASE_DNS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 53);
+/// The client never reads the clock itself; these checks say what time it is,
+/// starting from here.
+const START: u64 = 1_000_000;
+const HZ: u64 = crate::arch::TICK_HZ as u64;
+
+const DISCOVER: u8 = 1;
+const OFFER: u8 = 2;
+const REQUEST: u8 = 3;
+const ACK: u8 = 5;
+const NAK: u8 = 6;
+/// A lease time option of one day.
+const A_DAY: [u8; 6] = [51, 4, 0x00, 0x01, 0x51, 0x80];
+/// Where the DHCP message starts in a frame: after the Ethernet, IPv4 and UDP
+/// headers.
+const DHCP_AT: usize = 14 + 20 + 8;
+
+/// A frame from the peer to everyone.
+fn broadcast_frame(ethertype: u16, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0xFF; 6]);
+    out.extend_from_slice(&PEER_MAC);
+    out.extend_from_slice(&ethertype.to_be_bytes());
+    out.extend_from_slice(payload);
+    while out.len() < 60 {
+        out.push(0);
+    }
+    out
+}
+
+/// A frame as this stack should have broadcast it.
+fn expected_broadcast(ethertype: u16, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0xFF; 6]);
+    out.extend_from_slice(&OUR_MAC);
+    out.extend_from_slice(&ethertype.to_be_bytes());
+    out.extend_from_slice(payload);
+    while out.len() < 60 {
+        out.push(0);
+    }
+    out
+}
+
+/// An ARP packet from the peer, about the peer, to `target`.
+fn arp_from_peer(operation: u16, target_mac: [u8; 6], target: Ipv4Addr) -> Vec<u8> {
+    let mut packet = Vec::new();
+    packet.extend_from_slice(&[0x00, 0x01, 0x08, 0x00, 6, 4]); // ethernet, ipv4, lengths
+    packet.extend_from_slice(&operation.to_be_bytes());
+    packet.extend_from_slice(&PEER_MAC);
+    packet.extend_from_slice(&PEER_IP.to_be_bytes());
+    packet.extend_from_slice(&target_mac);
+    packet.extend_from_slice(&target.to_be_bytes());
+    packet
+}
+
+/// A file's contents, or nothing if there is no such file.
+fn read_file(path: &str) -> Vec<u8> {
+    let Ok(node) = crate::fs::lookup(path) else { return Vec::new() };
+    let mut buf = [0u8; 512];
+    let length = node.read_at(crate::fs::Offset::new(0), &mut buf).unwrap_or(0);
+    buf[..length].to_vec()
+}
+
+/// What `Config::new` takes and what it refuses.
+fn configurations(report: &mut Report) {
+    report.check(
+        "an address, a netmask, a gateway and a name server make a configuration",
+        Config::new(OUR_IP, NETMASK, Some(PEER_IP), &[NAMESERVER_IP]).is_ok(),
+    );
+    for (name, address) in [
+        ("0.0.0.0 is not an address a host holds", Ipv4Addr::UNSPECIFIED),
+        ("nor is the all-ones broadcast", Ipv4Addr::BROADCAST),
+        ("nor a loopback address", Ipv4Addr::new(127, 0, 0, 1)),
+        ("nor a multicast address", Ipv4Addr::new(224, 0, 0, 1)),
+        ("nor the subnet's own broadcast address", Ipv4Addr::new(10, 0, 2, 255)),
+        ("nor the subnet's network address", Ipv4Addr::new(10, 0, 2, 0)),
+    ] {
+        report.check(name, Config::new(address, NETMASK, None, &[]).is_err());
+    }
+    report.check(
+        "a netmask with a hole in it is refused",
+        Config::new(OUR_IP, Ipv4Addr::new(255, 0, 255, 0), None, &[]).is_err(),
+    );
+    report.check(
+        "and so is a netmask of nothing",
+        Config::new(OUR_IP, Ipv4Addr::UNSPECIFIED, None, &[]).is_err(),
+    );
+    report.check(
+        "a gateway off the subnet is refused",
+        Config::new(OUR_IP, NETMASK, Some(Ipv4Addr::new(10, 0, 3, 1)), &[]).is_err(),
+    );
+    report.check(
+        "and so is a gateway that is this machine",
+        Config::new(OUR_IP, NETMASK, Some(OUR_IP), &[]).is_err(),
+    );
+    let one = Ipv4Addr::new(1, 1, 1, 1);
+    let eight = Ipv4Addr::new(8, 8, 8, 8);
+    let servers = [Ipv4Addr::UNSPECIFIED, NAMESERVER_IP, one, eight, Ipv4Addr::new(9, 9, 9, 9)];
+    report.check(
+        "zero is left out of the name servers, and so is any past the third",
+        Config::new(OUR_IP, NETMASK, None, &servers)
+            .is_ok_and(|config| config.nameservers() == [NAMESERVER_IP, one, eight]),
+    );
+    report.check(
+        "a netmask left out is the one the address's class implies",
+        Config::class_netmask(Ipv4Addr::new(10, 1, 2, 3)) == Ipv4Addr::new(255, 0, 0, 0)
+            && Config::class_netmask(Ipv4Addr::new(172, 16, 0, 1)) == Ipv4Addr::new(255, 255, 0, 0)
+            && Config::class_netmask(Ipv4Addr::new(192, 168, 86, 57)) == NETMASK,
+    );
+}
+
+/// With no configuration, a socket reaches nothing but the broadcast address
+/// and nothing but a broadcast reaches it. A socket still holding an address
+/// the machine no longer has sends nothing from it.
+fn no_address(report: &mut Report, nic: &FakeNic) {
+    const PORT: u16 = 7790;
+    let subnet_broadcast = Ipv4Addr::new(10, 0, 2, 255);
+    socket::reset();
+    super::configure(None);
+    nic.take();
+
+    let socket = InetSocket::new(false);
+    if socket.bind(Endpoint::new(Ipv4Addr::UNSPECIFIED, PORT)).is_err() {
+        report.check("a datagram socket", false);
+        return;
+    }
+    report.check(
+        "a datagram to a host has nowhere to go",
+        matches!(
+            socket.send(b"hello", Some(Endpoint::new(PEER_IP, 5555))),
+            Err(Errno::ENETUNREACH)
+        ),
+    );
+    report.check(
+        "nor has a connection",
+        matches!(InetSocket::new(true).connect(Endpoint::new(PEER_IP, 80)), Err(Errno::ENETUNREACH)),
+    );
+    report.check(
+        "nor a connection to the broadcast address",
+        matches!(
+            InetSocket::new(true).connect(Endpoint::new(Ipv4Addr::BROADCAST, 80)),
+            Err(Errno::ENETUNREACH)
+        ),
+    );
+    report.check("and none of them put anything on the wire", nic.take().is_empty());
+    report.check(
+        "the address the machine used to have cannot be bound",
+        matches!(
+            InetSocket::new(false).bind(Endpoint::new(OUR_IP, PORT + 1)),
+            Err(Errno::EADDRNOTAVAIL)
+        ),
+    );
+
+    match socket.send(b"anyone?", Some(Endpoint::new(Ipv4Addr::BROADCAST, 5555))) {
+        Ok(n) => report.value("a broadcast can still be sent", n as u64, 7),
+        Err(_) => report.check("a broadcast can still be sent", false),
+    }
+    let sent = nic.take();
+    report.check("as one frame", sent.len() == 1);
+    if let [frame] = sent.as_slice() {
+        let expected = expected_broadcast(
+            ether::ETHERTYPE_IPV4,
+            &datagram(
+                identification_of(frame),
+                ip::PROTO_UDP,
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::BROADCAST,
+                &udp_datagram(PORT, 5555, b"anyone?", Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST),
+            ),
+        );
+        report.bytes("from 0.0.0.0, to everyone", frame, &expected);
+    }
+
+    deliver_ip(ip::PROTO_UDP, &udp_datagram(5555, PORT, b"to an address", PEER_IP, OUR_IP));
+    report.check(
+        "a datagram sent to an address is not taken by a machine with none",
+        queued_bytes_of(&socket) == 0,
+    );
+    deliver_ip_between(
+        ip::PROTO_UDP,
+        &udp_datagram(5555, PORT, b"to a subnet", PEER_IP, subnet_broadcast),
+        PEER_IP,
+        subnet_broadcast,
+    );
+    report.check(
+        "nor one sent to a subnet it is not known to be on",
+        queued_bytes_of(&socket) == 0,
+    );
+    deliver_ip_between(
+        ip::PROTO_UDP,
+        &udp_datagram(5555, PORT, b"to everyone", PEER_IP, Ipv4Addr::BROADCAST),
+        PEER_IP,
+        Ipv4Addr::BROADCAST,
+    );
+    report.check("but one sent to everyone is", queued_bytes_of(&socket) == 11);
+
+    deliver(ether::ETHERTYPE_ARP, &arp_from_peer(super::arp::OP_REQUEST, [0; 6], OUR_IP));
+    deliver_ip(ip::PROTO_ICMP, &echo_request());
+    report.check(
+        "the address it used to have is answered for by neither ARP nor ping",
+        nic.take().is_empty(),
+    );
+    socket::close(&socket);
+
+    // ---- an address taken away from under a socket ----
+    super::configure(Some(test_config()));
+    let bound = InetSocket::new(false);
+    if bound.bind(Endpoint::new(OUR_IP, PORT + 2)).is_err() {
+        report.check("a socket bound to the address", false);
+        return;
+    }
+    let other = Config::new(Ipv4Addr::new(10, 0, 2, 16), NETMASK, Some(PEER_IP), &[])
+        .expect("another address on the subnet");
+    super::configure(Some(other));
+    nic.take();
+    report.check(
+        "a socket bound to an address the machine no longer has cannot send from it",
+        matches!(
+            bound.send(b"stale", Some(Endpoint::new(PEER_IP, 5555))),
+            Err(Errno::EADDRNOTAVAIL)
+        ) && nic.take().is_empty(),
+    );
+    socket::close(&bound);
+    socket::reset();
+    super::configure(Some(test_config()));
+    nic.take();
+}
+
+/// A message as a DHCP server sends one, fields written out one by one.
+fn bootp_reply(xid: u32, chaddr: [u8; 6], yiaddr: Ipv4Addr, options: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(2); // a reply
+    out.push(1); // ethernet
+    out.push(6); // hardware address length
+    out.push(0); // hops
+    out.extend_from_slice(&xid.to_be_bytes());
+    out.extend_from_slice(&[0, 0]); // secs
+    out.extend_from_slice(&[0x80, 0x00]); // flags: broadcast, as the request asked
+    out.extend_from_slice(&[0; 4]); // ciaddr
+    out.extend_from_slice(&yiaddr.to_be_bytes());
+    out.extend_from_slice(&[0; 4]); // siaddr
+    out.extend_from_slice(&[0; 4]); // giaddr
+    out.extend_from_slice(&chaddr);
+    out.extend_from_slice(&[0; 10]); // the rest of chaddr
+    out.extend_from_slice(&[0; 64]); // sname
+    out.extend_from_slice(&[0; 128]); // file
+    out.extend_from_slice(&[99, 130, 83, 99]); // magic cookie
+    out.extend_from_slice(options);
+    out
+}
+
+/// A server's options: the message type, the server, the netmask, the router
+/// and the name server, then `extra`, then the end.
+fn server_options(kind: u8, extra: &[u8]) -> Vec<u8> {
+    let mut options = alloc::vec![53, 1, kind]; // message type
+    options.extend_from_slice(&[54, 4, 10, 0, 2, 2]); // server identifier
+    options.extend_from_slice(&[1, 4, 255, 255, 255, 0]); // netmask
+    options.extend_from_slice(&[3, 4, 10, 0, 2, 2]); // router
+    options.extend_from_slice(&[6, 4, 10, 0, 2, 53]); // name server
+    options.extend_from_slice(extra);
+    options.push(255);
+    options
+}
+
+/// A message as this client should have sent it, padded to 300 bytes.
+fn bootp_request(xid: u32, secs: u16, flags: u16, ciaddr: Ipv4Addr, options: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(1); // a request
+    out.push(1); // ethernet
+    out.push(6); // hardware address length
+    out.push(0); // hops
+    out.extend_from_slice(&xid.to_be_bytes());
+    out.extend_from_slice(&secs.to_be_bytes());
+    out.extend_from_slice(&flags.to_be_bytes());
+    out.extend_from_slice(&ciaddr.to_be_bytes());
+    out.extend_from_slice(&[0; 12]); // yiaddr, siaddr, giaddr
+    out.extend_from_slice(&OUR_MAC);
+    out.extend_from_slice(&[0; 10]); // the rest of chaddr
+    out.extend_from_slice(&[0; 192]); // sname and file
+    out.extend_from_slice(&[99, 130, 83, 99]); // magic cookie
+    out.extend_from_slice(options);
+    while out.len() < 300 {
+        out.push(0);
+    }
+    out
+}
+
+/// The options this client should send.
+fn client_options(kind: u8, requested: Option<Ipv4Addr>, server: Option<Ipv4Addr>) -> Vec<u8> {
+    let mut options = alloc::vec![53, 1, kind]; // message type
+    options.extend_from_slice(&[61, 7, 1]); // client identifier: ethernet, then the card
+    options.extend_from_slice(&OUR_MAC);
+    if let Some(requested) = requested {
+        options.extend_from_slice(&[50, 4]); // requested address
+        options.extend_from_slice(&requested.to_be_bytes());
+    }
+    if let Some(server) = server {
+        options.extend_from_slice(&[54, 4]); // server identifier
+        options.extend_from_slice(&server.to_be_bytes());
+    }
+    // Asking for the netmask, router, name servers, lease time, T1 and T2.
+    options.extend_from_slice(&[55, 6, 1, 3, 6, 51, 58, 59]);
+    options.push(255);
+    options
+}
+
+/// The transaction id of a message this client sent. It is drawn at random, so
+/// it is read back rather than predicted.
+fn xid_of(frame: &[u8]) -> u32 {
+    match frame.get(DHCP_AT + 4..DHCP_AT + 8) {
+        Some(&[a, b, c, d]) => u32::from_be_bytes([a, b, c, d]),
+        _ => 0,
+    }
+}
+
+/// The message type of a message this client sent, which is its first option.
+fn kind_of(frame: &[u8]) -> u8 {
+    frame.get(DHCP_AT + 242).copied().unwrap_or(0)
+}
+
+/// A server's message to port 68, broadcast.
+fn deliver_dhcp_broadcast(message: &[u8]) {
+    let packet = datagram(
+        0x4242,
+        ip::PROTO_UDP,
+        PEER_IP,
+        Ipv4Addr::BROADCAST,
+        &udp_datagram(67, 68, message, PEER_IP, Ipv4Addr::BROADCAST),
+    );
+    super::receive(&broadcast_frame(ether::ETHERTYPE_IPV4, &packet));
+}
+
+/// A server's message to port 68 at this machine's address, which is how a
+/// renewal is answered.
+fn deliver_dhcp_to_us(message: &[u8]) {
+    deliver_ip(ip::PROTO_UDP, &udp_datagram(67, 68, message, PEER_IP, OUR_IP));
+}
+
+/// What the checks' DHCP server hands out.
+fn leased_config() -> Config {
+    Config::new(OUR_IP, NETMASK, Some(PEER_IP), &[LEASE_DNS]).expect("the lease the checks hand out")
+}
+
+fn new_client(report: &mut Report, nameserver: Option<Ipv4Addr>) -> Option<super::dhcp::Client> {
+    socket::reset();
+    super::configure(None);
+    match super::dhcp::Client::new(OUR_MAC, nameserver, START) {
+        Ok(client) => Some(client),
+        Err(_) => {
+            report.check("a client on port 68", false);
+            None
+        }
+    }
+}
+
+/// Take a client through DISCOVER, OFFER, REQUEST and a day's ACK. The
+/// transaction id, or nothing if a step did not happen.
+fn lease_up(client: &mut super::dhcp::Client, nic: &FakeNic) -> Option<u32> {
+    client.run(START);
+    let xid = xid_of(nic.take().first()?);
+    deliver_dhcp_broadcast(&bootp_reply(xid, OUR_MAC, OUR_IP, &server_options(OFFER, &A_DAY)));
+    client.run(START + 1);
+    if nic.take().len() != 1 {
+        return None;
+    }
+    deliver_dhcp_broadcast(&bootp_reply(xid, OUR_MAC, OUR_IP, &server_options(ACK, &A_DAY)));
+    client.run(START + 2);
+    client.lease().map(|_| xid)
+}
+
+/// One lease from the first DISCOVER to its end: taken, renewed with the
+/// server that granted it, rebound with anyone, and given up.
+fn dhcp_exchange(report: &mut Report, nic: &FakeNic) {
+    nic.take();
+    let Some(mut client) = new_client(report, None) else { return };
+
+    // ---- the discover ----
+    client.run(START);
+    let sent = nic.take();
+    report.check("one discover", sent.len() == 1);
+    let [discover] = sent.as_slice() else { return };
+    let xid = xid_of(discover);
+    let expected = expected_broadcast(
+        ether::ETHERTYPE_IPV4,
+        &datagram(
+            identification_of(discover),
+            ip::PROTO_UDP,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            &udp_datagram(
+                68,
+                67,
+                &bootp_request(xid, 0, 0x8000, Ipv4Addr::UNSPECIFIED, &client_options(DISCOVER, None, None)),
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::BROADCAST,
+            ),
+        ),
+    );
+    report.bytes("the discover: from 0.0.0.0 to everyone, asking to be answered the same way", discover, &expected);
+    let wait = client.next_deadline() - START;
+    report.check("and the next is four seconds away, give or take one", (3 * HZ..=5 * HZ).contains(&wait));
+
+    // ---- answers that are not this client's ----
+    let offer = server_options(OFFER, &A_DAY);
+    deliver_dhcp_broadcast(&bootp_reply(xid ^ 1, OUR_MAC, OUR_IP, &offer));
+    deliver_dhcp_broadcast(&bootp_reply(xid, PEER_MAC, OUR_IP, &offer));
+    client.run(START + 1);
+    report.check(
+        "an offer in another exchange, or for another card, is not taken",
+        nic.take().is_empty(),
+    );
+
+    // ---- the offer, and the request for it ----
+    deliver_dhcp_broadcast(&bootp_reply(xid, OUR_MAC, OUR_IP, &offer));
+    client.run(START + 2);
+    let sent = nic.take();
+    report.check("one request for the offer", sent.len() == 1);
+    let [request] = sent.as_slice() else { return };
+    let expected = expected_broadcast(
+        ether::ETHERTYPE_IPV4,
+        &datagram(
+            identification_of(request),
+            ip::PROTO_UDP,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            &udp_datagram(
+                68,
+                67,
+                &bootp_request(
+                    xid,
+                    0,
+                    0x8000,
+                    Ipv4Addr::UNSPECIFIED,
+                    &client_options(REQUEST, Some(OUR_IP), Some(PEER_IP)),
+                ),
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::BROADCAST,
+            ),
+        ),
+    );
+    report.bytes("the request: in the offer's exchange, naming the address and the server", request, &expected);
+
+    // ---- the acknowledgement ----
+    deliver_dhcp_broadcast(&bootp_reply(xid, OUR_MAC, OUR_IP, &server_options(ACK, &A_DAY)));
+    client.run(START + 3);
+    report.check("the acknowledgement needs no answer", nic.take().is_empty());
+    report.check(
+        "and the lease it grants is the machine's configuration",
+        super::config() == Some(leased_config()),
+    );
+    let requested_at = START + 2;
+    report.check(
+        "for a day from the request, renewed at half of it and rebound at seven eighths",
+        client.lease().is_some_and(|lease| {
+            lease.renew_at == requested_at + 43_200 * HZ
+                && lease.rebind_at == requested_at + 75_600 * HZ
+                && lease.expires_at == requested_at + 86_400 * HZ
+        }),
+    );
+    let resolv = read_file("/etc/resolv.conf");
+    let servers: Vec<&str> = core::str::from_utf8(&resolv)
+        .unwrap_or("")
+        .lines()
+        .filter(|line| line.starts_with("nameserver"))
+        .collect();
+    report.check("and /etc/resolv.conf names the lease's name server", servers == ["nameserver 10.0.2.53"]);
+
+    // ---- T1: renewing with the server that granted it ----
+    let t1 = requested_at + 43_200 * HZ;
+    client.run(t1 - 1);
+    report.check("nothing is said before T1", nic.take().is_empty());
+    client.run(t1);
+    let sent = nic.take();
+    // The configuration changed, which forgot every hardware address, so the
+    // renewal to the server waits on the server's.
+    report.check(
+        "at T1 the server's hardware address is asked for",
+        matches!(sent.as_slice(), [frame] if u16::from_be_bytes([frame[12], frame[13]]) == ether::ETHERTYPE_ARP),
+    );
+    deliver(ether::ETHERTYPE_ARP, &arp_from_peer(super::arp::OP_REPLY, OUR_MAC, OUR_IP));
+    let sent = nic.take();
+    report.check("and the renewal goes when that is answered", sent.len() == 1);
+    let [renewal] = sent.as_slice() else { return };
+    let renew_xid = xid_of(renewal);
+    let expected = expected_frame(
+        ether::ETHERTYPE_IPV4,
+        &datagram(
+            identification_of(renewal),
+            ip::PROTO_UDP,
+            OUR_IP,
+            PEER_IP,
+            &udp_datagram(
+                68,
+                67,
+                &bootp_request(renew_xid, 0, 0, OUR_IP, &client_options(REQUEST, None, None)),
+                OUR_IP,
+                PEER_IP,
+            ),
+        ),
+    );
+    report.bytes("the renewal: from the leased address to the server alone, naming neither", renewal, &expected);
+    report.check("in an exchange of its own", renew_xid != xid);
+
+    // 1200 seconds, T1 at 600 and T2 at 900.
+    let shorter = [51, 4, 0, 0, 0x04, 0xB0, 58, 4, 0, 0, 0x02, 0x58, 59, 4, 0, 0, 0x03, 0x84];
+    deliver_dhcp_to_us(&bootp_reply(renew_xid, OUR_MAC, OUR_IP, &server_options(ACK, &shorter)));
+    client.run(t1 + 1);
+    report.check(
+        "the renewal's answer needs no answer and leaves the configuration as it was",
+        nic.take().is_empty() && super::config() == Some(leased_config()),
+    );
+    report.check(
+        "and the lease runs from the renewal now, by the server's own T1 and T2",
+        client.lease().is_some_and(|lease| {
+            lease.renew_at == t1 + 600 * HZ
+                && lease.rebind_at == t1 + 900 * HZ
+                && lease.expires_at == t1 + 1200 * HZ
+        }),
+    );
+
+    // ---- T2: rebinding with anyone ----
+    client.run(t1 + 600 * HZ);
+    report.check(
+        "at the next T1 the renewal goes straight out, the server's hardware address being known",
+        nic.take().len() == 1,
+    );
+    client.run(t1 + 900 * HZ);
+    let sent = nic.take();
+    report.check("at T2, still unanswered, one request to everyone", sent.len() == 1);
+    let [rebinding] = sent.as_slice() else { return };
+    let rebind_xid = xid_of(rebinding);
+    let expected = expected_broadcast(
+        ether::ETHERTYPE_IPV4,
+        &datagram(
+            identification_of(rebinding),
+            ip::PROTO_UDP,
+            OUR_IP,
+            Ipv4Addr::BROADCAST,
+            &udp_datagram(
+                68,
+                67,
+                &bootp_request(rebind_xid, 0, 0, OUR_IP, &client_options(REQUEST, None, None)),
+                OUR_IP,
+                Ipv4Addr::BROADCAST,
+            ),
+        ),
+    );
+    report.bytes("the rebinding request: from the leased address, to every server", rebinding, &expected);
+
+    // ---- the end of the lease ----
+    let end = t1 + 1200 * HZ;
+    client.run(end - 1);
+    report.check("the address is held to the last tick of the lease", super::config().is_some());
+    nic.take();
+    client.run(end);
+    let sent = nic.take();
+    report.check(
+        "and given up when it runs out",
+        super::config().is_none() && client.lease().is_none(),
+    );
+    report.check(
+        "after which a discover goes out at once, from 0.0.0.0",
+        matches!(sent.as_slice(), [frame] if kind_of(frame) == DISCOVER && frame[26..30] == [0, 0, 0, 0]),
+    );
+    drop(client);
+    socket::reset();
+    nic.take();
+}
+
+/// A NAK. In answer to the first request it takes nothing and the client asks
+/// again after a wait; in answer to a renewal it takes the address away.
+fn dhcp_refusal(report: &mut Report, nic: &FakeNic) {
+    let refusal = [53, 1, NAK, 54, 4, 10, 0, 2, 2, 255];
+    nic.take();
+    let Some(mut client) = new_client(report, None) else { return };
+    client.run(START);
+    let Some(xid) = nic.take().first().map(|frame| xid_of(frame)) else {
+        report.check("a discover", false);
+        return;
+    };
+    deliver_dhcp_broadcast(&bootp_reply(xid, OUR_MAC, OUR_IP, &server_options(OFFER, &A_DAY)));
+    client.run(START + 1);
+    nic.take();
+    deliver_dhcp_broadcast(&bootp_reply(xid, OUR_MAC, Ipv4Addr::UNSPECIFIED, &refusal));
+    client.run(START + 2);
+    report.check(
+        "a refused request takes no address",
+        super::config().is_none() && client.lease().is_none(),
+    );
+    report.check("and sends nothing straight away", nic.take().is_empty());
+    let wait = client.next_deadline() - (START + 2);
+    report.check("the next discover waits four seconds, give or take one", (3 * HZ..=5 * HZ).contains(&wait));
+    client.run(client.next_deadline());
+    report.check(
+        "and then goes, in a new exchange",
+        matches!(nic.take().as_slice(), [frame] if kind_of(frame) == DISCOVER && xid_of(frame) != xid),
+    );
+    drop(client);
+
+    // ---- a renewal refused ----
+    nic.take();
+    let Some(mut client) = new_client(report, None) else { return };
+    let leased = lease_up(&mut client, nic).is_some();
+    report.check("a lease to renew", leased && super::config() == Some(leased_config()));
+    let Some(t1) = client.lease().map(|lease| lease.renew_at) else { return };
+    client.run(t1);
+    deliver(ether::ETHERTYPE_ARP, &arp_from_peer(super::arp::OP_REPLY, OUR_MAC, OUR_IP));
+    let renew_xid = nic.take().last().map(|frame| xid_of(frame)).unwrap_or(0);
+    deliver_dhcp_to_us(&bootp_reply(renew_xid, OUR_MAC, Ipv4Addr::UNSPECIFIED, &refusal));
+    client.run(t1 + 1);
+    report.check(
+        "a refused renewal takes the address away",
+        super::config().is_none() && client.lease().is_none(),
+    );
+    drop(client);
+    socket::reset();
+    nic.take();
+}
+
+/// Messages wrong in the ways a length can be wrong. None of them is taken,
+/// none stops a good one after them from being taken, and no cut and no
+/// length byte panics the parser, which with overflow checks on would take
+/// the kernel down with it.
+fn dhcp_malformed(report: &mut Report, nic: &FakeNic) {
+    let named = Ipv4Addr::new(1, 1, 1, 1);
+    nic.take();
+    let Some(mut client) = new_client(report, Some(named)) else { return };
+    client.run(START);
+    let Some(xid) = nic.take().first().map(|frame| xid_of(frame)) else {
+        report.check("a discover", false);
+        return;
+    };
+
+    let server: [u8; 6] = [54, 4, 10, 0, 2, 2];
+    let offering: [u8; 3] = [53, 1, OFFER];
+    let reply = |options: &[&[u8]]| bootp_reply(xid, OUR_MAC, OUR_IP, &options.concat());
+    let mut file_overrun = reply(&[&offering, &server, &[52, 1, 1, 255]]);
+    file_overrun[108] = 6;
+    file_overrun[109] = 250;
+    let mut cut_short = reply(&[&offering, &server, &A_DAY, &[255]]);
+    cut_short.truncate(238);
+    let cases: [(&str, Vec<u8>); 8] = [
+        (
+            "an option running past the end of the message is not an offer",
+            reply(&[&offering, &server, &[1, 200, 255, 255, 255, 0]]),
+        ),
+        (
+            "nor is a netmask three bytes long",
+            reply(&[&offering, &server, &[1, 3, 255, 255, 255], &A_DAY, &[255]]),
+        ),
+        ("nor a message type two bytes long", reply(&[&[53, 2, OFFER, OFFER], &server, &[255]])),
+        (
+            "nor a router list with a byte left over",
+            reply(&[&offering, &server, &[3, 5, 10, 0, 2, 2, 0], &[255]]),
+        ),
+        (
+            "nor an overload option naming fields that do not exist",
+            reply(&[&offering, &server, &[52, 1, 4], &[255]]),
+        ),
+        ("nor an option running past the end of the file field", file_overrun),
+        ("nor an offer naming no server", reply(&[&offering, &A_DAY, &[255]])),
+        ("nor a message cut off inside the magic cookie", cut_short),
+    ];
+    for (name, message) in cases {
+        deliver_dhcp_broadcast(&message);
+        client.run(START + 1);
+        report.check(name, nic.take().is_empty());
+    }
+
+    // The parser alone, against every way a good message can be cut short and
+    // every value each of its length bytes could hold.
+    let good = bootp_reply(xid, OUR_MAC, OUR_IP, &server_options(ACK, &A_DAY));
+    let parses = super::dhcp::Reply::parse(&good).is_some();
+    for cut in 0..good.len() {
+        let _ = super::dhcp::Reply::parse(&good[..cut]);
+    }
+    let mut at = 240;
+    while at + 1 < good.len() && good[at] != 255 {
+        for length in 0..=255u8 {
+            let mut changed = good.clone();
+            changed[at + 1] = length;
+            let _ = super::dhcp::Reply::parse(&changed);
+        }
+        at += 2 + good[at + 1] as usize;
+    }
+    report.check("a good message parses, and no cut and no length byte panics the parser", parses);
+
+    // Option 52 moving options into the file field, and the name server
+    // option split in two, one half in each place (RFC 3396).
+    let mut carried = reply(&[&[53, 1, ACK], &server, &[52, 1, 1], &[6, 4, 10, 0, 2, 53], &[255]]);
+    carried[108..120].copy_from_slice(&[1, 4, 255, 255, 255, 0, 6, 4, 1, 1, 1, 1]);
+    carried[120] = 255;
+    report.check(
+        "options in the file field are read, and an option split in two is joined",
+        super::dhcp::Reply::parse(&carried).is_some_and(|parsed| {
+            parsed.netmask == Some(NETMASK) && parsed.nameservers == [LEASE_DNS, named]
+        }),
+    );
+
+    deliver_dhcp_broadcast(&bootp_reply(xid, OUR_MAC, OUR_IP, &server_options(OFFER, &A_DAY)));
+    client.run(START + 2);
+    report.check(
+        "the good offer after all of them is still taken",
+        matches!(nic.take().as_slice(), [frame] if kind_of(frame) == REQUEST),
+    );
+    deliver_dhcp_broadcast(&bootp_reply(xid, OUR_MAC, OUR_IP, &server_options(ACK, &A_DAY)));
+    client.run(START + 3);
+    report.check(
+        "and nameserver= takes the place of the name server the lease names",
+        super::config().is_some_and(|config| config.nameservers() == [named]),
+    );
+    drop(client);
+    socket::reset();
+    nic.take();
+}
+
+/// The DISCOVER goes again after 4, 8, 16, 32 and then every 64 seconds, each
+/// moved by up to a second, all in one exchange; and a link that comes up
+/// starts the asking again at once.
+fn dhcp_retransmission(report: &mut Report, nic: &FakeNic) {
+    nic.take();
+    let Some(mut client) = new_client(report, None) else { return };
+    client.run(START);
+    let Some(xid) = nic.take().first().map(|frame| xid_of(frame)) else {
+        report.check("a discover", false);
+        return;
+    };
+    let mut now = START;
+    let mut on_time = true;
+    let mut one_exchange = true;
+    let mut secs_counted = true;
+    for seconds in [4u64, 8, 16, 32, 64, 64] {
+        let deadline = client.next_deadline();
+        on_time &= ((seconds - 1) * HZ..=(seconds + 1) * HZ).contains(&(deadline - now));
+        client.run(deadline);
+        match nic.take().as_slice() {
+            [frame] => {
+                one_exchange &= xid_of(frame) == xid && kind_of(frame) == DISCOVER;
+                let secs = u16::from_be_bytes([frame[DHCP_AT + 8], frame[DHCP_AT + 9]]) as u64;
+                secs_counted &= secs == (deadline - START) / HZ;
+            }
+            _ => one_exchange = false,
+        }
+        now = deadline;
+    }
+    report.check(
+        "a discover goes again after 4, 8, 16, 32, 64 and 64 seconds, each give or take one",
+        on_time,
+    );
+    report.check("all of them in the one exchange", one_exchange);
+    report.check("with secs counting from the first", secs_counted);
+
+    nic.link.store(false, core::sync::atomic::Ordering::Relaxed);
+    client.run(now + 1);
+    nic.link.store(true, core::sync::atomic::Ordering::Relaxed);
+    client.run(now + 2);
+    report.check(
+        "a link that comes up starts the asking again at once, in a new exchange",
+        matches!(nic.take().as_slice(), [frame] if kind_of(frame) == DISCOVER && xid_of(frame) != xid),
+    );
+    drop(client);
+    socket::reset();
+    nic.take();
 }

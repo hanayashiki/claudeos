@@ -1000,6 +1000,28 @@ pub extern "C" fn user_entry_trampoline() -> ! {
     unsafe { arch::return_to_user(frame) }
 }
 
+/// The idle loop, until `ready` holds or the tick count reaches `deadline`.
+/// Returns true when `ready` held, with interrupts off either way.
+///
+/// For the boot context, which is the idle task and so has no task of its
+/// own to sleep in, to wait on work the tasks it has started are doing: the
+/// network task taking a lease before init is let run.
+pub fn idle_until(deadline: u64, mut ready: impl FnMut() -> bool) -> bool {
+    let held = loop {
+        if ready() {
+            break true;
+        }
+        if crate::trap::ticks() >= deadline {
+            break false;
+        }
+        enable_interrupts();
+        arch::halt();
+        schedule();
+    };
+    crate::sync::disable_interrupts();
+    held
+}
+
 /// Idle loop: run when nothing else can.
 pub fn idle_loop() -> ! {
     loop {

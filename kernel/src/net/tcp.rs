@@ -549,12 +549,13 @@ impl Tcb {
     }
 
     /// The address to put in the source field. A socket bound to every
-    /// address still has to name one on the wire.
-    fn source_address(&self) -> Ipv4Addr {
+    /// address still has to name one on the wire, and has none to name while
+    /// this machine has no address.
+    fn source_address(&self) -> Result<Ipv4Addr, crate::abi::Errno> {
         if self.local.address.is_unspecified() {
             super::source_for(self.remote.address)
         } else {
-            self.local.address
+            Ok(self.local.address)
         }
     }
 
@@ -607,7 +608,10 @@ impl Tcb {
     }
 
     fn send_segment(&mut self, flags: u8, sequence: u32, payload: &[u8], with_mss: bool) {
-        let source = Endpoint::new(self.source_address(), self.local.port);
+        // Nothing to send from means nothing is sent, the same as a segment
+        // the link lost: the retransmission timer is what notices.
+        let Ok(address) = self.source_address() else { return };
+        let source = Endpoint::new(address, self.local.port);
         let segment = build(
             source,
             self.remote,
@@ -1564,14 +1568,15 @@ fn send_reset(local: Endpoint, remote: Endpoint, segment: &Segment) {
     } else {
         (0, segment.sequence.wrapping_add(segment.length()), RST | ACK)
     };
-    let source = Endpoint::new(
-        if local.address.is_unspecified() {
-            super::source_for(remote.address)
-        } else {
-            local.address
-        },
-        local.port,
-    );
+    let address = if local.address.is_unspecified() {
+        match super::source_for(remote.address) {
+            Ok(address) => address,
+            Err(_) => return,
+        }
+    } else {
+        local.address
+    };
+    let source = Endpoint::new(address, local.port);
     let reply = build(source, remote, sequence, acknowledgement, flags, 0, None, &[]);
     let _ = ip::send_from(source.address, remote.address, ip::PROTO_TCP, &reply);
 }
@@ -1628,7 +1633,7 @@ pub fn receive(source: Ipv4Addr, destination: Ipv4Addr, bytes: &[u8]) {
     // have as the source, and open a connection with every host that answered.
     if destination.is_broadcast()
         || destination.is_multicast()
-        || destination == super::config().broadcast()
+        || super::config().is_some_and(|config| destination == config.broadcast())
     {
         return;
     }

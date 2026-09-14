@@ -562,6 +562,10 @@ impl Interface for E1000 {
         self.mac
     }
 
+    fn link_up(&self) -> bool {
+        E1000::link_up(self)
+    }
+
     fn transmit(&self, frame: &[u8]) -> Result<(), Errno> {
         if frame.len() < 14 || frame.len() > BUFFER_SIZE {
             return Err(Errno::EINVAL);

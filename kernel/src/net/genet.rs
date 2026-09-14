@@ -1192,6 +1192,12 @@ impl Interface for Genet {
         self.mac
     }
 
+    /// What the network task last read from the phy, which it asks every
+    /// half second.
+    fn link_up(&self) -> bool {
+        self.link.lock().up
+    }
+
     fn transmit(&self, frame: &[u8]) -> Result<(), Errno> {
         if frame.len() < 14 || frame.len() > BUFFER_SIZE {
             return Err(Errno::EINVAL);

@@ -101,7 +101,7 @@ impl UdpState {
             return Err(Errno::EINVAL);
         }
         let source_address = if self.local.address.is_unspecified() {
-            super::source_for(destination.address)
+            super::source_for(destination.address)?
         } else {
             self.local.address
         };

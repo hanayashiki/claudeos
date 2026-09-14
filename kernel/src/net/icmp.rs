@@ -41,7 +41,9 @@ pub fn receive(source: Ipv4Addr, destination: Ipv4Addr, message: &[u8]) {
     // a broadcast address makes this machine a way of pointing traffic at
     // whoever the request claims to be from, which is why Linux ignores those
     // by default.
-    if destination != super::config().address && !destination.is_loopback() {
+    let ours = destination.is_loopback()
+        || super::config().is_some_and(|config| config.address() == destination);
+    if !ours {
         return;
     }
     // The identifier and sequence number go back unchanged; so does the body,
