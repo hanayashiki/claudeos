@@ -186,6 +186,77 @@ panic=N          restart N seconds after a panic; 0 stays stopped, below 0 resta
 watchdog=off     leave the watchdog stopped, for a debugger holding the processor still
 ```
 
+### WiFi
+
+The board's WiFi is a Cypress CYW43455 on the SDIO bus of the second SD
+controller. The kernel brings it up itself: it powers the chip through the
+firmware's WL_ON line, enumerates the card, puts Cypress's firmware on the
+chip's own processor, loads the regulatory data, sets the country, scans,
+joins, and runs the WPA2 handshake. Only WPA2 with a passphrase and CCMP is
+joined.
+
+Two things it needs are not in this repository:
+
+```sh
+./scripts/fetch-wifi-firmware.sh     # firmware, NVRAM and regulatory data, into build/thirdparty
+./scripts/build-user-aarch64.sh      # puts them in /lib/firmware/brcm in the image
+```
+
+The firmware is the build Raspberry Pi OS installs, from
+`RPi-Distro/firmware-nonfree` at a pinned commit, and each file is checked
+against its sha256 before it is kept.
+
+The network to join goes in `build/wifi.conf`, which git ignores:
+
+```
+ssid=the network's name
+psk=its passphrase, 8 to 63 characters
+country=JP
+```
+
+`country` is JP when the line is absent. When the file exists, the image build
+copies it in as `/etc/wifi.conf`; the kernel reads it at bring-up and removes
+it from the ram filesystem once it has parsed. Neither the name nor the
+passphrase is printed anywhere, in the log, a panic or an error.
+
+`net=wifi` on the kernel command line leaves the wired cards alone, so that
+everything that reaches the network goes over the air:
+
+```
+net=wifi init=/bin/init
+```
+
+`scripts/mkcard.sh` writes `init=/bin/init` alone into `build/boot/cmdline.txt`,
+so add the word after running it. Without it the wired Ethernet is taken,
+whether or not a cable is plugged in, because the stack holds one interface
+and the wired driver is asked first; the WiFi is then not brought up at all.
+
+A join, from the serial console:
+
+```
+wifi: firmware: wl0: Aug 29 2023 01:47:08 version 7.45.265 (28bca26 CY) FWID 01-b677b91b
+wifi: CLM blob loaded, 2676 bytes in 2 pieces; clmload_status 0
+wifi: country set to JP; the firmware reports JP revision 0
+wifi: found the configured network on channel 6
+wifi: join requested, the station's RSN element 22 bytes, WMM true
+wifi: associated; the handshake can start
+wifi: handshake: message 1 received
+wifi: handshake: message 2 sent
+wifi: handshake: message 3 verified
+wifi: handshake: message 4 sent
+wifi: handshake: pairwise key installed
+wifi: handshake: group key installed, index 2
+wifi: link up 3536 ms after the join request: the 4-way handshake finished and the keys are installed
+dhcp: 192.168.86.22/24 gateway 192.168.86.1 dns 192.168.86.1, lease 86400 s from 192.168.86.1
+```
+
+The handshake runs in the kernel because the firmware Raspberry Pi OS installs
+has no supplicant of its own; Linux there runs wpa_supplicant and hands the
+chip only the keys. `kernel/src/net/wifi/wpa.rs` follows hostap's supplicant,
+and uses RustCrypto's SHA-1, HMAC, PBKDF2 and AES key wrap, which are compiled
+for aarch64 only. The derivations are checked at boot against published
+vectors; see Tests.
+
 ## The telnet console
 
 The console the serial cable carries can also be reached over the network, on
@@ -615,6 +686,23 @@ back out of a dozen or more handlers before it prints its line. That machine
 has no network device under emulation, so a tunnel cannot be established
 there; what the page buys is that the program lives past its first signal.
 
+On the board it can, over the WiFi:
+
+```
+claudeos:/root# inet serve 8080 > /tmp/inet.log 2>&1 &
+claudeos:/root# cloudflared tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:8080 > /tmp/cf.log 2>&1 &
+```
+
+```
+$ curl -i https://marshall-architecture-mortgages-adopt.trycloudflare.com/
+HTTP/2 200
+content-type: text/plain
+content-length: 20
+server: cloudflare
+
+hello from claudeos
+```
+
 **Console.** A 16550 UART and a PS/2 keyboard feed one input ring. A line
 discipline implements canonical mode with echo, backspace, `Ctrl-C`, `Ctrl-D`
 and `Ctrl-U`, and honours the `termios` settings a program sets through
@@ -722,7 +810,13 @@ failures.
   and to a renewal; offers whose option lengths are wrong in eight different
   ways, none of them taken; and a parser fed every truncation of a good message
   and every value of every length byte in it. On aarch64 the same run adds the
-  Pi's own Ethernet driver, for 287.
+  Pi's own Ethernet and WiFi drivers, for 431. The WiFi checks include the
+  WPA2 handshake: the SHA-1 PRF and the 802.11 passphrase-to-key vectors, RFC
+  3394 key wrap, and Wireshark's published `wpa-Induction` capture fed through
+  the supplicant. Messages 2 and 4 have to match the captured frames byte for
+  byte, once given the Key Length the 2006 station wrote, and a replayed
+  message, a changed byte, the wrong passphrase and a different RSN element
+  each have to be refused.
 - `tests/busybox.sh` runs **39 checks** against an upstream busybox binary that
   this project did not build: `awk`, `sed`, `tar` create and extract, `find`,
   `md5sum` and `sha256sum` (whose digests are compared against the ones the
@@ -800,6 +894,8 @@ kernel/src
   uaccess.rs          validated copying between kernel and user memory
   console/mod.rs      input ring and terminal line discipline
   console/telnet.rs   the same terminal over TCP port 23
+  net/wifi/           the Pi 4's WiFi: SD host, SDIO card, the chip and its
+                      firmware, its control and data framing, the WPA2 supplicant
   signal.rs           signal dispositions and default actions
   trap.rs             exception and interrupt handling
 
@@ -809,6 +905,8 @@ tools/mkcpio.py       initramfs builder
 tools/drive.py        drives the console over a socket, rendering as a terminal
 scripts/reap-stale.sh clears QEMU instances an earlier run left behind
 scripts/mkcard.sh     assembles the boot partition for a Pi, and writes a card
+scripts/fetch-wifi-firmware.sh
+                      the Pi 4's WiFi firmware, NVRAM and regulatory data
 scripts/console.py    a telnet client for the telnet console, interactive or scripted
 scripts/lossy-transfer.sh
                       megabytes each way through the card over a lossy link
@@ -830,6 +928,16 @@ PCIe root complex on the same board is still not driven, so anything on it --
 which is where the USB controller is -- is out of reach. There is nothing on
 the board that remembers the time across a power cycle, so the clock starts
 from the newest date on the ram disk rather than from the real one.
+
+The WiFi joins one kind of network: WPA2 with a passphrase, CCMP for pairwise
+and group traffic, and management frame protection not required. WPA3, TKIP,
+enterprise authentication and open networks are not joined. It scans once at
+bring-up, joins the strongest access point with the configured name, and asks
+again every 30 seconds while there is no link; it does not roam or scan again.
+The chip is polled once a tick rather than taking its interrupt, and the
+firmware's batching of frames towards the host is turned off rather than taken
+apart. The SHA-1 and HMAC crates the handshake uses leave their keyed state in
+freed stack memory without zeroing it.
 
 The random number generator is ChaCha20 and its output does not give up its
 state, but on a machine whose processor has no generator of its own its seed is
