@@ -565,6 +565,32 @@ pub fn link_node(path: &str, node: NodeRef) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Put a file holding `contents` at `path`, in place of whatever was there.
+///
+/// The new file is filled before it has a name, and naming it is one insertion
+/// under the directory's lock, so a program opening the path gets the old file
+/// whole or the new one whole and never one half written. A program that
+/// already has the old one open goes on reading the old one.
+pub fn replace_file(path: &str, contents: &[u8], mode: u32) -> Result<(), Errno> {
+    let node = Node::new_file(mode);
+    node.write_at(Offset::new(0), contents)?;
+    let (parent, name) = split_parent(path)?;
+    let replaced = {
+        let mut inner = parent.inner.lock();
+        if inner.children.get(&name).is_some_and(|existing| existing.is_dir()) {
+            return Err(Errno::EISDIR);
+        }
+        inner.children.insert(name, node)
+    };
+    // What was there has lost the name it had, the same as a file renamed
+    // over.
+    if let Some(replaced) = replaced {
+        let mut inner = replaced.inner.lock();
+        inner.nlink = inner.nlink.saturating_sub(1);
+    }
+    Ok(())
+}
+
 /// A second directory entry for a file that already has one.
 pub fn hard_link(path: &str, node: NodeRef) -> Result<(), Errno> {
     let (parent, name) = split_parent(path)?;
