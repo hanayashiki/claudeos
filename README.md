@@ -59,7 +59,12 @@ After `make alpine`, boot into Alpine itself:
 ./scripts/run.sh --initrd build/alpine.cpio --append 'init=/bin/sh'
 ```
 
-`make run` gives a shell on the serial console. `exit` powers the machine off.
+`make run` gives a shell on the serial console. `exit` powers the machine off,
+because `make run` puts `shell_exit=poweroff` on the command line. Without that
+word, as on a board, `exit` (or Ctrl-D on an empty line) starts a new shell, and
+`poweroff`, `halt` or `reboot` is what stops the machine. A shell that dies on a
+signal four times in a row, each within ten seconds of starting, restarts the
+machine, or with `shell_exit=poweroff` ends the session.
 QEMU's monitor is multiplexed onto that same console, which is what leaves
 `Ctrl-C` to the guest: it interrupts the job running there rather than killing
 the emulator. `Ctrl-A` then `X` is the way out of the emulator.

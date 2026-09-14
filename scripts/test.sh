@@ -76,7 +76,9 @@ run_suite() {
 
 # An interactive session: typing after boot, Ctrl-C on a running job, and a
 # background job. These only work if interrupts reach the kernel while a
-# process is blocked in a read.
+# process is blocked in a read. It boots without shell_exit=poweroff, as a
+# board does, so `exit` has to start a new shell rather than end the session,
+# and `poweroff` is what ends it.
 run_interactive() {
   banner "interactive session"
   local output
@@ -93,7 +95,8 @@ run_interactive() {
       "cat &\n" "wait:1.5" "jobs\n" "wait:0.8" \
       "fg\n" "wait:0.8" "into-cat\n" "wait:1" "\x04" "wait:1.2" \
       "uptime\n" "wait:1.5" \
-      "exit\n" "wait:3" 2>&1 | tr -d '\r')"
+      "exit\n" "wait:2" "echo new-shell-works\n" "wait:0.8" \
+      "poweroff\n" "wait:3" 2>&1 | tr -d '\r')"
   echo "$output"
   echo
   record_boot_id "$output"
@@ -106,7 +109,8 @@ run_interactive() {
   for expected in "live-input-works" "^abcZ$" "^line-kill-works$" \
                   "survived-interrupt" "Stopped  yes" "Running  yes" \
                   "Stopped  cat" "^into-cat$" \
-                  "session ended"; do
+                  "init: shell exited; starting a new one" "^new-shell-works$" \
+                  "powering off"; do
     if ! echo "$output" | grep -q "$expected"; then
       echo "   missing expected output: $expected"
       ok=0
@@ -139,7 +143,10 @@ run_interactive() {
 run_interrupt_key() {
   banner "interrupt key at a terminal"
   local output
-  output="$(python3 "$ROOT/tools/drive.py" --tty --timeout 60 --initramfs "$IMAGE" -- \
+  # shell_exit=poweroff, so the `exit` at the end ends the session, which is
+  # also what checks that word still does.
+  output="$(python3 "$ROOT/tools/drive.py" --tty --timeout 60 --initramfs "$IMAGE" \
+      --append shell_exit=poweroff -- \
       "until:claudeos shell" "wait:1" \
       "cat\n" "wait:1" "into-cat\n" "wait:1" "\x03" "wait:1.5" \
       "echo prompt-came-back\n" "wait:1.5" \
@@ -197,7 +204,7 @@ run_telnet() {
   # The forwarded port listens on this machine's loopback address only: what
   # is behind it is a root shell with no password.
   "$ROOT/scripts/run.sh" --timeout 150 --hostfwd "tcp:127.0.0.1:$port-:23" \
-      --initrd "$IMAGE" > "$serial" 2>&1 < /dev/null &
+      --initrd "$IMAGE" --append shell_exit=poweroff > "$serial" 2>&1 < /dev/null &
   qemu=$!
   if ! telnet_wait "$serial" "telnet: the console is on"; then
     echo "   the kernel never said it was listening"

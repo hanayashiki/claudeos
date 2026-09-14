@@ -31,7 +31,7 @@ user:
 	@$(USERLAND)
 
 run: all
-	@./scripts/run.sh --timeout 3600 --initrd $(IMAGE)
+	@./scripts/run.sh --timeout 3600 --initrd $(IMAGE) --append shell_exit=poweroff
 
 test: all
 	@./scripts/test.sh
