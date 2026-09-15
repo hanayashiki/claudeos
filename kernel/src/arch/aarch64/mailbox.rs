@@ -99,6 +99,17 @@ pub struct GpioConfig {
     pub term_pull_up: u32,
 }
 
+/// One transaction at a time across the kernel.
+///
+/// The WiFi driver's task and the storage driver's bring-up task each hold a
+/// `Mailbox` with a buffer of its own, and both run at boot, preemptibly. The
+/// replies come back through the one mailbox 0 they share, and a transaction
+/// starts by throwing away whatever is waiting there, so two interleaved would
+/// each lose or take the other's reply. The lock masks interrupts, which keeps
+/// the scheduler from switching tasks in the middle; the firmware answers in
+/// well under a millisecond, and `REPLY_TIMEOUT_US` bounds the worst case.
+static TRANSACTION: crate::sync::Spinlock<()> = crate::sync::Spinlock::new(());
+
 #[inline]
 fn counter_us() -> u64 {
     let frequency = arch::counter_frequency();
@@ -157,6 +168,7 @@ impl Mailbox {
         if words * 4 > PAGE_SIZE {
             return Err(Error::TooLong);
         }
+        let _one_at_a_time = TRANSACTION.lock();
         unsafe {
             core::ptr::write_volatile(self.word(0), (words * 4) as u32);
             core::ptr::write_volatile(self.word(1), STATUS_REQUEST);
