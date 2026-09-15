@@ -750,6 +750,7 @@ fn stat_format(format: &str, path: &str, metadata: &fs::Metadata) -> String {
             Some('s') => out.push_str(&metadata.len().to_string()),
             Some('h') => out.push_str(&metadata.nlink().to_string()),
             Some('i') => out.push_str(&metadata.ino().to_string()),
+            Some('d') => out.push_str(&metadata.dev().to_string()),
             Some('a') => out.push_str(&format!("{:o}", metadata.mode() & 0o7777)),
             Some('f') => out.push_str(&format!("{:x}", metadata.mode())),
             Some('u') => out.push_str(&metadata.uid().to_string()),

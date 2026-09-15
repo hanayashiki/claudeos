@@ -859,6 +859,9 @@ pub struct OpenFile {
     /// Path this descriptor was opened with, for *at() resolution and
     /// /proc/self/fd.
     pub path: String,
+    /// A directory's entries as they were when `getdents64` started reading
+    /// it, until it reads to the end or starts again.
+    pub listing: Spinlock<Option<Arc<Vec<DirEntry>>>>,
 }
 
 impl OpenFile {
@@ -872,6 +875,7 @@ impl OpenFile {
             offset: Spinlock::new(0),
             flags: Spinlock::new(flags),
             path: path.to_string(),
+            listing: Spinlock::new(None),
         })
     }
 

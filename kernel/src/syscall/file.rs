@@ -379,8 +379,10 @@ pub fn statx(dirfd: i64, path_addr: u64, flags: u32, _mask: u32, out: u64) -> Sy
     }
     put32(&mut buf, 128, (stat.st_rdev >> 8) as u32);
     put32(&mut buf, 132, (stat.st_rdev & 0xFF) as u32);
-    put32(&mut buf, 136, 0);
-    put32(&mut buf, 140, 1);
+    // The device the file is on, which is how a program such as `mv` or
+    // `find -xdev` tells /data from the ram filesystem.
+    put32(&mut buf, 136, (stat.st_dev >> 8) as u32);
+    put32(&mut buf, 140, (stat.st_dev & 0xFF) as u32);
 
     uaccess::write_bytes(out, &buf)?;
     Ok(0)
@@ -399,7 +401,21 @@ pub fn getdents64(fd: i32, out: u64, len: usize) -> SysResult {
         return Err(Errno::ENOTDIR);
     }
 
-    let entries = fs::readdir(&node)?;
+    // The listing is taken when a reading starts, at offset 0, and later calls
+    // continue it, so entries removed or added in between do not move the
+    // offsets. Otherwise a program that removes what it has read, as `rm -r`
+    // does, skips an entry for every one it removed. It is taken without the
+    // offset lock held: on /data a listing reads the card.
+    let start = *file.offset.lock();
+    let kept = if start == 0 { None } else { file.listing.lock().clone() };
+    let entries = match kept {
+        Some(entries) => entries,
+        None => {
+            let fresh = Arc::new(fs::readdir(&node)?);
+            *file.listing.lock() = Some(fresh.clone());
+            fresh
+        }
+    };
     let mut offset = file.offset.lock();
     let mut index = *offset as usize;
     let mut buf: Vec<u8> = Vec::new();
@@ -427,6 +443,10 @@ pub fn getdents64(fd: i32, out: u64, len: usize) -> SysResult {
     }
     *offset = index as u64;
     drop(offset);
+    // The end of the listing: nothing more is read from it, so it is not kept.
+    if buf.is_empty() {
+        *file.listing.lock() = None;
+    }
     uaccess::write_bytes(out, &buf)?;
     Ok(buf.len() as u64)
 }
@@ -1061,6 +1081,7 @@ pub fn eventfd(initial: u32, flags: u32) -> SysResult {
             O_RDWR | if flags & EFD_NONBLOCK != 0 { O_NONBLOCK } else { 0 },
         ),
         path: alloc::string::String::from("anon_inode:[eventfd]"),
+        listing: crate::sync::Spinlock::new(None),
     });
     let fd = sched::current().fds.alloc(file, flags & EFD_CLOEXEC != 0)?;
     Ok(fd as u64)
@@ -1090,6 +1111,7 @@ pub fn socketpair(domain: u32, kind: u32, _protocol: u32, out: u64) -> SysResult
             offset: crate::sync::Spinlock::new(0),
             flags: crate::sync::Spinlock::new(flags),
             path: alloc::string::String::from("socket:[unix]"),
+            listing: crate::sync::Spinlock::new(None),
         })
     };
     let first = sched::current().fds.alloc(make(one), cloexec)?;
@@ -1112,6 +1134,7 @@ pub fn epoll_create(flags: u32) -> SysResult {
         offset: crate::sync::Spinlock::new(0),
         flags: crate::sync::Spinlock::new(0),
         path: alloc::string::String::from("anon_inode:[eventpoll]"),
+        listing: crate::sync::Spinlock::new(None),
     });
     let fd = sched::current().fds.alloc(file, flags & EPOLL_CLOEXEC != 0)?;
     Ok(fd as u64)

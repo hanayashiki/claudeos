@@ -168,6 +168,7 @@ fn make_file(socket: Arc<InetSocket>, nonblock: bool) -> Arc<OpenFile> {
         offset: Spinlock::new(0),
         flags: Spinlock::new(O_RDWR | if nonblock { O_NONBLOCK } else { 0 }),
         path: alloc::string::String::from("socket:[inet]"),
+        listing: Spinlock::new(None),
     })
 }
 
