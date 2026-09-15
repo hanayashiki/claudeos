@@ -1450,10 +1450,31 @@ impl Dongle {
         self.reconnect.as_ref().map_or(true, |machine| machine.first_attempt())
     }
 
-    /// The access point to join from the scan that just finished: the
-    /// strongest with the configured name among those the supplicant can
-    /// join, or why there is none.
+    /// The access point to join from the scan that just finished, or why
+    /// there is none. With `wifi.hide=` or `wifi.drop=` on, every scan also
+    /// gets a line, so that a log shows the scan each attempt made; without
+    /// them, only bring-up's scan has one.
     fn choose(&mut self) -> Result<protocol::Bss, Failure> {
+        let result = self.choose_from_scan();
+        let hide = HIDE_SCANS.load(Ordering::Relaxed);
+        if hide != 0 || DROP_AFTER_S.load(Ordering::Relaxed) != 0 {
+            crate::println!(
+                "wifi: debug: scan {} finished with {} results: {}{}",
+                self.scans,
+                self.scan.len(),
+                match &result {
+                    Ok(bss) => format!("the configured network on channel {}", bss.channel),
+                    Err(failure) => format!("{}", failure),
+                },
+                if self.scans <= hide { ", hidden by wifi.hide" } else { "" }
+            );
+        }
+        result
+    }
+
+    /// The strongest access point with the configured name, in the scan that
+    /// just finished, among those the supplicant can join.
+    fn choose_from_scan(&mut self) -> Result<protocol::Bss, Failure> {
         self.scans += 1;
         let Some(config) = self.config.as_ref() else { return Err(Failure::NotFound) };
         if self.scans <= HIDE_SCANS.load(Ordering::Relaxed) {
