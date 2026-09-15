@@ -1,7 +1,12 @@
 #!/bin/bash
-# Prepare an SD card that rewrites a Raspberry Pi 4's bootloader EEPROM so the
-# Pi asks this machine for its boot files over ethernet before it reads its SD
-# card, and put it on a card if you name one.
+# Prepare the update that rewrites a Raspberry Pi 4's bootloader EEPROM so the
+# Pi boots from its SD card when the card holds boot files and otherwise asks
+# this machine for them over the network, and put it on a card if you name one.
+#
+# A board already booting over the network also takes the update without a
+# card: put build/eeprom/pieeprom.upd and pieeprom.sig in the directory
+# scripts/netboot-serve.py serves, and the bootloader writes them into flash on
+# its next network boot, because their timestamp is newer than its own.
 #
 #   scripts/mkeeprom.sh 192.168.86.43               prepare build/eeprom and stop
 #   scripts/mkeeprom.sh 192.168.86.43 /dev/disk4    prepare, then erase that card
@@ -130,24 +135,24 @@ prepare() {
   # BOOT_UART=1       print the bootloader's progress on the serial port on
   #                   GPIO 14 and 15 at 115200 baud. This Pi has no screen, so
   #                   the serial port is the only place a failed boot says why.
-  # BOOT_ORDER=0xf12  the boot modes to try, read from the lowest hex digit up:
-  #                   2 is the network, 1 is the SD card, and f starts again
-  #                   from the lowest digit.
+  # BOOT_ORDER=0xf21  the boot modes to try, read from the lowest hex digit up:
+  #                   1 is the SD card, 2 is the network, and f starts again
+  #                   from the lowest digit. A card made by mkcard.sh holds a
+  #                   boot partition and boots on its own, with no wait on this
+  #                   machine; a card without start4.elf, such as one holding
+  #                   only /data, is passed over and the board boots from here.
+  #                   So which way a board boots is decided by the card in it.
   # TFTP_IP           the TFTP server to ask for the boot files. Without it the
   #                   bootloader asks the server named in the DHCP answer, and
   #                   the home router that answers DHCP names none.
-  # TFTP_FILE_TIMEOUT how long one whole file may take to arrive, in
-  #                   milliseconds; the default is 30000. TFTP sends one block
-  #                   and waits for its acknowledgement before the next, so
-  #                   start4.elf (2.3 MB) takes about 1,600 round trips to this
-  #                   machine, which is on WiFi. The documentation gives a
-  #                   minimum of 5000 and no maximum; 120000 is our choice. A
-  #                   server that does not answer holds the Pi at least this
-  #                   long before it moves on to the SD card.
+  #
+  # TFTP_FILE_TIMEOUT is left at its default of 30000 ms for one whole file.
+  # start4.elf, the largest file the bootloader itself fetches, took 7.4 s from
+  # this machine over WiFi, and with the SD card tried first a card that boots
+  # never waits on it.
   set_key "$CONF/boot.conf" BOOT_UART 1
-  set_key "$CONF/boot.conf" BOOT_ORDER 0xf12
+  set_key "$CONF/boot.conf" BOOT_ORDER 0xf21
   set_key "$CONF/boot.conf" TFTP_IP "$tftp_ip"
-  set_key "$CONF/boot.conf" TFTP_FILE_TIMEOUT 120000
 
   python3 "$CACHE/rpi-eeprom-config" --config "$CONF/boot.conf" \
     --out "$OUT/pieeprom.upd" "$CACHE/$IMAGE"
@@ -216,7 +221,8 @@ ls -la "$OUT" | sed 's/^/  /'
 say ""
 say "On the Pi, recovery.bin writes pieeprom.upd to the EEPROM, renames itself to"
 say "RECOVERY.000 and resets the board. The new bootloader then prints its progress"
-say "on the serial port and tries the network before the SD card."
+say "on the serial port, boots from the SD card when it holds boot files, and
+otherwise boots from the network."
 
 if [ $# -ge 2 ]; then
   "$ROOT/scripts/mkcard.sh" --dir "$OUT" "$2"
