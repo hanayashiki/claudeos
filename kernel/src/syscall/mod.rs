@@ -255,8 +255,10 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
 
         // ---- time -----------------------------------------------------
         nr::CLOCK_GETTIME => proc::clock_gettime(args[0], args[1]),
+        nr::CLOCK_SETTIME => proc::clock_settime(args[0], args[1]),
         nr::CLOCK_GETRES => proc::clock_getres(args[0], args[1]),
         nr::GETTIMEOFDAY => proc::gettimeofday(args[0], args[1]),
+        nr::SETTIMEOFDAY => proc::settimeofday(args[0], args[1]),
         nr::TIME => {
             let now = crate::time::unix_time();
             if args[0] != 0 {
@@ -265,7 +267,9 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
             Ok(now as u64)
         }
         nr::NANOSLEEP => proc::nanosleep(args[0], args[1]),
-        nr::CLOCK_NANOSLEEP => proc::nanosleep(args[2], args[3]),
+        nr::CLOCK_NANOSLEEP => {
+            proc::clock_nanosleep(args[0], args[1] as u32, args[2], args[3])
+        }
         nr::SETITIMER => proc::setitimer(args[0] as i32, args[1], args[2]),
         nr::GETITIMER => proc::getitimer(args[0] as i32, args[1]),
         nr::ALARM => proc::alarm(args[0] as u32),
@@ -411,6 +415,8 @@ pub fn name_of(number: u64) -> &'static str {
         nr::FUTEX => "futex",
         nr::SET_TID_ADDRESS => "set_tid_address",
         nr::CLOCK_GETTIME => "clock_gettime",
+        nr::CLOCK_SETTIME => "clock_settime",
+        nr::SETTIMEOFDAY => "settimeofday",
         nr::EXIT_GROUP => "exit_group",
         nr::OPENAT => "openat",
         nr::FSTATAT => "newfstatat",

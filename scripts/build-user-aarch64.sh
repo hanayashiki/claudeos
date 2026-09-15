@@ -103,6 +103,19 @@ if [ -f "$ROOT/build/wifi.conf" ]; then
   chmod 600 "$RFS/etc/wifi.conf"
 fi
 
+# The Go program under user/go, built from source here for this machine rather
+# than copied, so it is never the wrong architecture or a stale build for
+# the host. Go needs no libc and links statically with cgo off. A program
+# that fails to build is left out with a warning rather than failing the
+# image, since the test harness builds this image before every run.
+if command -v go >/dev/null 2>&1; then
+  mkdir -p "$RFS/root"
+  if ! (cd "$ROOT/user/go" && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+        go build -trimpath -o "$RFS/root/go_main" .); then
+    echo "warning: user/go did not build; /root/go_main left out" >&2
+  fi
+fi
+
 # No /etc/resolv.conf: the kernel writes it once it has a network
 # configuration, from `nameserver=` or from the DHCP lease, so a fixed one here
 # would name a server the machine may not be able to reach.
@@ -119,6 +132,17 @@ for CERTS in "$ROOT/build/alpine-rootfs-aarch64/etc/ssl/certs/ca-certificates.cr
   ln -sf certs/ca-certificates.crt "$RFS/etc/ssl/cert.pem"
   break
 done
+
+# ---- network time --------------------------------------------------------
+# The servers BusyBox ntpd asks. init starts ntpd in the background when this
+# file and /bin/busybox are both in an image, which is how a board with no
+# battery-backed clock learns the date. scripts/images.sh puts it in the board
+# image only, so the test images the suites boot never wait on servers across
+# the internet; the network time section of scripts/test.sh adds it to a copy.
+cat > "$RFS/etc/ntp.conf" <<'NTP'
+server ntp.nict.jp
+server time.cloudflare.com
+NTP
 
 cat > "$RFS/etc/passwd" <<'PASSWD'
 root:x:0:0:root:/root:/bin/sh

@@ -171,6 +171,10 @@ pub const CLOCK_MONOTONIC: u64 = 1;
 pub const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
 pub const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
 
+/// `clock_nanosleep` flag: the time given is a reading of the clock to wake at,
+/// not a length of time to sleep for.
+pub const TIMER_ABSTIME: u32 = 1;
+
 // futex ops
 pub const FUTEX_WAIT: u32 = 0;
 pub const FUTEX_WAKE: u32 = 1;

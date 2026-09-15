@@ -68,6 +68,19 @@ if [ -x "$ROOT/build/thirdparty/cloudflared" ]; then
   chmod +x "$RFS/bin/cloudflared"
 fi
 
+# The Go program under user/go, built from source here for this machine rather
+# than copied, so it is never the wrong architecture or a stale build for
+# the host. Go needs no libc and links statically with cgo off. A program
+# that fails to build is left out with a warning rather than failing the
+# image, since the test harness builds this image before every run.
+if command -v go >/dev/null 2>&1; then
+  mkdir -p "$RFS/root"
+  if ! (cd "$ROOT/user/go" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+        go build -trimpath -o "$RFS/root/go_main" .); then
+    echo "warning: user/go did not build; /root/go_main left out" >&2
+  fi
+fi
+
 # No /etc/resolv.conf: the kernel writes it once it has a network
 # configuration, from `nameserver=` or from the DHCP lease, so a fixed one here
 # would name a server the machine may not be able to reach.

@@ -478,6 +478,136 @@ run_integrity() {
   echo
 }
 
+# Network time: init starts BusyBox ntpd when the image has /etc/ntp.conf, ntpd
+# asks the servers the board image names, and the kernel steps the clock. The
+# image is the one the suites above booted, with that file added and every date
+# in it put an hour back, and the emulated battery clock reads 2000, so the
+# kernel starts from a floor an hour behind, as a board does, and the step is
+# large enough to see. A `sleep 20` spans the step and is timed on this
+# machine's clock.
+#
+# It needs the internet. When this machine cannot get an answer from either
+# server itself, the section says it did not run, which counts as a skip and
+# not as a pass.
+run_ntp() {
+  banner "network time"
+  if [ "$ARCH" != x86_64 ]; then
+    echo "   QEMU's raspi4b emulates no network card, so ntpd has no server to"
+    echo "   reach on this machine."
+    echo ">> network time: not run on $ARCH"
+    echo
+    return
+  fi
+  # init starts the time keeper only when there is a busybox to run.
+  if [ ! -x "$BUSYBOX" ]; then
+    echo ">> network time: skipped (run ARCH=$ARCH scripts/fetch-busybox.sh)"
+    skipped=$((skipped + 1))
+    echo
+    return
+  fi
+  if ! ntp_reachable; then
+    echo "   neither ntp.nict.jp nor time.cloudflare.com answered this machine"
+    echo ">> network time: not run: no internet"
+    skipped=$((skipped + 1))
+    echo
+    return
+  fi
+  local dir floor ok=1
+  dir="$(mktemp -d)"
+  cp -R "$ROOT/build/rootfs" "$dir/rootfs"
+  # The same two lines as /etc/ntp.conf in the board image, which
+  # scripts/build-user-aarch64.sh writes.
+  printf 'server ntp.nict.jp\nserver time.cloudflare.com\n' > "$dir/rootfs/etc/ntp.conf"
+  cat > "$dir/rootfs/root/ntp.sh" <<'SCRIPT'
+#!/bin/sh
+echo "ntp-check: booted at $(date +%s)"
+echo "ntp-check: sleep-start"
+sleep 20
+echo "ntp-check: sleep-end"
+i=0
+until grep -q "setting time to" /var/log/ntpd.log 2>/dev/null || [ $i -ge 40 ]; do
+  sleep 1
+  i=$((i + 1))
+done
+echo "ntp-check: now $(date +%s)"
+echo "--- /var/log/ntpd.log"
+cat /var/log/ntpd.log
+SCRIPT
+  chmod +x "$dir/rootfs/root/ntp.sh"
+  floor="$(python3 - "$dir/rootfs" <<'PY'
+import os, sys, time
+stamp = int(time.time()) - 3600
+for top, dirs, files in os.walk(sys.argv[1]):
+    for name in dirs + files:
+        os.utime(os.path.join(top, name), (stamp, stamp), follow_symlinks=False)
+os.utime(sys.argv[1], (stamp, stamp))
+print(stamp)
+PY
+)"
+  python3 "$ROOT/tools/mkcpio.py" "$dir/rootfs" "$dir/ntp.cpio" > /dev/null
+
+  # Every console line, prefixed with the time this machine received it.
+  "$ROOT/scripts/run.sh" --timeout 120 --net --initrd "$dir/ntp.cpio" \
+      --append /root/ntp.sh -rtc base=2000-01-01T00:00:00 < /dev/null 2>&1 |
+    python3 -u -c '
+import sys, time
+for line in iter(sys.stdin.buffer.readline, b""):
+    text = line.decode("utf-8", "replace").rstrip("\r\n")
+    print("%.3f %s" % (time.time(), text), flush=True)' > "$dir/serial"
+  cat "$dir/serial"
+  echo
+  record_boot_id "$(cat "$dir/serial")"
+
+  python3 - "$dir/serial" "$floor" <<'PY' || ok=0
+import sys
+floor = int(sys.argv[2])
+keys = ["ntp-check: booted at", "ntp-check: sleep-start", "clock: set to",
+        "ntp-check: sleep-end", "ntp-check: now", "setting time to"]
+seen = {}
+for raw in open(sys.argv[1], errors="replace"):
+    stamp, _, text = raw.rstrip("\n").partition(" ")
+    for key in keys:
+        if key in text and key not in seen:
+            seen[key] = (float(stamp), text)
+missing = [key for key in keys if key not in seen]
+if missing:
+    print("   missing expected output: " + "; ".join(missing))
+    sys.exit(1)
+ok = True
+booted = int(seen["ntp-check: booted at"][1].split()[-1])
+print("   booted at %d, floor %d" % (booted, floor))
+if not floor <= booted < floor + 120:
+    print("   the clock did not start from the floor")
+    ok = False
+start = seen["ntp-check: sleep-start"][0]
+step = seen["clock: set to"][0]
+end = seen["ntp-check: sleep-end"][0]
+print("   sleep 20 took %.2f s here; the step came %.2f s into it" % (end - start, step - start))
+if not start < step < end:
+    print("   the clock was not stepped while the sleep ran")
+    ok = False
+if not 19.5 <= end - start <= 21.5:
+    print("   the sleep did not last 20 s by this machine's clock")
+    ok = False
+host, text = seen["ntp-check: now"]
+guest = int(text.split()[-1])
+print("   afterwards the guest said %d and this machine's clock read %.3f" % (guest, host))
+if abs(guest - host) > 2:
+    print("   the guest's clock is more than 2 s from this machine's")
+    ok = False
+sys.exit(0 if ok else 1)
+PY
+  rm -rf "$dir"
+
+  if [ $ok -eq 1 ]; then
+    echo ">> network time: OK"
+  else
+    echo ">> network time: FAILED"
+    status=1
+  fi
+  echo
+}
+
 # The digest the test image's manifest gives the item $1.
 integrity_digest() {
   awk -v name="$1" '$2 == name { print $1 }' "$TREE/etc/claudeos/checksums"
@@ -597,6 +727,24 @@ run_board_image() {
   echo
 }
 
+# Whether this machine gets an SNTP answer from either server the board image
+# names, within three seconds each.
+ntp_reachable() {
+  python3 - <<'PY'
+import socket, sys
+for host in ("ntp.nict.jp", "time.cloudflare.com"):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(3)
+            s.sendto(b"\x1b" + 47 * b"\0", (host, 123))
+            if len(s.recv(48)) >= 48:
+                sys.exit(0)
+    except OSError:
+        pass
+sys.exit(1)
+PY
+}
+
 # The boots above, compared against each other. Every one seeds its generator
 # from what it can observe of its own start-up, and the id says where that left
 # it; two the same would mean two machines produced one stream, which is the
@@ -653,6 +801,7 @@ run_board_image
 run_interactive
 run_interrupt_key
 run_telnet
+run_ntp
 run_boot_ids
 
 if [ $status -ne 0 ]; then

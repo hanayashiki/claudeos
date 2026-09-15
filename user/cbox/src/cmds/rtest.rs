@@ -1557,6 +1557,211 @@ fn signals_raised_while_others_are_taken(report: &mut Report) {
     );
 }
 
+/// Setting the wall clock, which is what BusyBox ntpd does on a board with no
+/// clock of its own, and the things that must not move when it is set.
+///
+/// The clock is put back at the end to where it would have been had nothing
+/// here set it, because the sections after this one read the wall clock too.
+fn setting_the_wall_clock(report: &mut Report) {
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Timespec {
+        tv_sec: i64,
+        tv_nsec: i64,
+    }
+    #[repr(C)]
+    struct Timeval {
+        tv_sec: i64,
+        tv_usec: i64,
+    }
+    extern "C" {
+        fn clock_gettime(clock: i32, out: *mut Timespec) -> i32;
+        fn clock_settime(clock: i32, value: *const Timespec) -> i32;
+        fn settimeofday(value: *const Timeval, zone: *const u8) -> i32;
+        fn clock_nanosleep(clock: i32, flags: i32, wake: *const Timespec, left: *mut Timespec) -> i32;
+        fn syscall(number: i64, ...) -> i64;
+    }
+    const CLOCK_REALTIME: i32 = 0;
+    const CLOCK_MONOTONIC: i32 = 1;
+    const TIMER_ABSTIME: i32 = 1;
+    const EINVAL: i32 = 22;
+    const NS: i128 = 1_000_000_000;
+    const HOUR: i128 = 3600 * NS;
+    // How far a reading taken just after a set may be from the value set: the
+    // calls in between, and a tick of another task running.
+    const SLACK: i128 = 250_000_000;
+    // musl makes its settimeofday out of clock_settime, so the call of this
+    // name is only reached by number.
+    #[cfg(target_arch = "x86_64")]
+    const SYS_SETTIMEOFDAY: i64 = 164;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_SETTIMEOFDAY: i64 = 170;
+
+    fn read(clock: i32) -> i128 {
+        let mut value = Timespec::default();
+        unsafe { clock_gettime(clock, &mut value) };
+        value.tv_sec as i128 * NS + value.tv_nsec as i128
+    }
+    fn spec(ns: i128) -> Timespec {
+        Timespec { tv_sec: ns.div_euclid(NS) as i64, tv_nsec: ns.rem_euclid(NS) as i64 }
+    }
+    fn errno() -> i32 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    }
+    /// clock_settime with the fields as given: the result, and errno if it failed.
+    fn set(clock: i32, value: Timespec) -> (i32, i32) {
+        let rc = unsafe { clock_settime(clock, &value) };
+        (rc, if rc == 0 { 0 } else { errno() })
+    }
+    /// The wall clock reads `target`, give or take the calls since it was set.
+    fn reads(target: i128) -> (bool, i128) {
+        let off = read(CLOCK_REALTIME) - target;
+        (off >= 0 && off < SLACK, off)
+    }
+
+    let real_start = read(CLOCK_REALTIME);
+    let mono_start = read(CLOCK_MONOTONIC);
+    // What the wall clock would read now had nothing here set it.
+    let undisturbed = || real_start + (read(CLOCK_MONOTONIC) - mono_start);
+
+    let mono_before = read(CLOCK_MONOTONIC);
+    let target = undisturbed() + HOUR;
+    let (rc, err) = set(CLOCK_REALTIME, spec(target));
+    let (close, off) = reads(target);
+    let mono_after = read(CLOCK_MONOTONIC);
+    report.check(
+        "clock_settime moves CLOCK_REALTIME",
+        rc == 0 && close,
+        format!("rc {} errno {}; reads {} ns from the time set", rc, err, off),
+    );
+    report.check(
+        "CLOCK_MONOTONIC runs straight through a step",
+        mono_after >= mono_before && mono_after - mono_before < SLACK,
+        format!("moved {} ns across the call", mono_after - mono_before),
+    );
+
+    // 2001: earlier than the dates on the ram disk, which the clock is held
+    // above only while the machine boots.
+    let target = 1_000_000_000 * NS;
+    let (rc, err) = set(CLOCK_REALTIME, spec(target));
+    let (close, off) = reads(target);
+    report.check(
+        "a time before the boot floor is taken",
+        rc == 0 && close,
+        format!("rc {} errno {}; reads {} ns from the time set", rc, err, off),
+    );
+
+    // Each refusal names a time far from the present, so one that was taken
+    // shows as the clock moving as well as a wrong result.
+    let real_before = read(CLOCK_REALTIME);
+    let refusals = [
+        ("CLOCK_MONOTONIC", set(CLOCK_MONOTONIC, spec(2_000_000_000 * NS))),
+        (
+            "a billion nanoseconds",
+            set(CLOCK_REALTIME, Timespec { tv_sec: 2_000_000_000, tv_nsec: 1_000_000_000 }),
+        ),
+        ("negative nanoseconds", set(CLOCK_REALTIME, Timespec { tv_sec: 2_000_000_000, tv_nsec: -1 })),
+    ];
+    let moved = read(CLOCK_REALTIME) - real_before;
+    let wrong: Vec<String> = refusals
+        .iter()
+        .filter(|(_, result)| *result != (-1, EINVAL))
+        .map(|(name, result)| format!("{}: {:?}", name, result))
+        .collect();
+    report.check(
+        "clock_settime refuses another clock and a bad tv_nsec with EINVAL",
+        wrong.is_empty() && moved >= 0 && moved < SLACK,
+        format!("{:?}; the clock moved {} ns", wrong, moved),
+    );
+
+    let target = undisturbed() + 2 * HOUR;
+    let value = Timeval { tv_sec: (target / NS) as i64, tv_usec: (target % NS / 1000) as i64 };
+    let target = value.tv_sec as i128 * NS + value.tv_usec as i128 * 1000;
+    let rc = unsafe { settimeofday(&value, std::ptr::null()) };
+    let err = if rc == 0 { 0 } else { errno() };
+    let (close, off) = reads(target);
+    report.check(
+        "settimeofday sets the wall clock",
+        rc == 0 && close,
+        format!("rc {} errno {}; reads {} ns from the time set", rc, err, off),
+    );
+
+    let target = undisturbed() + 3 * HOUR;
+    let value = Timeval { tv_sec: (target / NS) as i64, tv_usec: (target % NS / 1000) as i64 };
+    let target = value.tv_sec as i128 * NS + value.tv_usec as i128 * 1000;
+    let rc = unsafe { syscall(SYS_SETTIMEOFDAY, &value as *const Timeval, 0usize) };
+    let err = if rc == 0 { 0 } else { errno() };
+    let (close, off) = reads(target);
+    let bad = Timeval { tv_sec: 2_000_000_000, tv_usec: 1_000_000 };
+    let rc_bad = unsafe { syscall(SYS_SETTIMEOFDAY, &bad as *const Timeval, 0usize) };
+    let err_bad = errno();
+    let (still, _) = reads(target);
+    report.check(
+        "the settimeofday system call sets the clock and refuses a second of microseconds",
+        rc == 0 && close && rc_bad == -1 && err_bad == EINVAL && still,
+        format!("rc {} errno {}, off {} ns; bad: rc {} errno {}", rc, err, off, rc_bad, err_bad),
+    );
+
+    let wake = read(CLOCK_MONOTONIC) + 200_000_000;
+    let started = Instant::now();
+    let rc = unsafe { clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &spec(wake), std::ptr::null_mut()) };
+    let slept = started.elapsed();
+    report.check(
+        "clock_nanosleep to a CLOCK_MONOTONIC reading",
+        rc == 0 && slept >= Duration::from_millis(150) && slept < Duration::from_secs(1),
+        format!("rc {} after {:?}", rc, slept),
+    );
+
+    // A thread sleeps until the wall clock reads `ahead` from now, and the
+    // clock is moved by `step` while it sleeps. The sleep's length is measured
+    // on the monotonic clock.
+    let across_a_step = |ahead: i128, step: i128| -> (i32, Duration) {
+        let wake = read(CLOCK_REALTIME) + ahead;
+        let started = Instant::now();
+        let sleeper = std::thread::spawn(move || unsafe {
+            clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &spec(wake), std::ptr::null_mut())
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = set(CLOCK_REALTIME, spec(read(CLOCK_REALTIME) + step));
+        let rc = sleeper.join().unwrap_or(-1);
+        (rc, started.elapsed())
+    };
+    let (rc, slept) = across_a_step(5 * NS, HOUR);
+    report.check(
+        "a sleep to a wall-clock time the clock is stepped past ends at the step",
+        rc == 0 && slept >= Duration::from_millis(250) && slept < Duration::from_secs(2),
+        format!("rc {} after {:?}, where the sleep asked for 5 s", rc, slept),
+    );
+    let (rc, slept) = across_a_step(NS, -NS);
+    report.check(
+        "a sleep to a wall-clock time the clock is stepped back from runs on",
+        rc == 0 && slept >= Duration::from_millis(1800) && slept < Duration::from_secs(3),
+        format!("rc {} after {:?}, where 2 s was due", rc, slept),
+    );
+
+    let sleeper = std::thread::spawn(|| {
+        let started = Instant::now();
+        std::thread::sleep(Duration::from_secs(1));
+        started.elapsed()
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = set(CLOCK_REALTIME, spec(read(CLOCK_REALTIME) - HOUR));
+    let slept = sleeper.join().unwrap_or_default();
+    report.check(
+        "a one-second sleep lasts a second across a step back",
+        slept >= Duration::from_millis(950) && slept < Duration::from_millis(1500),
+        format!("{:?}", slept),
+    );
+
+    let (rc, err) = set(CLOCK_REALTIME, spec(undisturbed()));
+    let off = read(CLOCK_REALTIME) - undisturbed();
+    report.check(
+        "the wall clock is put back",
+        rc == 0 && off.abs() < SLACK,
+        format!("rc {} errno {}; {} ns from where it would have been", rc, err, off),
+    );
+}
+
 pub fn main(_args: &[String]) -> i32 {
     let mut report = Report { passed: 0, failed: 0 };
     println!("=== Rust standard library on claudeos ===");
@@ -1817,6 +2022,10 @@ pub fn main(_args: &[String]) -> i32 {
 
     let args: Vec<String> = std::env::args().collect();
     report.check("argv[0] present", !args.is_empty(), format!("{:?}", args));
+
+    println!();
+    println!("-- setting the wall clock --");
+    setting_the_wall_clock(&mut report);
 
     println!();
     println!("-- system call numbers --");
