@@ -8,8 +8,11 @@ a socket hands every byte to the guest untouched, so it says nothing about the
 keys a terminal's line discipline acts on before the guest can see them.
 
 Usage:
-    drive.py [--timeout SECS] [--initramfs FILE] [--append CMDLINE] [--raw]
-             [--tty] -- <step> [<step> ...]
+    drive.py [--timeout SECS] [--initramfs FILE] [--kernel FILE]
+             [--append CMDLINE] [--raw] [--tty] -- <step> [<step> ...]
+
+--kernel boots a kernel image other than the one in build/, such as a copy
+with a byte changed.
 
 Each step is either text to send (backslash escapes are interpreted),
 "wait:SECONDS" to pause, or "until:TEXT" to pause until TEXT has been printed.
@@ -134,7 +137,7 @@ class SocketConsole:
     the driver's own deadline is what ends the run.
     """
 
-    def __init__(self, initramfs, append, timeout):
+    def __init__(self, initramfs, append, timeout, kernel):
         sock_path = os.path.join(tempfile.mkdtemp(), "console.sock")
         console = [
             "-chardev", f"socket,id=console,path={sock_path},server=on,wait=off",
@@ -149,13 +152,13 @@ class SocketConsole:
             command = [
                 "qemu-system-aarch64",
                 "-M", "raspi4b",
-                "-kernel", os.path.join(ROOT, "build", "kernel8.img"),
+                "-kernel", kernel or os.path.join(ROOT, "build", "kernel8.img"),
                 "-initrd", initramfs,
             ] + console
         else:
             command = [
                 "qemu-system-x86_64",
-                "-kernel", os.path.join(ROOT, "build", "kernel.elf"),
+                "-kernel", kernel or os.path.join(ROOT, "build", "kernel.elf"),
                 "-initrd", initramfs,
             ] + console + [
                 "-m", "512M",
@@ -212,10 +215,12 @@ class TerminalConsole:
     character is either passed on to the guest or taken by QEMU.
     """
 
-    def __init__(self, initramfs, append, timeout):
+    def __init__(self, initramfs, append, timeout, kernel):
         self.master, slave = pty.openpty()
         command = [os.path.join(ROOT, "scripts", "run.sh"),
                    "--timeout", str(timeout), "--initrd", initramfs]
+        if kernel:
+            command += ["--kernel", kernel]
         if append:
             command += ["--append", append]
         # Its own session, so a signal the terminal raises reaches this guest
@@ -253,6 +258,7 @@ def main():
     args = sys.argv[1:]
     timeout = 60
     initramfs = os.path.join(ROOT, "build", "initramfs.cpio")
+    kernel = None
     append = None
     raw = False
     tty = False
@@ -262,6 +268,8 @@ def main():
             timeout, args = int(args[1]), args[2:]
         elif args[0] == "--initramfs":
             initramfs, args = args[1], args[2:]
+        elif args[0] == "--kernel":
+            kernel, args = args[1], args[2:]
         elif args[0] == "--append":
             append, args = args[1], args[2:]
         elif args[0] == "--raw":
@@ -280,8 +288,8 @@ def main():
         subprocess.run([reaper, "15"], check=False)
 
     try:
-        console = TerminalConsole(initramfs, append, timeout) if tty \
-            else SocketConsole(initramfs, append, timeout)
+        console = TerminalConsole(initramfs, append, timeout, kernel) if tty \
+            else SocketConsole(initramfs, append, timeout, kernel)
     except OSError as err:
         print(err, file=sys.stderr)
         return 1

@@ -56,5 +56,7 @@ clean:
 	       build/alpine-rootfs build/alpine.cpio build/toolchain build/hello_c.o \
 	       build/kernel-aarch64.elf build/kernel8.img build/rootfs-aarch64 \
 	       build/initramfs-aarch64.cpio build/alpine-rootfs-aarch64 \
+	       build/stage build/stage-aarch64 build/rootfs-aarch64-board \
+	       build/initramfs-aarch64-board.cpio \
 	       build/alpine-aarch64.cpio build/hello_c-aarch64.o \
 	       kernel/target user/cbox/target

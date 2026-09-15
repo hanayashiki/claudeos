@@ -4,13 +4,21 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# SHA-1 on both machines, for the boot-time integrity check in
+# src/integrity.rs, and on aarch64 for the WPA2 handshake as well.
+#
+# `force-soft`, because on x86 the crate otherwise asks the processor at run
+# time whether it has the SHA instructions and uses them if it does. Those
+# instructions use the vector registers, which this kernel is built without
+# and does not save, so they would corrupt whatever program was interrupted.
+# On aarch64 the crate has no hardware path without its `asm` feature, so the
+# code it compiles there is the same either way.
+sha1 = { version = "=0.10.7", default-features = false, features = ["force-soft"] }
 
-# The WPA2 handshake the WiFi driver runs needs SHA-1, HMAC, PBKDF2, AES and
-# AES key wrap. The driver exists only on aarch64, so these are compiled only
-# there, and the x86-64 kernel has no dependencies. Versions are pinned
-# exactly; Cargo.lock pins what they depend on.
+# The rest of the WPA2 handshake: HMAC, PBKDF2, AES and AES key wrap. The
+# driver exists only on aarch64, so these are compiled only there. Versions are
+# pinned exactly; Cargo.lock pins what they depend on.
 [target.'cfg(target_arch = "aarch64")'.dependencies]
-sha1 = { version = "=0.10.7", default-features = false }
 hmac = { version = "=0.12.1", default-features = false }
 pbkdf2 = { version = "=0.12.2", default-features = false, features = ["hmac"] }
 aes = { version = "=0.8.4", default-features = false, features = ["zeroize"] }

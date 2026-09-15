@@ -22,6 +22,13 @@ SECTIONS
     .text : AT(ADDR(.text) - KERNEL_VMA) ALIGN(4K)
     {
         __text_start = .;
+        /* The bytes the boot-time integrity check hashes run from here to
+         * __integrity_end at the end of .rodata: the code and the read-only
+         * data, which do not change once the kernel is loaded. The kernel
+         * hashes them in memory through these two symbols, and
+         * tools/checksums.py reads the same two symbols out of the ELF to
+         * hash the same bytes at build time. */
+        __integrity_start = .;
         *(.text .text.*)
         . = ALIGN(4K);
         __text_end = .;
@@ -33,6 +40,7 @@ SECTIONS
         *(.rodata .rodata.*)
         . = ALIGN(4K);
         __rodata_end = .;
+        __integrity_end = .;
     }
 
     .data : AT(ADDR(.data) - KERNEL_VMA) ALIGN(4K)

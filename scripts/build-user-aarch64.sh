@@ -28,33 +28,28 @@ ln -sf "$LLVMBIN/rust-lld" "$ROOT/build/toolchain/ld.lld"
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$ROOT/build/toolchain/ld.lld"
 export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static -C relocation-model=static"
 
-cd "$ROOT/user/cbox"
-cargo build --release --target "$TARGET"
-CBOX="$ROOT/user/cbox/target/$TARGET/release/cbox"
+# ---- which image gets what -----------------------------------------------
+# The list, and the steps that make each image out of the staging tree below,
+# are in scripts/images.sh, shared with the x86-64 build. cbox is built there,
+# once per image, because the two images build it with different features.
+. "$ROOT/scripts/images.sh"
+check_image_items
+print_image_items
+TEST_TREE="$ROOT/build/rootfs-aarch64"
+BOARD_TREE="$ROOT/build/rootfs-aarch64-board"
+echo
 
 cd "$ROOT/user/inet"
 cargo build --release --target "$TARGET"
 INET="$ROOT/user/inet/target/$TARGET/release/inet"
 
-# ---- assemble the root filesystem ----------------------------------------
-RFS="$ROOT/build/rootfs-aarch64"
+# ---- stage everything either image can have ------------------------------
+RFS="$ROOT/build/stage-aarch64"
 rm -rf "$RFS"
 mkdir -p "$RFS"/{bin,etc,root,tmp,dev,proc}
 
-cp "$CBOX" "$RFS/bin/cbox"
-chmod +x "$RFS/bin/cbox"
-
 cp "$INET" "$RFS/bin/inet"
 chmod +x "$RFS/bin/inet"
-
-# One symlink per applet, busybox style.
-APPLETS=$("$ROOT/scripts/list-applets.sh" "$ROOT/user/cbox/src/main.rs")
-for applet in $APPLETS; do
-  [ "$applet" = "cbox" ] && continue
-  ln -sf cbox "$RFS/bin/$applet"
-done
-# "[" cannot appear in the applet table's identifier list.
-ln -sf cbox "$RFS/bin/["
 
 # A C program built against musl, to show the ABI is not Rust-specific.
 #
@@ -125,18 +120,6 @@ for CERTS in "$ROOT/build/alpine-rootfs-aarch64/etc/ssl/certs/ca-certificates.cr
   break
 done
 
-cat > "$RFS/etc/motd" <<'MOTD'
-Welcome to claudeos.
-
-This is a kernel written from scratch in Rust that implements enough of the
-Linux system call interface to run unmodified static Linux binaries. The
-userland you are talking to was built for aarch64-unknown-linux-musl.
-
-Try:  ls -l /bin | head      ps      free      cat /proc/cpuinfo
-      echo hi | tr a-z A-Z   sh /root/demo.sh
-      rtest                  hello_c 60
-MOTD
-
 cat > "$RFS/etc/passwd" <<'PASSWD'
 root:x:0:0:root:/root:/bin/sh
 PASSWD
@@ -162,13 +145,21 @@ for script in "$RFS"/root/*.sh; do
   chmod +x "$script"
 done
 
-python3 "$ROOT/tools/mkcpio.py" "$RFS" "$ROOT/build/initramfs-aarch64.cpio"
-ls -la "$ROOT/build/initramfs-aarch64.cpio"
+# ---- the two images --------------------------------------------------------
+# The kernel is built before this, by scripts/test.sh and by hand alike, so its
+# digest in the manifests is the kernel's that boots with them.
+check_staged "$RFS"
+assemble_image test "$RFS" "$TEST_TREE" "$ROOT/build/initramfs-aarch64.cpio" \
+    "$ROOT/build/kernel-aarch64.elf"
+assemble_image board "$RFS" "$BOARD_TREE" "$ROOT/build/initramfs-aarch64-board.cpio" \
+    "$ROOT/build/kernel-aarch64.elf"
+echo
+ls -la "$ROOT/build/initramfs-aarch64.cpio" "$ROOT/build/initramfs-aarch64-board.cpio"
 
 # Say what came out, since the point of this script is binaries for a machine
 # this one is not.
 echo
-for binary in "$RFS/bin/cbox" "$RFS/bin/inet" "$RFS/bin/hello_c"; do
+for binary in "$TEST_TREE/bin/cbox" "$TEST_TREE/bin/inet" "$TEST_TREE/bin/hello_c"; do
   [ -f "$binary" ] || continue
   echo "== $(basename "$binary")"
   file "$binary"

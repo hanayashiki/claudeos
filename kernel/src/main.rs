@@ -15,6 +15,7 @@ mod console;
 mod elf;
 mod fs;
 mod futex;
+mod integrity;
 mod itimer;
 mod mm;
 #[cfg(target_arch = "aarch64")]
@@ -288,6 +289,9 @@ pub fn start(boot: &boot::BootInfo) -> ! {
 
     fs::init();
     mount_initramfs(boot);
+    // Straight after unpacking, so what is checked is what the image held
+    // before the kernel or any program has changed a file in it.
+    integrity::check();
 
     // Nothing reads low memory through the identity map from here on.
     unsafe { arch::paging::drop_identity_map() };

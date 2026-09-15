@@ -78,7 +78,7 @@ real. `ARCH` picks which one; everything defaults to x86-64.
 rustup target add aarch64-unknown-none-softfloat aarch64-unknown-linux-musl
 
 ARCH=aarch64 ./scripts/build.sh          # build/kernel8.img
-./scripts/build-user-aarch64.sh          # build/initramfs-aarch64.cpio
+./scripts/build-user-aarch64.sh          # build/initramfs-aarch64.cpio, and -board.cpio
 ARCH=aarch64 ./scripts/run.sh --initrd build/initramfs-aarch64.cpio \
     --append 'init=/bin/init'
 ARCH=aarch64 make busybox                # an aarch64 busybox to test against
@@ -87,8 +87,10 @@ ARCH=aarch64 ./scripts/test.sh           # every section but the telnet console
 ```
 
 Both third-party images are fetched for the machine `ARCH` names, so the same
-nine sections run on either one. x86-64 runs a tenth, the telnet console, which
-needs the network card that QEMU's `raspi4b` does not emulate. busybox.net has no aarch64 build among its
+ten sections run on either one. x86-64 runs an eleventh, the telnet console,
+which needs the network card that QEMU's `raspi4b` does not emulate, and
+aarch64 runs a different eleventh, a boot of the board image described below,
+which only that machine has. busybox.net has no aarch64 build among its
 prebuilt binaries, so that one comes from Alpine's `busybox-static` package
 instead; `scripts/fetch-busybox.sh` refuses anything that is not a static ELF
 for the machine asked for, since a dynamically linked one has no interpreter to
@@ -108,6 +110,26 @@ ARCH=aarch64 ./scripts/build.sh
 ./scripts/mkcard.sh /dev/disk4           # and write it to that card
 ```
 
+The userland build makes two images out of one list, `IMAGE_ITEMS` in
+`scripts/images.sh`, and prints the list as it builds. Each line names the
+images an item goes in (`both`, `test` or `board`), so moving an item from one
+image to the other is a change to one word.
+
+```
+build/initramfs-aarch64.cpio         the test image, which scripts/test.sh and
+                                     make run boot under QEMU
+build/initramfs-aarch64-board.cpio   the board image, which mkcard.sh puts on
+                                     the card and netboot.sh serves
+```
+
+The board image has cbox, busybox, cloudflared, the certificate store, the WiFi
+firmware, `wifi.conf` and the files in `/etc`. It has none of what only the
+tests use: nothing in `/root` (the suites, `demo.sh`, `hello.txt`), no
+`hello_c` or `inet` in `/bin`, and a cbox built without its `rtest` applet,
+which is a cargo feature only the test image's build turns on. A file the build
+makes that no line of the list names stops the build, so nothing can drop out
+of both images unnoticed. x86-64 has only the test image.
+
 Run it once with no argument first and look at what it assembled. With a device
 named it erases that card, so it refuses anything that is not a removable whole
 disk and then asks you to type the path again before it writes. Find the path
@@ -123,8 +145,8 @@ bcm2711-rpi-4-b.dtb        the device tree describing this board
 overlays/disable-bt.dtbo   the change to it described below
 config.txt                 what the firmware reads before anything else
 cmdline.txt                the kernel's command line
-kernel8.img                this kernel, as a flat image
-initramfs-aarch64.cpio     the userland
+kernel8.img                    this kernel, as a flat image
+initramfs-aarch64-board.cpio   the userland, the board image
 ```
 
 The first four are Raspberry Pi firmware. They are not in this repository; the
@@ -137,7 +159,7 @@ The lines in `config.txt` that matter:
 arm_64bit=1
 enable_uart=1
 dtoverlay=disable-bt
-initramfs initramfs-aarch64.cpio followkernel
+initramfs initramfs-aarch64-board.cpio followkernel
 ```
 
 `arm_64bit` starts the processor in 64-bit mode and makes the firmware look for
@@ -352,6 +374,53 @@ tables, switch the CPU into long mode, and jump to Rust code linked at
 no bootloader to install. The build converts the linked ELF64 to ELF32 with
 `llvm-objcopy` because QEMU's multiboot loader only accepts 32-bit ELF headers;
 the physical load addresses are what it actually uses.
+
+**Integrity check.** Right after the ram disk is unpacked, and before init
+starts, the kernel checks itself and the core software against
+`/etc/claudeos/checksums`, which the userland build writes into every image it
+makes. Each line is a SHA-1 digest, two spaces and a name, as `shasum` prints
+them; on x86-64, for example:
+
+```
+8f381dfc881e1e2ed27075a946a8f98d31dd6c70  kernel
+7f2f52086e855810103b7b7b853bf2f3a6183c8e  /bin/cbox
+434b3b60c0514192558a00c8dc7542721ed7fe43  /bin/busybox
+```
+
+The items are `CHECKSUM_ITEMS` in `scripts/images.sh`: the kernel,
+`/bin/cbox`, `/bin/busybox` and the three WiFi firmware files. Adding one is a
+line there. An item an image does not have, such as the firmware on x86-64, is
+left out of its manifest. So is `kernel` when the kernel ELF has not been
+built, with a warning, which is why the kernel is built before the userland.
+
+For each item the console and the kernel log get `integrity: /bin/cbox ok`,
+`integrity: /bin/cbox DAMAGED: expected ..., got ...` or
+`integrity: /bin/cbox missing`, then a summary with the time the check took.
+`/proc/claudeos/integrity` holds the same lines, and the telnet console sends
+the kernel log to a client when it connects, so a remote client sees them too.
+Nothing the check finds stops the machine. A damaged or missing item is
+reported and the boot carries on to init, a malformed line is reported and
+skipped, and an image with no manifest, such as Alpine's, gets one line saying
+there is nothing to check. SHA-1 is there to catch accidental damage, such as
+a failing card or a transfer cut short. It does not guard against tampering:
+whoever can change a file in the image can change the manifest beside it.
+
+`kernel` means the kernel's code and read-only data as they are in memory: the
+bytes from `__integrity_start`, at the start of `.text`, to `__integrity_end`,
+at the end of `.rodata`. `.data` and `.bss` are left out because they change
+while the kernel runs. Both linker scripts define the two symbols. The kernel
+hashes the memory between them, and `tools/checksums.py` reads the same two
+symbols out of the ELF and hashes the file contents of the loadable segments
+that cover that range, so the build and the kernel hash the same bytes. On the
+current builds that range is 576 KiB on x86-64 and 796 KiB on aarch64.
+`scripts/mkcard.sh` refuses a board image whose manifest names a different
+kernel digest from `build/kernel-aarch64.elf`, since that card would report its
+kernel damaged at every boot.
+
+Under QEMU the check took 17.3 ms on x86-64 for its three items, 2.5 MiB in
+all, and 12.5 ms on aarch64 for its six, 3.2 MiB. It runs with interrupts
+masked, as boot has them up to that point, so the board's watchdog, which
+allows 15 seconds, is not fed while it runs.
 
 **Memory.** A bitmap frame allocator covers all usable physical memory reported
 by the boot loader's E820 map. A frame is handed out as an owned value whose
@@ -773,7 +842,8 @@ failures.
   subprocesses and `/proc`. The device checks include `/dev/urandom`: that two
   reads differ and that 4 KiB of it holds nearly all 256 byte values, which is
   a check that the generator is running and not a check that it is any good.
-- The `rtest` applet runs **66 checks** against the Rust standard library:
+- The `rtest` applet, which only the test image's cbox is built with, runs
+  **66 checks** against the Rust standard library:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
   thread sleep against the monotonic clock, the tick measured against that same
@@ -841,6 +911,20 @@ failures.
   invert, so what is worth asserting is that this is the cipher it claims to
   be. The rest check that a request leaves behind a key that is not the bytes
   it handed out.
+- The **integrity check at boot** boots the test image as built, where every
+  item in the manifest has to be reported ok, and then five copies with one
+  thing wrong in each: a byte of `/bin/cbox` changed, which has to be reported
+  DAMAGED; a byte of the kernel's code changed in a copy of the kernel image,
+  past the end of its last function so the kernel still runs, which has to be
+  reported DAMAGED for `kernel`; an item taken out of the image, reported
+  missing; a manifest of twelve malformed lines and one good one, where each
+  malformed line is reported and skipped and the good one still checked; and
+  no manifest at all. Every one of those boots has to reach the shell without
+  a panic, and `/proc/claudeos/integrity` has to hold what the console showed.
+- The **board image** boots `build/initramfs-aarch64-board.cpio` on aarch64.
+  It has to reach the shell, report every item ok, list nothing under `/root`
+  and none of `hello_c`, `inet` or `rtest` in `/bin`, and answer `cbox rtest`
+  with an unknown applet.
 - **Two boots, two streams** compares the boot id from every boot above. Two
   the same would mean the seed did not vary, and every byte the generator
   handed out would be the same in both. It costs no boot of its own.
@@ -884,6 +968,7 @@ kernel/src
                       numbers, device tree and tag list decoders
   boot.rs             what a machine looks like, whatever told the kernel
   main.rs             start-up sequence and kernel command line
+  integrity.rs        the check of the kernel and the core software at boot
   mm/                 frame allocator and kernel heap
   syscall/            the Linux system call implementations
   fs/                 in-memory filesystem, devices, pipes, cpio, /proc
@@ -902,7 +987,10 @@ kernel/src
 user/cbox             the multicall userland binary (shell, init, coreutils)
 user/c/hello.c        a C program linked against musl
 tools/mkcpio.py       initramfs builder
+tools/checksums.py    the manifest the boot check reads, and the kernel's digest
 tools/drive.py        drives the console over a socket, rendering as a terminal
+scripts/images.sh     what goes in the test image and the board image, and what
+                      the boot check covers
 scripts/reap-stale.sh clears QEMU instances an earlier run left behind
 scripts/mkcard.sh     assembles the boot partition for a Pi, and writes a card
 scripts/fetch-wifi-firmware.sh
