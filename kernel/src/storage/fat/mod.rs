@@ -37,6 +37,14 @@
 //! - Every failure is an `FsError`: `Io` (EIO) when the card failed a command,
 //!   `Corrupt` (EUCLEAN) when what is on the card contradicts itself.
 //!
+//! None of these files calls `unwrap`, `expect`, `panic!` or `unreachable!`,
+//! or indexes a buffer with `[]`. What else in Rust can panic is used only
+//! where the line before it rules the panic out: a subtraction after a
+//! comparison that keeps it from going below zero, a division by a constant
+//! or by a cluster size `boot::parse` has held to 512 bytes or more,
+//! `copy_from_slice` between two ranges of the same length, and `Vec::remove`
+//! at an index `position` has just found.
+//!
 //! `tools/fatdisk fuzz` runs these files, built with overflow checks, against
 //! images with random bytes over the boot sector, the FATs and the
 //! directories.
