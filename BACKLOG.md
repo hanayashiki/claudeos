@@ -138,33 +138,20 @@ bytes such as 0xff, on both machines.
   30 s of retransmissions would likely drop a session that sends during it;
   that has not been tried.
 
-## Decided, not yet done
-
-- **Boot services from two lists, both read once at boot (no start or stop
-  while running).** Being built (2026-09-16).
-  - **The system list** is in the image, covered by the boot checksums, and
-    never edited on the board. It holds the time keeper, and cloudflared when
-    the system runs one.
-  - **The user list** is on /data and edited freely, from the Mac or the board.
-  - Both have one line per service: a name, a restart policy (`always`,
-    `once` or `off`), and a command.
-  - Each service runs in its own process group, with a size-capped log in
-    /var/log and a status file.
-  - A missing, unmounted or malformed user list is logged and skipped, and
-    never stops boot or the system services.
-  - Open detail: whether programs on /data may be executed, since FAT has no
-    execute bit and files there are reported as 0644.
-  - The aarch64 busybox (Alpine's busybox-static) has no httpd; Alpine moved
-    it to busybox-extras, which is linked against musl's loader. Both are
-    being added to the aarch64 images, pinned and checksummed.
-
 ## Open decisions
 
 - **When init dies.** Keep the kernel up instead of powering off.
 - **A restart key.** A console key sequence that restarts the board with no
   working shell, like Linux's SysRq.
-- **Starting cloudflared from init.** A quick tunnel's URL changes on every
-  start; a fixed URL needs a named tunnel and a Cloudflare account.
+- **A fixed tunnel address.** The tunnel is a quick tunnel, started from the
+  user list on /data (decided 2026-09-16), and gets a new trycloudflare.com
+  address at every start. A fixed address needs a named tunnel: a Cloudflare
+  account, a credentials file on /data, and a changed `tunnel` line in
+  /data/services.txt, with no new image.
+- **Programs on /data.** FAT has no execute bit, and the kernel reports files
+  on /data as mode 0644, so a program kept there, including one a user service
+  names, may not be executable. Not checked; the services in use all run from
+  the image.
 
 ## Over-the-air updates of the card, so no card reader is needed
 
