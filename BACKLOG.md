@@ -98,6 +98,20 @@ bytes such as 0xff, on both machines.
   - `CLONE_SIGHAND` copies the signal disposition table instead of sharing it;
   - one kernel fault under heavy forking, never reproduced.
 
+## /data (kernel/src/storage/fat)
+
+- **A listed name that cannot be opened.** On the board (main cd228b8,
+  2026-09-16, a card partition macOS had written to), `ls /data` lists an entry
+  `._`, and `ls -la /data/._` and `ls -la /data/._.` both fail with "No such
+  file or directory". Likely cause, not yet checked against the card's bytes:
+  the long name on the card is `._.`, the AppleDouble file macOS makes for a
+  volume's root. `name.rs` drops trailing periods from a name looked up, as
+  Linux's vfat does, so the lookup asks for `._` and the stored `._.` does not
+  match. The listing shows `._`, so the name it returns is not the one stored.
+  Fix: find the stored name, then make directory listing and lookup agree, so
+  every name a listing returns can be opened, renamed and removed. `rm -rf` of
+  a directory holding such an entry would otherwise fail.
+
 ## Tests
 
 - **"a stopped job shows T" failed once** (tests/suite.sh, x86-64, main
