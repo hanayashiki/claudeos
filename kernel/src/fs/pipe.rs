@@ -282,6 +282,7 @@ pub fn open_fifo(ino: u64, flags: u32, path: &str) -> Result<Arc<super::OpenFile
         offset: Spinlock::new(0),
         flags: Spinlock::new(flags),
         path: alloc::string::String::from(path),
+        listing: Spinlock::new(None),
     });
 
     if end != PipeEnd::Both && !nonblock {
@@ -317,12 +318,14 @@ pub fn create_pair(flags: u32) -> (Arc<super::OpenFile>, Arc<super::OpenFile>) {
         offset: Spinlock::new(0),
         flags: Spinlock::new(flags),
         path: alloc::string::String::from("pipe:"),
+        listing: Spinlock::new(None),
     });
     let write_end = Arc::new(OpenFile {
         backing: FileBacking::Pipe(pipe, PipeEnd::Write),
         offset: Spinlock::new(0),
         flags: Spinlock::new(flags),
         path: alloc::string::String::from("pipe:"),
+        listing: Spinlock::new(None),
     });
     (read_end, write_end)
 }

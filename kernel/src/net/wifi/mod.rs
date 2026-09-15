@@ -42,7 +42,7 @@
 
 pub mod chip;
 pub mod config;
-pub mod delay;
+pub use crate::mmc::delay;
 pub mod nvram;
 pub mod protocol;
 pub mod sdhci;
@@ -458,7 +458,7 @@ fn bring_up(mut found: Found) -> Result<Dongle, String> {
         route_pins(pins);
     }
 
-    let mut host = unsafe { sdhci::Sdhci::new(found.regs, base_clock) };
+    let mut host = unsafe { sdhci::Sdhci::new(found.regs, base_clock, &sdhci::ARASAN) };
     let (caps, caps1) = host.capabilities();
     crate::println!(
         "wifi: sdhci version {:#06x}, capabilities {:#010x} {:#010x}, present state {:#010x}",

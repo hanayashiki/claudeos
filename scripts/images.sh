@@ -33,6 +33,7 @@ test   cbox:rtest         the rtest applet, the Rust standard library suite
 test   /root/suite.sh     the userland suite
 test   /root/busybox.sh   the upstream busybox suite
 test   /root/demo.sh      the scripted tour
+test   /root/data.sh      the /data suite, run with a card in the emulated slot
 test   /root/hello.txt    a file to read back
 test   /root/go_main      the Go program under user/go, when the build makes it
 both   /etc/passwd        the root account

@@ -260,12 +260,7 @@ fn try_frequency(host: &mut Sdhci, power: &mut dyn FnMut(bool), frequency: u32) 
 /// the voltages below the defined range dropped, what the host cannot supply
 /// dropped, and then the highest voltage left and the one below it.
 pub fn select_voltage(ocr: u32) -> u32 {
-    let ocr = ocr & !0x7F & 0x00FF_FFFF & HOST_OCR;
-    if ocr == 0 {
-        return 0;
-    }
-    let bit = 31 - ocr.leading_zeros();
-    ocr & (3 << (bit - 1))
+    crate::mmc::select_voltage(ocr, HOST_OCR)
 }
 
 /// CMD52, `mmc_io_rw_direct_host`: one byte read or written, and the
@@ -532,7 +527,7 @@ impl Card {
     /// One CMD53, `mmc_io_rw_extended`.
     fn extended(&mut self, write: bool, function: u8, address: u32, increment: bool, data: Data, blocks: usize, size: usize) -> Result<(), SdioError> {
         let argument = extended_argument(write, function, address, increment, blocks, size);
-        let transfer = Transfer { block_size: size, blocks: blocks.max(1), data };
+        let transfer = Transfer { block_size: size, blocks: blocks.max(1), data, stop: false };
         let response = self
             .host
             .command(Command { opcode: SD_IO_RW_EXTENDED, argument, response: Response::R5 }, Some(transfer))

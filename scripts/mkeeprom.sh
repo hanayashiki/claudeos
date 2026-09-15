@@ -225,7 +225,9 @@ say "on the serial port, boots from the SD card when it holds boot files, and
 otherwise boots from the network."
 
 if [ $# -ge 2 ]; then
-  "$ROOT/scripts/mkcard.sh" --dir "$OUT" "$2"
+  # --new: a recovery card is a card erased for the purpose, and mkcard.sh
+  # without it only rewrites the boot partition of a card it made before.
+  "$ROOT/scripts/mkcard.sh" --dir "$OUT" --new "$2"
 else
   say ""
   say "no device named, so nothing was written."

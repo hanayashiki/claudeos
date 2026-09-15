@@ -18,12 +18,16 @@ mod futex;
 mod integrity;
 mod itimer;
 mod mm;
+#[cfg(target_arch = "aarch64")]
+mod mmc;
 mod net;
 mod pci;
 mod reboot;
 mod rng;
 mod sched;
 mod signal;
+#[cfg(target_arch = "aarch64")]
+mod storage;
 mod sync;
 mod syscall;
 mod task;
@@ -88,6 +92,9 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
         } else if word.starts_with("panic=") || word.starts_with("watchdog=") {
             // The kernel's, and read by `reboot::configure` at the start of
             // boot, before there is a heap; not a setting for init.
+        } else if word.starts_with("data=") {
+            // The kernel's, read by `storage::start`: which volume on the
+            // card is /data, or `off`.
         } else if let Some(value) = word.strip_prefix("trace=") {
             options.trace = if value == "all" {
                 syscall::TRACE_ALL
@@ -364,6 +371,12 @@ pub fn start(boot: &boot::BootInfo) -> ! {
             net::arptest::start();
         }
     }
+
+    // /data, from the card. After init's pid, like the network task, and
+    // waited for here, with a bound, so that init finds it mounted and nothing
+    // about the card can hold boot up.
+    #[cfg(target_arch = "aarch64")]
+    storage::start(boot.cmdline(), &options.init);
 
     if asking && init.is_ok() {
         wait_for_address(&options.init);

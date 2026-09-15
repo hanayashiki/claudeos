@@ -2,17 +2,31 @@
 # Assemble the boot partition of an SD card for a Raspberry Pi 4, and put it on
 # a card if you name one.
 #
-#   scripts/mkcard.sh                 assemble build/boot and stop
-#   scripts/mkcard.sh /dev/disk4      assemble, then erase that card and write it
-#   scripts/mkcard.sh --dir DIR /dev/disk4
-#                                     erase that card and write DIR to it
-#                                     instead, without assembling anything
+#   scripts/mkcard.sh                    assemble build/boot and stop
+#   scripts/mkcard.sh --new /dev/disk4   assemble, erase the whole card, make its
+#                                        two partitions, and write the boot one
+#   scripts/mkcard.sh /dev/disk4         assemble, and rewrite only the boot
+#                                        partition of a card made with --new;
+#                                        the /data partition is not touched
+#   scripts/mkcard.sh --dir DIR [--new] /dev/disk4
+#                                        the same with DIR in place of
+#                                        build/boot, assembling nothing
+#   scripts/mkcard.sh [--dir DIR] [--new] --image FILE
+#                                        the same against a disk image file
+#                                        instead of a card, on macOS, which is
+#                                        how the writes here are tested
 #
-# A Pi 4 boots from a single FAT32 partition. Its bootloader lives in an EEPROM
-# on the board and can read nothing else, so everything it needs -- its own
-# firmware, a device tree, our kernel and our ram disk -- is a plain file on
-# that partition. There is no boot sector to install and nothing to make
-# bootable; the firmware looks for files by name.
+# A card made with --new has two partitions in an MBR:
+#
+#   1  FAT32, labelled CLAUDEOS, 512 MiB: the firmware, the kernel and the ram
+#      disk. A Pi 4's bootloader lives in an EEPROM on the board and reads the
+#      first FAT partition and nothing else, finding files by name, so there is
+#      no boot sector to install and nothing to mark bootable.
+#   2  FAT32, labelled CLAUDEDATA, the rest of the card: /data, which the
+#      kernel mounts read-write (README.md, "/data on the SD card").
+#
+# Updating a card rewrites partition 1 and nothing else, so what is on /data
+# stays. The whole card is erased only with --new.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -25,6 +39,11 @@ FIRMWARE_URL="https://github.com/raspberrypi/firmware/raw/master/boot"
 # how to split memory with the video core, and the two device tree files
 # describe the board and move the serial port to the header pins.
 FIRMWARE_FILES="start4.elf fixup4.dat bcm2711-rpi-4-b.dtb overlays/disable-bt.dtbo"
+
+# The two partitions a new card gets.
+BOOT_LABEL=CLAUDEOS
+BOOT_SIZE=512M
+DATA_LABEL=CLAUDEDATA
 
 say() { printf '%s\n' "$*"; }
 die() { printf '%s\n' "$*" >&2; exit 1; }
@@ -101,7 +120,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Write it to a card
+# Which disk to write
 # ---------------------------------------------------------------------------
 
 # Refuse anything that is not a removable disk. Naming the wrong device here
@@ -135,80 +154,208 @@ require_removable() {
   esac
 }
 
+# Attach the image file $1 as a disk without mounting anything, and print the
+# disk's path. The disk is checked to be a disk image, so nothing this script
+# does next can reach a physical disk.
+attach_image() {
+  local device
+  device="$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$1" | awk 'NR == 1 { print $1 }')"
+  case "$device" in
+    /dev/disk[0-9]*) ;;
+    *) die "hdiutil did not attach $1" ;;
+  esac
+  if ! diskutil info "$device" | grep -q "Protocol:.*Disk Image"; then
+    hdiutil detach "$device" > /dev/null 2>&1 || true
+    die "$device, attached from $1, does not say it is a disk image; nothing was written"
+  fi
+  echo "$device"
+}
+
+# A field of what diskutil knows about the disk or partition $1, such as
+# VolumeName or MountPoint, or nothing.
+volume_field() {
+  diskutil info -plist "$1" 2>/dev/null | plutil -extract "$2" raw - 2>/dev/null || true
+}
+
+# The path of partition $2 of the disk $1 on Linux: sdb1, or mmcblk0p1.
+linux_partition() {
+  if [ -b "$1$2" ]; then echo "$1$2"; else echo "$1p$2"; fi
+}
+
+# Show the disk $2 and require its path to be typed again. $1 says what is
+# about to happen to it.
 confirm() {
-  local device="$1"
+  local what="$1" device="$2" answer
   say ""
-  say "About to ERASE $device and write the boot partition to it."
+  say "$what"
   case "$(uname -s)" in
     Darwin) diskutil list "$device" | sed 's/^/  /' ;;
-    Linux)  lsblk "$device" | sed 's/^/  /' ;;
+    Linux)  lsblk -o NAME,SIZE,FSTYPE,LABEL "$device" | sed 's/^/  /' ;;
   esac
   say ""
-  printf 'Everything on it will be lost. Type the device path again to go ahead: '
-  local answer
+  printf 'Type the device path again to go ahead: '
   read -r answer
   [ "$answer" = "$device" ] || die "not confirmed; nothing was written"
 }
 
-write_card() {
-  local device="$1"
-  confirm "$device"
+# ---------------------------------------------------------------------------
+# Writing
+# ---------------------------------------------------------------------------
 
+# Copy the boot files onto the partition $1, mounting it if it is not mounted.
+copy_boot() {
+  local partition="$1" mount
+  case "$(uname -s)" in
+    Darwin)
+      mount="$(volume_field "$partition" MountPoint)"
+      if [ -z "$mount" ]; then
+        diskutil mount "$partition" > /dev/null
+        mount="$(volume_field "$partition" MountPoint)"
+      fi
+      [ -n "$mount" ] && [ -d "$mount" ] || die "$partition did not mount"
+      # -X: without it, a file with extended attributes gets a second file
+      # beside it on FAT, `._` and its name, holding them.
+      cp -RX "$BOOT"/ "$mount"/
+      sync
+      ;;
+    Linux)
+      mount="$(mktemp -d)"
+      command mount "$partition" "$mount"
+      cp -R "$BOOT"/. "$mount"/
+      sync
+      umount "$mount"
+      rmdir "$mount"
+      ;;
+  esac
+}
+
+# Erase the whole disk $1, make both partitions and write the boot files.
+write_new() {
+  local device="$1" p1 p2
   case "$(uname -s)" in
     Darwin)
       diskutil unmountDisk "$device"
-      # One FAT32 partition in an old-style partition table, which is the only
-      # arrangement this bootloader understands.
-      diskutil eraseDisk FAT32 CLAUDEOS MBRFormat "$device"
-      local mount="/Volumes/CLAUDEOS"
-      [ -d "$mount" ] || die "the card did not mount at $mount"
-      cp -R "$BOOT"/ "$mount"/
-      sync
+      # MBR, which is the only partition table this bootloader reads.
+      diskutil partitionDisk "$device" 2 MBR \
+        FAT32 "$BOOT_LABEL" "$BOOT_SIZE" FAT32 "$DATA_LABEL" R
+      copy_boot "${device}s1"
       diskutil eject "$device"
       ;;
     Linux)
-      local partition="${device}1"
-      [ -b "$partition" ] || partition="${device}p1"
       umount "$device"* 2>/dev/null || true
-      # One partition of type W95 FAT32 (LBA), marked bootable.
-      printf 'label: dos\n,,c,*\n' | sfdisk "$device"
-      sync
-      mkfs.vfat -F 32 -n CLAUDEOS "$partition"
-      local where
-      where="$(mktemp -d)"
-      mount "$partition" "$where"
-      cp -R "$BOOT"/. "$where"/
-      sync
-      umount "$where"
-      rmdir "$where"
+      # Both of type W95 FAT32 (LBA), the first marked bootable.
+      printf 'label: dos\n,%s,c,*\n,,c\n' "$BOOT_SIZE" | sfdisk "$device"
+      partprobe "$device" 2>/dev/null || true
+      udevadm settle 2>/dev/null || true
+      p1="$(linux_partition "$device" 1)"
+      p2="$(linux_partition "$device" 2)"
+      mkfs.vfat -F 32 -n "$BOOT_LABEL" "$p1"
+      mkfs.vfat -F 32 -n "$DATA_LABEL" "$p2"
+      copy_boot "$p1"
       ;;
   esac
+}
 
-  say ""
-  say "written. Put the card in the Pi, connect a serial cable to GPIO 14, 15"
-  say "and ground, and read it at 115200 baud, 8 bits, no parity, one stop bit."
+# Reformat partition 1 of the disk $1 and write the boot files to it. The
+# disk has to look like what write_new makes: partition 1 labelled CLAUDEOS
+# and a partition 2 after it. On a card with one partition across it, that
+# partition may be the one holding /data, so such a card is refused.
+write_update() {
+  local device="$1" p1 p2 label
+  case "$(uname -s)" in
+    Darwin)
+      p1="${device}s1"
+      p2="${device}s2"
+      label="$(volume_field "$p1" VolumeName)"
+      ;;
+    Linux)
+      p1="$(linux_partition "$device" 1)"
+      p2="$(linux_partition "$device" 2)"
+      label="$(lsblk -no LABEL "$p1" 2>/dev/null || true)"
+      ;;
+  esac
+  if [ "$label" != "$BOOT_LABEL" ] || ! { [ -b "$p2" ] || diskutil info "$p2" > /dev/null 2>&1; }; then
+    die "$device does not have partition 1 labelled $BOOT_LABEL and a partition 2 after it, which is what --new makes; nothing was written. To erase the whole card and make them, run: $0 --new $device"
+  fi
+  case "$(uname -s)" in
+    Darwin)
+      diskutil unmount "$p1" > /dev/null 2>&1 || true
+      diskutil eraseVolume FAT32 "$BOOT_LABEL" "$p1"
+      copy_boot "$p1"
+      diskutil eject "$device"
+      ;;
+    Linux)
+      umount "$p1" 2>/dev/null || true
+      mkfs.vfat -F 32 -n "$BOOT_LABEL" "$p1"
+      copy_boot "$p1"
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
 
-if [ "${1:-}" = "--dir" ]; then
-  # A directory something else prepared, such as the EEPROM update files from
-  # scripts/mkeeprom.sh, goes through the same checks and the same write.
-  [ $# -eq 3 ] || die "usage: $0 --dir DIR /dev/diskN"
-  require_removable "$3"
-  [ -d "$2" ] || die "$2 is not a directory"
-  BOOT="$(cd "$2" && pwd)"
-  write_card "$3"
-elif [ $# -ge 1 ]; then
-  # Check the device before building anything, so a wrong one is refused at
-  # once rather than after a page of output.
-  require_removable "$1"
-  assemble
-  write_card "$1"
-else
+NEW=""
+DIR=""
+CARD_IMAGE=""
+DEVICE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --new)   NEW=1; shift ;;
+    --dir)   [ $# -ge 2 ] || die "--dir needs a directory"; DIR="$2"; shift 2 ;;
+    --image) [ $# -ge 2 ] || die "--image needs a file"; CARD_IMAGE="$2"; shift 2 ;;
+    -*)      die "unknown option $1; see the top of $0" ;;
+    *)       [ -z "$DEVICE" ] || die "name one device"; DEVICE="$1"; shift ;;
+  esac
+done
+
+if [ -z "$DEVICE" ] && [ -z "$CARD_IMAGE" ]; then
+  [ -z "$NEW" ] || die "--new needs a device, or --image FILE, to erase"
+  [ -z "$DIR" ] || die "--dir needs a device, or --image FILE, to write to"
   assemble
   say ""
   say "no device named, so nothing was written."
-  say "to write a card:  $0 /dev/diskN        (macOS)"
-  say "                  $0 /dev/sdX          (Linux, as root)"
+  say "to prepare a new card:       $0 --new /dev/diskN"
+  say "to update its boot files:    $0 /dev/diskN"
+  say "(/dev/sdX on Linux, as root)"
+  exit 0
 fi
+[ -z "$DEVICE" ] || [ -z "$CARD_IMAGE" ] || die "name a device or --image FILE, not both"
+
+# Check the target before building anything, so a wrong one is refused at once
+# rather than after a page of output.
+if [ -n "$DEVICE" ]; then
+  require_removable "$DEVICE"
+else
+  [ "$(uname -s)" = Darwin ] || die "--image attaches the file with hdiutil, which only macOS has"
+  [ -f "$CARD_IMAGE" ] || die "$CARD_IMAGE: no such file; make an empty one with: mkfile -n 1g $CARD_IMAGE"
+fi
+
+if [ -n "$DIR" ]; then
+  # A directory something else prepared, such as the EEPROM update files from
+  # scripts/mkeeprom.sh, goes through the same checks and the same write.
+  [ -d "$DIR" ] || die "$DIR is not a directory"
+  BOOT="$(cd "$DIR" && pwd)"
+else
+  assemble
+fi
+
+if [ -n "$CARD_IMAGE" ]; then
+  DEVICE="$(attach_image "$CARD_IMAGE")"
+  trap 'hdiutil detach "$DEVICE" > /dev/null 2>&1 || true' EXIT
+  if [ -n "$NEW" ]; then write_new "$DEVICE"; else write_update "$DEVICE"; fi
+  say ""
+  say "written to $CARD_IMAGE."
+  exit 0
+fi
+
+if [ -n "$NEW" ]; then
+  confirm "About to ERASE all of $DEVICE, make partition 1 ($BOOT_LABEL, $BOOT_SIZE) and partition 2 ($DATA_LABEL, the rest), and write the boot files to partition 1. Everything on the card will be lost." "$DEVICE"
+  write_new "$DEVICE"
+else
+  confirm "About to erase partition 1 ($BOOT_LABEL) of $DEVICE and write the boot files to it. Partition 2, which holds /data, is not touched." "$DEVICE"
+  write_update "$DEVICE"
+fi
+
+say ""
+say "written. Put the card in the Pi, connect a serial cable to GPIO 14, 15"
+say "and ground, and read it at 115200 baud, 8 bits, no parity, one stop bit."

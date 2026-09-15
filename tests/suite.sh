@@ -42,6 +42,10 @@ check "tr ranges"         "ABC"      "$(echo abc | tr a-z A-Z)"
 check "tr delete"         "ac"       "$(echo abc | tr -d b)"
 check "rev"               "cba"      "$(echo abc | rev)"
 check "head"              "1"        "$(seq 1 100 | head -n 1)"
+# seq writes megabytes into a pipe head closes after its first line. The write
+# after that ends seq by SIGPIPE, and nothing is printed; a panic message on
+# seq's standard error would show here.
+check "closed pipe, quiet" ""        "$( (seq 1 1000000 | head -n 1 > /dev/null) 2>&1 )"
 check "tail"              "100"      "$(seq 1 100 | tail -n 1)"
 check "sort -n first"     "1"        "$(seq 1 20 | sort -n | head -n 1)"
 check "sort -r first"     "9"        "$(seq 1 9 | sort -r | head -n 1)"

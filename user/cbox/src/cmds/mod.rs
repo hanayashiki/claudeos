@@ -60,6 +60,7 @@ pub fn run(name: &str, args: &[String]) -> Option<i32> {
         "sleep" => sysinfo::sleep(args),
         "kill" => sysinfo::kill(args),
         "sync" => sysinfo::sync(args),
+        "fsync" => sysinfo::fsync(args),
         "reboot" => sysinfo::reboot(args),
         "halt" => sysinfo::halt(args),
         "poweroff" => sysinfo::poweroff(args),

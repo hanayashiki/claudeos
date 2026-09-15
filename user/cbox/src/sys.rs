@@ -47,6 +47,7 @@ mod numbers {
     pub const SYS_RT_SIGACTION: u64 = 13;
     pub const SYS_IOCTL: u64 = 16;
     pub const SYS_SYNC: u64 = 162;
+    pub const SYS_FSYNC: u64 = 74;
     pub const SYS_MKNOD: u64 = 133;
     pub const SYS_SYSLOG: u64 = 103;
     pub const SYS_EVENTFD2: u64 = 290;
@@ -86,6 +87,7 @@ mod numbers {
     pub const SYS_RT_SIGACTION: u64 = 134;
     pub const SYS_IOCTL: u64 = 29;
     pub const SYS_SYNC: u64 = 81;
+    pub const SYS_FSYNC: u64 = 82;
     pub const SYS_MKNODAT: u64 = 33;
     pub const SYS_SYSLOG: u64 = 116;
     pub const SYS_EVENTFD2: u64 = 19;
@@ -401,6 +403,11 @@ pub fn sync() {
     unsafe { syscall0(SYS_SYNC) };
 }
 
+/// Zero, or a negative errno.
+pub fn fsync(fd: i32) -> i64 {
+    unsafe { syscall1(SYS_FSYNC, fd as u64) }
+}
+
 /// The first magic number `reboot` has to be given, and the first of the four
 /// second ones it accepts.
 pub const REBOOT_MAGIC1: u32 = 0xfee1dead;
@@ -511,6 +518,7 @@ pub const SIG_IGN: usize = 1;
 
 pub const SIGINT: i32 = 2;
 pub const SIGQUIT: i32 = 3;
+pub const SIGPIPE: i32 = 13;
 #[allow(dead_code)]
 pub const SIGTERM: i32 = 15;
 pub const SIGCONT: i32 = 18;

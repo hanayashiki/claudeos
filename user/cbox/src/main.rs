@@ -71,6 +71,7 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("sort", "sort lines of text"),
     ("stat", "show file status"),
     ("sync", "flush filesystem buffers"),
+    ("fsync", "put files on their storage, and fail if it cannot"),
     ("tail", "print the last lines of a file"),
     ("tee", "copy standard input to files and stdout"),
     ("test", "evaluate a condition"),
@@ -103,6 +104,15 @@ pub fn shell_glob(name: &str, pattern: &str) -> bool {
 }
 
 fn main() {
+    // A write to a pipe whose reader has gone ends the process, as it does for
+    // a C program on Linux: `ls | head` stops ls without a word. Rust's runtime
+    // sets SIGPIPE to be ignored before main, which turns that write into an
+    // EPIPE error, and println! panics on it. Every applet writes through
+    // println!, so the default action is put back here, once, for all of them.
+    // The shell is not put at risk by it: each stage of a pipeline runs in a
+    // child, and the shell's own process writes only to the terminal or a file.
+    sys::set_signal(sys::SIGPIPE, sys::SIG_DFL);
+
     // args_os, because args panics on an argument that is not valid text and
     // a file name handed on by xargs need not be. The applets hold their
     // arguments as text, so such a name still does not survive intact; what

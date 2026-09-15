@@ -168,7 +168,10 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::FCHMODAT => file::chmod(args[0] as i64, args[1], args[2] as u32),
         // Everything runs as root on a single-user system.
         nr::CHOWN | nr::FCHOWN | nr::LCHOWN | nr::FCHOWNAT => Ok(0),
-        nr::FSYNC | nr::SYNC | nr::MSYNC => Ok(0),
+        nr::FSYNC | nr::FDATASYNC => file::fsync(args[0] as i32),
+        nr::SYNC => file::sync(),
+        nr::SYNCFS => file::syncfs(args[0] as i32),
+        nr::MSYNC => Ok(0),
         nr::UMASK => {
             let task = sched::current();
             let old = task.umask.get();

@@ -199,9 +199,15 @@ pub fn render(kind: Generated) -> String {
             crate::arch::MACHINE
         ),
         Generated::CpuInfo => crate::arch::cpu_info_text(),
-        Generated::Mounts => String::from(
-            "rootfs / rootfs rw 0 0\nproc /proc proc rw 0 0\ndevtmpfs /dev devtmpfs rw 0 0\n",
-        ),
+        Generated::Mounts => {
+            let mut mounts = String::from(
+                "rootfs / rootfs rw 0 0\nproc /proc proc rw 0 0\ndevtmpfs /dev devtmpfs rw 0 0\n",
+            );
+            if let Some(line) = super::data::mounts() {
+                mounts.push_str(&line);
+            }
+            mounts
+        }
         Generated::Filesystems => String::from("nodev\tproc\nnodev\tdevtmpfs\n\trootfs\n"),
         Generated::Loadavg => {
             format!("0.00 0.00 0.00 1/{} {}\n", crate::sched::task_count(), 1)

@@ -9,10 +9,11 @@ keys a terminal's line discipline acts on before the guest can see them.
 
 Usage:
     drive.py [--timeout SECS] [--initramfs FILE] [--kernel FILE]
-             [--append CMDLINE] [--raw] [--tty] -- <step> [<step> ...]
+             [--append CMDLINE] [--sd IMAGE] [--raw] [--tty] -- <step> [<step> ...]
 
 --kernel boots a kernel image other than the one in build/, such as a copy
-with a byte changed.
+with a byte changed. --sd puts a card holding IMAGE in the emulated Pi 4's
+card slot, as scripts/run.sh --sd does.
 
 Each step is either text to send (backslash escapes are interpreted),
 "wait:SECONDS" to pause, or "until:TEXT" to pause until TEXT has been printed.
@@ -79,8 +80,23 @@ class Screen:
                 self.column = (self.column // 8 + 1) * 8
             elif byte == 0x07:
                 pass
+            elif 0x20 <= byte < 0x7F:
+                self._put(chr(byte))
+            elif byte >= 0x80:
+                # UTF-8: a character of two to four bytes. One cut off at the
+                # end of this chunk waits in `pending` for the rest, as an
+                # escape sequence does; bytes that are not UTF-8 are drawn as
+                # U+FFFD.
+                need = 2 if 0xC0 <= byte < 0xE0 else 3 if 0xE0 <= byte < 0xF0 else 4 if 0xF0 <= byte < 0xF8 else 1
+                start = index - 1
+                if start + need > len(data):
+                    self.pending = data[start:]
+                    return
+                for char in data[start:start + need].decode("utf-8", errors="replace"):
+                    self._put(char)
+                index = start + need
             else:
-                self._put(chr(byte) if 0x20 <= byte < 0x7F else ".")
+                self._put(".")
 
     def _put(self, char):
         while len(self.line) <= self.column:
@@ -137,7 +153,7 @@ class SocketConsole:
     the driver's own deadline is what ends the run.
     """
 
-    def __init__(self, initramfs, append, timeout, kernel):
+    def __init__(self, initramfs, append, timeout, kernel, sd):
         sock_path = os.path.join(tempfile.mkdtemp(), "console.sock")
         console = [
             "-chardev", f"socket,id=console,path={sock_path},server=on,wait=off",
@@ -155,6 +171,12 @@ class SocketConsole:
                 "-kernel", kernel or os.path.join(ROOT, "build", "kernel8.img"),
                 "-initrd", initramfs,
             ] + console
+            if sd:
+                # The bus path is explained where scripts/run.sh does the same.
+                command += [
+                    "-drive", f"if=none,format=raw,id=card,file={sd}",
+                    "-device", "sd-card,drive=card,bus=/generic-sdhci/sd-bus",
+                ]
         else:
             command = [
                 "qemu-system-x86_64",
@@ -215,12 +237,14 @@ class TerminalConsole:
     character is either passed on to the guest or taken by QEMU.
     """
 
-    def __init__(self, initramfs, append, timeout, kernel):
+    def __init__(self, initramfs, append, timeout, kernel, sd):
         self.master, slave = pty.openpty()
         command = [os.path.join(ROOT, "scripts", "run.sh"),
                    "--timeout", str(timeout), "--initrd", initramfs]
         if kernel:
             command += ["--kernel", kernel]
+        if sd:
+            command += ["--sd", sd]
         if append:
             command += ["--append", append]
         # Its own session, so a signal the terminal raises reaches this guest
@@ -260,6 +284,7 @@ def main():
     initramfs = os.path.join(ROOT, "build", "initramfs.cpio")
     kernel = None
     append = None
+    sd = None
     raw = False
     tty = False
 
@@ -272,6 +297,8 @@ def main():
             kernel, args = args[1], args[2:]
         elif args[0] == "--append":
             append, args = args[1], args[2:]
+        elif args[0] == "--sd":
+            sd, args = args[1], args[2:]
         elif args[0] == "--raw":
             raw, args = True, args[1:]
         elif args[0] == "--tty":
@@ -288,8 +315,8 @@ def main():
         subprocess.run([reaper, "15"], check=False)
 
     try:
-        console = TerminalConsole(initramfs, append, timeout, kernel) if tty \
-            else SocketConsole(initramfs, append, timeout, kernel)
+        console = TerminalConsole(initramfs, append, timeout, kernel, sd) if tty \
+            else SocketConsole(initramfs, append, timeout, kernel, sd)
     except OSError as err:
         print(err, file=sys.stderr)
         return 1

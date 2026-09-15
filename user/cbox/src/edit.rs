@@ -73,10 +73,13 @@ impl Editor {
             };
         }
 
-        let mut buffer: Vec<char> = Vec::new();
+        // The line as the bytes typed, never decoded or changed: cbox passes
+        // bytes through, as Unix does. See `step_left` for the one use made of
+        // UTF-8 here, which is where the cursor stops.
+        let mut buffer: Vec<u8> = Vec::new();
         let mut cursor = 0usize;
         let mut browsing: Option<usize> = None;
-        let mut stash = String::new();
+        let mut stash: Vec<u8> = Vec::new();
 
         emit(prompt);
         let result = loop {
@@ -101,32 +104,36 @@ impl Editor {
                         break Line::EndOfInput;
                     }
                     if cursor < buffer.len() {
-                        buffer.remove(cursor);
+                        let end = step_right(&buffer, cursor);
+                        buffer.drain(cursor..end);
                     }
                 }
                 0x7F | 0x08 => {
                     if cursor > 0 {
-                        cursor -= 1;
-                        buffer.remove(cursor);
+                        let start = step_left(&buffer, cursor);
+                        buffer.drain(start..cursor);
+                        cursor = start;
                     }
                 }
-                0x01 => cursor = 0,             // Ctrl-A
-                0x05 => cursor = buffer.len(),  // Ctrl-E
-                0x02 => cursor = cursor.saturating_sub(1), // Ctrl-B
-                0x06 => cursor = (cursor + 1).min(buffer.len()), // Ctrl-F
-                0x0B => buffer.truncate(cursor), // Ctrl-K
+                0x01 => cursor = 0,                                // Ctrl-A
+                0x05 => cursor = buffer.len(),                     // Ctrl-E
+                0x02 => cursor = step_left(&buffer, cursor),       // Ctrl-B
+                0x06 => cursor = step_right(&buffer, cursor),      // Ctrl-F
+                0x0B => buffer.truncate(cursor),                   // Ctrl-K
                 0x15 => {
                     // Ctrl-U: discard everything before the cursor.
                     buffer.drain(..cursor);
                     cursor = 0;
                 }
                 0x17 => {
-                    // Ctrl-W: discard the word before the cursor.
+                    // Ctrl-W: discard the word before the cursor. Words are
+                    // divided by ASCII whitespace only, which no byte of a
+                    // UTF-8 character can be, so this never stops inside one.
                     let mut start = cursor;
-                    while start > 0 && buffer[start - 1].is_whitespace() {
+                    while start > 0 && buffer[start - 1].is_ascii_whitespace() {
                         start -= 1;
                     }
-                    while start > 0 && !buffer[start - 1].is_whitespace() {
+                    while start > 0 && !buffer[start - 1].is_ascii_whitespace() {
                         start -= 1;
                     }
                     buffer.drain(start..cursor);
@@ -147,43 +154,46 @@ impl Editor {
                             }
                             let index = match browsing {
                                 None => {
-                                    stash = collect(&buffer);
+                                    stash = buffer.clone();
                                     self.history.len() - 1
                                 }
                                 Some(0) => 0,
                                 Some(i) => i - 1,
                             };
                             browsing = Some(index);
-                            buffer = self.history[index].chars().collect();
+                            buffer = self.history[index].as_bytes().to_vec();
                             cursor = buffer.len();
                         }
                         Some(Key::Down) => match browsing {
                             None => continue,
                             Some(i) if i + 1 < self.history.len() => {
                                 browsing = Some(i + 1);
-                                buffer = self.history[i + 1].chars().collect();
+                                buffer = self.history[i + 1].as_bytes().to_vec();
                                 cursor = buffer.len();
                             }
                             Some(_) => {
                                 browsing = None;
-                                buffer = stash.chars().collect();
+                                buffer = stash.clone();
                                 cursor = buffer.len();
                             }
                         },
-                        Some(Key::Left) => cursor = cursor.saturating_sub(1),
-                        Some(Key::Right) => cursor = (cursor + 1).min(buffer.len()),
+                        Some(Key::Left) => cursor = step_left(&buffer, cursor),
+                        Some(Key::Right) => cursor = step_right(&buffer, cursor),
                         Some(Key::Home) => cursor = 0,
                         Some(Key::End) => cursor = buffer.len(),
                         Some(Key::Delete) => {
                             if cursor < buffer.len() {
-                                buffer.remove(cursor);
+                                let end = step_right(&buffer, cursor);
+                                buffer.drain(cursor..end);
                             }
                         }
                         None => continue,
                     }
                 }
                 byte if byte >= 0x20 => {
-                    buffer.insert(cursor, byte as char);
+                    // Every byte of 0x20 and up goes in as it came, those of a
+                    // UTF-8 character and those that are not UTF-8 alike.
+                    buffer.insert(cursor, byte);
                     cursor += 1;
                 }
                 _ => continue,
@@ -206,12 +216,135 @@ enum Key {
     Delete,
 }
 
-fn collect(buffer: &[char]) -> String {
-    buffer.iter().collect()
+/// Whether a byte continues a UTF-8 character: 0x80 to 0xBF.
+fn continues(byte: u8) -> bool {
+    (0x80..=0xBF).contains(&byte)
+}
+
+/// The bytes a UTF-8 character starting with `lead` has, by its high bits:
+/// two for 110xxxxx, three for 1110xxxx, four for 11110xxx, and one for any
+/// other byte.
+fn declared_length(lead: u8) -> usize {
+    match lead {
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    }
+}
+
+/// Where the cursor stops one character to the right of `at`.
+///
+/// This and `step_left` are the one place the editor knows about UTF-8, and
+/// that is not at odds with keeping bytes as they are: they choose where the
+/// cursor may stop, so that one key moves over or deletes one character a
+/// UTF-8 terminal drew, and they never change, add or drop a byte. A lead
+/// byte is one character with as many continuation bytes after it as it
+/// declares, fewer when a byte that cannot continue it comes first. Any other
+/// byte is a character of its own, and so is a continuation byte past what
+/// its lead declared or with no lead before it, which the terminal draws as a
+/// replacement glyph.
+fn step_right(buffer: &[u8], at: usize) -> usize {
+    let Some(&lead) = buffer.get(at) else {
+        return buffer.len();
+    };
+    let mut end = at + 1;
+    while end < buffer.len() && end - at < declared_length(lead) && continues(buffer[end]) {
+        end += 1;
+    }
+    end
+}
+
+/// Where the cursor stops one character to the left of `at`: the start of
+/// the last character that begins before it. The characters are found from
+/// the start of the line, since bytes read backwards cannot say which lead a
+/// continuation byte belongs to; a typed line is short.
+fn step_left(buffer: &[u8], at: usize) -> usize {
+    let mut start = 0;
+    let mut next = 0;
+    while next < at.min(buffer.len()) {
+        start = next;
+        next = step_right(buffer, next);
+    }
+    start
+}
+
+/// The characters, counted as the cursor steps over them, in `buffer`.
+fn steps(buffer: &[u8]) -> usize {
+    let mut count = 0;
+    let mut at = 0;
+    while at < buffer.len() {
+        at = step_right(buffer, at);
+        count += 1;
+    }
+    count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{step_left, step_right, steps};
+
+    /// Backspace from the end of `line`, as the editor does it.
+    fn backspace(line: &[u8]) -> Vec<u8> {
+        let start = step_left(line, line.len());
+        line[..start].to_vec()
+    }
+
+    #[test]
+    fn a_step_is_one_character_a_terminal_draws() {
+        let line = "タ日本🎉x".as_bytes();
+        assert_eq!(backspace(line), "タ日本🎉".as_bytes());
+        assert_eq!(backspace(&backspace(line)), "タ日本".as_bytes());
+        assert_eq!(steps(line), 5);
+        // From the start, right steps land after each whole character.
+        let mut at = 0;
+        let mut stops = Vec::new();
+        while at < line.len() {
+            at = step_right(line, at);
+            stops.push(at);
+        }
+        assert_eq!(stops, vec![3, 6, 9, 13, 14]);
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_are_steps_of_their_own_and_kept() {
+        // A stray continuation byte, a lead byte with nothing after it, and 0xff.
+        let line = [b'a', 0x80, b'b', 0xE3, 0xFF, b'c'];
+        assert_eq!(steps(&line), 6);
+        assert_eq!(step_left(&line, 2), 1);
+        assert_eq!(step_left(&line, 5), 4);
+        assert_eq!(step_right(&line, 3), 4);
+        assert_eq!(backspace(&line[..5]), vec![b'a', 0x80, b'b', 0xE3]);
+        // A lead byte followed by more continuation bytes than it declares:
+        // タ, then each extra byte is a character of its own.
+        let long = [0xE3, 0x82, 0xBF, 0x80, 0x80];
+        assert_eq!(step_right(&long, 0), 3);
+        assert_eq!(step_right(&long, 3), 4);
+        assert_eq!(steps(&long), 3);
+        assert_eq!(step_left(&long, 5), 4);
+        assert_eq!(step_left(&long, 3), 0);
+        // One stray byte after a whole character: backspace takes only it.
+        assert_eq!(backspace(&[0xE3, 0x82, 0xBF, 0x80]), vec![0xE3, 0x82, 0xBF]);
+        // A cursor left inside a character, as while one is being typed.
+        assert_eq!(step_left(&[b'a', 0xE3, 0x82, 0xBF], 3), 1);
+    }
+}
+
+/// The typed line handed to the shell. The shell still holds lines as
+/// `String`, so bytes that are not UTF-8 are replaced by U+FFFD here, the same
+/// way the shell's own `read_line` treats input that is not a terminal. Valid
+/// UTF-8 arrives exactly as typed. This boundary goes when the shell takes
+/// lines as bytes.
+fn collect(buffer: &[u8]) -> String {
+    String::from_utf8_lossy(buffer).into_owned()
 }
 
 fn emit(text: &str) {
-    let _ = sys::write(sys::STDOUT, text.as_bytes());
+    emit_bytes(text.as_bytes());
+}
+
+fn emit_bytes(bytes: &[u8]) {
+    let _ = sys::write(sys::STDOUT, bytes);
 }
 
 fn read_byte() -> Option<u8> {
@@ -258,20 +391,20 @@ fn read_escape() -> Option<Key> {
     }
 }
 
-fn redraw(prompt: &str, buffer: &[char], cursor: usize) {
-    let mut out = String::with_capacity(buffer.len() + prompt.len() + 16);
-    out.push('\r');
-    out.push_str(prompt);
-    out.extend(buffer.iter());
-    out.push_str("\x1b[K"); // erase whatever the line used to be longer by
-    let column = prompt.chars().count() + cursor;
-    out.push('\r');
+/// Draw the prompt and the line's bytes as they are, and put the cursor after
+/// the characters before it, one column each.
+fn redraw(prompt: &str, buffer: &[u8], cursor: usize) {
+    let mut out: Vec<u8> = Vec::with_capacity(buffer.len() + prompt.len() + 16);
+    out.push(b'\r');
+    out.extend_from_slice(prompt.as_bytes());
+    out.extend_from_slice(buffer);
+    out.extend_from_slice(b"\x1b[K"); // erase whatever the line used to be longer by
+    let column = prompt.chars().count() + steps(&buffer[..cursor]);
+    out.push(b'\r');
     if column > 0 {
-        out.push_str("\x1b[");
-        out.push_str(&column.to_string());
-        out.push('C');
+        out.extend_from_slice(format!("\x1b[{}C", column).as_bytes());
     }
-    emit(&out);
+    emit_bytes(&out);
 }
 
 /// Supplies candidate completions for the word under the cursor.
@@ -281,14 +414,18 @@ pub trait Completer {
     fn candidates(&self, word: &str, is_command: bool) -> Vec<String>;
 }
 
-fn complete(completer: &dyn Completer, buffer: &mut Vec<char>, cursor: &mut usize, prompt: &str) {
-    let text: String = buffer[..*cursor].iter().collect();
-    let start = text
-        .rfind(|c: char| c.is_whitespace() || c == '|' || c == ';' || c == '>' || c == '<')
+fn complete(completer: &dyn Completer, buffer: &mut Vec<u8>, cursor: &mut usize, prompt: &str) {
+    // The word ends at the cursor and starts after the last separator before
+    // it. Separators are ASCII, so the word's bytes are whole characters.
+    let before = &buffer[..*cursor];
+    let start = before
+        .iter()
+        .rposition(|&b| b.is_ascii_whitespace() || b == b'|' || b == b';' || b == b'>' || b == b'<')
         .map(|i| i + 1)
         .unwrap_or(0);
-    let word = &text[start..];
-    let is_command = text[..start].trim().is_empty();
+    let word = String::from_utf8_lossy(&before[start..]).into_owned();
+    let word = word.as_str();
+    let is_command = before[..start].iter().all(|b| b.is_ascii_whitespace());
 
     let matches = completer.candidates(word, is_command);
     if matches.is_empty() {
@@ -325,17 +462,10 @@ fn complete(completer: &dyn Completer, buffer: &mut Vec<char>, cursor: &mut usiz
     };
 
     // Replace the word with the completion.
-    let word_chars = word.chars().count();
-    for _ in 0..word_chars {
-        *cursor -= 1;
-        buffer.remove(*cursor);
-    }
-    for c in insert.chars() {
-        buffer.insert(*cursor, c);
-        *cursor += 1;
-    }
+    buffer.splice(start..*cursor, insert.bytes());
+    *cursor = start + insert.len();
     if matches.len() == 1 && !insert.ends_with('/') {
-        buffer.insert(*cursor, ' ');
+        buffer.insert(*cursor, b' ');
         *cursor += 1;
     }
     redraw(prompt, buffer, *cursor);

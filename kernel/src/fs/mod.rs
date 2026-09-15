@@ -4,6 +4,7 @@
 //! from the root, so directories do not need parent back-pointers.
 
 pub mod cpio;
+pub mod data;
 pub mod dev;
 pub mod chan;
 pub mod pipe;
@@ -31,6 +32,12 @@ pub enum NodeKind {
     /// An entry in /proc/<pid>/fd. Opening it is opening that descriptor,
     /// whatever it is attached to; reading the link gives the name it carries.
     Fd(u32, i32),
+    /// A file on the data volume mounted at /data. Its contents are read from
+    /// and written to the card, and `stored` says where it is.
+    DataFile,
+    /// A directory on the data volume, whose entries are read from the card
+    /// rather than kept in `children`.
+    DataDir,
 }
 
 pub struct NodeInner {
@@ -47,6 +54,9 @@ pub struct NodeInner {
     /// node unlocked between them. Another writer waits for it: what the
     /// first one is copying must not change underneath it.
     changing: bool,
+    /// Where a `DataFile` or `DataDir` is on the data volume; nothing for
+    /// every other node.
+    pub stored: Option<data::Stored>,
 }
 
 pub struct Node {
@@ -153,6 +163,29 @@ impl Node {
                 mtime: crate::time::unix_time(),
                 nlink: 1,
                 changing: false,
+                stored: None,
+            }),
+        })
+    }
+
+    /// A node for an entry on the data volume, with the inode number the
+    /// volume's code gives its path. Files on FAT have no owner or permission
+    /// bits, so every one is root's, 0644 for a file and 0755 for a directory.
+    pub fn new_stored(ino: u64, is_dir: bool, path: String, len: u64, mtime: i64) -> NodeRef {
+        let (kind, mode) = if is_dir { (NodeKind::DataDir, S_IFDIR | 0o755) } else { (NodeKind::DataFile, S_IFREG | 0o644) };
+        Arc::new(Node {
+            ino,
+            kind,
+            inner: Spinlock::new(NodeInner {
+                mode,
+                uid: 0,
+                gid: 0,
+                data: Vec::new(),
+                children: BTreeMap::new(),
+                mtime,
+                nlink: 1,
+                changing: false,
+                stored: Some(data::Stored { path, len, gone: false }),
             }),
         })
     }
@@ -172,12 +205,18 @@ impl Node {
     }
 
     pub fn is_dir(&self) -> bool {
-        matches!(self.kind, NodeKind::Dir)
+        matches!(self.kind, NodeKind::Dir | NodeKind::DataDir)
+    }
+
+    /// Whether the node is on the data volume rather than in memory.
+    pub fn is_stored(&self) -> bool {
+        matches!(self.kind, NodeKind::DataFile | NodeKind::DataDir)
     }
 
     pub fn size(&self) -> u64 {
         match self.kind {
-            NodeKind::Dir => 4096,
+            NodeKind::Dir | NodeKind::DataDir => 4096,
+            NodeKind::DataFile => self.inner.lock().stored.as_ref().map_or(0, |stored| stored.len),
             NodeKind::Device(_) => 0,
             NodeKind::Generated(kind) => procfs::size(kind),
             _ => self.inner.lock().data.len() as u64,
@@ -197,6 +236,8 @@ impl Node {
             NodeKind::Generated(_) => DT_REG,
             NodeKind::Fifo => DT_FIFO,
             NodeKind::Fd(..) => DT_LNK,
+            NodeKind::DataFile => DT_REG,
+            NodeKind::DataDir => DT_DIR,
         }
     }
 
@@ -206,7 +247,9 @@ impl Node {
         let size = self.size() as i64;
         let inner = self.inner.lock();
         Stat {
-            st_dev: 1,
+            // The data volume is a device of its own, so a program that
+            // compares devices, as `mv` and `find -xdev` do, sees the mount.
+            st_dev: if self.is_stored() { 2 } else { 1 },
             st_ino: self.ino,
             st_nlink: inner.nlink as u64,
             st_mode: inner.mode,
@@ -230,7 +273,8 @@ impl Node {
         match self.kind {
             NodeKind::Device(kind) => dev::read(kind, buf),
             NodeKind::Generated(kind) => procfs::read(kind, offset, buf),
-            NodeKind::Dir => Err(Errno::EISDIR),
+            NodeKind::Dir | NodeKind::DataDir => Err(Errno::EISDIR),
+            NodeKind::DataFile => data::read(self, offset, buf),
             _ => {
                 let want = offset.range(buf.len())?;
                 let inner = self.inner.lock();
@@ -320,7 +364,8 @@ impl Node {
         match self.kind {
             NodeKind::Device(kind) => dev::write(kind, buf),
             NodeKind::Generated(_) => Err(Errno::EACCES),
-            NodeKind::Dir => Err(Errno::EISDIR),
+            NodeKind::Dir | NodeKind::DataDir => Err(Errno::EISDIR),
+            NodeKind::DataFile => data::write(self, offset, buf),
             _ => {
                 let want = offset.range(buf.len())?;
                 let change = self.change();
@@ -336,6 +381,9 @@ impl Node {
     pub fn truncate(&self, len: Offset) -> Result<(), Errno> {
         if self.is_dir() {
             return Err(Errno::EISDIR);
+        }
+        if self.kind == NodeKind::DataFile {
+            return data::truncate(self, len);
         }
         // A truncation names the file's new end, which is the empty range
         // that begins there.
@@ -439,11 +487,13 @@ fn lookup_inner(path: &str, follow_final: bool, depth: usize) -> Result<NodeRef,
             own = alloc::format!("{}", crate::sched::current_pid());
             key = &own;
         }
-        let child = {
+        let child = if node.kind == NodeKind::DataDir {
+            // The volume's entries are on the card, not in `children`.
+            data::lookup(&node, key)?
+        } else {
             let inner = node.inner.lock();
-            inner.children.get(key).cloned()
+            inner.children.get(key).cloned().ok_or(Errno::ENOENT)?
         };
-        let child = child.ok_or(Errno::ENOENT)?;
 
         // A descriptor entry is followed to the file it names only when that
         // file has a name; opening it is handled where the descriptor can be
@@ -497,6 +547,12 @@ pub fn create(path: &str, mode: u32) -> Result<NodeRef, Errno> {
         return Err(Errno::EISDIR);
     }
     let (parent, name) = split_parent(path)?;
+    if parent.kind == NodeKind::DataDir {
+        return match data::create(&parent, &name) {
+            Err(Errno::EEXIST) => data::lookup(&parent, &name),
+            result => result,
+        };
+    }
     let mut inner = parent.inner.lock();
     if let Some(existing) = inner.children.get(&name) {
         return Ok(existing.clone());
@@ -513,6 +569,9 @@ pub fn mkdir(path: &str, mode: u32) -> Result<NodeRef, Errno> {
         return Err(Errno::EEXIST);
     }
     let (parent, name) = split_parent(path)?;
+    if parent.kind == NodeKind::DataDir {
+        return data::mkdir(&parent, &name);
+    }
     let mut inner = parent.inner.lock();
     if inner.children.contains_key(&name) {
         return Err(Errno::EEXIST);
@@ -540,6 +599,10 @@ pub fn mkdir_p(path: &str) -> Result<NodeRef, Errno> {
 
 pub fn symlink(path: &str, target: &str) -> Result<(), Errno> {
     let (parent, name) = split_parent(path)?;
+    // FAT has no symbolic links, and Linux's vfat answers EPERM.
+    if parent.kind == NodeKind::DataDir {
+        return Err(Errno::EPERM);
+    }
     let mut inner = parent.inner.lock();
     if inner.children.contains_key(&name) {
         return Err(Errno::EEXIST);
@@ -550,6 +613,10 @@ pub fn symlink(path: &str, target: &str) -> Result<(), Errno> {
 
 pub fn mkfifo(path: &str, mode: u32) -> Result<NodeRef, Errno> {
     let (parent, name) = split_parent(path)?;
+    // Nor named pipes.
+    if parent.kind == NodeKind::DataDir {
+        return Err(Errno::EPERM);
+    }
     let mut inner = parent.inner.lock();
     if inner.children.contains_key(&name) {
         return Err(Errno::EEXIST);
@@ -561,6 +628,9 @@ pub fn mkfifo(path: &str, mode: u32) -> Result<NodeRef, Errno> {
 
 pub fn link_node(path: &str, node: NodeRef) -> Result<(), Errno> {
     let (parent, name) = split_parent(path)?;
+    if parent.kind == NodeKind::DataDir {
+        return Err(Errno::EPERM);
+    }
     parent.inner.lock().children.insert(name, node);
     Ok(())
 }
@@ -575,6 +645,10 @@ pub fn replace_file(path: &str, contents: &[u8], mode: u32) -> Result<(), Errno>
     let node = Node::new_file(mode);
     node.write_at(Offset::new(0), contents)?;
     let (parent, name) = split_parent(path)?;
+    // The kernel replaces only its own files this way, and none is on /data.
+    if parent.kind == NodeKind::DataDir {
+        return Err(Errno::EPERM);
+    }
     let replaced = {
         let mut inner = parent.inner.lock();
         if inner.children.get(&name).is_some_and(|existing| existing.is_dir()) {
@@ -594,6 +668,13 @@ pub fn replace_file(path: &str, contents: &[u8], mode: u32) -> Result<(), Errno>
 /// A second directory entry for a file that already has one.
 pub fn hard_link(path: &str, node: NodeRef) -> Result<(), Errno> {
     let (parent, name) = split_parent(path)?;
+    // FAT has one entry per file, so no second name: EPERM, as vfat answers.
+    // Between the volume and memory it is two filesystems: EXDEV.
+    match (parent.kind == NodeKind::DataDir, node.is_stored()) {
+        (true, true) => return Err(Errno::EPERM),
+        (true, false) | (false, true) => return Err(Errno::EXDEV),
+        (false, false) => {}
+    }
     let mut inner = parent.inner.lock();
     if inner.children.contains_key(&name) {
         return Err(Errno::EEXIST);
@@ -608,8 +689,15 @@ pub fn unlink(path: &str, want_dir: bool) -> Result<(), Errno> {
         return Err(Errno::EBUSY);
     }
     let (parent, name) = split_parent(path)?;
+    if parent.kind == NodeKind::DataDir {
+        return data::unlink(&parent, &name, want_dir);
+    }
     let mut inner = parent.inner.lock();
     let node = inner.children.get(&name).ok_or(Errno::ENOENT)?.clone();
+    // The data volume's root is where the volume is mounted.
+    if node.kind == NodeKind::DataDir {
+        return Err(Errno::EBUSY);
+    }
     if node.is_dir() != want_dir {
         return Err(if want_dir { Errno::ENOTDIR } else { Errno::EISDIR });
     }
@@ -653,7 +741,21 @@ pub fn rename(from: &str, to: &str) -> Result<(), Errno> {
     let node = lookup_nofollow(from)?;
     let (from_parent, from_name) = split_parent(from)?;
     let (to_parent, to_name) = split_parent(to)?;
+    // The data volume is a filesystem of its own. A rename stays inside it or
+    // outside it, and `mv` copies when told EXDEV.
+    let from_stored = from_parent.kind == NodeKind::DataDir;
+    let to_stored = to_parent.kind == NodeKind::DataDir;
+    if from_stored || to_stored {
+        if from_stored != to_stored {
+            return Err(Errno::EXDEV);
+        }
+        return data::rename(&from_parent, &from_name, &to_parent, &to_name);
+    }
     let existing = to_parent.inner.lock().children.get(&to_name).cloned();
+    // Nor does the volume's root move, or get renamed over.
+    if node.kind == NodeKind::DataDir || existing.as_ref().is_some_and(|existing| existing.kind == NodeKind::DataDir) {
+        return Err(Errno::EBUSY);
+    }
 
     // The same file under both names, which includes a path renamed onto
     // itself. Inserting the entry and then removing it is what loses the file.
@@ -698,7 +800,10 @@ pub struct DirEntry {
     pub name: String,
 }
 
-pub fn readdir(node: &NodeRef) -> Vec<DirEntry> {
+pub fn readdir(node: &NodeRef) -> Result<Vec<DirEntry>, Errno> {
+    if node.kind == NodeKind::DataDir {
+        return data::readdir(node);
+    }
     procfs::refresh_dir(node);
     let mut out = Vec::new();
     out.push(DirEntry { ino: node.ino, kind: DT_DIR, name: ".".to_string() });
@@ -710,7 +815,7 @@ pub fn readdir(node: &NodeRef) -> Vec<DirEntry> {
             name: name.clone(),
         });
     }
-    out
+    Ok(out)
 }
 
 /// A descriptor's hold on an internet socket.
@@ -754,6 +859,9 @@ pub struct OpenFile {
     /// Path this descriptor was opened with, for *at() resolution and
     /// /proc/self/fd.
     pub path: String,
+    /// A directory's entries as they were when `getdents64` started reading
+    /// it, until it reads to the end or starts again.
+    pub listing: Spinlock<Option<Arc<Vec<DirEntry>>>>,
 }
 
 impl OpenFile {
@@ -767,6 +875,7 @@ impl OpenFile {
             offset: Spinlock::new(0),
             flags: Spinlock::new(flags),
             path: path.to_string(),
+            listing: Spinlock::new(None),
         })
     }
 
