@@ -134,8 +134,9 @@ for CERTS in "$ROOT/build/alpine-rootfs-aarch64/etc/ssl/certs/ca-certificates.cr
 done
 
 # ---- network time --------------------------------------------------------
-# The servers BusyBox ntpd asks. init starts ntpd in the background when this
-# file and /bin/busybox are both in an image, which is how a board with no
+# The servers BusyBox ntpd asks. The ntpd line in user/services, the system
+# services list every image has, says needs=/etc/ntp.conf, so init starts ntpd
+# only in an image that has this file, which is how a board with no
 # battery-backed clock learns the date. scripts/images.sh puts it in the board
 # image only, so the test images the suites boot never wait on servers across
 # the internet; the network time section of scripts/test.sh adds it to a copy.
@@ -151,6 +152,10 @@ PASSWD
 cat > "$RFS/etc/hostname" <<'HOSTNAME'
 claudeos
 HOSTNAME
+
+# The system services init starts at boot, the same list in both images.
+mkdir -p "$RFS/etc/claudeos"
+cp "$ROOT/user/services" "$RFS/etc/claudeos/services"
 
 cp "$ROOT/tests/demo.sh" "$RFS/root/demo.sh"
 cp "$ROOT/tests/suite.sh" "$RFS/root/suite.sh"

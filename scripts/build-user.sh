@@ -103,6 +103,10 @@ cat > "$RFS/etc/hostname" <<'HOSTNAME'
 claudeos
 HOSTNAME
 
+# The system services init starts at boot, the same list in every image.
+mkdir -p "$RFS/etc/claudeos"
+cp "$ROOT/user/services" "$RFS/etc/claudeos/services"
+
 cp "$ROOT/tests/demo.sh" "$RFS/root/demo.sh"
 
 cat > "$RFS/root/hello.txt" <<'HELLO'

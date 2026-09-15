@@ -1,0 +1,29 @@
+# The system services: what init starts at every boot, before the user list,
+# /data/services.txt. The build puts this file in both images as
+# /etc/claudeos/services, and the kernel checks it at boot against
+# /etc/claudeos/checksums, so it is changed here and rebuilt, never on the
+# board. The format is described in the README, under "Services".
+#
+# name  policy  options  command
+
+# The clock. BusyBox ntpd asks the servers /etc/ntp.conf names, which only the
+# board image has, so the test images never wait on servers across the
+# internet. `-n -q` keeps ntpd in the foreground and makes it exit once the
+# clock has been set or found within a second.
+#
+# every=6h: after a run that exits 0, the next is six hours later. A board's
+# crystal keeps to some tens of parts per million, a second or two over six
+# hours, so the clock is back around the second ntpd -q does not correct.
+#
+# backoff=30s-10m: after a failed run the next is 30 s later, doubling with each
+# failure in a row to ten minutes. The usual failure at boot is a network not up
+# yet, and a WiFi join and a DHCP lease take tens of seconds. The cap means a
+# network that comes up late still gives the date within ten minutes of it.
+#
+# limit=180s: BusyBox 1.36.1's ntpd -q ends itself about ten seconds after it
+# starts if no server has answered, and fifty seconds after the first answer,
+# but notices that only between name lookups, which take about ten seconds each
+# when unanswered, so a run ends on its own within about ninety seconds. Three
+# minutes is that with room, and it is short against the ten-minute cap, so no
+# run lasts long enough to reset the count of failures.
+ntpd  always  needs=/etc/ntp.conf every=6h limit=180s backoff=30s-10m  /bin/busybox ntpd -n -q

@@ -9,6 +9,8 @@ mod cmds;
 mod edit;
 mod regex;
 mod init;
+mod service_list;
+mod services;
 mod shell;
 mod sys;
 

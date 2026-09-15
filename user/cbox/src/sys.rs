@@ -18,6 +18,8 @@ pub const O_RDWR: u64 = 2;
 pub const O_CREAT: u64 = 0o100;
 pub const O_TRUNC: u64 = 0o1000;
 pub const O_APPEND: u64 = 0o2000;
+/// The same value on both machines, and the same as EPOLL_CLOEXEC.
+pub const O_CLOEXEC: u64 = 0o2000000;
 
 // The call numbers and the instruction that makes the call are the machine's
 // own. x86-64 keeps its historical table; aarch64 uses the asm-generic one,
@@ -280,6 +282,19 @@ pub fn pipe() -> Result<(i32, i32), i64> {
     }
 }
 
+/// A pipe whose ends are closed across `execve`. A program started from here
+/// holds one only when it is duplicated onto a descriptor of its own, since
+/// `dup2` makes the copy without the flag.
+pub fn pipe_cloexec() -> Result<(i32, i32), i64> {
+    let mut fds = [0i32; 2];
+    let rc = unsafe { syscall2(SYS_PIPE2, fds.as_mut_ptr() as u64, O_CLOEXEC) };
+    if rc < 0 {
+        Err(rc)
+    } else {
+        Ok((fds[0], fds[1]))
+    }
+}
+
 pub fn open(path: &str, flags: u64, mode: u64) -> i64 {
     let c = match CString::new(path) {
         Ok(c) => c,
@@ -358,6 +373,11 @@ pub fn eventfd(initial: u32, flags: u32) -> i64 {
 
 pub fn epoll_create() -> i64 {
     unsafe { syscall1(SYS_EPOLL_CREATE1, 0) }
+}
+
+/// An epoll set closed across `execve`.
+pub fn epoll_create_cloexec() -> i64 {
+    unsafe { syscall1(SYS_EPOLL_CREATE1, O_CLOEXEC) }
 }
 
 /// A `struct epoll_event`: a 4-byte mask, then 8 bytes of caller data at
