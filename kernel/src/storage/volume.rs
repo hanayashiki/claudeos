@@ -48,6 +48,14 @@ use fatfs::{Read as FatRead, Seek as FatSeek, Write as FatWrite};
 
 /// Files kept open between operations.
 pub const MAX_OPEN: usize = 32;
+/// Directories remembered between operations, by path. The kernel resolves a
+/// path one component at a time, each a lookup in the directory the one before
+/// it named, and without these each lookup found that directory again from the
+/// root, so a path d directories deep cost about d²/2 directory scans instead of
+/// d. On a damaged test card whose directories form a cycle, which `find`
+/// follows until paths reach the length limit, `fatdisk walk` resolving paths
+/// the kernel's way took 84 s on the Mac without these and 0.7 s with them.
+pub const MAX_DIRS: usize = 32;
 /// Entries one listing returns. A FAT directory holds at most 65536 entries,
 /// fewer with long names, so a valid one never reaches this.
 pub const MAX_LIST: usize = 65536;
@@ -414,13 +422,16 @@ struct Open<B: Blocks + 'static> {
 pub struct Volume<B: Blocks + 'static> {
     state: Shared<B>,
     /// The filesystem, from `Box::into_raw`, or null once it could not be
-    /// mounted again. Every `File` in `open` borrows it, and they are all
-    /// dropped before it is freed; nothing else that borrows it outlives the
-    /// call it was made in.
+    /// mounted again. Every `File` in `open` and every entry in `dirs` borrows
+    /// it, and they are all dropped before it is freed; nothing else that
+    /// borrows it outlives the call it was made in.
     fs: *mut Fs<B>,
     clock: Clock,
     geometry: Geometry,
     open: Vec<Open<B>>,
+    /// Directory entries found by earlier operations, by the path inside the
+    /// volume they are at, the most recently used last.
+    dirs: Vec<(String, FatEntry<B>)>,
 }
 
 // The volume holds reference-counted handles and a raw pointer, none of which
@@ -452,7 +463,7 @@ impl<B: Blocks + 'static> Volume<B> {
         state.borrow_mut().begin(calls, millis);
         let options = fatfs::FsOptions::new().time_provider(clock);
         let fs = fatfs::FileSystem::new(Disk::new(state.clone()), options).map_err(fat_error)?;
-        Ok(Volume { state, fs: Box::into_raw(Box::new(fs)), clock, geometry, open: Vec::new() })
+        Ok(Volume { state, fs: Box::into_raw(Box::new(fs)), clock, geometry, open: Vec::new(), dirs: Vec::new() })
     }
 
     pub fn geometry(&self) -> Geometry {
@@ -468,9 +479,11 @@ impl<B: Blocks + 'static> Volume<B> {
         unsafe { self.fs.as_ref() }.ok_or(FsError::Offline)
     }
 
-    /// Free the filesystem, which unmounts it. Every open file goes first.
+    /// Free the filesystem, which unmounts it. Every open file and every
+    /// remembered directory goes first.
     fn drop_fs(&mut self) -> Option<Box<Fs<B>>> {
         self.open.clear();
+        self.dirs.clear();
         if self.fs.is_null() {
             return None;
         }
@@ -529,16 +542,46 @@ impl<B: Blocks + 'static> Volume<B> {
         result
     }
 
-    fn dir(&self, path: &str) -> Result<FatDir<B>, FsError> {
-        let mut dir = self.fs()?.root_dir();
-        for part in path.split('/').filter(|part| !part.is_empty()) {
+    /// The directory at `path`, found from the deepest remembered directory on
+    /// the way to it, and remembered with every directory passed on the way.
+    fn dir(&mut self, path: &str) -> Result<FatDir<B>, FsError> {
+        let root = self.fs()?.root_dir();
+        if path.is_empty() {
+            return Ok(root);
+        }
+        if let Some(at) = self.dirs.iter().position(|(known, _)| known == path) {
+            let remembered = self.dirs.remove(at);
+            let dir = remembered.1.to_dir();
+            self.dirs.push(remembered);
+            return Ok(dir);
+        }
+        let nearest = self
+            .dirs
+            .iter()
+            .filter(|(known, _)| path.len() > known.len() && path.starts_with(known.as_str()) && path.as_bytes()[known.len()] == b'/')
+            .max_by_key(|(known, _)| known.len())
+            .map(|(known, entry)| (known.clone(), entry.to_dir()));
+        let (mut walked, mut dir) = nearest.unwrap_or((String::new(), root));
+        for part in path[walked.len()..].split('/').filter(|part| !part.is_empty()) {
             let entry = find(&dir, part)?.ok_or(FsError::NotFound)?;
             if !entry.is_dir() {
                 return Err(FsError::NotDir);
             }
+            walked = join(&walked, part);
             dir = entry.to_dir();
+            self.remember(walked.clone(), entry);
         }
         Ok(dir)
+    }
+
+    /// Remember `entry` as the directory at `path`, forgetting the least
+    /// recently used when `MAX_DIRS` are remembered.
+    fn remember(&mut self, path: String, entry: FatEntry<B>) {
+        self.dirs.retain(|(known, _)| *known != path);
+        if self.dirs.len() >= MAX_DIRS {
+            self.dirs.remove(0);
+        }
+        self.dirs.push((path, entry));
     }
 
     /// The open file for `path`, opening it if it is not open.
@@ -566,10 +609,14 @@ impl<B: Blocks + 'static> Volume<B> {
         Ok(self.open.len() - 1)
     }
 
-    /// Close every open file at or under `path`.
+    /// Close every open file, and forget every remembered directory, at or
+    /// under `path`. Called before the entry at `path` is removed or moved,
+    /// after which a remembered entry would name freed clusters or a path that
+    /// no longer leads to it.
     fn close_under(&mut self, path: &str) {
         let prefix = format!("{}/", path);
         self.open.retain(|open| open.path != path && !open.path.starts_with(&prefix));
+        self.dirs.retain(|(known, _)| known != path && !known.starts_with(&prefix));
     }
 
     /// Put the open file at `at` at `offset`, which must be inside the file.
@@ -606,11 +653,17 @@ impl<B: Blocks + 'static> Volume<B> {
 
     // ---- operations ----------------------------------------------------
 
-    /// The entry called `name` in the directory `dir`.
+    /// The entry called `name` in the directory `dir`. A directory found is
+    /// remembered, because the kernel's path walk asks for it next.
     pub fn lookup(&mut self, dir: &str, name: &str) -> Result<Entry, FsError> {
         self.run(0, |volume| {
-            let dir = volume.dir(dir)?;
-            find(&dir, name)?.map(|entry| entry_of(&entry)).ok_or(FsError::NotFound)
+            let parent = volume.dir(dir)?;
+            let entry = find(&parent, name)?.ok_or(FsError::NotFound)?;
+            let found = entry_of(&entry);
+            if found.is_dir {
+                volume.remember(join(dir, &found.name), entry);
+            }
+            Ok(found)
         })
     }
 

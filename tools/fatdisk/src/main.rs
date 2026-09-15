@@ -18,12 +18,16 @@
 //!                                     boot: random bytes over the boot sector
 //!                                     loops: a directory and a file whose
 //!                                       cluster chains loop (after fill)
+//!                                     cycle: www/css pointed at the root
+//!                                       directory (after fill)
 //!                                     meta: COUNT random bytes over the boot
 //!                                       sector, the FATs and the root
 //!                                     random: COUNT random bytes anywhere in
 //!                                       the image
 //! fatdisk fuzz FIRST LAST             the kernel's volume code against damaged
 //!                                     images, one per seed, in this process
+//! fatdisk walk IMAGE LABEL            walk the volume as `find` does, through
+//!                                     the kernel's volume code, and time it
 //! ```
 //!
 //! Every image is a sparse file the size given, so QEMU can take it as a card:
@@ -523,10 +527,40 @@ fn damage_loops(file: &mut File, start: u64) {
     }
 }
 
+/// The entry for `www/css` pointed at the root directory's first cluster, so
+/// that /www/css is the root again and the tree under it has no bottom.
+fn damage_cycle(file: &mut File, start: u64) {
+    let mut boot = [0u8; 512];
+    read_at(file, start * SECTOR, &mut boot);
+    let (data_start, per_cluster, _, _, _, root) = layout(&boot);
+    let offset = |cluster: u64| (start + data_start + (cluster - 2) * per_cluster) * SECTOR;
+    // The byte offset of the short entry called `name` in the first cluster
+    // of the directory at `cluster`, and the first cluster it names.
+    let entry_in = |file: &mut File, cluster: u64, name: &[u8]| -> Option<(u64, u64)> {
+        let mut data = vec![0u8; (per_cluster * SECTOR) as usize];
+        read_at(file, offset(cluster), &mut data);
+        let at = data.chunks_exact(32).position(|raw| &raw[..11] == name)?;
+        let raw = &data[at * 32..at * 32 + 32];
+        let first = (u16::from_le_bytes([raw[20], raw[21]]) as u64) << 16 | u16::from_le_bytes([raw[26], raw[27]]) as u64;
+        Some((offset(cluster) + at as u64 * 32, first))
+    };
+    let (_, www) = entry_in(file, root, b"WWW        ").unwrap_or_else(|| die("www is not in the root's first cluster; run fill first"));
+    let (css, _) = entry_in(file, www, b"CSS        ").unwrap_or_else(|| die("css is not in the first cluster of www; run fill first"));
+    let mut raw = [0u8; 32];
+    read_at(file, css, &mut raw);
+    raw[20..22].copy_from_slice(&((root >> 16) as u16).to_le_bytes());
+    raw[26..28].copy_from_slice(&(root as u16).to_le_bytes());
+    write_at(file, css, &raw);
+}
+
 fn damage(path: &str, label: &str, mode: &str, seed: u64, count: u64) {
     let (mut file, start, length) = find(path, label, true);
     if mode == "loops" {
         damage_loops(&mut file, start);
+        return;
+    }
+    if mode == "cycle" {
+        damage_cycle(&mut file, start);
         return;
     }
     // Only the region that can change is read and written back.
@@ -717,6 +751,83 @@ fn fuzz(first: u64, last: u64) {
 
 // ---------------------------------------------------------------------------
 
+/// The entry at `path`, looked up the way the kernel's path walk does it: one
+/// lookup per component, each in the directory the one before it named. So a
+/// path of depth d costs d lookups, as `stat` or `open` of it does on /data.
+fn resolve(volume: &mut Volume<Memory>, path: &str) -> Result<volume::Entry, volume::FsError> {
+    let mut dir = String::new();
+    let mut last = None;
+    for part in path.split('/').filter(|part| !part.is_empty()) {
+        let entry = volume.lookup(&dir, part)?;
+        dir = volume::join(&dir, &entry.name);
+        last = Some(entry);
+    }
+    last.ok_or(volume::FsError::NotFound)
+}
+
+/// Walk the volume labelled `label` the way `find` walks /data, through the
+/// kernel's volume code and with paths resolved as the kernel resolves them:
+/// open a directory by its path and list it, look up every entry in it by
+/// its path, and go into every directory, until a path under /data would
+/// reach the kernel's 4096-byte limit. The volume is read into memory, so
+/// nothing is written to the image.
+fn walk(path: &str, label: &str) {
+    let (mut file, start, length) = find(path, label, false);
+    let mut image = vec![0u8; (length * SECTOR) as usize];
+    read_at(&mut file, start * SECTOR, &mut image);
+    let mut blocks = Memory { data: image, start: Instant::now() };
+    let probe = volume::probe(&mut blocks).unwrap_or_else(|why| die(&why));
+    let state = disk::share(blocks);
+    let mut volume = Volume::mount(state, probe.geometry, Clock { now: unix_now })
+        .unwrap_or_else(|e| die(&format!("mounting {}: {:?}", label, e)));
+    let started = Instant::now();
+    let (mut operations, mut failed, mut deepest) = (0u64, 0u64, 0usize);
+    let mut slowest = (0u128, String::new());
+    let mut time = |what: String, took: u128| {
+        operations += 1;
+        if took > slowest.0 {
+            slowest = (took, what);
+        }
+    };
+    let mut pending = vec![String::new()];
+    while let Some(dir) = pending.pop() {
+        let one = Instant::now();
+        let listed = if dir.is_empty() { volume.list(&dir) } else { resolve(&mut volume, &dir).and_then(|_| volume.list(&dir)) };
+        time(format!("listing /{}", dir), one.elapsed().as_millis());
+        let Ok(entries) = listed else {
+            failed += 1;
+            continue;
+        };
+        for entry in entries {
+            let child = volume::join(&dir, &entry.name);
+            if "/data/".len() + child.len() >= 4096 {
+                continue;
+            }
+            let one = Instant::now();
+            let found = resolve(&mut volume, &child);
+            time(format!("looking up /{}", child), one.elapsed().as_millis());
+            match found {
+                Ok(found) if found.is_dir => {
+                    deepest = deepest.max(child.split('/').count());
+                    pending.push(child);
+                }
+                Ok(_) => {}
+                Err(_) => failed += 1,
+            }
+        }
+    }
+    let shown: String = slowest.1.chars().take(120).collect();
+    println!(
+        "walk: {} operations, {} failed, {} levels at the deepest, {} ms in all; the slowest took {} ms: {}",
+        operations,
+        failed,
+        deepest,
+        started.elapsed().as_millis(),
+        slowest.0,
+        shown
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |i: usize| args.get(i).cloned().unwrap_or_else(|| die("missing argument; see the top of tools/fatdisk/src/main.rs"));
@@ -750,6 +861,7 @@ fn main() {
         }
         "damage" => damage(&arg(2), &arg(3), &arg(4), number(5), args.get(6).and_then(|c| c.parse().ok()).unwrap_or(64)),
         "fuzz" => fuzz(number(2), number(3)),
+        "walk" => walk(&arg(2), &arg(3)),
         other => die(&format!("{} is not a command; see the top of tools/fatdisk/src/main.rs", other)),
     }
 }

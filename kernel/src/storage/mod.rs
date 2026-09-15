@@ -30,7 +30,8 @@
 //!    ends. `tools/fatdisk` runs the same code against damaged images, and the
 //!    harness boots damaged cards.
 //! 3. /data cannot take the system's memory: 4 MiB of cached blocks, 32 open
-//!    files, and a node only for what something holds.
+//!    files, 32 remembered directories, a listing only for a directory a
+//!    descriptor is reading, and a node only for what something holds.
 //! 4. A write is on the card when the system call returns, and a failed one is
 //!    an error to the program. `fsync` puts the directory entry there too, and
 //!    `sync` leaves the volume marked clean.
