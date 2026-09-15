@@ -88,6 +88,19 @@ if [ -f "$CERTS" ]; then
   ln -sf certs/ca-certificates.crt "$RFS/etc/ssl/cert.pem"
 fi
 
+# ---- network time (NTP_CONF=1) -------------------------------------------
+# The servers BusyBox ntpd asks. init starts ntpd in the background when this
+# file and /bin/busybox are both in the image, which is how a machine with no
+# clock of its own learns the date. Off unless NTP_CONF=1, so the images the
+# suites boot stay as they were and nothing in them waits on servers across
+# the internet.
+if [ "${NTP_CONF:-0}" = 1 ]; then
+  cat > "$RFS/etc/ntp.conf" <<'NTP'
+server ntp.nict.jp
+server time.cloudflare.com
+NTP
+fi
+
 cat > "$RFS/etc/motd" <<'MOTD'
 Welcome to claudeos.
 

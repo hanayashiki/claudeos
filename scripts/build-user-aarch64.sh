@@ -125,6 +125,19 @@ for CERTS in "$ROOT/build/alpine-rootfs-aarch64/etc/ssl/certs/ca-certificates.cr
   break
 done
 
+# ---- network time (NTP_CONF=1) -------------------------------------------
+# The servers BusyBox ntpd asks. init starts ntpd in the background when this
+# file and /bin/busybox are both in the image, which is how a board with no
+# battery-backed clock learns the date. Off unless NTP_CONF=1, so the images
+# the suites boot stay as they were and nothing in them waits on servers
+# across the internet.
+if [ "${NTP_CONF:-0}" = 1 ]; then
+  cat > "$RFS/etc/ntp.conf" <<'NTP'
+server ntp.nict.jp
+server time.cloudflare.com
+NTP
+fi
+
 cat > "$RFS/etc/motd" <<'MOTD'
 Welcome to claudeos.
 
