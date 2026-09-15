@@ -1,14 +1,15 @@
-//! Waiting, for the WiFi driver.
+//! Waiting, for the drivers of the two SD host controllers.
 //!
 //! Every wait in bring-up is one a reference driver asks for by name, or a
 //! bound on how long a register may take to change. Short ones spin on the
 //! architected counter, which reports its own rate; long ones give the
 //! processor back to the scheduler.
 //!
-//! All of this runs in the WiFi driver's own kernel task with interrupts on,
-//! so a spin is preempted by the timer like any other work and a sleep is an
-//! ordinary sleep. Neither is called from the boot context or with a lock
-//! held.
+//! All of this runs in a kernel task or a system call with interrupts on: the
+//! WiFi driver's own task, the storage driver's bring-up task, and whichever
+//! task is reading or writing /data. A spin is preempted by the timer like any
+//! other work and a sleep is an ordinary sleep. Neither is called from the
+//! boot context or with a spinlock held.
 
 use crate::arch;
 

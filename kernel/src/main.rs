@@ -17,6 +17,8 @@ mod fs;
 mod futex;
 mod itimer;
 mod mm;
+#[cfg(target_arch = "aarch64")]
+mod mmc;
 mod net;
 mod pci;
 mod reboot;
