@@ -439,6 +439,17 @@ names, which `fsck_msdos` reclaims, and never a file whose entry names clusters
 that were not written or were freed; "Power cuts" below lists what the Mac's
 `fsck_msdos -n` reports after a cut at each write.
 
+That guarantee costs a program that writes in small pieces. Each `write` puts
+its bytes, any new FAT link and the directory entry's new length on the card
+before it returns, which is two to four card writes, and the Raspberry Pi 4's
+SD card takes them as small writes to scattered places. Measured on the board
+with its 30 GiB card: `seq 1 2000000 > big.txt`, which writes through musl's
+1 KiB stdio buffer, took about 250 ms per `write` and ran at about 4 KB/s;
+`busybox dd bs=1M` of 16 MiB ran at 13.5 MB/s, and `cp` of the same 16 MiB
+file took about 1 s. So copy bulk content onto `/data` with `cp`, with `dd`
+and a large block size, or from the Mac, rather than with a program that
+writes a line at a time.
+
 Before its first write after mounting or after a sync, the kernel marks the
 volume in use: it clears the clean-shutdown bit of FAT[1] in every FAT copy it
 writes, which is what the Mac's `fsck_msdos` and Windows look at, and sets the
