@@ -518,6 +518,7 @@ pub const SIG_IGN: usize = 1;
 
 pub const SIGINT: i32 = 2;
 pub const SIGQUIT: i32 = 3;
+pub const SIGPIPE: i32 = 13;
 #[allow(dead_code)]
 pub const SIGTERM: i32 = 15;
 pub const SIGCONT: i32 = 18;
