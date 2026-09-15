@@ -2345,13 +2345,31 @@ impl Shell {
             subshell: command.subshell,
             words: Vec::new(),
         };
+        // POSIX 2.9.1 expands an assignment word but does not split it into
+        // fields or expand pathnames in it. Split like any other bare word,
+        // `l=$(cmd)` whose output was `exited with status 1` became the
+        // assignment `l=exited` followed by a command named `with`. The
+        // assignment words are the NAME=value words before the command name,
+        // and those after `export` or `local`, which POSIX.1-2024 2.9.1.1 (for
+        // `export`, a declaration utility) and bash (for `local`) expand the
+        // same way.
+        let mut before_name = true;
+        let mut declares = false;
         for (word, quoting) in &command.words {
+            let assignment = is_assignment(word) && (before_name || declares);
+            if before_name && !assignment {
+                before_name = false;
+                declares = matches!(word.as_str(), "export" | "local");
+            }
             match quoting {
                 Quoting::Single => out.words.push((word.clone(), Quoting::Single)),
                 Quoting::Double => {
                     for expanded in self.expand_double(word) {
                         out.words.push((expanded, Quoting::Double));
                     }
+                }
+                Quoting::Bare if assignment => {
+                    out.words.push((self.expand_text(word), Quoting::Double));
                 }
                 Quoting::Bare => {
                     for expanded in self.expand_word_bare(word) {
