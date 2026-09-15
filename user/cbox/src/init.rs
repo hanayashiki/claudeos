@@ -1,6 +1,7 @@
 //! pid 1: bring the system up, start a shell, and reap orphans.
 
 use crate::sys;
+use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -206,7 +207,10 @@ fn keep_time() -> ! {
             failures += 1;
             retry_wait(failures)
         };
-        println!(
+        // Not `println!`, which panics when the write fails: a log on a full
+        // RAM filesystem would then end the keeper, and the clock with it.
+        let _ = writeln!(
+            std::io::stdout(),
             "timekeeper: {}s after boot: ntpd {} after {}s; next run in {}s",
             seconds_since_boot(),
             run,
@@ -252,7 +256,7 @@ fn run_ntpd() -> Run {
         let argv: Vec<String> = ["busybox", "ntpd", "-n", "-q"].iter().map(|a| a.to_string()).collect();
         let envp: Vec<String> = std::env::vars().map(|(k, v)| format!("{}={}", k, v)).collect();
         sys::execve(BUSYBOX, &argv, &envp);
-        eprintln!("timekeeper: cannot start {}", BUSYBOX);
+        let _ = writeln!(std::io::stderr(), "timekeeper: cannot start {}", BUSYBOX);
         sys::exit_group(127);
     }
     if child < 0 {

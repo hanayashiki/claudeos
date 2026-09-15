@@ -379,6 +379,13 @@ run_ntp() {
     echo
     return
   fi
+  # init starts the time keeper only when there is a busybox to run.
+  if [ ! -x "$BUSYBOX" ]; then
+    echo ">> network time: skipped (run ARCH=$ARCH scripts/fetch-busybox.sh)"
+    skipped=$((skipped + 1))
+    echo
+    return
+  fi
   if ! ntp_reachable; then
     echo "   neither ntp.nict.jp nor time.cloudflare.com answered this machine"
     echo ">> network time: not run: no internet"
