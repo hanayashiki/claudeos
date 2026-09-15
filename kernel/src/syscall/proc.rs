@@ -642,6 +642,106 @@ pub fn gettimeofday(tv: u64, tz: u64) -> SysResult {
     Ok(0)
 }
 
+/// The latest second the wall clock can be set to, the same limit Linux sets.
+/// The clock is nanoseconds in a signed 64-bit word, which runs out in 2262,
+/// and thirty years are kept back so that the monotonic clock added to a time
+/// set at the limit cannot run it past the end within any machine's uptime.
+const SETTABLE_SECONDS_MAX: i64 = i64::MAX / 1_000_000_000 - 30 * 365 * 86400;
+
+/// Set the wall clock to `seconds` and `nanos` since the epoch, `nanos` already
+/// checked to be under a second, and say so on the console.
+fn set_wall_clock(seconds: i64, nanos: i64) -> SysResult {
+    if !(0..=SETTABLE_SECONDS_MAX).contains(&seconds) {
+        return Err(Errno::EINVAL);
+    }
+    let target = seconds * 1_000_000_000 + nanos;
+    let was = crate::time::set_realtime(target);
+    // One line per change, naming the program, so that a step to a wrong time
+    // shows on the console and can be traced to what made it.
+    let task = sched::current();
+    crate::println!(
+        "clock: set to {} by pid {} ({}); was {}, {}",
+        crate::time::Utc(target),
+        task.tgid,
+        task.name(),
+        crate::time::Utc(was),
+        crate::time::Step(target - was)
+    );
+    Ok(0)
+}
+
+/// Only the wall clock can be set. The monotonic clock is what every wait in
+/// the kernel is measured against, and Linux refuses to set it too.
+pub fn clock_settime(clock: u64, value: u64) -> SysResult {
+    if clock != CLOCK_REALTIME {
+        return Err(Errno::EINVAL);
+    }
+    let spec: Timespec = uaccess::read_struct(value)?;
+    if !(0..1_000_000_000).contains(&spec.tv_nsec) {
+        return Err(Errno::EINVAL);
+    }
+    set_wall_clock(spec.tv_sec, spec.tv_nsec)
+}
+
+/// The time zone argument is not read. Linux keeps it only to hand back from
+/// `gettimeofday`, which here always reports a zero zone, and it never moves
+/// the clock, which is kept in UTC.
+pub fn settimeofday(value: u64, _zone: u64) -> SysResult {
+    if value == 0 {
+        return Ok(0);
+    }
+    let tv: Timeval = uaccess::read_struct(value)?;
+    if !(0..1_000_000).contains(&tv.tv_usec) {
+        return Err(Errno::EINVAL);
+    }
+    set_wall_clock(tv.tv_sec, tv.tv_usec * 1000)
+}
+
+/// `clock_nanosleep`. A relative sleep is `nanosleep` whichever clock it names,
+/// because a length of time is counted in the same ticks on every clock here.
+///
+/// An absolute one is a reading of the clock to wake at. It is turned into a
+/// tick deadline, and on the wall clock that deadline is only good until the
+/// clock is next set, so the sleep waits on the queue setting the clock wakes
+/// and works the deadline out again against the new time when it is woken.
+/// That is what Linux does: a sleeper whose time the clock was stepped past
+/// wakes at the step, and one the clock was stepped back from sleeps on.
+pub fn clock_nanosleep(clock: u64, flags: u32, req: u64, rem: u64) -> SysResult {
+    if flags & TIMER_ABSTIME == 0 {
+        return nanosleep(req, rem);
+    }
+    let spec: Timespec = uaccess::read_struct(req)?;
+    if spec.tv_sec < 0 || !(0..1_000_000_000).contains(&spec.tv_nsec) {
+        return Err(Errno::EINVAL);
+    }
+    let wake_at = spec.tv_sec.saturating_mul(1_000_000_000).saturating_add(spec.tv_nsec);
+    let wall = clock == CLOCK_REALTIME;
+    loop {
+        if sched::stop_if_requested() {
+            continue;
+        }
+        if sched::has_pending_signal() {
+            return Err(Errno::EINTR);
+        }
+        // The count is read before the clock, so a step that lands after the
+        // clock was read has already changed the count by the time the check
+        // below runs with interrupts off.
+        let changes = crate::time::realtime_changes();
+        let now = if wall {
+            crate::time::realtime_ns()
+        } else {
+            crate::time::monotonic_ns() as i64
+        };
+        if now >= wake_at {
+            return Ok(0);
+        }
+        let deadline = super::deadline_in((wake_at - now) as u64);
+        crate::time::REALTIME_SET.wait_until_or_at(deadline, || {
+            (wall && crate::time::realtime_changes() != changes) || sched::has_pending_signal()
+        });
+    }
+}
+
 pub fn nanosleep(req: u64, rem: u64) -> SysResult {
     let spec: Timespec = uaccess::read_struct(req)?;
     if spec.tv_sec < 0 || spec.tv_nsec < 0 || spec.tv_nsec >= 1_000_000_000 {
