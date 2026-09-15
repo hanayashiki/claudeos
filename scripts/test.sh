@@ -829,14 +829,10 @@ board_card() {
   record_boot_id "$output"
   echo "--- the card, booted"
   echo "$output" | grep -E "^services:|^data:|This page is|^tunnel-check:|KERNEL PANIC" | sed 's/^/   /'
-  # The tunnel's run can also read `ended on signal 9`: cloudflared is a Go
-  # program, which may call exit_group from a thread other than its first, and
-  # the kernel then records SIGKILL for the first thread, whose status wait4
-  # reports. Either way the run ended and counts as a failure.
   for expected in "^data: mounted partition 2 of the card, labelled CLAUDEDATA" \
                   "^services: 1 system started; 2 user started$" \
                   "This page is /data/site/index.html on the card" \
-                  "^tunnel-check: [2-9] starts; (exited with status [1-9][0-9]*|ended on signal 9) after [0-9]+ s; [1-9][0-9]* failed requests$"; do
+                  "^tunnel-check: [2-9] starts; exited with status [1-9][0-9]* after [0-9]+ s; [1-9][0-9]* failed requests$"; do
     if ! echo "$output" | grep -qE "$expected"; then
       echo "   missing expected output: $expected"
       failed=1

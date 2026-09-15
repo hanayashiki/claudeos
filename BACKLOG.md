@@ -90,6 +90,18 @@ bytes such as 0xff, on both machines.
   them on. aarch64 already does the equivalent, and the copy-on-write repair
   masks explicitly either way.
 - **`fork` does not copy the parent's signal mask**; Linux does.
+- **A fatal signal ends one thread, not the process.** A SIGKILL sent from
+  outside, a fault, or a signal whose default action is to terminate ends only
+  the thread that takes it: `check_signals` and `kill_current` call
+  `exit_current`, and `kill` signals only the task with that pid. The other
+  threads keep running. Linux ends the whole thread group.
+- **A thread-group leader can be reaped while its threads run.** `wait4`
+  reaps a leader as soon as it exits, even with other threads still running;
+  Linux waits until the group is empty. A parent that reaps it early never
+  sees the status a later `exit_group` sets.
+- **A stopped thread survives `exit_group`.** The call marks SIGKILL pending
+  on the other threads with `add_pending` rather than `post_signal`, so a
+  stopped thread is not woken to take it.
 - **Carried over from the 2026-09-14 notes, not re-checked since:**
   - `openat(AT_FDCWD, "")` returns the current directory, where Linux returns
     ENOENT;
@@ -121,12 +133,6 @@ bytes such as 0xff, on both machines.
   Linux (`do_signal_stop` runs in the task being stopped), so `ps` can read the
   state before that. The check should wait for the state, for a bounded time,
   rather than read it once.
-- **The card check accepts `ended on signal 9` for the tunnel**
-  (`board_card` in scripts/test.sh). When a Go program calls exit_group from a
-  thread other than its first, `sched::exit_group` gives the other threads
-  SIGKILL, and wait4 reports the first thread's status, so cloudflared's exit
-  with status 1 is seen as signal 9. Remove the `ended on signal 9` alternative
-  and its comment once the exitfix agent's change is merged.
 
 ## Telnet console
 
