@@ -39,6 +39,9 @@ pub struct Partition {
     /// The volume's length in blocks.
     count: u64,
     errors: u32,
+    /// The last card error, which choosing a volume adds to its reason for
+    /// passing one over.
+    last: Option<String>,
 }
 
 impl Partition {
@@ -62,7 +65,10 @@ impl Partition {
 
     fn report(&mut self, what: &str, block: u64, why: String) -> DeviceError {
         self.errors = self.errors.saturating_add(1);
-        if self.errors <= ERRORS_LOGGED {
+        self.last = Some(format!("card {} at block {} of the volume failed: {}", what, block, why));
+        // Until /data is mounted, the one line bring-up prints says what went
+        // wrong, and nothing else about the card is printed before the shell.
+        if crate::storage::vfs::mounted() && self.errors <= ERRORS_LOGGED {
             crate::println!("data: card {} at block {} of the volume failed: {}", what, block, why);
             if self.errors == ERRORS_LOGGED {
                 crate::println!("data: {} card errors; further ones are not printed", ERRORS_LOGGED);
@@ -144,11 +150,14 @@ pub fn choose(mut card: Card, label: &str) -> Result<Chosen, String> {
 
     let mut seen: Vec<String> = Vec::new();
     for (first, count, what, slot) in candidates {
-        let mut partition = Partition { card, first, count, errors: 0 };
+        let mut partition = Partition { card, first, count, errors: 0, last: None };
         match volume::probe(&mut partition) {
             Ok(probe) if probe.labelled(label) => return Ok(Chosen { partition, probe, what, slot }),
             Ok(probe) => seen.push(format!("{} is labelled {}", what, probe.label())),
-            Err(why) => seen.push(format!("{}: {}", what, why)),
+            Err(why) => match partition.last.take() {
+                Some(card_error) => seen.push(format!("{}: {} ({})", what, why, card_error)),
+                None => seen.push(format!("{}: {}", what, why)),
+            },
         }
         card = partition.card;
     }

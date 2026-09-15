@@ -55,6 +55,7 @@ use crate::sync::Spinlock;
 use crate::task::Task;
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// The label looked for when the command line names none.
@@ -127,9 +128,18 @@ pub fn start(cmdline: &str, init: &str) {
 extern "C" fn task_main() -> ! {
     let label = LABEL.lock().take().unwrap_or_else(|| String::from(DEFAULT_LABEL));
     let started = now_us();
-    match bring_up(&label) {
-        Ok(what) => crate::println!("data: mounted {} at /data, in {} ms", what, (now_us() - started) / 1000),
-        Err(why) => crate::println!("data: /data is not mounted: {}", why),
+    // What bring-up learns about the controller and the card goes on the end
+    // of the one line either outcome prints, so that a card that fails still
+    // says what it is.
+    let mut found = Vec::new();
+    let line = match bring_up(&label, &mut found) {
+        Ok(what) => format!("mounted {} at /data, in {} ms", what, (now_us() - started) / 1000),
+        Err(why) => format!("/data is not mounted: {}", why),
+    };
+    if found.is_empty() {
+        crate::println!("data: {}", line);
+    } else {
+        crate::println!("data: {}; {}", line, found.join("; "));
     }
     SETTLED.store(true, Ordering::Relaxed);
     loop {
@@ -137,11 +147,11 @@ extern "C" fn task_main() -> ! {
     }
 }
 
-fn bring_up(label: &str) -> Result<String, String> {
+fn bring_up(label: &str, found: &mut Vec<String>) -> Result<String, String> {
     let mut controller = emmc2::find()?;
     let (mut host, from_caps, from_firmware) = controller.host()?;
-    crate::println!(
-        "data: EMMC2 at {:#x}, from {}; base clock {} Hz from the capabilities register, {} from the firmware; supplies: {}",
+    found.push(format!(
+        "EMMC2 at {:#x}, from {}, base clock {} Hz from the capabilities register and {} from the firmware, supplies: {}",
         controller.phys,
         controller.source,
         from_caps,
@@ -150,14 +160,14 @@ fn bring_up(label: &str) -> Result<String, String> {
             None => String::from("nothing"),
         },
         controller.supplies()
-    );
+    ));
     host.init().map_err(|e| format!("resetting the EMMC2 controller: {}", e))?;
 
     let card = card::attach(host, &mut |on| controller.supply(on))?;
     let id = card.identity;
     let product: String = id.product.iter().map(|&b| if b.is_ascii_graphic() { b as char } else { '?' }).collect();
-    crate::println!(
-        "data: card from manufacturer {:#04x}, product {}, {} MiB, {}, {} Hz{}, {} data lines",
+    found.push(format!(
+        "card from manufacturer {:#04x}, product {}, {} MiB, {}, {} Hz{}, {} data lines",
         id.manufacturer,
         product,
         id.blocks / 2048,
@@ -165,7 +175,7 @@ fn bring_up(label: &str) -> Result<String, String> {
         id.clock,
         if id.high_speed { " in high speed" } else { "" },
         if id.four_bit { 4 } else { 1 }
-    );
+    ));
     if id.write_protected {
         return Err(String::from("the card says it is write-protected"));
     }
