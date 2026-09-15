@@ -327,6 +327,8 @@ pub fn run() -> bool {
     dhcp_malformed(&mut report, nic);
     crate::println!("net: dhcp, retransmission and the link coming up");
     dhcp_retransmission(&mut report, nic);
+    crate::println!("net: dhcp, a lease held while the link goes down and comes back");
+    dhcp_link_return(&mut report, nic);
     super::configure(Some(test_config()));
     // The driver for this board's own Ethernet, as far as it can be exercised
     // with no such Ethernet anywhere: nothing emulates it, so this is the only
@@ -3077,6 +3079,62 @@ fn dhcp_retransmission(report: &mut Report, nic: &FakeNic) {
     report.check(
         "a link that comes up starts the asking again at once, in a new exchange",
         matches!(nic.take().as_slice(), [frame] if kind_of(frame) == DISCOVER && xid_of(frame) != xid),
+    );
+    drop(client);
+    socket::reset();
+    nic.take();
+}
+
+/// A link that goes down and comes back while a lease is held, as a WiFi link
+/// does when the access point drops it and the driver joins again.
+fn dhcp_link_return(report: &mut Report, nic: &FakeNic) {
+    use core::sync::atomic::Ordering;
+    nic.take();
+    let Some(mut client) = new_client(report, None) else { return };
+    if lease_up(&mut client, nic).is_none() {
+        report.check("a lease to hold while the link goes down", false);
+        return;
+    }
+    let Some(lease) = client.lease() else { return };
+
+    nic.link.store(false, Ordering::Relaxed);
+    client.run(START + 10 * HZ);
+    nic.link.store(true, Ordering::Relaxed);
+    client.run(START + 20 * HZ);
+    report.check(
+        "a link down and back before T1 sends nothing, and the lease stands as it was",
+        nic.take().is_empty()
+            && client.lease().is_some_and(|held| held.expires_at == lease.expires_at)
+            && super::config() == Some(leased_config()),
+    );
+
+    // The renewal at T1, once the server's hardware address is answered.
+    let t1 = lease.renew_at;
+    client.run(t1);
+    nic.take();
+    deliver(ether::ETHERTYPE_ARP, &arp_from_peer(super::arp::OP_REPLY, OUR_MAC, OUR_IP));
+    let sent = nic.take();
+    let [renewal] = sent.as_slice() else {
+        report.check("a renewal at T1", false);
+        return;
+    };
+    let renew_xid = xid_of(renewal);
+
+    // Unanswered, the next would go hours later, at half of what is left
+    // before T2. The link going down and back sends it again at once.
+    nic.link.store(false, Ordering::Relaxed);
+    client.run(t1 + 30 * HZ);
+    let quiet = nic.take().is_empty();
+    nic.link.store(true, Ordering::Relaxed);
+    client.run(t1 + 31 * HZ);
+    report.check(
+        "a renewal under way goes again the tick the link is back, in the same exchange",
+        quiet
+            && matches!(nic.take().as_slice(), [frame] if kind_of(frame) == REQUEST && xid_of(frame) == renew_xid),
+    );
+    report.check(
+        "and the address is held throughout",
+        super::config() == Some(leased_config()) && client.lease().is_some(),
     );
     drop(client);
     socket::reset();

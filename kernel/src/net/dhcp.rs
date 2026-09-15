@@ -536,11 +536,26 @@ impl Client {
         let mut effects = Vec::new();
 
         let up = super::link_up();
-        if up && !self.link_up && self.lease().is_none() {
+        if up && !self.link_up {
             // Whatever went out while the link was down arrived nowhere, and
-            // after a few unanswered DISCOVERs the timer may not fire again for
-            // a minute. Start again now.
-            self.state = State::Init { at: now };
+            // the timer may not fire again for a minute, or, while renewing,
+            // for half of what is left before rebinding. Without a lease, start
+            // again now. A lease is kept: a link that went down and came back,
+            // as a WiFi link does when it is joined again, leaves the address
+            // as good as it was. So a lease not yet due for renewal is left
+            // alone, and a renewal or a rebinding under way asks again now.
+            match self.state {
+                State::Init { .. } | State::Selecting(_) | State::Requesting(..) => {
+                    self.state = State::Init { at: now };
+                }
+                State::Renewing(exchange, lease) => {
+                    self.state = State::Renewing(Exchange { deadline: now, ..exchange }, lease);
+                }
+                State::Rebinding(exchange, lease) => {
+                    self.state = State::Rebinding(Exchange { deadline: now, ..exchange }, lease);
+                }
+                State::Bound(_) => {}
+            }
         }
         self.link_up = up;
 

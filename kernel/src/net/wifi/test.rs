@@ -14,11 +14,13 @@
 use super::config;
 use super::nvram;
 use super::protocol::{self, HeaderError};
+use super::reconnect::{self, Effect, Failure, Input, Reconnect, Target};
 use super::sdhci;
 use super::sdio;
 use super::wpa;
 use crate::arch;
 use crate::net::genettest::{place, Builder};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 pub struct Report {
@@ -66,6 +68,367 @@ pub fn run(report: &mut Report) {
     induction_handshake(report);
     group_rekey(report);
     key_layout(report);
+    reconnect_absent_at_boot(report);
+    reconnect_other_channel(report);
+    reconnect_join_refused(report);
+    reconnect_handshake_failure(report);
+    reconnect_flapping(report);
+    reconnect_a_day_away(report);
+}
+
+// ---------------------------------------------------------------------------
+// Getting the link back
+// ---------------------------------------------------------------------------
+
+/// An access point as the reconnect machine's checks see one: its channel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Ap(u8);
+
+impl Target for Ap {
+    fn channel(&self) -> u8 {
+        self.0
+    }
+}
+
+/// How long a scan takes in these scripts, which is what one took on the
+/// board.
+const SCAN_MS: u64 = 2_400;
+
+/// What one step of the machine asked for.
+#[derive(Default)]
+struct Asked {
+    scan: bool,
+    join: Option<Ap>,
+    disassociate: bool,
+}
+
+/// The machine, a clock moved by hand, and every line the machine printed.
+struct Script {
+    machine: Reconnect<Ap>,
+    now: u64,
+    lines: Vec<String>,
+    scans: u64,
+    joins: u64,
+    /// Whether lines are printed as they come as well as kept. A script that
+    /// runs for a simulated day keeps them to itself.
+    echo: bool,
+}
+
+impl Script {
+    /// A machine made at time zero, whose first scan is bring-up's.
+    fn new(echo: bool) -> Script {
+        Script { machine: Reconnect::new(0), now: 0, lines: Vec::new(), scans: 0, joins: 0, echo }
+    }
+
+    /// A machine whose first attempt joined `ap`: associated 2 s after the
+    /// request and the link up 0.6 s after that.
+    fn up_on(ap: Ap) -> Script {
+        let mut script = Script::new(true);
+        script.feed(Input::Scanned(Ok(ap)));
+        script.now += 2_000;
+        script.feed(Input::Associated);
+        script.now += 600;
+        script.feed(Input::LinkUp);
+        script
+    }
+
+    fn feed(&mut self, input: Input<Ap>) -> Asked {
+        let mut asked = Asked::default();
+        for effect in self.machine.step(self.now, input) {
+            match effect {
+                Effect::Scan => {
+                    asked.scan = true;
+                    self.scans += 1;
+                }
+                Effect::Join(ap) => {
+                    asked.join = Some(ap);
+                    self.joins += 1;
+                }
+                Effect::Disassociate => asked.disassociate = true,
+                Effect::Log(line) => {
+                    if self.echo {
+                        crate::println!("        {}", line);
+                    }
+                    self.lines.push(line);
+                }
+            }
+        }
+        asked
+    }
+
+    /// Move the clock to the machine's next deadline, and tick there.
+    fn wait(&mut self) -> Asked {
+        if let Some(at) = self.machine.deadline() {
+            self.now = self.now.max(at);
+        }
+        self.feed(Input::Tick)
+    }
+
+    /// Wait for the next attempt, which has to begin with a scan, and finish
+    /// that scan with `result` 2.4 s later. `None` if the attempt did not
+    /// begin with a scan.
+    fn attempt(&mut self, result: Result<Ap, Failure>) -> Option<Asked> {
+        if !self.wait().scan {
+            return None;
+        }
+        self.now += SCAN_MS;
+        Some(self.feed(Input::Scanned(result)))
+    }
+
+    /// Join `ap` after a scan found it: associated 2 s after the request, and
+    /// the link up 0.6 s after that. Whether the join was asked for.
+    fn rejoin(&mut self, ap: Ap) -> bool {
+        let joined = self.attempt(Ok(ap)).and_then(|asked| asked.join) == Some(ap);
+        self.now += 2_000;
+        self.feed(Input::Associated);
+        self.now += 600;
+        self.feed(Input::LinkUp);
+        joined && self.machine.link_up()
+    }
+
+    /// How far off the machine's next deadline is.
+    fn scheduled(&self) -> Option<u64> {
+        self.machine.deadline().map(|at| at - self.now)
+    }
+}
+
+/// The network missing from bring-up's scan and from the next six, then there.
+fn reconnect_absent_at_boot(report: &mut Report) {
+    let mut s = Script::new(true);
+    let boot = s.feed(Input::Scanned(Err(Failure::NotFound)));
+    report.check(
+        "reconnect, absent at boot: no join, and the next attempt 4 s on",
+        boot.join.is_none() && s.scheduled() == Some(4_000),
+    );
+    let mut waits = Vec::new();
+    let mut every_one_scanned = true;
+    for _ in 0..6 {
+        waits.push(s.scheduled().unwrap_or(0));
+        match s.attempt(Err(Failure::NotFound)) {
+            Some(asked) => every_one_scanned &= asked.join.is_none(),
+            None => every_one_scanned = false,
+        }
+    }
+    report.check(
+        "reconnect, absent at boot: attempts 4, 8, 16, 30, 30 and 30 s after each failure",
+        waits == [4_000, 8_000, 16_000, 30_000, 30_000, 30_000],
+    );
+    report.check("reconnect, absent at boot: each attempt a scan of its own, and no join", every_one_scanned && s.scans == 6);
+    report.check("reconnect, absent at boot: the network in the next scan is joined", s.rejoin(Ap(6)));
+    report.check(
+        "reconnect, absent at boot: two lines, the first failure and the join on channel 6",
+        s.lines.len() == 2 && s.lines[0].contains("not in the scan") && s.lines[1].contains("joined on channel 6"),
+    );
+    s.now += reconnect::LINK_STABLE_MS;
+    s.feed(Input::Tick);
+    report.check(
+        "reconnect, absent at boot: a minute up ends the run, in a line counting the 7 failed attempts",
+        s.lines.len() == 3 && s.lines[2].contains("7 failed attempts") && s.machine.deadline().is_none(),
+    );
+}
+
+/// A link up for an hour, lost, and the network found again on another
+/// channel.
+fn reconnect_other_channel(report: &mut Report) {
+    let mut s = Script::up_on(Ap(6));
+    s.now += 3_600_000;
+    s.feed(Input::Tick);
+    let before = s.lines.len();
+    let lost = s.feed(Input::LinkLost { cause: "DEAUTH_IND", reason: 7 });
+    report.check(
+        "reconnect, lost: nothing asked at once, and the first attempt 2 s after the loss",
+        !lost.scan && lost.join.is_none() && s.scheduled() == Some(reconnect::FIRST_RETRY_MS),
+    );
+    report.check(
+        "reconnect, lost: one line, naming the event and the reason",
+        s.lines.len() == before + 1 && s.lines[before].contains("link lost: DEAUTH_IND reason 7"),
+    );
+    let late = s.feed(Input::LinkLost { cause: "LINK", reason: 0 });
+    report.check(
+        "reconnect, lost: the end of the association arriving again changes nothing",
+        !late.scan && s.scheduled() == Some(reconnect::FIRST_RETRY_MS) && s.lines.len() == before + 1,
+    );
+    let asked = s.attempt(Ok(Ap(11)));
+    report.check(
+        "reconnect, lost: a new scan, and the join goes to what it found, on channel 11",
+        s.scans == 1 && asked.and_then(|asked| asked.join) == Some(Ap(11)),
+    );
+    s.now += 2_000;
+    s.feed(Input::Associated);
+    s.now += 600;
+    s.feed(Input::LinkUp);
+    report.check(
+        "reconnect, lost: the link up on channel 11, in one more line",
+        s.machine.link_up() && s.lines.len() == before + 2 && s.lines[before + 1].contains("joined on channel 11"),
+    );
+}
+
+/// The firmware refusing every join for forty attempts.
+fn reconnect_join_refused(report: &mut Report) {
+    let refusal = || String::from("wpaie: the firmware answered with error -23");
+    let mut s = Script::new(false);
+    s.feed(Input::Scanned(Ok(Ap(1))));
+    s.feed(Input::JoinRefused(refusal()));
+    let mut waits = Vec::new();
+    let mut joined_each_time = true;
+    for _ in 0..40 {
+        waits.push(s.scheduled().unwrap_or(0));
+        match s.attempt(Ok(Ap(1))) {
+            Some(asked) if asked.join == Some(Ap(1)) => {
+                s.feed(Input::JoinRefused(refusal()));
+            }
+            _ => joined_each_time = false,
+        }
+    }
+    report.check(
+        "reconnect, join refused: forty attempts after the first, each one a scan and a join",
+        joined_each_time && s.scans == 40 && s.joins == 41,
+    );
+    report.check(
+        "reconnect, join refused: waits of 4, 8 and 16 s, then 30 s every time",
+        waits[..3] == [4_000, 8_000, 16_000] && waits[3..].iter().all(|&wait| wait == reconnect::MAX_RETRY_MS),
+    );
+    let most = 1 + s.now / reconnect::REPORT_INTERVAL_MS;
+    report.check(
+        "reconnect, join refused: the refusal once, with what the firmware said, then a count every 5 minutes",
+        s.lines.len() >= 2
+            && s.lines.len() as u64 <= most
+            && s.lines[0].contains("error -23")
+            && s.lines[1..].iter().all(|line| line.contains("more times since the last report")),
+    );
+}
+
+/// Attempts that end after the join request: the handshake refused, no
+/// handshake, no association, and the access point ending one, then a join.
+fn reconnect_handshake_failure(report: &mut Report) {
+    let mut s = Script::new(true);
+    s.feed(Input::Scanned(Ok(Ap(6))));
+    s.now += 2_000;
+    s.feed(Input::Associated);
+    s.now += 300;
+    let refused = s.feed(Input::HandshakeFailed { reason: 17 });
+    report.check(
+        "reconnect, handshake: refused with reason 17, the next attempt 4 s on, and nothing more asked",
+        !refused.disassociate
+            && refused.join.is_none()
+            && s.scheduled() == Some(4_000)
+            && s.lines.last().is_some_and(|line| line.contains("reason 17")),
+    );
+
+    let asked = s.attempt(Ok(Ap(6)));
+    s.now += 2_000;
+    s.feed(Input::Associated);
+    s.now += reconnect::HANDSHAKE_TIMEOUT_MS - 1;
+    let early = s.feed(Input::Tick);
+    s.now += 1;
+    let late = s.feed(Input::Tick);
+    report.check(
+        "reconnect, handshake: an association is left for 10 s, then left for good and retried 8 s on",
+        asked.is_some() && !early.disassociate && late.disassociate && s.scheduled() == Some(8_000),
+    );
+
+    s.attempt(Ok(Ap(6)));
+    s.now += reconnect::ASSOCIATE_TIMEOUT_MS - 1;
+    let early = s.feed(Input::Tick);
+    s.now += 1;
+    let late = s.feed(Input::Tick);
+    report.check(
+        "reconnect, handshake: a join with no association is left for 10 s, then abandoned and retried 16 s on",
+        !early.disassociate && late.disassociate && s.scheduled() == Some(16_000),
+    );
+
+    s.attempt(Ok(Ap(6)));
+    s.now += 2_000;
+    s.feed(Input::Associated);
+    s.now += 4_000;
+    s.feed(Input::LinkLost { cause: "DEAUTH_IND", reason: 15 });
+    report.check(
+        "reconnect, handshake: an attempt the access point ends is retried at the cap",
+        s.scheduled() == Some(reconnect::MAX_RETRY_MS) && s.lines.last().is_some_and(|line| line.contains("DEAUTH_IND reason 15")),
+    );
+    let stray = s.feed(Input::Associated);
+    report.check("reconnect, handshake: an association no attempt is waiting for is left", stray.disassociate);
+
+    report.check("reconnect, handshake: then joined", s.rejoin(Ap(6)));
+    report.check("reconnect, handshake: five lines, one per kind of failure and the join", s.lines.len() == 5);
+}
+
+/// A link that comes up and is lost 5 s later, thirty times.
+fn reconnect_flapping(report: &mut Report) {
+    let mut s = Script::up_on(Ap(6));
+    let began = s.now;
+    let mut waits = Vec::new();
+    let mut rejoined = true;
+    for _ in 0..30 {
+        s.now += 5_000;
+        s.feed(Input::LinkLost { cause: "DEAUTH_IND", reason: 2 });
+        waits.push(s.scheduled().unwrap_or(0));
+        rejoined &= s.rejoin(Ap(6));
+    }
+    report.check("reconnect, flapping: thirty losses, each joined again", rejoined);
+    report.check(
+        "reconnect, flapping: the waits 4, 8 and 16 s, then 30 s, since no link stayed up a minute",
+        waits[..3] == [4_000, 8_000, 16_000] && waits[3..].iter().all(|&wait| wait == reconnect::MAX_RETRY_MS),
+    );
+    let most = 3 + 2 * (s.now - began) / reconnect::REPORT_INTERVAL_MS;
+    report.check(
+        "reconnect, flapping: the first loss and its join in a line each, then two lines every 5 minutes at most",
+        s.lines.len() >= 3 && s.lines.len() as u64 <= most && s.lines[1].contains("link lost") && s.lines[2].contains("joined"),
+    );
+    let before = s.lines.len();
+    s.now += reconnect::LINK_STABLE_MS;
+    s.feed(Input::Tick);
+    report.check(
+        "reconnect, flapping: a minute up ends the run, in a line counting the 30 losses",
+        s.lines.len() == before + 1 && s.lines[before].contains("30 losses"),
+    );
+    s.now += 1_000;
+    s.feed(Input::LinkLost { cause: "DEAUTH_IND", reason: 2 });
+    report.check(
+        "reconnect, flapping: a loss after that waits 2 s again, and has its line",
+        s.scheduled() == Some(reconnect::FIRST_RETRY_MS) && s.lines.len() == before + 2,
+    );
+}
+
+/// The network gone for a day from bring-up on, and a minute of ticks with a
+/// scan that never finishes.
+fn reconnect_a_day_away(report: &mut Report) {
+    const DAY_MS: u64 = 24 * 3600 * 1000;
+    let mut s = Script::new(false);
+    s.feed(Input::Scanned(Err(Failure::NotFound)));
+    let mut attempts = 0u64;
+    let mut capped = true;
+    while s.now < DAY_MS {
+        let wait = s.scheduled().unwrap_or(0);
+        if attempts >= 3 {
+            capped &= wait == reconnect::MAX_RETRY_MS;
+        }
+        if s.attempt(Err(Failure::NotFound)).is_none() {
+            break;
+        }
+        attempts += 1;
+    }
+    report.check(
+        "reconnect, a day away: a scan every 32.4 s, all day",
+        s.scans == attempts && attempts >= DAY_MS / (reconnect::MAX_RETRY_MS + SCAN_MS),
+    );
+    report.check("reconnect, a day away: the wait at the cap from the fourth attempt on", capped);
+    let most = 1 + s.now / reconnect::REPORT_INTERVAL_MS;
+    report.check(
+        "reconnect, a day away: no more than one line per 5 minutes",
+        s.lines.len() >= 2 && s.lines.len() as u64 <= most,
+    );
+    crate::println!("        {} attempts and {} lines in the day; the last: {}", attempts, s.lines.len(), s.lines.last().map_or("", |line| line.as_str()));
+
+    let (lines, scans) = (s.lines.len(), s.scans);
+    for _ in 0..6_000 {
+        s.now += 10;
+        s.feed(Input::Tick);
+    }
+    report.check(
+        "reconnect, a day away: a minute of ticks 10 ms apart with no scan finishing: at most two scans and one line",
+        s.scans > scans && s.scans - scans <= 2 && s.lines.len() - lines <= 1,
+    );
 }
 
 fn hex(text: &str) -> Vec<u8> {
@@ -609,12 +972,12 @@ fn join_payloads(report: &mut Report) {
     report.value("pmk: 132 bytes", pmk.len() as u64, 132);
     report.check("pmk: length 9, the passphrase flag, the key, zeroes after", pmk[0..4] == [9, 0, 1, 0] && &pmk[4..13] == b"abcdefghi" && pmk[13..].iter().all(|&b| b == 0));
 
-    let join = protocol::ext_join_params(4, |field| field.copy_from_slice(b"home"));
+    let join = protocol::ext_join_params(4, [0xAA, 0xBB, 0xCC, 1, 2, 3], |field| field.copy_from_slice(b"home"));
     report.value("join: 68 bytes", join.len() as u64, 68);
     report.check("join: the SSID length and name", join[0..4] == [4, 0, 0, 0] && &join[4..8] == b"home" && join[8..36].iter().all(|&b| b == 0));
     report.check("join: scan type -1, three bytes of padding", join[36] == 0xFF && join[37..40] == [0, 0, 0]);
     report.check("join: nprobes, active, passive and home time -1", join[40..56].iter().all(|&b| b == 0xFF));
-    report.check("join: broadcast BSSID, padding, no chanspecs", join[56..62] == [0xFF; 6] && join[62..68] == [0; 6]);
+    report.check("join: the chosen BSSID at 56, padding, no chanspecs", join[56..62] == [0xAA, 0xBB, 0xCC, 1, 2, 3] && join[62..68] == [0; 6]);
     let ssid = protocol::ssid_le(4, |field| field.copy_from_slice(b"home"));
     report.check("set ssid: the SSID alone in 36 bytes", ssid.len() == 36 && ssid[0] == 4 && &ssid[4..8] == b"home");
 
