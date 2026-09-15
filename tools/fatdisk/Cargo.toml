@@ -1,0 +1,22 @@
+[package]
+name = "fatdisk"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A host program, built for the Mac and never for the kernel. It compiles the
+# kernel's own volume code, kernel/src/storage/disk.rs and volume.rs, against
+# the same rust-fatfs commit the kernel uses, with std so that it can make and
+# read image files as well.
+[dependencies]
+fatfs = { git = "https://github.com/rafalh/rust-fatfs", rev = "2aefc2a027ce94ed0671752814dac203f0450e11", default-features = false, features = ["std", "alloc", "lfn"] }
+
+# Built the way the kernel builds the same code: overflow checks on for the
+# volume code, off for rust-fatfs (see kernel/Cargo.toml), and unwinding, so
+# that `fuzz` can catch a panic and name the seed that caused it.
+[profile.release]
+overflow-checks = true
+debug = true
+
+[profile.release.package.fatfs]
+overflow-checks = false
