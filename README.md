@@ -204,8 +204,10 @@ two can push current back through the board. Read it at 115200 baud, 8 bits, no 
 `screen /dev/tty.usbserial-* 115200` on macOS, `screen /dev/ttyUSB0 115200`
 on Linux.
 
-Nothing is written to the card at run time, so the machine comes up the same
-way every time and a bad experiment costs a rebuild rather than a reflash.
+Nothing is written to the boot partition at run time, so the machine comes up
+the same way every time and a bad experiment costs a rebuild rather than a
+reflash. The kernel writes only to /data, and refuses to mount a partition that
+holds `start4.elf` or `kernel8.img` there.
 
 `reboot` at the shell restarts the machine, and `poweroff` and `halt` stop it.
 On the board a restart goes back through the firmware, so a board that boots
@@ -260,10 +262,11 @@ everything that reaches the network goes over the air:
 net=wifi init=/bin/init
 ```
 
-`scripts/mkcard.sh` writes `init=/bin/init` alone into `build/boot/cmdline.txt`,
-so add the word after running it. Without it the wired Ethernet is taken,
-whether or not a cable is plugged in, because the stack holds one interface
-and the wired driver is asked first; the WiFi is then not brought up at all.
+`scripts/mkcard.sh` writes this line into `cmdline.txt` when the board image
+holds `/etc/wifi.conf`, and `init=/bin/init` alone when it does not. Without
+`net=wifi` the wired Ethernet is taken, whether or not a cable is plugged in,
+because the stack holds one interface and the wired driver is asked first; the
+WiFi is then not brought up at all.
 
 A join, from the serial console:
 
@@ -271,6 +274,7 @@ A join, from the serial console:
 wifi: firmware: wl0: Aug 29 2023 01:47:08 version 7.45.265 (28bca26 CY) FWID 01-b677b91b
 wifi: CLM blob loaded, 2676 bytes in 2 pieces; clmload_status 0
 wifi: country set to JP; the firmware reports JP revision 0
+wifi: scan finished in 2381 ms with status Some(0): 33 results, 18 distinct networks; by channel: 1x2 6x3 11x1 13x2 36x6 40x1 52x3; 0 glommed frames received so far
 wifi: found the configured network on channel 6
 wifi: join requested, the station's RSN element 22 bytes, WMM true
 wifi: associated; the handshake can start
@@ -280,9 +284,43 @@ wifi: handshake: message 3 verified
 wifi: handshake: message 4 sent
 wifi: handshake: pairwise key installed
 wifi: handshake: group key installed, index 2
-wifi: link up 3536 ms after the join request: the 4-way handshake finished and the keys are installed
+wifi: joined on channel 6: link up 2629 ms after the join request, on attempt 1, 2629 ms without a link
 dhcp: 192.168.86.22/24 gateway 192.168.86.1 dns 192.168.86.1, lease 86400 s from 192.168.86.1
 ```
+
+**When the link goes.** While there is no link, from bring-up on, the driver
+keeps trying to join, whatever went wrong: the network missing from the scan,
+the firmware refusing a request, the association or the handshake failing, or
+the access point dropping a link that was up. Each attempt is a new scan, a
+join that names the strongest usable access point with the configured name in
+that scan, and the handshake, checked against that access point's RSN element
+from the same scan. The first attempt after the loss of a link that had been
+up for a minute starts 2 s later. Each failure in a row doubles the wait, to 4,
+8 and 16 s, and after that it is 30 s for as long as the network stays away. A
+link lost within a minute of coming up counts as a failure. An attempt is
+given up, and any association it made left, after 15 s of scanning, 10 s from
+the join request without the association, or 10 s from the association
+without the handshake finishing. A scan does not hold up the network task. The
+DHCP lease is kept while the link is down, and a renewal under way when the
+link comes back is sent again at once.
+
+The log gets a line for the link lost and its reason, for the first failure of
+each kind, and for the link coming back. A failure or a loss that repeats is
+counted, and the count is printed every 5 minutes; once the link has stayed up
+for a minute, one line sums up what was counted. The step-by-step lines above,
+requests, events and handshake messages, are printed for bring-up's attempt
+only.
+
+Two words on the command line make the link go without touching the access
+point. Both are off unless given:
+
+```
+wifi.hide=N      take the configured network as absent from the first N scans, bring-up's included
+wifi.drop=S      leave the association once, S seconds after the link first comes up
+```
+
+With either word given, every scan also prints a `wifi: debug: scan N finished`
+line, so the log shows the scan each attempt made.
 
 The handshake runs in the kernel because the firmware Raspberry Pi OS installs
 has no supplicant of its own; Linux there runs wpa_supplicant and hands the
@@ -1304,7 +1342,7 @@ failures.
   them run a thread alongside a sibling failing an exec over and over, which is
   a smoke test for a race rather than proof of its absence.
 - The **network protocols** run against a card that only records what it is
-  asked to send: **216 checks** with frames handed in by hand and frames out
+  asked to send: **235 checks** with frames handed in by hand and frames out
   compared byte for byte. Above that sits a peer with a link in each direction
   that is told before the run what to do with each segment -- lose this one,
   hold that one back behind the next, deliver the one after twice, damage the
@@ -1323,14 +1361,22 @@ failures.
   up when it runs out, each message compared byte for byte; a NAK to a request
   and to a renewal; offers whose option lengths are wrong in eight different
   ways, none of them taken; and a parser fed every truncation of a good message
-  and every value of every length byte in it. On aarch64 the same run adds the
-  Pi's own Ethernet and WiFi drivers, for 431. The WiFi checks include the
+  and every value of every length byte in it; and a lease kept while the link
+  goes down and comes back, with a renewal under way sent again on the tick the
+  link returns. On aarch64 the same run adds the Pi's own Ethernet and WiFi
+  drivers, for 464. The WiFi checks include the
   WPA2 handshake: the SHA-1 PRF and the 802.11 passphrase-to-key vectors, RFC
   3394 key wrap, and Wireshark's published `wpa-Induction` capture fed through
   the supplicant. Messages 2 and 4 have to match the captured frames byte for
   byte, once given the Key Length the 2006 station wrote, and a replayed
   message, a changed byte, the wrong passphrase and a different RSN element
-  each have to be refused.
+  each have to be refused. The WiFi's reconnection runs through scripted
+  sequences on a clock of its own: the network absent at boot and then there, a
+  link lost and the network found again on another channel, forty refused
+  joins, a refused handshake, a join with no association, an association with
+  no handshake, an attempt the access point ends, thirty losses 5 s after each
+  join, and a day with the network gone. Each checks the waits, that every
+  failure leads to another scan, and how many lines the log got.
 - `tests/busybox.sh` runs **40 checks** against an upstream busybox binary that
   this project did not build: `awk`, `sed`, `tar` create and extract, `find`,
   `md5sum` and `sha256sum` (whose digests are compared against the ones the
@@ -1579,9 +1625,9 @@ The WiFi joins one kind of network: WPA2 with a passphrase, CCMP for pairwise
 and group traffic, and management frame protection not required. A network
 that offers only WPA3's SAE, only TKIP, only enterprise authentication, or no
 security at all is not joined; one that offers PSK beside SAE is joined with
-PSK. It scans once at
-bring-up, joins the strongest access point with the configured name, and asks
-again every 30 seconds while there is no link; it does not roam or scan again.
+PSK. While the link is up it neither scans nor roams: it stays with the access
+point it joined, even when a stronger one with the same name comes into range,
+until that access point drops the link.
 The chip is polled once a tick rather than taking its interrupt, and the
 firmware's batching of frames towards the host is turned off rather than taken
 apart. The SHA-1 and HMAC crates the handshake uses leave their keyed state in

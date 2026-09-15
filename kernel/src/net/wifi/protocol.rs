@@ -381,12 +381,19 @@ pub fn wsec_pmk(key_len: usize, flags: u16, fill: impl FnOnce(&mut [u8])) -> [u8
     out
 }
 
-/// The "join" iovar's data as `brcmf_cfg80211_connect` fills it with no BSSID
-/// and no channel: the SSID, a scan type of -1 and every timing -1, and a
-/// broadcast BSSID with no chanspecs. The offsets follow the structures'
-/// natural alignment: `scan_type` at 36 then three bytes of padding, the four
-/// timings from 40, the BSSID at 56 then two bytes, and `chanspec_num` at 64.
-pub fn ext_join_params(ssid_len: usize, fill: impl FnOnce(&mut [u8])) -> [u8; EXT_JOIN_PARAMS_LEN] {
+/// The "join" iovar's data as `brcmf_cfg80211_connect` fills it with a BSSID
+/// and no channel: the SSID, a scan type of -1 and every timing -1, the BSSID,
+/// and no chanspecs. The offsets follow the structures' natural alignment:
+/// `scan_type` at 36 then three bytes of padding, the four timings from 40,
+/// the BSSID at 56 then two bytes, and `chanspec_num` at 64.
+///
+/// The BSSID is the access point the driver chose from its own scan, as
+/// wpa_supplicant hands brcmfmac the one it chose from its. The firmware then
+/// joins that access point and no other with the name, so the RSN element the
+/// scan recorded for it is the one message 3 is checked against. With no
+/// chanspec the firmware still finds the access point's channel with its own
+/// scan.
+pub fn ext_join_params(ssid_len: usize, bssid: [u8; 6], fill: impl FnOnce(&mut [u8])) -> [u8; EXT_JOIN_PARAMS_LEN] {
     let mut out = [0u8; EXT_JOIN_PARAMS_LEN];
     out[0..4].copy_from_slice(&(ssid_len as u32).to_le_bytes());
     fill(&mut out[4..4 + ssid_len.min(32)]);
@@ -394,7 +401,7 @@ pub fn ext_join_params(ssid_len: usize, fill: impl FnOnce(&mut [u8])) -> [u8; EX
     for field in 0..4 {
         out[40 + field * 4..44 + field * 4].copy_from_slice(&(-1i32).to_le_bytes());
     }
-    out[56..62].copy_from_slice(&[0xFF; 6]);
+    out[56..62].copy_from_slice(&bssid);
     out
 }
 
