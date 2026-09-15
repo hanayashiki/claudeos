@@ -52,6 +52,9 @@ struct BootOptions {
     /// protocols do about loss can be seen on the real card path. Zero is
     /// off, and it is zero unless the command line says otherwise.
     net_loss: u32,
+    /// `wifi.hide=` and `wifi.drop=`, for `net::wifi::set_debug`.
+    wifi_hide: u32,
+    wifi_drop: u64,
     /// Serve the console over TCP port 23 once the network has an address.
     /// On unless the command line says `telnet=off`.
     telnet: bool,
@@ -71,6 +74,8 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
         net_test: false,
         cards: net::Cards::Any,
         net_loss: 0,
+        wifi_hide: 0,
+        wifi_drop: 0,
         telnet: true,
         args: Vec::new(),
         env: ["PATH=/bin:/usr/bin", "HOME=/root", "TERM=linux", "USER=root", "PWD=/"]
@@ -107,6 +112,12 @@ fn parse_cmdline(cmdline: &str) -> BootOptions {
             }
         } else if let Some(value) = word.strip_prefix("netloss=") {
             options.net_loss = value.parse().unwrap_or(0);
+        } else if let Some(value) = word.strip_prefix("wifi.hide=") {
+            // Two debugging words for the WiFi's reconnection, off unless
+            // given: see `net::wifi::set_debug`.
+            options.wifi_hide = value.parse().unwrap_or(0);
+        } else if let Some(value) = word.strip_prefix("wifi.drop=") {
+            options.wifi_drop = value.parse().unwrap_or(0);
         } else if let Some(value) = word.strip_prefix("telnet=") {
             match value {
                 "on" => options.telnet = true,
@@ -306,6 +317,13 @@ pub fn start(boot: &boot::BootInfo) -> ! {
     if options.net_loss != 0 {
         net::set_loss(options.net_loss);
         println!("net: losing one frame in {} in each direction", options.net_loss);
+    }
+    // Before the WiFi driver's task starts, which is after init is prepared.
+    #[cfg(target_arch = "aarch64")]
+    net::wifi::set_debug(options.wifi_hide, options.wifi_drop);
+    #[cfg(not(target_arch = "aarch64"))]
+    if options.wifi_hide != 0 || options.wifi_drop != 0 {
+        println!("wifi.hide= and wifi.drop= are ignored: this machine has no Raspberry Pi WiFi");
     }
     if options.net_test {
         println!();

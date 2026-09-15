@@ -36,6 +36,15 @@
 //! "wsec_key" iovar. The link the stack sees is up only once the pairwise and
 //! group keys are in.
 //!
+//! **Getting the link back.** Nothing in user space notices a lost link and
+//! tries again, so the driver does, from bring-up on and for as long as there
+//! is no link: a fresh scan, the strongest usable access point with the
+//! configured name from that scan, a join that names it, and the handshake,
+//! repeated with growing waits until the link is up. `reconnect` decides the
+//! order and the timing, and this file carries it out. A scan does not stop
+//! the task: the request goes out, the results arrive as events the loop reads
+//! once a tick, and frames are sent and received in between.
+//!
 //! **Nothing is signalled by interrupt yet.** The chip is polled once a
 //! timer tick and whenever a frame is queued, the way brcmfmac runs a bus in
 //! its poll mode.
@@ -45,6 +54,7 @@ pub mod config;
 pub mod delay;
 pub mod nvram;
 pub mod protocol;
+pub mod reconnect;
 pub mod sdhci;
 pub mod sdio;
 pub mod test;
@@ -65,9 +75,10 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use chip::{Backplane, Chip};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use delay::{now_us, sleep_ms, spin_us, Deadline};
 use protocol::{DcmdResponse, Event, HeaderError};
+use reconnect::{Effect, Failure, Input, Reconnect};
 use sdio::SdioError;
 
 /// What the controller node says it is. Raspberry Pi's tree gives `mmcnr`
@@ -93,9 +104,6 @@ const RXBOUND: usize = 50;
 const TXRETRIES: usize = 2;
 /// `BRCMF_DCMD_SMLEN`: the buffer `brcmf_c_preinit_dcmds` gives "ver".
 const DCMD_SMLEN: usize = 256;
-/// `BRCMF_ESCAN_TIMER_INTERVAL_MS` is ten seconds; a scan of both bands with
-/// the firmware's own dwell times takes several, so this allows fifteen.
-const SCAN_TIMEOUT_MS: u64 = 15_000;
 /// `sizeof(struct brcmf_rev_info_le)`: seventeen words.
 const REVINFO_LEN: usize = 68;
 /// `MAX_CAPS_BUFFER_SIZE` in `feature.c`: room for the "cap" string.
@@ -108,10 +116,10 @@ const WL_ON_LOGGED_CHANGES: u32 = 2;
 /// How long a data frame waits for the firmware's window before it is
 /// dropped, the way a full ring drops one.
 const DATA_CREDIT_WAIT_MS: u64 = 100;
-/// Without the link after this long, a join is asked for again. Nothing in
-/// brcmfmac does this, because a supplicant in user space decides there; here
-/// the kernel is the only thing that would.
-const JOIN_RETRY_MS: u64 = 30_000;
+/// `WLAN_REASON_DEAUTH_LEAVING` in hostap's `ieee802_11_defs.h`: the reason
+/// wpa_supplicant gives when it leaves an association itself, as when an
+/// authentication times out in `wpa_supplicant_timeout`.
+const REASON_DEAUTH_LEAVING: u16 = 3;
 /// EAPOL frames waiting for the task's loop. A handshake is four frames and a
 /// rekey two, so a few is plenty; more than that is dropped.
 const EAPOL_QUEUE_DEPTH: usize = 8;
@@ -143,6 +151,16 @@ static GLOMS: AtomicU64 = AtomicU64::new(0);
 static EARLY_FRAMES: AtomicU64 = AtomicU64::new(0);
 /// How many of those are described in the log.
 const EARLY_FRAMES_LOGGED: u64 = 8;
+/// `wifi.hide=N` on the command line: the configured network is taken as
+/// absent from the first N scans, bring-up's included, so that a network
+/// missing at boot can be shown without switching an access point off. Zero,
+/// the default, is off.
+static HIDE_SCANS: AtomicU32 = AtomicU32::new(0);
+/// `wifi.drop=S`: S seconds after the link first comes up, the driver
+/// disassociates once and tells the reconnect machine the link was lost, so
+/// that losing the link can be shown without touching the access point. Zero,
+/// the default, is off.
+static DROP_AFTER_S: AtomicU64 = AtomicU64::new(0);
 /// `ETH_P_PAE` in Linux's `if_ether.h`: IEEE 802.1X, which carries the WPA2
 /// handshake.
 const ETHERTYPE_EAPOL: u16 = 0x888E;
@@ -214,6 +232,20 @@ pub fn attached() -> bool {
 /// Frames received, receive errors, and frames dropped on the way out.
 pub fn counters() -> (u64, u64, u64) {
     (RECEIVED.load(Ordering::Relaxed), RX_ERRORS.load(Ordering::Relaxed), TX_DROPPED.load(Ordering::Relaxed))
+}
+
+/// `wifi.hide=` and `wifi.drop=` from the command line, before the driver's
+/// task starts. Each is printed when it is on, so a log shows why the network
+/// went missing or the link dropped.
+pub fn set_debug(hide_scans: u32, drop_after_s: u64) {
+    HIDE_SCANS.store(hide_scans, Ordering::Relaxed);
+    DROP_AFTER_S.store(drop_after_s, Ordering::Relaxed);
+    if hide_scans != 0 {
+        crate::println!("wifi: wifi.hide={}: the configured network is taken as absent from the first {} scans", hide_scans, hide_scans);
+    }
+    if drop_after_s != 0 {
+        crate::println!("wifi: wifi.drop={}: the link is dropped once, {} s after it first comes up", drop_after_s, drop_after_s);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -422,6 +454,29 @@ fn format_suites(suites: &[u32]) -> String {
         out.push_str("none");
     }
     out
+}
+
+/// The reconnect machine's clock: milliseconds on the architected counter.
+fn now_ms() -> u64 {
+    now_us() / 1000
+}
+
+/// Whether the supplicant can join this access point, or why not: WPA2-PSK
+/// with CCMP for pairwise and group traffic, and management frame protection
+/// not required.
+fn usable(bss: &protocol::Bss) -> Result<(), &'static str> {
+    let s = bss.security;
+    let offers = s.rsn
+        && s.group == wpa::SUITE_CCMP
+        && s.pairwise[..s.pairwise_count].contains(&wpa::SUITE_CCMP)
+        && s.akm[..s.akm_count].contains(&protocol::AKM_PSK);
+    if !offers {
+        return Err("the network does not offer WPA2-PSK with CCMP for pairwise and group traffic");
+    }
+    if s.capabilities.unwrap_or(0) & protocol::RSN_CAP_MFPR != 0 {
+        return Err("the network requires management frame protection, which this supplicant does not do");
+    }
+    Ok(())
 }
 
 impl From<SdioError> for String {
@@ -682,8 +737,21 @@ pub struct Dongle {
     /// The last EAPOL frame that arrived before the association event, and
     /// when. `pending_eapol_rx` and `pending_eapol_rx_time`.
     pending_eapol: Option<(Vec<u8>, u64)>,
-    /// When the last join was asked for, while the link has not come up.
-    joining_since: Option<u64>,
+    /// What to scan for and join while there is no link. `None` with no
+    /// configured network, which is scanned for once and never joined.
+    reconnect: Option<Reconnect<protocol::Bss>>,
+    /// What the machine asked for and the loop has not done yet.
+    effects: VecDeque<Effect<protocol::Bss>>,
+    /// A scan the machine asked for is running.
+    scanning: bool,
+    /// Scans finished since bring-up, bring-up's included, for `wifi.hide=`.
+    scans: u32,
+    /// The access point the join in progress named, from the scan that chose
+    /// it. Its RSN element is the one message 3 has to carry.
+    target: Option<protocol::Bss>,
+    /// When `wifi.drop=` leaves the association, on the microsecond clock.
+    drop_at: Option<u64>,
+    dropped: bool,
     /// Every BSSID the scan saw carrying the configured network's name, so an
     /// event's address can be checked against them without printing either.
     configured_bssids: Vec<[u8; 6]>,
@@ -718,7 +786,13 @@ impl Dongle {
             supplicant: None,
             eapol: VecDeque::new(),
             pending_eapol: None,
-            joining_since: None,
+            reconnect: None,
+            effects: VecDeque::new(),
+            scanning: false,
+            scans: 0,
+            target: None,
+            drop_at: None,
+            dropped: false,
             configured_bssids: Vec::new(),
         }
     }
@@ -1256,18 +1330,26 @@ impl Dongle {
         Ok(())
     }
 
+    /// Ask the firmware to scan every channel. The results arrive as events,
+    /// which `on_event` collects into `scan` until the one that says the scan
+    /// is over sets `scan_done`. Bring-up waits for that; the loop reads it
+    /// once a tick. `brcmf_run_escan`.
+    fn request_scan(&mut self) -> Result<(), IoctlError> {
+        self.scan.clear();
+        self.scan_done = None;
+        self.set_iovar("escan", &protocol::escan_request(0x1234))
+    }
+
     /// Scan every channel and say what was seen, without naming any network:
     /// how many, on which channels, and whether the configured one was among
     /// them, with the security it advertises.
     fn scan(&mut self, config: Option<&config::Config>) -> Result<(), String> {
-        self.scan.clear();
-        self.scan_done = None;
         let start = now_us();
-        self.set_iovar("escan", &protocol::escan_request(0x1234))?;
-        let deadline = Deadline::after_ms(SCAN_TIMEOUT_MS);
+        self.request_scan()?;
+        let deadline = Deadline::after_ms(reconnect::SCAN_TIMEOUT_MS);
         while self.scan_done.is_none() {
             if deadline.expired() {
-                crate::println!("wifi: the scan did not finish within {} ms", SCAN_TIMEOUT_MS);
+                crate::println!("wifi: the scan did not finish within {} ms", reconnect::SCAN_TIMEOUT_MS);
                 break;
             }
             self.poll()?;
@@ -1332,35 +1414,79 @@ impl Dongle {
         Ok(())
     }
 
-    /// Join the configured network, if there is one.
-    fn join(&mut self) {
-        let Some(config) = self.config.take() else { return };
-        if let Err(why) = self.join_with(&config) {
-            crate::println!("wifi: asking to join failed: {}", why);
+    /// Tell the reconnect machine what happened, and keep what it asks for.
+    fn feed(&mut self, input: Input<protocol::Bss>) {
+        if let Some(machine) = self.reconnect.as_mut() {
+            let effects = machine.step(now_ms(), input);
+            self.effects.extend(effects);
         }
+    }
+
+    /// Do what the machine asked for, in order. Doing it can tell the machine
+    /// more, a scan or a join refused, and what that asks for is done in the
+    /// same call.
+    fn carry_out(&mut self) {
+        while let Some(effect) = self.effects.pop_front() {
+            match effect {
+                Effect::Scan => match self.request_scan() {
+                    Ok(()) => self.scanning = true,
+                    Err(error) => {
+                        self.scanning = false;
+                        self.feed(Input::ScanRefused(format!("{}", error)));
+                    }
+                },
+                Effect::Join(bss) => self.join(bss),
+                Effect::Disassociate => self.disassociate(REASON_DEAUTH_LEAVING),
+                Effect::Log(line) => crate::println!("{}", line),
+            }
+        }
+    }
+
+    /// Whether the attempt in progress is bring-up's, which the log describes
+    /// step by step: requests, events, handshake messages. Later attempts are
+    /// described by the reconnect machine's lines alone, so that an attempt
+    /// every half minute does not fill the log.
+    fn detailed(&self) -> bool {
+        self.reconnect.as_ref().map_or(true, |machine| machine.first_attempt())
+    }
+
+    /// The access point to join from the scan that just finished: the
+    /// strongest with the configured name among those the supplicant can
+    /// join, or why there is none.
+    fn choose(&mut self) -> Result<protocol::Bss, Failure> {
+        self.scans += 1;
+        let Some(config) = self.config.as_ref() else { return Err(Failure::NotFound) };
+        if self.scans <= HIDE_SCANS.load(Ordering::Relaxed) {
+            return Err(Failure::NotFound);
+        }
+        let matching: Vec<&protocol::Bss> = self.scan.iter().filter(|bss| config.ssid.matches(bss.ssid())).collect();
+        self.configured_bssids = matching.iter().map(|bss| bss.bssid).collect();
+        if let Some(bss) = matching.iter().filter(|bss| usable(bss).is_ok()).max_by_key(|bss| bss.rssi) {
+            return Ok((*bss).clone());
+        }
+        match matching.iter().max_by_key(|bss| bss.rssi) {
+            Some(bss) => Err(Failure::Unsuitable(usable(bss).err().unwrap_or("the network cannot be joined"))),
+            None => Err(Failure::NotFound),
+        }
+    }
+
+    /// Join the access point the reconnect machine chose.
+    fn join(&mut self, bss: protocol::Bss) {
+        let Some(config) = self.config.take() else { return };
+        let result = self.join_with(&config, &bss);
         self.config = Some(config);
+        match result {
+            Ok(()) => self.target = Some(bss),
+            Err(why) => {
+                self.target = None;
+                self.feed(Input::JoinRefused(why));
+            }
+        }
     }
 
     /// The security and the join, in the order `brcmf_cfg80211_connect` sets
     /// them up for WPA2-PSK with CCMP when the supplicant is on the host.
-    fn join_with(&mut self, config: &config::Config) -> Result<(), String> {
-        // The network as the scan saw it: its strongest BSS with this name.
-        // Only what the supplicant can do is joined.
-        let Some(bss) = self.scan.iter().filter(|bss| config.ssid.matches(bss.ssid())).max_by_key(|bss| bss.rssi).cloned()
-        else {
-            return Err(String::from("the configured network was not in the scan"));
-        };
-        let s = bss.security;
-        let offers = s.rsn
-            && s.group == wpa::SUITE_CCMP
-            && s.pairwise[..s.pairwise_count].contains(&wpa::SUITE_CCMP)
-            && s.akm[..s.akm_count].contains(&protocol::AKM_PSK);
-        if !offers {
-            return Err(String::from("the network does not offer WPA2-PSK with CCMP for pairwise and group traffic"));
-        }
-        if s.capabilities.unwrap_or(0) & protocol::RSN_CAP_MFPR != 0 {
-            return Err(String::from("the network requires management frame protection, which this supplicant does not do"));
-        }
+    fn join_with(&mut self, config: &config::Config, bss: &protocol::Bss) -> Result<(), String> {
         let own_rsn = wpa::station_rsn_element(bss.wmm);
 
         // `brcmf_cfg80211_connect` hands the RSN element wpa_supplicant built
@@ -1387,18 +1513,21 @@ impl Dongle {
         self.eapol.clear();
         self.pending_eapol = None;
         self.own_rsn = own_rsn;
-        let mut join = protocol::ext_join_params(config.ssid.len(), |field| config.ssid.copy_into(field));
+        let mut join = protocol::ext_join_params(config.ssid.len(), bss.bssid, |field| config.ssid.copy_into(field));
         let joined = self.set_iovar_secret("join", &join);
         join.fill(0);
         if let Err(error) = joined {
-            crate::println!("wifi: the join iovar was refused ({}); asking with WLC_SET_SSID", error);
+            if self.detailed() {
+                crate::println!("wifi: the join iovar was refused ({}); asking with WLC_SET_SSID", error);
+            }
             let mut params = protocol::ssid_le(config.ssid.len(), |field| config.ssid.copy_into(field));
             let set = self.ioctl_secret(protocol::C_SET_SSID, &params);
             params.fill(0);
             set.map_err(|e| format!("WLC_SET_SSID: {}", e))?;
         }
-        self.joining_since = Some(now_us());
-        crate::println!("wifi: join requested, the station's RSN element {} bytes, WMM {}", self.own_rsn.len(), bss.wmm);
+        if self.detailed() {
+            crate::println!("wifi: join requested, the station's RSN element {} bytes, WMM {}", self.own_rsn.len(), bss.wmm);
+        }
         Ok(())
     }
 
@@ -1412,9 +1541,13 @@ impl Dongle {
             if event.status == protocol::E_STATUS_SUCCESS {
                 self.associated = true;
                 self.aa = Some(event.addr);
+                // The machine hears of the association before the supplicant
+                // starts, because starting it can run a held frame through the
+                // handshake, and a frame refused there ends the attempt.
+                self.feed(Input::Associated);
                 self.start_supplicant(event.addr);
             } else {
-                crate::println!("wifi: the join failed: SET_SSID status {} reason {}", event.status, event.reason);
+                self.feed(Input::AssociationFailed { status: event.status, reason: event.reason });
             }
             return;
         }
@@ -1422,12 +1555,7 @@ impl Dongle {
             || (event.event_type == protocol::E_LINK && event.flags & protocol::EVENT_MSG_LINK == 0);
         if down {
             self.lose_association();
-            crate::println!(
-                "wifi: association ended: event {} status {} reason {}",
-                protocol::event_name(event.event_type),
-                event.status,
-                event.reason
-            );
+            self.feed(Input::LinkLost { cause: protocol::event_name(event.event_type), reason: event.reason });
         }
     }
 
@@ -1443,7 +1571,13 @@ impl Dongle {
             return;
         };
         let pmk = config.pmk();
-        let bss = self.scan.iter().find(|bss| bss.bssid == aa);
+        // The access point the join named, as the scan that chose it saw it.
+        // The scan is searched only for an association with another, which
+        // a join that fell back to WLC_SET_SSID, naming no BSSID, can make.
+        let bss = match self.target.as_ref() {
+            Some(target) if target.bssid == aa => Some(target),
+            _ => self.scan.iter().find(|bss| bss.bssid == aa),
+        };
         let association = wpa::Association {
             own: self.mac,
             aa,
@@ -1455,10 +1589,12 @@ impl Dongle {
         };
         let seen = bss.is_some();
         self.supplicant = Some(wpa::Supplicant::new(association, pmk, crate::rng::fill));
-        crate::println!(
-            "wifi: associated{}; the handshake can start",
-            if seen { "" } else { " with a BSS the scan did not see, so message 3 cannot be checked" }
-        );
+        if self.detailed() || !seen {
+            crate::println!(
+                "wifi: associated{}; the handshake can start",
+                if seen { "" } else { " with a BSS the scan did not see, so message 3 cannot be checked" }
+            );
+        }
 
         // `wpa_supplicant_event_assoc`: the frame held from just before the
         // association is handled if it is young enough and came from the
@@ -1467,9 +1603,11 @@ impl Dongle {
             let age = associated_at.saturating_sub(at);
             let from_aa = frame.get(6..12) == Some(&aa[..]);
             if age < PENDING_EAPOL_MAX_AGE_US && from_aa {
-                crate::println!("wifi: handling the EAPOL frame that arrived {} ms before the association", age / 1000);
+                if self.detailed() {
+                    crate::println!("wifi: handling the EAPOL frame that arrived {} ms before the association", age / 1000);
+                }
                 self.handshake(&frame);
-            } else {
+            } else if self.detailed() {
                 crate::println!(
                     "wifi: an EAPOL frame from before the association was forgotten: {} ms old, {}",
                     age / 1000,
@@ -1480,33 +1618,51 @@ impl Dongle {
     }
 
     /// Forget the association: the supplicant and its keys, and the stack's
-    /// link. A join is asked for again later.
+    /// link. Whoever calls this tells the reconnect machine why, unless the
+    /// machine asked for it.
     fn lose_association(&mut self) {
         self.associated = false;
         self.aa = None;
         self.supplicant = None;
         self.eapol.clear();
         self.pending_eapol = None;
-        if CARD.link.swap(false, Ordering::Relaxed) {
-            crate::println!("wifi: link down");
-        }
-        if self.joining_since.is_none() {
-            self.joining_since = Some(now_us());
-        }
+        CARD.link.store(false, Ordering::Relaxed);
     }
 
     /// `brcmf_cfg80211_disconnect`, which hostap's `wpa_sm_deauthenticate`
     /// reaches through nl80211: WLC_DISASSOC with the reason and the access
-    /// point's address.
+    /// point's address. Before any association the address is the one the
+    /// join named, which is how an attempt given up stops the firmware's join.
     fn disassociate(&mut self, reason: u16) {
-        if let Some(aa) = self.aa {
-            let request = protocol::scb_val(reason as u32, aa);
-            if let Err(error) = self.ioctl(protocol::C_DISASSOC, true, request.len(), &request) {
-                crate::println!("wifi: WLC_DISASSOC: {}", error);
+        let peer = self.aa.or(self.target.as_ref().map(|target| target.bssid));
+        if let Some(peer) = peer {
+            let request = protocol::scb_val(reason as u32, peer);
+            let result = self.ioctl(protocol::C_DISASSOC, true, request.len(), &request);
+            if self.detailed() {
+                match result {
+                    Ok(_) => crate::println!("wifi: disassociated with reason {}", reason),
+                    Err(error) => crate::println!("wifi: WLC_DISASSOC with reason {}: {}", reason, error),
+                }
             }
         }
-        crate::println!("wifi: disassociated with reason {}", reason);
+        self.target = None;
         self.lose_association();
+    }
+
+    /// `wifi.drop=`: once the time has come and the link is up, leave the
+    /// association the way the reconnect machine's own disassociation does,
+    /// and tell the machine the link was lost, as an access point ending it
+    /// would.
+    fn drop_if_due(&mut self) {
+        let Some(at) = self.drop_at else { return };
+        if now_us() < at || !CARD.link.load(Ordering::Relaxed) {
+            return;
+        }
+        self.drop_at = None;
+        self.dropped = true;
+        crate::println!("wifi: wifi.drop: leaving the association once, as the command line asks");
+        self.disassociate(REASON_DEAUTH_LEAVING);
+        self.feed(Input::LinkLost { cause: "wifi.drop", reason: REASON_DEAUTH_LEAVING as u32 });
     }
 
     /// One EAPOL frame from the chip: to the supplicant, its reply to the
@@ -1521,33 +1677,47 @@ impl Dongle {
             // `wpa_supplicant_rx_eapol`: the association event and the frame
             // come by different paths, so a frame ahead of the event is kept,
             // the latest one only, until the event arrives.
-            crate::println!("wifi: an EAPOL frame before the association; held until it");
+            if self.detailed() {
+                crate::println!("wifi: an EAPOL frame before the association; held until it");
+            }
             self.pending_eapol = Some((frame.to_vec(), now_us()));
             return;
         }
+        // Bring-up's attempt has every step printed. After that a group key
+        // handshake's steps still are, since one comes an hour or a day
+        // apart, and an attempt's are left to the reconnect machine's lines.
+        let detailed = self.detailed();
         let (Some(aa), Some(supplicant)) = (self.aa, self.supplicant.as_mut()) else {
             return;
         };
         if source != aa {
-            crate::println!("wifi: an EAPOL frame from an address other than the access point's; dropped");
+            if detailed {
+                crate::println!("wifi: an EAPOL frame from an address other than the access point's; dropped");
+            }
             return;
         }
         let outcome = match supplicant.receive(&frame[14..]) {
             Ok(outcome) => outcome,
             Err(error) => {
-                crate::println!("wifi: handshake frame refused: {}", error);
+                if detailed {
+                    crate::println!("wifi: handshake frame refused: {}", error);
+                }
                 if let Some(reason) = error.deauthenticate() {
                     self.disassociate(reason);
+                    self.feed(Input::HandshakeFailed { reason });
                 }
                 return;
             }
         };
+        let say = detailed || outcome.step == wpa::Step::GroupMessage1;
         let (received, sent) = match outcome.step {
             wpa::Step::Message1 => ("message 1 received", "message 2 sent"),
             wpa::Step::Message3 => ("message 3 verified", "message 4 sent"),
             wpa::Step::GroupMessage1 => ("group key message 1 verified", "group key message 2 sent"),
         };
-        crate::println!("wifi: handshake: {}", received);
+        if say {
+            crate::println!("wifi: handshake: {}", received);
+        }
 
         let mut ethernet = Vec::with_capacity(14 + outcome.reply.len());
         ethernet.extend_from_slice(&aa);
@@ -1555,29 +1725,47 @@ impl Dongle {
         ethernet.extend_from_slice(&ETHERTYPE_EAPOL.to_be_bytes());
         ethernet.extend_from_slice(&outcome.reply);
         if let Err(error) = self.send_data(&ethernet) {
-            crate::println!("wifi: handshake: the reply was not sent: {}", error);
+            if say {
+                crate::println!("wifi: handshake: the reply was not sent: {}", error);
+            }
             return;
         }
-        crate::println!("wifi: handshake: {}", sent);
+        if say {
+            crate::println!("wifi: handshake: {}", sent);
+        }
 
         if let Some(pairwise) = &outcome.pairwise {
             // wpa_supplicant's nl80211 driver passes the access point's
             // address and a sequence counter of zero for the PTK.
             match self.install_key(0, pairwise.key(), Some(aa), [0; wpa::RSC_LEN]) {
-                Ok(()) => crate::println!("wifi: handshake: pairwise key installed"),
+                Ok(()) => {
+                    if say {
+                        crate::println!("wifi: handshake: pairwise key installed");
+                    }
+                }
                 Err(error) => {
-                    crate::println!("wifi: handshake: installing the pairwise key failed: {}", error);
+                    if say {
+                        crate::println!("wifi: handshake: installing the pairwise key failed: {}", error);
+                    }
                     self.disassociate(wpa::REASON_UNSPECIFIED);
+                    self.feed(Input::HandshakeFailed { reason: wpa::REASON_UNSPECIFIED });
                     return;
                 }
             }
         }
         if let Some(group) = &outcome.group {
             match self.install_key(group.index() as u32, group.key(), None, group.rsc()) {
-                Ok(()) => crate::println!("wifi: handshake: group key installed, index {}", group.index()),
+                Ok(()) => {
+                    if say {
+                        crate::println!("wifi: handshake: group key installed, index {}", group.index());
+                    }
+                }
                 Err(error) => {
-                    crate::println!("wifi: handshake: installing the group key failed: {}", error);
+                    if say {
+                        crate::println!("wifi: handshake: installing the group key failed: {}", error);
+                    }
                     self.disassociate(wpa::REASON_UNSPECIFIED);
+                    self.feed(Input::HandshakeFailed { reason: wpa::REASON_UNSPECIFIED });
                     return;
                 }
             }
@@ -1585,8 +1773,11 @@ impl Dongle {
         let completed = self.supplicant.as_ref().map(|s| s.completed()).unwrap_or(false);
         if completed && !CARD.link.load(Ordering::Relaxed) {
             CARD.link.store(true, Ordering::Relaxed);
-            let took = self.joining_since.take().map(|t| (now_us() - t) / 1000).unwrap_or(0);
-            crate::println!("wifi: link up {} ms after the join request: the 4-way handshake finished and the keys are installed", took);
+            self.feed(Input::LinkUp);
+            let drop_after = DROP_AFTER_S.load(Ordering::Relaxed);
+            if drop_after != 0 && !self.dropped && self.drop_at.is_none() {
+                self.drop_at = Some(now_us() + drop_after * 1_000_000);
+            }
         }
     }
 
@@ -1656,7 +1847,14 @@ fn first_line(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 fn run(mut dongle: Dongle) -> ! {
-    dongle.join();
+    // With no configured network, bring-up's scan was all there is to do.
+    if dongle.config.is_some() {
+        dongle.reconnect = Some(Reconnect::new(now_ms()));
+        // Bring-up's scan is the first attempt's.
+        let chosen = dongle.choose();
+        dongle.feed(Input::Scanned(chosen));
+        dongle.carry_out();
+    }
     let mut last_tick = crate::trap::ticks();
     let mut errors = 0u32;
     let mut send_errors = 0u32;
@@ -1669,16 +1867,18 @@ fn run(mut dongle: Dongle) -> ! {
             }
         }
         while let Some(event) = dongle.events.pop_front() {
-            crate::println!(
-                "wifi: event {} {} status {} reason {} flags {:#x} auth type {}{}",
-                protocol::event_name(event.event_type),
-                event.event_type,
-                event.status,
-                event.reason,
-                event.flags,
-                event.auth_type,
-                dongle.event_source(&event)
-            );
+            if dongle.detailed() {
+                crate::println!(
+                    "wifi: event {} {} status {} reason {} flags {:#x} auth type {}{}",
+                    protocol::event_name(event.event_type),
+                    event.event_type,
+                    event.status,
+                    event.reason,
+                    event.flags,
+                    event.auth_type,
+                    dongle.event_source(&event)
+                );
+            }
             dongle.link_event(&event);
         }
         while let Some(frame) = dongle.eapol.pop_front() {
@@ -1700,14 +1900,14 @@ fn run(mut dongle: Dongle) -> ! {
                 }
             }
         }
-        if !CARD.link.load(Ordering::Relaxed) {
-            if let Some(since) = dongle.joining_since {
-                if now_us() - since > JOIN_RETRY_MS * 1000 {
-                    crate::println!("wifi: no link {} s after asking to join; asking again", JOIN_RETRY_MS / 1000);
-                    dongle.join();
-                }
-            }
+        if dongle.scanning && dongle.scan_done.is_some() {
+            dongle.scanning = false;
+            let chosen = dongle.choose();
+            dongle.feed(Input::Scanned(chosen));
         }
+        dongle.drop_if_due();
+        dongle.feed(Input::Tick);
+        dongle.carry_out();
         let now = crate::trap::ticks();
         if now != last_tick {
             let missed = (now - last_tick).min(8);
