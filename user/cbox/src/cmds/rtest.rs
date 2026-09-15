@@ -311,6 +311,87 @@ fn a_child_that_aborts_is_the_one_signalled(report: &mut Report) {
     );
 }
 
+/// A process that ends itself from a thread other than its first reports the
+/// status it asked for. `exit_group` ends the other threads with SIGKILL, and
+/// the first thread, which is the one a wait reports, recorded that signal
+/// instead of the status: Go calls `exit_group` from whichever thread ran
+/// `os.Exit`, and a parent was told a process that exited with 1 had been
+/// killed by signal 9. Linux keeps the status for the thread group and every
+/// thread leaves with it. The first thread is asleep throughout, so in every
+/// round it is the SIGKILL that ends it.
+fn an_exit_from_a_thread_is_the_process_status(report: &mut Report) {
+    use crate::sys;
+    const CODE: i32 = 3;
+    const CHILDREN: usize = 20;
+
+    let mut wrong = Vec::new();
+    for _ in 0..CHILDREN {
+        let child = sys::fork();
+        if child == 0 {
+            std::thread::spawn(|| std::process::exit(CODE));
+            // Only the other thread's exit is meant to end this one. A status
+            // nothing else gives says it did not, rather than a hang.
+            std::thread::sleep(Duration::from_secs(10));
+            sys::exit_group(99);
+        }
+        if child < 0 {
+            wrong.push(format!("fork returned {}", child));
+            continue;
+        }
+        let (reaped, status) = sys::wait4(child as i32, 0);
+        if reaped != child || sys::signal_of(status).is_some() || sys::exit_code_of(status) != CODE {
+            wrong.push(format!("forked {} reaped {} status {:#x}", child, reaped, status));
+        }
+    }
+    report.check(
+        "an exit from a second thread is the process's status",
+        wrong.is_empty(),
+        format!("{} of {} children: {}", wrong.len(), CHILDREN, wrong.join("; ")),
+    );
+}
+
+/// A process with a second thread that a signal from outside ends still
+/// reports that signal: nothing called `exit_group`, so the thread group has no
+/// status of its own to report in its place.
+fn a_signal_from_outside_is_still_reported(report: &mut Report) {
+    use crate::sys;
+    const SIGKILL: i32 = 9;
+    const SIGTERM: i32 = 15;
+
+    for (name, signum) in [("SIGKILL", SIGKILL), ("SIGTERM", SIGTERM)] {
+        let check = format!("a child killed by {} from outside reports it", name);
+        let Ok((reader, writer)) = sys::pipe() else {
+            report.check(&check, false, "no pipe to hear the child is ready".into());
+            continue;
+        };
+        let child = sys::fork();
+        if child == 0 {
+            // A thread group like the ones above, whose second thread returns
+            // on its own after a second.
+            std::thread::spawn(|| std::thread::sleep(Duration::from_secs(1)));
+            sys::write(writer, b"x");
+            std::thread::sleep(Duration::from_secs(10));
+            sys::exit_group(99);
+        }
+        sys::close(writer);
+        if child < 0 {
+            sys::close(reader);
+            report.check(&check, false, format!("fork returned {}", child));
+            continue;
+        }
+        let mut buf = [0u8; 1];
+        let ready = sys::read(reader, &mut buf) == 1;
+        sys::close(reader);
+        sys::kill(child as i32, signum);
+        let (reaped, status) = sys::wait4(child as i32, 0);
+        report.check(
+            &check,
+            ready && reaped == child && sys::signal_of(status) == Some(signum),
+            format!("forked {} ready {} reaped {} status {:#x}", child, ready, reaped, status),
+        );
+    }
+}
+
 /// A process blocked on something other than a child still has to learn that a
 /// child finished: the child signal is a signal, and every other one returns a
 /// sleeping task to the run queue. A shell waiting for a key is the case that
@@ -2061,6 +2142,8 @@ pub fn main(_args: &[String]) -> i32 {
     println!("-- threads, processes and waiting --");
     thread_of_a_child_is_not_a_child(&mut report);
     a_child_that_aborts_is_the_one_signalled(&mut report);
+    an_exit_from_a_thread_is_the_process_status(&mut report);
+    a_signal_from_outside_is_still_reported(&mut report);
     a_child_exit_reaches_a_blocked_parent(&mut report);
     what_a_wait_does_with_signals(&mut report);
     a_continued_job_has_no_stop_to_report(&mut report);

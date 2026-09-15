@@ -386,11 +386,19 @@ pub fn handle_user_page_fault(fault: &arch::PageFault) -> bool {
     current().fault_in(fault.address)
 }
 
-/// Terminate the current task. `status` is already encoded the way wait4
-/// reports it: exit codes in bits 8..15, a killing signal in bits 0..6.
 /// Terminate every task in `tgid`'s thread group except the caller, then the
 /// caller itself.
+///
+/// `status` becomes the thread group's, as Linux's `do_group_exit` stores it in
+/// `group_exit_code`. The other threads are ended by SIGKILL and leave through
+/// `exit_current`, which gives each of them this status rather than the signal.
+/// The leader is the task a wait reports, and a program ends itself from
+/// whichever thread it is on -- Go from the one that ran `os.Exit` -- so when
+/// the leader recorded the signal, a parent was told that a process which
+/// exited with 1 had been killed by signal 9. The first thread to get here sets
+/// the status; a second caller leaves with that one, as in Linux.
 pub fn exit_group(status: i32) -> ! {
+    let status = *current().group_exit.lock().get_or_insert(status);
     let tgid = current().tgid;
     let me = current().pid;
     for_each(|task, table| {
@@ -402,6 +410,8 @@ pub fn exit_group(status: i32) -> ! {
     exit_current(status)
 }
 
+/// Terminate the current task. `status` is already encoded the way wait4
+/// reports it: exit codes in bits 8..15, a killing signal in bits 0..6.
 pub fn exit_current(status: i32) -> ! {
     {
         // Threads that finished earlier are still holding a kernel stack and a
@@ -410,7 +420,11 @@ pub fn exit_current(status: i32) -> ! {
         reap_dead_threads();
 
         let task = current();
-        task.exit_code.set(status);
+        // Once `exit_group` has run, the thread leaves with the status that
+        // call gave the group, whichever way it got here: the SIGKILL the call
+        // sent, its own exit, or a fault.
+        let group_status = *task.group_exit.lock();
+        task.exit_code.set(group_status.unwrap_or(status));
 
         // A thread that asked for it gets its tid slot cleared so whoever is
         // joining on it can see that it finished. This goes through the
@@ -772,7 +786,12 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
             if !matches_want(task, want) {
                 continue;
             }
-            found = Some((task.pid, task.exit_code.get(), entry.0));
+            // A leader that left before the group was ended -- its own `exit`
+            // while other threads ran on -- holds a code that is not the
+            // process's. Linux's wait reports `group_exit_code` whenever the
+            // group was ended by `exit_group`.
+            let status = (*task.group_exit.lock()).unwrap_or(task.exit_code.get());
+            found = Some((task.pid, status, entry.0));
             break;
         }
     }
