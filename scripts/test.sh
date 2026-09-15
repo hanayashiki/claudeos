@@ -745,6 +745,297 @@ sys.exit(1)
 PY
 }
 
+# /data on the emulated Pi 4's SD card, with card images made by tools/fatdisk,
+# which needs no root. Two boots on one card go through every operation and
+# then read back what the first left; the Mac reads the image after the fsync,
+# before the sync, and after each boot, and requires the boot partition beside
+# /data to be unchanged. Then boots with no card, with data=off, with a label
+# the card does not have, with a boot partition carrying the /data label, with
+# a bad partition table and with volumes damaged on purpose each have to reach
+# the shell with one `data:` line before it and no panic, and walk whatever
+# /data they have to the end.
+run_data() {
+  banner "/data on an SD card"
+  if [ "$ARCH" != aarch64 ]; then
+    echo "   /data is on the Raspberry Pi 4's SD card, and $ARCH has no card slot"
+    echo ">> /data on an SD card: not run on $ARCH"
+    echo
+    return
+  fi
+  local fatdisk="$ROOT/tools/fatdisk/target/release/fatdisk"
+  if ! (cd "$ROOT/tools/fatdisk" && cargo build --release -q); then
+    echo "   tools/fatdisk did not build"
+    echo ">> /data on an SD card: FAILED"
+    status=1
+    echo
+    return
+  fi
+  local dir ok=1 card qemu boot_before whole_before start length seed seeds="${DATA_SEEDS:-12}"
+  local long="/claudeos-test/An index page with a long name, spaces, and (brackets).html"
+  dir="$(mktemp -d)"
+  card="$dir/card.img"
+  "$fatdisk" mbr "$card" 256 CLAUDEOS:64+boot CLAUDEDATA:rest
+  boot_before="$(data_digest "$card" CLAUDEOS)"
+
+  # The first boot runs in the background, so that the image can be read in
+  # the pause the guest makes between its fsync and its sync.
+  "$ROOT/scripts/run.sh" --timeout 240 --sd "$card" --initrd "$IMAGE" \
+      --append "/root/data.sh datatest=write" > "$dir/write" 2>&1 < /dev/null &
+  qemu=$!
+  if data_wait "$dir/write" "^data-test: fsync done" 200; then
+    "$fatdisk" cat "$card" CLAUDEDATA /claudeos-test/fsync.txt > "$dir/after-fsync" 2>&1
+    if tr -d '\r' < "$dir/write" | grep -q "^data-test: syncing"; then
+      echo "   the image was read after the guest went on to sync, so it shows nothing about fsync"
+      ok=0
+    elif [ "$(cat "$dir/after-fsync")" != "reached the card" ]; then
+      echo "   after the fsync, before the sync, the image did not hold the file:"
+      sed 's/^/     /' "$dir/after-fsync"
+      ok=0
+    fi
+  else
+    echo "   the first boot never reached its fsync"
+    ok=0
+  fi
+  wait $qemu
+  data_suite write || ok=0
+  if [ "$(cat "$dir/after-fsync" 2>/dev/null)" = "reached the card" ]; then
+    echo "   read from the image after the fsync and before the sync: reached the card"
+  fi
+
+  # What the Mac finds on the card between the boots.
+  if [ "$("$fatdisk" cat "$card" CLAUDEDATA "$long" 2>&1)" != "<h1>first</h1>" ]; then
+    echo "   the Mac does not find the file with the long name the guest wrote"
+    ok=0
+  fi
+  if [ "$("$fatdisk" cat "$card" CLAUDEDATA /claudeos-test/big.txt | shasum | cut -c 1-40)" \
+      != "$(seq 1 200000 | shasum | cut -c 1-40)" ]; then
+    echo "   the large file on the image is not the bytes the guest copied in"
+    ok=0
+  fi
+  data_check "$card" after-write || ok=0
+
+  "$ROOT/scripts/run.sh" --timeout 120 --sd "$card" --initrd "$IMAGE" \
+      --append "/root/data.sh datatest=verify" > "$dir/verify" 2>&1 < /dev/null
+  data_suite verify || ok=0
+  data_check "$card" after-verify || ok=0
+  if [ "$(data_digest "$card" CLAUDEOS)" != "$boot_before" ]; then
+    echo "   partition 1, the boot partition beside /data, changed"
+    ok=0
+  else
+    echo "   partition 1, the boot partition beside /data, is unchanged after both boots"
+  fi
+
+  # No card in the slot.
+  data_boot nocard "" ""
+  data_expect nocard "^data: /data is not mounted: nothing answered in the card slot" || ok=0
+
+  # data=off leaves the card alone.
+  whole_before="$(shasum "$card" | cut -c 1-40)"
+  data_boot off "$card" "data=off"
+  data_expect off "^data: off, from the command line" || ok=0
+
+  # A label no volume on the card has: nothing is mounted and nothing written.
+  data_boot label "$card" "data=ELSEWHERE"
+  data_expect label "^data: /data is not mounted: no FAT32 volume on the card is labelled ELSEWHERE" || ok=0
+  if [ "$(shasum "$card" | cut -c 1-40)" != "$whole_before" ]; then
+    echo "   the card changed in a boot with data=off or a label it does not have"
+    ok=0
+  fi
+  rm -f "$card"
+
+  # A boot partition labelled CLAUDEDATA: the label matches, and start4.elf and
+  # kernel8.img in its root keep it from being mounted or written.
+  "$fatdisk" mbr "$dir/guard.img" 128 CLAUDEDATA:rest+boot
+  whole_before="$(shasum "$dir/guard.img" | cut -c 1-40)"
+  data_boot guard "$dir/guard.img" ""
+  data_expect guard "^data: /data is not mounted: partition 1 is labelled CLAUDEDATA but its root holds start4.elf, so it is a boot partition" || ok=0
+  if [ "$(shasum "$dir/guard.img" | cut -c 1-40)" != "$whole_before" ]; then
+    echo "   the boot partition labelled CLAUDEDATA changed"
+    ok=0
+  fi
+  rm -f "$dir/guard.img"
+
+  # What the damaged cards start from: a boot partition, and /data holding
+  # directories, long names, a file of many clusters, a directory of two
+  # clusters and a file of three.
+  "$fatdisk" mbr "$dir/template.img" 128 CLAUDEOS:40+boot CLAUDEDATA:rest
+  "$fatdisk" fill "$dir/template.img" CLAUDEDATA
+  read -r start length < <("$fatdisk" span "$dir/template.img" CLAUDEDATA)
+
+  # A partition table with a boot indicator that is neither 0 nor 0x80.
+  cp "$dir/template.img" "$dir/badmbr.img"
+  printf '\063' | dd of="$dir/badmbr.img" bs=1 seek=446 conv=notrunc 2>/dev/null
+  data_boot badmbr "$dir/badmbr.img" ""
+  data_expect badmbr "^data: /data is not mounted: block 0 of the card has the 55 AA signature but no valid partition table" || ok=0
+  rm -f "$dir/badmbr.img"
+
+  # /data's boot sector zeroed, and then three with random bytes over its
+  # fields.
+  cp "$dir/template.img" "$dir/zeroed.img"
+  dd if=/dev/zero of="$dir/zeroed.img" bs=512 seek="$start" count=1 conv=notrunc 2>/dev/null
+  data_boot zeroed "$dir/zeroed.img" ""
+  data_expect zeroed "^data: /data is not mounted: no FAT32 volume on the card is labelled CLAUDEDATA" || ok=0
+  rm -f "$dir/zeroed.img"
+  for seed in 1 2 3; do
+    cp "$dir/template.img" "$dir/boot-$seed.img"
+    "$fatdisk" damage "$dir/boot-$seed.img" CLAUDEDATA boot "$seed" 16
+    data_boot "boot-$seed" "$dir/boot-$seed.img" ""
+    data_expect "boot-$seed" || ok=0
+    rm -f "$dir/boot-$seed.img"
+  done
+
+  # A directory and a file whose cluster chains loop back to their start.
+  cp "$dir/template.img" "$dir/loops.img"
+  "$fatdisk" damage "$dir/loops.img" CLAUDEDATA loops 0
+  data_boot loops "$dir/loops.img" ""
+  data_expect loops "^data: mounted partition 2 of the card, labelled CLAUDEDATA" || ok=0
+  rm -f "$dir/loops.img"
+
+  # www/css pointed at the root directory, so the tree under it has no bottom
+  # and `find` goes down it until paths reach the length limit.
+  cp "$dir/template.img" "$dir/cycle.img"
+  "$fatdisk" damage "$dir/cycle.img" CLAUDEDATA cycle 0
+  data_boot cycle "$dir/cycle.img" ""
+  data_expect cycle "^data: mounted partition 2 of the card, labelled CLAUDEDATA" || ok=0
+  rm -f "$dir/cycle.img"
+
+  # Random bytes anywhere in the image: the partition table, both volumes'
+  # boot sectors, FATs and directories, and file contents alike. 200000 bytes
+  # over 128 MiB is one in about every 670, which changes /data's FAT in
+  # every seed and the partition table's entries or /data's boot sector
+  # fields in about one seed in five.
+  for seed in $(seq 1 "$seeds"); do
+    cp "$dir/template.img" "$dir/random-$seed.img"
+    "$fatdisk" damage "$dir/random-$seed.img" CLAUDEDATA random "$seed" 200000
+    data_boot "random-$seed" "$dir/random-$seed.img" ""
+    data_expect "random-$seed" || ok=0
+    rm -f "$dir/random-$seed.img"
+  done
+  rm -rf "$dir"
+
+  if [ $ok -eq 1 ]; then
+    echo ">> /data on an SD card: OK"
+  else
+    echo ">> /data on an SD card: FAILED"
+    status=1
+  fi
+  echo
+}
+
+# Wait up to $3 seconds for a line matching $2 in the file $1.
+data_wait() {
+  local i
+  for i in $(seq 1 $(($3 * 2))); do
+    if tr -d '\r' < "$1" | grep -q "$2"; then return 0; fi
+    sleep 0.5
+  done
+  return 1
+}
+
+# The SHA-1 of the blocks of the volume labelled $2 in the image $1.
+data_digest() {
+  local start length
+  read -r start length < <("$fatdisk" span "$1" "$2")
+  python3 -c 'import hashlib, sys
+path, start, length = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+digest = hashlib.sha1()
+with open(path, "rb") as image:
+    image.seek(start * 512)
+    left = length * 512
+    while left:
+        chunk = image.read(min(left, 1 << 20))
+        if not chunk:
+            break
+        digest.update(chunk)
+        left -= len(chunk)
+print(digest.hexdigest())' "$1" "$start" "$length"
+}
+
+# Read every file on /data in the image $1 from the Mac, and require no cluster
+# to belong to two files.
+data_check() {
+  if "$fatdisk" check "$1" CLAUDEDATA > "$dir/check-$2" 2>&1; then
+    echo "   fatdisk check $2: $(cat "$dir/check-$2")"
+  else
+    echo "   fatdisk check $2 failed:"
+    sed 's/^/     /' "$dir/check-$2"
+    return 1
+  fi
+}
+
+# Print what the boot $1 showed, and require its suite to have passed without a
+# panic.
+data_suite() {
+  local output
+  output="$(tr -d '\r' < "$dir/$1")"
+  echo "--- $1"
+  echo "$output"
+  record_boot_id "$output"
+  if ! echo "$output" | grep -qE "^=== [0-9]+ passed, 0 failed ===$"; then
+    echo "   $1: the suite did not pass"
+    return 1
+  fi
+  if echo "$output" | grep -q "KERNEL PANIC"; then
+    echo "   $1: the kernel panicked"
+    return 1
+  fi
+}
+
+# Boot with the card image $2, or with no card when $2 is empty, and the
+# command line $3; at the shell, walk /data with the damaged-card part of
+# tests/data.sh, and power off. What the console showed is kept as $dir/$1.
+data_boot() {
+  local steps=("until:claudeos shell" "wait:0.5"
+      "datatest=damaged sh /root/data.sh\n"
+      "until:the damaged card was walked to the end" "until:the damaged card was walked to the end"
+      "until:the damaged card was walked to the end" "until:the damaged card was walked to the end"
+      "wait:0.5" "poweroff\n" "wait:3")
+  if [ -n "$2" ]; then
+    python3 "$ROOT/tools/drive.py" --timeout 180 --initramfs "$IMAGE" --sd "$2" --append "$3" -- "${steps[@]}"
+  else
+    python3 "$ROOT/tools/drive.py" --timeout 180 --initramfs "$IMAGE" --append "$3" -- "${steps[@]}"
+  fi 2>&1 | tr -d '\r' > "$dir/$1"
+}
+
+# Require, in what the boot $1 showed: every pattern after the first argument;
+# exactly one `data:` line before the shell started; the shell; the walk over
+# /data finished; and no panic.
+data_expect() {
+  local name="$1" pattern missing=0 lines
+  shift
+  echo "--- $name"
+  grep -E "^data|claudeos shell|KERNEL PANIC|powering off" "$dir/$name" | sed 's/^/   /'
+  for pattern in "$@"; do
+    if ! grep -q -- "$pattern" "$dir/$name"; then
+      echo "   $name: missing expected output: $pattern"
+      missing=1
+    fi
+  done
+  lines="$(awk '/claudeos shell/ { exit } /^data: / { n++ } END { print n + 0 }' "$dir/$name")"
+  if [ "$lines" != 1 ]; then
+    echo "   $name: $lines data: lines before the shell, where one is expected"
+    missing=1
+  fi
+  if ! grep -q "claudeos shell" "$dir/$name"; then
+    echo "   $name: the boot did not reach the shell"
+    missing=1
+  fi
+  if ! grep -q "^data-test: the damaged card was walked to the end" "$dir/$name"; then
+    echo "   $name: the walk over /data did not finish"
+    missing=1
+  fi
+  if grep -q "KERNEL PANIC" "$dir/$name"; then
+    echo "   $name: the kernel panicked"
+    missing=1
+  fi
+  if [ $missing -ne 0 ]; then
+    echo "   --- everything boot $name showed"
+    sed 's/^/   /' "$dir/$name"
+  fi
+  record_boot_id "$(cat "$dir/$name")"
+  return $missing
+}
+
 # The boots above, compared against each other. Every one seeds its generator
 # from what it can observe of its own start-up, and the id says where that left
 # it; two the same would mean two machines produced one stream, which is the
@@ -798,6 +1089,7 @@ else
 fi
 run_integrity
 run_board_image
+run_data
 run_interactive
 run_interrupt_key
 run_telnet

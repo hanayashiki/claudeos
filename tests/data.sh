@@ -1,11 +1,9 @@
-# /data on an SD card, run by the data section of scripts/test.sh with a card
-# image in the emulated Pi 4's slot. Which part runs comes from the kernel
-# command line as `datatest=PART`, which reaches this script through init's
-# environment:
+# /data on an SD card, run by the /data section of scripts/test.sh with a card
+# image in the emulated Pi 4's slot. Which part runs comes from `datatest=PART`,
+# given on the kernel command line or in front of the command:
 #
-#   write     the first boot: every operation, ending with a file for the
-#             second boot, fsync, sync, and a line the harness waits for
-#             before it reads the image from the Mac
+#   write     the first boot: every operation, then an fsync, a pause in which
+#             the harness reads the image from the Mac, and a sync
 #   verify    the second boot on the same image: what the first left is there
 #   damaged   a card damaged on purpose: walk it, read it and write to it,
 #             and reach the end whatever happens
@@ -23,6 +21,11 @@ check() {
   fi
 }
 
+# 1 when $1 and $2 are at most $3 apart, else 0.
+near() {
+  if [ $(($1 - $2)) -le "$3" ] && [ $(($2 - $1)) -le "$3" ]; then echo 1; else echo 0; fi
+}
+
 T=/data/claudeos-test
 LONG="An index page with a long name, spaces, and (brackets).html"
 
@@ -35,6 +38,7 @@ write)
   check "long name read back"        "<h1>first</h1>"  "$(cat "$T/$LONG")"
   check "long name listed"           "$LONG"           "$(ls $T)"
   check "long name found in any case" "<h1>first</h1>" "$(cat "$T/an INDEX page with a long name, spaces, and (brackets).HTML")"
+  check "its size"                   "15"              "$(stat -c %s "$T/$LONG")"
 
   seq 1 3000 > $T/lines.txt
   check "a file of many clusters"    "3000"            "$(wc -l < $T/lines.txt)"
@@ -47,6 +51,19 @@ write)
   check "length after the rewrite"   "10"              "$(wc -c < $T/lines.txt)"
   : > $T/lines.txt
   check "truncate to nothing"        "0"               "$(wc -c < $T/lines.txt)"
+
+  # A file of 1288895 bytes, copied in from memory. The harness compares it
+  # with the same `seq` output on the Mac after this boot.
+  seq 1 200000 > /tmp/big.txt
+  cp /tmp/big.txt $T/big.txt
+  check "a large file copied in"     "1288895"         "$(wc -c < $T/big.txt)"
+  check "a line from its middle"     "123456"          "$(sed -n 123456p $T/big.txt)"
+
+  # More long names than one cluster of directory entries holds.
+  mkdir $T/many
+  for i in $(seq 1 300); do echo $i > "$T/many/a file with a long name, number $i.txt"; done
+  check "300 long names listed"      "300"             "$(ls $T/many | wc -l)"
+  check "one of them read back"      "217"             "$(cat "$T/many/a file with a long name, number 217.txt")"
 
   echo one > $T/a.txt
   mv $T/a.txt $T/b.txt
@@ -69,6 +86,7 @@ write)
   mv $T/d1/inner $T/d2/moved
   check "move a directory"           "deep"            "$(cat $T/d2/moved/f)"
   check "into its own subdirectory"  "1"               "$(mv $T/d2 $T/d2/moved/x 2>/dev/null; echo $?)"
+  check "a moved directory's .."     "moved"           "$(cd $T/d2/moved/.. && ls)"
 
   echo gone > $T/doomed
   rm $T/doomed
@@ -86,18 +104,29 @@ write)
   check "a directory on the card is not /" "0"         "$(test "$(stat -c %d /data)" != "$(stat -c %d /)"; echo $?)"
 
   echo "survives a reboot" > $T/persist.txt
+  modified="$(stat -c %Y $T/persist.txt)"
+  check "mtime from the kernel clock" "1"              "$(near "$modified" "$(date +%s)" 60)"
+  echo "$modified" > $T/persist.mtime
+
   echo "reached the card" > $T/fsync.txt
   check "fsync"                      "0"               "$(fsync $T/fsync.txt; echo $?)"
+  # The harness reads the image during this pause, before the sync below: what
+  # it finds there is what was on the card after fsync.
+  echo "data-test: fsync done; the image can be read"
+  sleep 8
+  echo "data-test: syncing"
   check "sync"                       "0"               "$(sync; echo $?)"
-  echo "data-test: written; the image can be read"
-  sleep 4
   ;;
 
 verify)
   echo "=== /data: the second boot ==="
   check "mounted as vfat"            "1"               "$(grep -c ' /data vfat rw' /proc/mounts)"
   check "the file for this boot"     "survives a reboot" "$(cat $T/persist.txt)"
+  check "its mtime, to FAT's two seconds" "1"          "$(near "$(stat -c %Y $T/persist.txt)" "$(cat $T/persist.mtime)" 2)"
   check "the long name"              "<h1>first</h1>"  "$(cat "$T/$LONG")"
+  check "the large file's length"    "1288895"         "$(wc -c < $T/big.txt)"
+  check "the large file's last line" "200000"          "$(tail -n 1 $T/big.txt)"
+  check "300 long names"             "300"             "$(ls $T/many | wc -l)"
   check "the renamed file"           "one"             "$(cat $T/sub/B.TXT)"
   check "the moved directory"        "deep"            "$(cat $T/d2/moved/f)"
   check "the file renamed over"      "new"             "$(cat $T/target)"
@@ -107,15 +136,21 @@ verify)
   rmdir $T/d2/moved
   rmdir $T/d2
   check "cleaned up"                 "1"               "$(test -e $T/d2; echo $?)"
+  rm -r $T/many
+  check "rm -r of 300 files"         "1"               "$(test -e $T/many; echo $?)"
+  sync
   ;;
 
 damaged)
   echo "=== /data: a damaged card ==="
   # Whatever is on the card, all of this has to come to an end, with errors
-  # or without. Nothing is checked but that the end is reached.
-  find /data > /tmp/walked 2>/dev/null
+  # or without. Nothing is checked but that the end is reached. The walks stop
+  # 16 levels down: damaged directory entries can point back at a directory
+  # above them, and then the tree has no bottom and a walk without a limit goes
+  # down until paths reach 4096 bytes, which is thousands of lookups.
+  find /data -maxdepth 16 > /tmp/walked 2>/dev/null
   echo "data-test: $(wc -l < /tmp/walked) names walked"
-  find /data -type f 2>/dev/null | head -n 64 > /tmp/files
+  find /data -maxdepth 16 -type f 2>/dev/null | head -n 64 > /tmp/files
   while read -r name; do
     cat "$name" > /dev/null 2>&1
   done < /tmp/files

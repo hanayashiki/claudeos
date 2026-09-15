@@ -155,6 +155,8 @@ HOSTNAME
 cp "$ROOT/tests/demo.sh" "$RFS/root/demo.sh"
 cp "$ROOT/tests/suite.sh" "$RFS/root/suite.sh"
 cp "$ROOT/tests/busybox.sh" "$RFS/root/busybox.sh"
+# Only the Pi 4 has a card slot, so only this image has the /data suite.
+cp "$ROOT/tests/data.sh" "$RFS/root/data.sh"
 
 cat > "$RFS/root/hello.txt" <<'HELLO'
 This file came from the initramfs, unpacked by the kernel at boot.
