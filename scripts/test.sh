@@ -433,6 +433,21 @@ run_integrity() {
       "^integrity: /bin/cbox ok$" \
       "^integrity: $((count - 1)) ok, 1 damaged, 0 missing, 0 malformed lines skipped" || ok=0
 
+  # The system services list changed: its last byte, the newline after the
+  # ntpd line, made a byte that is not text. The check reports the list, and
+  # init's reading of it skips the line the byte is in.
+  integrity_image services rewrite-last-byte etc/claudeos/services
+  integrity_boot services "$dir/services.cpio" "$KERNEL_IMAGE"
+  integrity_expect services \
+      "^integrity: /etc/claudeos/services DAMAGED: expected $(integrity_digest /etc/claudeos/services), got [0-9a-f]\{40\}$" \
+      "^integrity: /bin/cbox ok$" \
+      "^integrity: $((count - 1)) ok, 1 damaged, 0 missing, 0 malformed lines skipped" || ok=0
+  if ! grep -q "^services: 0 system started, 1 line skipped; " "$dir/services"; then
+    echo "   services: the summary line does not say the damaged line was skipped"
+    grep "^services:" "$dir/services" | sed 's/^/   /'
+    ok=0
+  fi
+
   # An item the manifest names taken out of the image. cbox is init and the
   # shell, so the item is the first one after it.
   victim="$(awk '$2 != "kernel" && $2 != "/bin/cbox" { print $2; exit }' "$manifest")"
@@ -1083,6 +1098,281 @@ data_expect() {
   return $missing
 }
 
+# Services at boot: the system list in the image, /etc/claudeos/services, and
+# the user list on the card, /data/services.txt. The image booted is the test
+# image with /etc/ntp.conf added, so that the system list's ntpd starts, and
+# with /root/services.sh, which prints what /run/services and the logs say.
+# Every boot has to reach the shell with the expected summary line before it,
+# or with none and init's line saying why, and show ntpd started from the
+# system list.
+#
+# On aarch64 the cards hold: a list of an always service that exits at once,
+# a once service writing to /tmp, busybox httpd serving /data/site, a once
+# service whose output passes the log cap, a program that does not exist and
+# an off service, in CRLF lines; a list of malformed lines that runs past the
+# byte cap; no list; the first card again with data=off; and a list naming
+# ntpd. x86-64 has no card slot, so there the test image as built, which has no
+# /etc/ntp.conf, has to leave ntpd unstarted, and the image with it has to
+# start ntpd and skip the user list. On both, a starter that hangs and one that
+# aborts, through the test image's servicetest= hook, have to leave the shell
+# arriving and ntpd started.
+run_services() {
+  banner "services at boot"
+  local dir ok=1 fatdisk="$ROOT/tools/fatdisk/target/release/fatdisk" card="" system_ntpd filler
+  dir="$(mktemp -d)"
+
+  # The list format's own tests, which build cbox for the Mac.
+  if (cd "$ROOT/user/cbox" && cargo test --release -q > "$dir/host-tests" 2>&1); then
+    echo "   user/cbox tests: $(grep -E '^test result' "$dir/host-tests" | awk '{ p += $4; f += $6 } END { print p " passed, " f " failed" }')"
+  else
+    echo "   user/cbox tests failed:"
+    tail -n 40 "$dir/host-tests" | sed 's/^/     /'
+    ok=0
+  fi
+
+  cp -R "$TREE" "$dir/services-tree"
+  printf 'server ntp.nict.jp\nserver time.cloudflare.com\n' > "$dir/services-tree/etc/ntp.conf"
+  cat > "$dir/services-tree/root/services.sh" <<'SCRIPT'
+#!/bin/sh
+# Run at the shell by the services section of scripts/test.sh; $1 names the boot.
+field() {
+  sed -n "s/^$2: //p" "/run/services/$1"
+}
+echo "--- cat /run/services/*"
+cat /run/services/*
+for name in ntpd flap note site chatty missing spare good late other; do
+  if [ -f "/run/services/$name" ]; then
+    echo "svc-status: $name list=$(field $name list) state=$(field $name state) starts=$(field $name starts) last=$(field $name 'last run')"
+  else
+    echo "svc-status: $name absent"
+  fi
+done
+echo "svc-ntpd-command: $(field ntpd command)"
+sed 's/^/svc-errors: /' /run/services/errors.txt
+case "$1" in
+main)
+  echo "svc-once: $(cat /tmp/once.txt)"
+  echo "svc-web: $(busybox wget -q -O - http://127.0.0.1:8080/index.html)"
+  echo "svc-flap-waits: $(grep -o 'next start in [0-9]* s' /var/log/flap.log | head -n 4 | cut -d ' ' -f 4 | xargs echo)"
+  size=$(wc -c < /var/log/chatty.log)
+  first=$(head -n 1 /var/log/chatty.log)
+  if [ "$size" -le 262144 ] && [ "$first" != 1 ]; then
+    echo "svc-chatty: cut to $size bytes"
+  else
+    echo "svc-chatty: not cut: $size bytes, starting with $first"
+  fi
+  echo "svc-chatty-end: $(grep -c '^60000$' /var/log/chatty.log) $(grep -c '^chatty done$' /var/log/chatty.log)"
+  ;;
+bad)
+  if [ -f /tmp/good.txt ]; then echo "svc-good: ran"; else echo "svc-good: did not run"; fi
+  if [ -f /tmp/late.txt ]; then echo "svc-late: ran"; else echo "svc-late: did not run"; fi
+  ;;
+ntpd)
+  if [ -f /tmp/other.txt ]; then echo "svc-other: ran"; else echo "svc-other: did not run"; fi
+  if [ -f /tmp/impostor.txt ]; then echo "svc-impostor: ran"; else echo "svc-impostor: did not run"; fi
+  ;;
+esac
+echo "svc-done"
+SCRIPT
+  python3 "$ROOT/tools/mkcpio.py" "$dir/services-tree" "$dir/services.cpio" > /dev/null
+  rm -rf "$dir/services-tree"
+  system_ntpd='^svc-status: ntpd list=system state=(running|waiting) starts=[1-9][0-9]* last='
+
+  if [ "$ARCH" = x86_64 ]; then
+    services_boot plain "$IMAGE" "" "" \
+        "wait:0.5" "cat /run/services/ntpd /run/services/errors.txt\n" "wait:1.5"
+    services_expect plain "services: 0 system started, 1 not started; no user list, /data is not mounted" \
+        '^state: not started: it needs /etc/ntp.conf, which does not exist$' \
+        '^/data/services.txt: /data is not mounted, so no user services were started$' || ok=0
+
+    services_boot system "$dir/services.cpio" "" "" "wait:2" "sh /root/services.sh system\n" "until:svc-done"
+    services_expect system "services: 1 system started; no user list, /data is not mounted" \
+        "$system_ntpd" '^svc-ntpd-command: /bin/busybox ntpd -n -q$' \
+        '^svc-errors: /data/services.txt: /data is not mounted, so no user services were started$' || ok=0
+  elif [ "$(uname -s)" != Darwin ]; then
+    echo "   the card images are made by macOS's newfs_msdos through hdiutil"
+    skipped=$((skipped + 1))
+  elif ! (cd "$ROOT/tools/fatdisk" && cargo build --release -q); then
+    echo "   tools/fatdisk did not build"
+    ok=0
+  else
+    card="$dir/main.img"
+    services_card main "$(printf '%s\r\n' \
+        "# The harness's user services, saved with CRLF line endings." \
+        "flap     always  /bin/sh -c 'echo flap ran; exit 3'" \
+        "note     once    /bin/sh -c \"echo written by once > /tmp/once.txt\"" \
+        "site     always  /bin/httpd -f -p 8080 -h /data/site" \
+        "chatty   once    /bin/sh -c '/bin/busybox seq 1 60000; echo chatty done'" \
+        "missing  always  /bin/no-such-program --flag" \
+        "spare    off     /bin/true")" || ok=0
+    "$fatdisk" put "$card" CLAUDEDATA /site/index.html "<h1>served from /data</h1>" || ok=0
+    # Ctrl-C at the prompt ends the sleep and reaches no service; the rest of
+    # the wait lets flap fail four times.
+    services_boot main "$dir/services.cpio" "$card" "" \
+        "wait:1" "sleep 5\n" "wait:1.5" "\x03" "wait:10" "sh /root/services.sh main\n" "until:svc-done"
+    services_expect main "services: 1 system started; 5 user started, 1 not started" \
+        "$system_ntpd" \
+        '^svc-status: flap list=user state=(running|waiting) starts=([3-9]|[1-9][0-9]) last=exited with status 3 after 0 s$' \
+        '^svc-status: note list=user state=finished starts=1 last=exited with status 0 after [0-9]+ s$' \
+        '^svc-status: site list=user state=running starts=1 last=none yet$' \
+        '^svc-status: chatty list=user state=finished starts=1 last=exited with status 0 after [0-9]+ s$' \
+        '^svc-status: missing list=user state=waiting starts=([3-9]|[1-9][0-9]) last=could not be started: No such file or directory \(os error 2\)$' \
+        '^svc-status: spare list=user state=off starts=0 last=none yet$' \
+        '^svc-once: written by once$' \
+        '^svc-web: <h1>served from /data</h1>$' \
+        '^svc-flap-waits: 1 2 4 8$' \
+        '^svc-chatty: cut to [0-9]+ bytes$' \
+        '^svc-chatty-end: 1 1$' \
+        '!^svc-errors: ' || ok=0
+
+    # Eight lines wrong in eight ways with a good line among them, and 70 KiB
+    # of comments, which put the last line past the byte cap.
+    filler="$(for n in $(seq 1 700); do printf '# filler line %085d\n' "$n"; done)"
+    services_card bad "$(printf '%s\n' \
+        "Web      always  /bin/true" \
+        "web      sometimes  /bin/true" \
+        "web      always  port=80 /bin/true" \
+        "web      always  busybox httpd -f" \
+        "web      always  /bin/echo 'not closed" \
+        "good     once    /bin/sh -c 'echo good > /tmp/good.txt'" \
+        "good     once    /bin/true" \
+        "long     once    /bin/echo $(printf '%01100d' 0)" \
+        "$(printf 'web      always  /bin/echo \033[2J')" \
+        "$filler" \
+        "late     once    /bin/sh -c 'echo late > /tmp/late.txt'")" || ok=0
+    services_boot bad "$dir/services.cpio" "$dir/bad.img" "" "wait:2" "sh /root/services.sh bad\n" "until:svc-done"
+    services_expect bad "services: 1 system started; 1 user started, 8 lines skipped, the end of the file not read (see /run/services/errors.txt)" \
+        "$system_ntpd" \
+        '^svc-errors: /data/services.txt line 1: the name `Web` is not 1 to 32 of the characters a-z, 0-9, _ and -$' \
+        '^svc-errors: /data/services.txt line 2: the policy `sometimes` is not always, once or off$' \
+        '^svc-errors: /data/services.txt line 3: `port=` is not an option; the options are needs=, every=, limit= and backoff=$' \
+        '^svc-errors: /data/services.txt line 4: `busybox` is neither an option nor the absolute path of a program$' \
+        '^svc-errors: /data/services.txt line 5: a single quote is not closed$' \
+        '^svc-errors: /data/services.txt line 7: the name good is already used on line 6$' \
+        '^svc-errors: /data/services.txt line 8: it is 1127 bytes long, and a line may be 1024$' \
+        '^svc-errors: /data/services.txt line 9: it holds a control character$' \
+        '^svc-errors: /data/services.txt: only the first 65536 bytes were read, so lines from [0-9]+ on were not$' \
+        '^svc-good: ran$' '^svc-late: did not run$' || ok=0
+    rm -f "$dir/bad.img"
+
+    services_card nofile "" || ok=0
+    services_boot nofile "$dir/services.cpio" "$dir/nofile.img" "" "wait:2" "sh /root/services.sh nofile\n" "until:svc-done"
+    services_expect nofile "services: 1 system started; no user list, /data/services.txt does not exist" \
+        "$system_ntpd" \
+        '^svc-errors: /data/services.txt: it does not exist, so no user services were started$' || ok=0
+    rm -f "$dir/nofile.img"
+
+    services_boot off "$dir/services.cpio" "$card" "data=off" "wait:2" "sh /root/services.sh off\n" "until:svc-done"
+    services_expect off "services: 1 system started; no user list, /data is not mounted" \
+        "$system_ntpd" '^svc-status: site absent$' \
+        '^svc-errors: /data/services.txt: /data is not mounted, so no user services were started$' || ok=0
+
+    services_card ntpd "$(printf '%s\n' \
+        "ntpd     always  /bin/sh -c 'echo impostor > /tmp/impostor.txt'" \
+        "other    once    /bin/sh -c 'echo other > /tmp/other.txt'")" || ok=0
+    services_boot ntpd "$dir/services.cpio" "$dir/ntpd.img" "" "wait:2" "sh /root/services.sh ntpd\n" "until:svc-done"
+    services_expect ntpd "services: 1 system started; 1 user started, 1 line skipped (see /run/services/errors.txt)" \
+        "$system_ntpd" '^svc-ntpd-command: /bin/busybox ntpd -n -q$' \
+        '^svc-errors: /data/services.txt line 1: ntpd is the name of a system service, which runs as the system list has it, and a user service cannot replace or disable it$' \
+        '^svc-other: ran$' '^svc-impostor: did not run$' || ok=0
+    rm -f "$dir/ntpd.img"
+  fi
+
+  # The starter stopped after the system services and before the user list,
+  # with the first card in the slot on aarch64, whose services it would
+  # otherwise start.
+  services_boot hang "$dir/services.cpio" "$card" "servicetest=hang" "wait:1" "sh /root/services.sh hang\n" "until:svc-done"
+  services_expect hang none \
+      '^init: the service starter has not finished after 10 s; starting the shell, and the starter carries on$' \
+      "$system_ntpd" '^svc-status: site absent$' || ok=0
+  services_boot abort "$dir/services.cpio" "$card" "servicetest=abort" "wait:1" "sh /root/services.sh abort\n" "until:svc-done"
+  services_expect abort none \
+      '^init: the service starter ended on signal 6 before it finished; the services it had not started are not running$' \
+      "$system_ntpd" '^svc-status: site absent$' || ok=0
+  rm -rf "$dir"
+
+  if [ $ok -eq 1 ]; then
+    echo ">> services at boot: OK"
+  else
+    echo ">> services at boot: FAILED"
+    status=1
+  fi
+  echo
+}
+
+# A card image $dir/$1.img of 128 MiB with one FAT32 volume labelled
+# CLAUDEDATA, holding $2 as /services.txt unless $2 is empty.
+services_card() {
+  "$fatdisk" mbr "$dir/$1.img" 128 CLAUDEDATA:rest > /dev/null || return 1
+  if [ -n "$2" ]; then
+    "$fatdisk" put "$dir/$1.img" CLAUDEDATA /services.txt "$2" || return 1
+  fi
+}
+
+# Boot the image $2 with the card image $3, or no card when $3 is empty, and
+# the command line $4; once the shell has started, send the steps after those,
+# and power off. What the console showed is kept as $dir/$1.
+services_boot() {
+  local name="$1" image="$2" card="$3" append="$4"
+  shift 4
+  if [ -n "$card" ]; then
+    python3 "$ROOT/tools/drive.py" --timeout 150 --initramfs "$image" --sd "$card" --append "$append" -- \
+        "until:claudeos shell" "$@" "wait:0.5" "poweroff\n" "wait:3"
+  else
+    python3 "$ROOT/tools/drive.py" --timeout 150 --initramfs "$image" --append "$append" -- \
+        "until:claudeos shell" "$@" "wait:0.5" "poweroff\n" "wait:3"
+  fi 2>&1 | tr -d '\r' > "$dir/$name"
+  record_boot_id "$(cat "$dir/$name")"
+}
+
+# Require, in what boot $1 showed: the line $2 as the only `services:` line
+# before the shell started, or no such line when $2 is `none`; the shell; no
+# panic; and each pattern after those, an extended regular expression, which
+# has to match a line, or match none when it starts with `!`.
+services_expect() {
+  local name="$1" summary="$2" pattern missing=0 before
+  shift 2
+  echo "--- $name"
+  grep -E "^services:|^init:|^svc-|^state:|^/data/services.txt|claudeos shell|KERNEL PANIC" "$dir/$name" | sed 's/^/   /'
+  before="$(awk '/claudeos shell/ { exit } /^services: / { print }' "$dir/$name")"
+  if [ "$summary" = none ]; then
+    if [ -n "$before" ]; then
+      echo "   $name: a summary line before the shell, where none is expected"
+      missing=1
+    fi
+  elif [ "$before" != "$summary" ]; then
+    echo "   $name: expected before the shell: $summary"
+    missing=1
+  fi
+  for pattern in "$@"; do
+    case "$pattern" in
+      !*)
+        if grep -qE -- "${pattern#!}" "$dir/$name"; then
+          echo "   $name: unexpected output: ${pattern#!}"
+          missing=1
+        fi ;;
+      *)
+        if ! grep -qE -- "$pattern" "$dir/$name"; then
+          echo "   $name: missing expected output: $pattern"
+          missing=1
+        fi ;;
+    esac
+  done
+  if ! grep -q "claudeos shell" "$dir/$name"; then
+    echo "   $name: the boot did not reach the shell"
+    missing=1
+  fi
+  if grep -q "KERNEL PANIC" "$dir/$name"; then
+    echo "   $name: the kernel panicked"
+    missing=1
+  fi
+  if [ $missing -ne 0 ]; then
+    echo "   --- everything boot $name showed"
+    sed 's/^/   /' "$dir/$name"
+  fi
+  return $missing
+}
+
 # The boots above, compared against each other. Every one seeds its generator
 # from what it can observe of its own start-up, and the id says where that left
 # it; two the same would mean two machines produced one stream, which is the
@@ -1137,6 +1427,7 @@ fi
 run_integrity
 run_board_image
 run_data
+run_services
 run_interactive
 run_interrupt_key
 run_telnet
