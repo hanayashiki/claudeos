@@ -109,7 +109,8 @@ no boot sector to install and nothing to mark bootable.
 ARCH=aarch64 ./scripts/build.sh
 ./scripts/build-user-aarch64.sh
 ./scripts/mkcard.sh                      # assemble build/boot and stop
-./scripts/mkcard.sh /dev/disk4           # and write it to that card
+./scripts/mkcard.sh --new /dev/disk4     # erase that card, partition it, write it
+./scripts/mkcard.sh /dev/disk4           # later: rewrite its boot partition only
 ```
 
 The userland build makes two images out of one list, `IMAGE_ITEMS` in
@@ -132,11 +133,19 @@ which is a cargo feature only the test image's build turns on. A file the build
 makes that no line of the list names stops the build, so nothing can drop out
 of both images unnoticed. x86-64 has only the test image.
 
-Run it once with no argument first and look at what it assembled. With a device
-named it erases that card, so it refuses anything that is not a removable whole
-disk and then asks you to type the path again before it writes. Find the path
-with `diskutil list` on macOS or `lsblk` on Linux, and check the size against
-the card in your hand: naming the wrong one destroys whatever was on it.
+Run it once with no argument first and look at what it assembled. `--new`
+erases the whole card and makes two MBR partitions: partition 1, FAT32 labelled
+`CLAUDEOS`, 512 MiB, which gets the files below, and partition 2, FAT32
+labelled `CLAUDEDATA`, the rest of the card, which is `/data` (see "/data on
+the SD card"). A device named without `--new` erases partition 1 alone and
+writes the files again, leaving `/data` as it was; it refuses a card whose
+partition 1 is not labelled `CLAUDEOS` with a partition 2 after it. Either way
+it refuses anything that is not a removable whole disk and asks you to type the
+path again before it writes. Find the path with `diskutil list` on macOS or
+`lsblk` on Linux, and check the size against the card in your hand: naming the
+wrong one destroys whatever was on it. On macOS, `--image FILE` in place of the
+device does the same to a disk image file attached with `hdiutil`, which is how
+those writes are tested.
 
 What ends up on the card:
 
@@ -367,6 +376,109 @@ drops whatever the client sends about options, subnegotiation included. CR NUL
 and CR LF from the client reach the line discipline as the single CR that
 Enter is on the cable. In the output, a 0xFF byte is doubled and a CR on its
 own is sent as CR NUL.
+
+## /data on the SD card
+
+On the Raspberry Pi 4 the kernel mounts a FAT32 volume on the microSD card at
+`/data`, read-write, for files that have to outlive a reboot, such as the pages
+a web server serves. Everything the system boots and runs still comes from the
+ram disk the firmware loaded, so nothing on `/data` is needed for either. A
+card that is missing, unreadable or damaged leaves the machine booting and
+running without `/data`.
+
+A card from `scripts/mkcard.sh --new` has `/data` as its partition 2, labelled
+`CLAUDEDATA`. Updating the boot files later with `scripts/mkcard.sh /dev/diskN`
+rewrites partition 1 and leaves partition 2 alone. Mounted on the Mac, partition
+2 is `/Volumes/CLAUDEDATA`, which is one way to put files on it.
+
+**Which volume.** `data=LABEL` on the kernel command line names the label to
+look for, `CLAUDEDATA` when the word is absent, and `data=off` leaves the card
+alone. The kernel reads block 0 of the card. A FAT32 boot sector there is one
+volume across the whole card; otherwise the four primary entries of the MBR of
+type 0x0B or 0x0C are looked at in order, and the first volume whose label
+matches, in its boot sector or in the label entry of its root directory, with
+ASCII letters in either case, is the one. A GPT card is refused. No other
+partition is mounted or written. A volume whose root directory holds
+`start4.elf` or `kernel8.img` is refused even when the label matches, because
+that is a boot partition. The outcome is one line, which also says what the
+card and the controller are:
+
+```
+data: mounted partition 2 of the card, labelled CLAUDEDATA, 191 MiB in 385142 clusters of 512 bytes at /data, in 85 ms; EMMC2 at 0xfe340000, ...; card from manufacturer ...
+data: /data is not mounted: nothing answered in the card slot, which is empty or holds no SD memory card; EMMC2 at 0xfe340000, ...
+```
+
+Boot waits for that line for at most 20 seconds and then starts init; `/data`
+appears later if the card is mounted then.
+
+**Keeping the card away from the system.** What the filesystem is given is a
+`Partition`: the card, with the chosen volume's first block and its length.
+Its block numbers count from the volume's first block, a block at or past the
+length is refused before any command is sent, and nothing else in the kernel
+can send a block command, so no number read off a damaged FAT can reach the
+boot partition or any other part of the card. The boot sector is checked
+before rust-fatfs reads it. rust-fatfs is compiled without overflow checks, so
+arithmetic on a damaged number gives a wrong number, which the bounds check
+refuses, rather than a panic, which would restart the board into the same card.
+Each operation has a budget of calls and a deadline of 30 seconds plus a second
+per MiB it moves, so a cluster chain that loops ends in an error. At most
+4 MiB of blocks are cached, 32 files kept open and 32 directories remembered.
+A directory found by a lookup is remembered because the kernel resolves a path
+one component at a time, so a path costs one directory scan per component
+rather than a walk from the root for each. A damaged card whose directory
+entries point back at a directory above them has a tree with no bottom, and
+`find` on it goes down until paths reach the 4096-byte limit.
+
+**What a write means.** A write system call returns once its blocks are on the
+card, and a card command that failed is EIO to the program that made the call.
+`fsync` and `fdatasync` put the file's directory entry on the card as well.
+`sync` and `syncfs` unmount the volume and mount it again, which writes its
+count of free clusters and marks it clean, and `reboot`, `halt` and `poweroff`
+do the same before the machine stops. There is no journal. A power cut during a
+write can leave that file, its directory or the FAT inconsistent, as on any FAT
+volume; the next boot mounts what is there, and the Mac's `fsck_msdos` or Disk
+Utility's First Aid repairs it.
+
+**What FAT does not have, and what happens instead.**
+
+- Owners and permission bits. Every file reports root and mode 0644, every
+  directory root and 0755. `chmod` and `fchmod` succeed and change nothing, so
+  that `cp -p` and `tar` can copy onto `/data`.
+- Hard links, symbolic links and named pipes. Making one answers EPERM. A link
+  or a rename between `/data` and the ram filesystem answers EXDEV, which makes
+  `mv` copy instead.
+- Case. A name keeps the case it was created with and is found with ASCII
+  letters in any case, so two names that differ only in case are one file.
+- Time zones and fine timestamps. The modification time is the kernel's clock
+  when the change was made, stored to FAT's two seconds as UTC. On a board
+  whose clock has not been set from the network it is as far behind as the
+  clock is.
+- Large files. A file is at most 4 GiB less one byte; a write past that answers
+  EFBIG. FAT has no holes, so writing past the end of a file or truncating it
+  longer writes zeros up to the new bytes.
+- An atomic rename over an existing name. It removes that name and then
+  renames, in two steps, and a power cut between them leaves the file under its
+  old name only. A rename that changes only the case of a name goes through a
+  temporary name, and a directory moved to another directory gets its `..`
+  entry pointed at the new parent.
+- A file that outlives its name. When a file is removed, or renamed over, while
+  a descriptor is open on it, reads and writes through that descriptor answer
+  ESTALE: FAT frees a file's clusters when its entry goes.
+
+A listing of a directory is taken when a program starts reading it, and the
+later reads on that descriptor continue the same listing, so a program that
+removes entries while it reads, as `rm -r` does, still sees each entry once.
+`/proc/mounts` lists the volume as `/dev/mmcblk0p2 /data vfat rw 0 0`, or
+`/dev/mmcblk0` for a volume across the whole card, `statfs` reports vfat's
+magic number with sizes in clusters, and files on `/data` have a device number
+of their own.
+
+The controller is EMMC2, `brcm,bcm2711-emmc2`, driven as Linux's
+`sdhci-iproc.c` drives it, and the card is brought up as Linux's MMC core does:
+CMD0, CMD8, ACMD41 asking for high capacity, CMD2, CMD3, CMD9, CMD7, ACMD6 for
+four data lines, and CMD17, CMD18, CMD24 and CMD25 for blocks, by PIO. The bus
+stays at 3.3 V, at 50 MHz when the card has high speed; 1.8 V signalling and
+UHS-I are not used. A card taken out or put in after boot is not noticed.
 
 ## What the kernel does
 
@@ -954,6 +1066,34 @@ failures.
   It has to reach the shell, report every item ok, list nothing under `/root`
   and none of `hello_c`, `inet` or `rtest` in `/bin`, and answer `cbox rtest`
   with an unknown applet.
+- **/data on an SD card** runs on aarch64, with card images `tools/fatdisk`
+  makes on the Mac without root put in the emulated slot. A first boot runs
+  `tests/data.sh` through long names found in any case, a file of many clusters
+  appended to, rewritten and truncated, a 1.2 MiB file, 300 long names in one
+  directory, renames within and across directories, over a file, into the
+  directory's own subdirectory and changing only case, a moved directory's
+  `..`, unlink and rmdir, the modes FAT reports and `chmod` changing nothing, no
+  hard or symbolic links, a device number of its own, the modification time from
+  the kernel clock, `fsync` and `sync`. While that boot pauses after its fsync
+  and before its sync, the Mac reads the file out of the image. Between the
+  boots the Mac compares the large file with the same `seq` output, reads every
+  file to its length, and requires no cluster to belong to two files. A second
+  boot on the same image reads back what the first left, the modification time
+  to FAT's two seconds, and removes the directory of 300 files with `rm -r`,
+  and the boot partition beside `/data` has to be unchanged after both. Then
+  boots with no card, with `data=off`, with a label the card does not have,
+  with a boot partition labelled `CLAUDEDATA`, with a partition table whose boot
+  indicator is invalid, with `/data`'s boot sector zeroed and with random bytes
+  over its fields, with a directory and a file whose cluster chains loop, with
+  `www/css` pointed at the root directory so that the tree has no bottom, and
+  with 200000 random bytes anywhere in a 128 MiB image for each of 12 seeds
+  (`DATA_SEEDS` sets the number) each have to print exactly one `data:` line
+  before the shell, reach the shell without a panic, and walk whatever `/data`
+  they have to 16 levels, read it and write to it, to the end. The cards booted with `data=off`, with
+  the wrong label and with the labelled boot partition have to come back
+  unchanged. Beside the harness, `tools/fatdisk fuzz FIRST LAST` runs the
+  kernel's own `storage/disk.rs` and `storage/volume.rs` against one damaged
+  image per seed in a single process on the Mac, and counts panics.
 - **Two boots, two streams** compares the boot id from every boot above. Two
   the same would mean the seed did not vary, and every byte the generator
   handed out would be the same in both. It costs no boot of its own.
@@ -1020,6 +1160,9 @@ kernel/src
   console/telnet.rs   the same terminal over TCP port 23
   net/wifi/           the Pi 4's WiFi: SD host, SDIO card, the chip and its
                       firmware, its control and data framing, the WPA2 supplicant
+  mmc/                the SD host controller code the WiFi and the card slot share
+  storage/            /data: the card slot's controller, the SD card, the choice
+                      of volume, the block cache, rust-fatfs and its checks
   signal.rs           signal dispositions and default actions
   trap.rs             exception and interrupt handling
 
@@ -1028,10 +1171,13 @@ user/c/hello.c        a C program linked against musl
 tools/mkcpio.py       initramfs builder
 tools/checksums.py    the manifest the boot check reads, and the kernel's digest
 tools/drive.py        drives the console over a socket, rendering as a terminal
+tools/fatdisk         makes, reads and damages SD card images, and fuzzes the
+                      kernel's volume code
 scripts/images.sh     what goes in the test image and the board image, and what
                       the boot check covers
 scripts/reap-stale.sh clears QEMU instances an earlier run left behind
-scripts/mkcard.sh     assembles the boot partition for a Pi, and writes a card
+scripts/mkcard.sh     assembles the boot partition for a Pi, and prepares or
+                      updates a card
 scripts/fetch-wifi-firmware.sh
                       the Pi 4's WiFi firmware, NVRAM and regulatory data
 scripts/console.py    a telnet client for the telnet console, interactive or scripted
@@ -1040,12 +1186,15 @@ scripts/lossy-transfer.sh
 tests/suite.sh        in-OS shell and userland test suite
 tests/busybox.sh      in-OS suite driving an upstream busybox
 tests/alpine.sh       in-OS suite run inside an Alpine root filesystem
+tests/data.sh         in-OS /data suite, run with a card image in the emulated slot
 ```
 
 ## Limitations
 
-Single CPU; no SMP. There is no block device driver and no on-disk filesystem:
-the root filesystem lives in RAM and changes do not survive a reboot.
+Single CPU; no SMP. The root filesystem lives in RAM and changes to it do not
+survive a reboot. The one filesystem on a disk is `/data`, FAT32 on the Pi's SD
+card, with the limits described in "/data on the SD card"; x86-64 has no block
+device at all.
 
 The Pi's Ethernet driver has never run. QEMU's `raspi4b` machine emulates no
 network device at all, so nothing about it can be tried before it meets a
