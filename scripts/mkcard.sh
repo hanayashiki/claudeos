@@ -112,7 +112,17 @@ initramfs $IMAGE followkernel
 EOF
 
   # Passed to the kernel as its command line, through the device tree.
-  echo 'init=/bin/init' > "$BOOT/cmdline.txt"
+  #
+  # net=wifi  bring up the WiFi rather than the wired port, when the image
+  #           carries a network to join in /etc/wifi.conf. The kernel's
+  #           network stack holds one interface, and without this word it
+  #           takes the wired port whether or not a cable is plugged in.
+  local cmdline='init=/bin/init'
+  if [ -f "$ROOT/build/rootfs-aarch64-board/etc/wifi.conf" ]; then
+    cmdline="net=wifi $cmdline"
+  fi
+  echo "$cmdline" > "$BOOT/cmdline.txt"
+  say "command line: $cmdline"
 
   say ""
   say "assembled $BOOT:"

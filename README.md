@@ -203,8 +203,10 @@ two can push current back through the board. Read it at 115200 baud, 8 bits, no 
 `screen /dev/tty.usbserial-* 115200` on macOS, `screen /dev/ttyUSB0 115200`
 on Linux.
 
-Nothing is written to the card at run time, so the machine comes up the same
-way every time and a bad experiment costs a rebuild rather than a reflash.
+Nothing is written to the boot partition at run time, so the machine comes up
+the same way every time and a bad experiment costs a rebuild rather than a
+reflash. The kernel writes only to /data, and refuses to mount a partition that
+holds `start4.elf` or `kernel8.img` there.
 
 `reboot` at the shell restarts the machine, and `poweroff` and `halt` stop it.
 On the board a restart goes back through the firmware, so a board that boots
@@ -259,10 +261,11 @@ everything that reaches the network goes over the air:
 net=wifi init=/bin/init
 ```
 
-`scripts/mkcard.sh` writes `init=/bin/init` alone into `build/boot/cmdline.txt`,
-so add the word after running it. Without it the wired Ethernet is taken,
-whether or not a cable is plugged in, because the stack holds one interface
-and the wired driver is asked first; the WiFi is then not brought up at all.
+`scripts/mkcard.sh` writes this line into `cmdline.txt` when the board image
+holds `/etc/wifi.conf`, and `init=/bin/init` alone when it does not. Without
+`net=wifi` the wired Ethernet is taken, whether or not a cable is plugged in,
+because the stack holds one interface and the wired driver is asked first; the
+WiFi is then not brought up at all.
 
 A join, from the serial console:
 
