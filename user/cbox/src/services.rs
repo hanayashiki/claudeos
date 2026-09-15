@@ -64,6 +64,17 @@ const ERRORS: &str = "/run/services/errors.txt";
 const LOG_CAP: u64 = 256 * 1024;
 const LOG_KEEP: u64 = 128 * 1024;
 
+/// When a log is cut, the first lines of the service's current run go ahead of
+/// what is kept, if they are older than it: at most `HEAD_LINES` whole lines in
+/// at most `HEAD_BYTES`, from the keeper's line that starts the run, then
+/// `CUT_LINE`. A program can print what a person needs from it once, at start,
+/// and run for longer than 128 KiB of output: cloudflared prints the address
+/// of a quick tunnel about twenty lines in. The head of an earlier run is not
+/// kept.
+const HEAD_LINES: usize = 64;
+const HEAD_BYTES: usize = 8 * 1024;
+const CUT_LINE: &[u8] = b"services: the log was cut here, to keep it under 256 KiB\n";
+
 /// How often a keeper asks whether its running service has ended. It bounds
 /// how late an exit is noticed, and so how much later than its backoff wait a
 /// service is started again: a quarter of the shortest wait, 1 s. Output wakes
@@ -475,6 +486,7 @@ fn keep(service: &Service, mut status: Status) -> ! {
         let run = match spawn(&service.argv, output.write) {
             Err(errno) => Run::NotStarted(errno),
             Ok(pid) => {
+                log.start_run(&format!("{} started, pid {}", service.name, pid));
                 status.state = String::from("running");
                 status.pid = Some(pid);
                 status.next = None;
@@ -659,6 +671,11 @@ impl Output {
 /// `/var/log/NAME.log`, written only by the service's keeper.
 struct Log {
     file: Option<File>,
+    /// Where the keeper's line that starts the current run begins.
+    run_start: usize,
+    /// The length of the head at the start of the file, once a cut has put
+    /// the current run's first lines there.
+    head: Option<usize>,
 }
 
 impl Log {
@@ -670,7 +687,17 @@ impl Log {
             .mode(0o644)
             .open(format!("/var/log/{}.log", name))
             .ok();
-        Log { file }
+        Log { file, run_start: 0, head: None }
+    }
+
+    /// The keeper's line for a run that has started, which the run's head
+    /// starts from.
+    fn start_run(&mut self, text: &str) {
+        if let Some(file) = self.file.as_ref() {
+            self.run_start = file.metadata().map(|meta| meta.len() as usize).unwrap_or(0);
+        }
+        self.head = None;
+        self.line(text);
     }
 
     fn append(&mut self, bytes: &[u8]) {
@@ -684,13 +711,15 @@ impl Log {
         if length <= LOG_CAP {
             return;
         }
-        let mut tail = vec![0u8; LOG_KEEP as usize];
-        if file.read_exact_at(&mut tail, length - LOG_KEEP).is_err() {
+        let mut whole = vec![0u8; length as usize];
+        if file.read_exact_at(&mut whole, 0).is_err() {
             return;
         }
-        let from = first_line_start(&tail);
+        let cut = cut_log(&whole, self.run_start, self.head, LOG_KEEP as usize);
         if file.set_len(0).is_ok() {
-            let _ = file.write_all(&tail[from..]);
+            let _ = file.write_all(&cut.kept);
+            self.run_start = cut.run_start;
+            self.head = cut.head;
         }
     }
 
@@ -698,6 +727,56 @@ impl Log {
     fn line(&mut self, text: &str) {
         self.append(format!("services: {} s after boot: {}\n", seconds_since_boot(), text).as_bytes());
     }
+}
+
+/// A log after a cut, and where the current run's first line and head are in
+/// it.
+struct Cut {
+    kept: Vec<u8>,
+    run_start: usize,
+    head: Option<usize>,
+}
+
+/// Cut `log` to its newest `keep` bytes, from the first line that starts in
+/// them. When the current run, starting at `run_start`, started before those,
+/// its head goes first: the `head` bytes at the start of the log when an
+/// earlier cut put it there, or else its first lines, as `HEAD_LINES` and
+/// `HEAD_BYTES` allow, and then `CUT_LINE`.
+fn cut_log(log: &[u8], run_start: usize, head: Option<usize>, keep: usize) -> Cut {
+    let run_start = run_start.min(log.len());
+    let tail_start = match log.len().checked_sub(keep) {
+        Some(from) if from > 0 => from + first_line_start(&log[from..]),
+        _ => 0,
+    };
+    if run_start >= tail_start {
+        return Cut { kept: log[tail_start..].to_vec(), run_start: run_start - tail_start, head: None };
+    }
+    let head = match head {
+        Some(length) if run_start == 0 => &log[..length.min(tail_start)],
+        _ => run_head(&log[run_start..tail_start]),
+    };
+    let mut kept = Vec::with_capacity(head.len() + CUT_LINE.len() + log.len() - tail_start);
+    kept.extend_from_slice(head);
+    kept.extend_from_slice(CUT_LINE);
+    kept.extend_from_slice(&log[tail_start..]);
+    Cut { head: Some(head.len()), kept, run_start: 0 }
+}
+
+/// The first whole lines of `run`, at most `HEAD_LINES` of them in at most
+/// `HEAD_BYTES`.
+fn run_head(run: &[u8]) -> &[u8] {
+    let mut end = 0;
+    let mut lines = 0;
+    for (index, &byte) in run.iter().enumerate().take(HEAD_BYTES) {
+        if byte == b'\n' {
+            end = index + 1;
+            lines += 1;
+            if lines == HEAD_LINES {
+                break;
+            }
+        }
+    }
+    &run[..end]
 }
 
 /// Where the first whole line in `tail` starts: just after its first newline,
@@ -751,6 +830,64 @@ mod tests {
             summary(&trouble, &taken(0, 0, 0, false)),
             "services: 2 system started; 0 user started (see /run/services/errors.txt)"
         );
+    }
+
+    fn numbered(from: usize, to: usize) -> String {
+        (from..=to).map(|n| format!("{}\n", n)).collect()
+    }
+
+    #[test]
+    fn a_log_under_the_size_kept_is_left_as_it_is() {
+        let log = format!("services: 1 s after boot: web started, pid 9\n{}", numbered(1, 10));
+        let cut = cut_log(log.as_bytes(), 0, None, 1000);
+        assert_eq!(cut.kept, log.as_bytes());
+        assert_eq!((cut.run_start, cut.head), (0, None));
+    }
+
+    #[test]
+    fn a_run_that_started_in_what_is_kept_needs_no_head() {
+        let old = numbered(1, 300);
+        let log = format!("{}services: 9 s after boot: web started, pid 20\n{}", old, numbered(1, 20));
+        let cut = cut_log(log.as_bytes(), old.len(), None, 400);
+        let text = String::from_utf8(cut.kept.clone()).unwrap();
+        assert!(!text.contains("was cut here"));
+        assert!(text.ends_with("20\n"));
+        assert_eq!(&cut.kept[cut.run_start..cut.run_start + 9], b"services:");
+        assert_eq!(cut.head, None);
+    }
+
+    #[test]
+    fn a_long_run_keeps_its_first_lines_through_every_cut() {
+        let start = "services: 3 s after boot: tunnel started, pid 12\n";
+        let banner = "INF |  https://example-words-here.trycloudflare.com |\n";
+        let mut log = format!("{}{}{}", start, banner, numbered(1, 500));
+        let mut run_start = 0;
+        let mut head = None;
+        for round in 0..5 {
+            let cut = cut_log(log.as_bytes(), run_start, head, 1000);
+            let text = String::from_utf8(cut.kept).unwrap();
+            assert!(text.starts_with(start), "round {}", round);
+            assert!(text.contains(banner), "round {}", round);
+            assert_eq!(text.matches("was cut here").count(), 1, "round {}", round);
+            assert!(text.len() <= 1000 + HEAD_BYTES + CUT_LINE.len());
+            let last = 500 + round * 400;
+            assert!(text.ends_with(&format!("{}\n", last)), "round {}", round);
+            run_start = cut.run_start;
+            head = cut.head;
+            log = text + &numbered(last + 1, last + 400);
+        }
+    }
+
+    #[test]
+    fn a_head_is_at_most_so_many_lines_and_bytes() {
+        let short = numbered(1, 1000);
+        assert_eq!(run_head(short.as_bytes()), numbered(1, HEAD_LINES).as_bytes());
+        let long_line = format!("{}\n", "x".repeat(999));
+        let long: String = long_line.repeat(20);
+        assert_eq!(run_head(long.as_bytes()).len(), 8 * 1000);
+        // A first line longer than the limit leaves no head, only the cut line.
+        let huge = format!("{}\nrest\n", "y".repeat(HEAD_BYTES + 10));
+        assert_eq!(run_head(huge.as_bytes()), b"");
     }
 
     #[test]

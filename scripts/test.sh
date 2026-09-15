@@ -1155,12 +1155,14 @@ main)
   echo "svc-web: $(busybox wget -q -O - http://127.0.0.1:8080/index.html)"
   echo "svc-flap-waits: $(grep -o 'next start in [0-9]* s' /var/log/flap.log | head -n 4 | cut -d ' ' -f 4 | xargs echo)"
   size=$(wc -c < /var/log/chatty.log)
-  first=$(head -n 1 /var/log/chatty.log)
-  if [ "$size" -le 262144 ] && [ "$first" != 1 ]; then
-    echo "svc-chatty: cut to $size bytes"
+  if [ "$size" -le 262144 ]; then
+    echo "svc-chatty: $size bytes, under the cap"
   else
-    echo "svc-chatty: not cut: $size bytes, starting with $first"
+    echo "svc-chatty: $size bytes, over the cap"
   fi
+  # The run's head: the keeper's start line and the first 63 lines of output,
+  # once each, then one cut line, and nothing after 63 until the newest part.
+  echo "svc-chatty-head: $(grep -c ' chatty started, pid ' /var/log/chatty.log) $(grep -c '^1$' /var/log/chatty.log) $(grep -c '^63$' /var/log/chatty.log) $(grep -c '^64$' /var/log/chatty.log) $(grep -c 'the log was cut here' /var/log/chatty.log)"
   echo "svc-chatty-end: $(grep -c '^60000$' /var/log/chatty.log) $(grep -c '^chatty done$' /var/log/chatty.log)"
   ;;
 bad)
@@ -1221,7 +1223,8 @@ SCRIPT
         '^svc-once: written by once$' \
         '^svc-web: <h1>served from /data</h1>$' \
         '^svc-flap-waits: 1 2 4 8$' \
-        '^svc-chatty: cut to [0-9]+ bytes$' \
+        '^svc-chatty: [0-9]+ bytes, under the cap$' \
+        '^svc-chatty-head: 1 1 1 0 1$' \
         '^svc-chatty-end: 1 1$' \
         '!^svc-errors: ' || ok=0
 
