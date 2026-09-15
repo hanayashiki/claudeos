@@ -121,6 +121,12 @@ bytes such as 0xff, on both machines.
   Linux (`do_signal_stop` runs in the task being stopped), so `ps` can read the
   state before that. The check should wait for the state, for a bounded time,
   rather than read it once.
+- **The card check accepts `ended on signal 9` for the tunnel**
+  (`board_card` in scripts/test.sh). When a Go program calls exit_group from a
+  thread other than its first, `sched::exit_group` gives the other threads
+  SIGKILL, and wait4 reports the first thread's status, so cloudflared's exit
+  with status 1 is seen as signal 9. Remove the `ended on signal 9` alternative
+  and its comment once the exitfix agent's change is merged.
 
 ## Telnet console
 
