@@ -16,8 +16,9 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-# With no device named, mkcard.sh only copies the kernel, the ram disk and the
-# Pi firmware into build/boot. It writes to no disk.
+# With no device named, mkcard.sh only copies the kernel, the board image
+# (build/initramfs-aarch64-board.cpio, without the test suites) and the Pi
+# firmware into build/boot. It writes to no disk.
 "$ROOT/scripts/mkcard.sh"
 
 echo ""
