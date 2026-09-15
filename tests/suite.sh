@@ -154,7 +154,12 @@ check "fixed strings"  "1"  "$(printf 'a.b\naxb\n' | grep -cF 'a.b')"
 check "invert"         "99" "$(seq 1 100 | grep -vc '^42$')"
 check "ignore case"    "2"  "$(printf 'Cat\ncat\ndog\n' | grep -ci '^cat$')"
 check "quiet status"   "1"  "$(seq 1 10 | grep -q '^99$'; echo $?)"
-check "recursive"      "2"  "$(grep -rl claudeos /etc | wc -l)"
+# In a tree made here, not in /etc, whose files change with what the image
+# holds.
+mkdir -p /tmp/grr/a/b; echo claudeos > /tmp/grr/top.txt
+echo claudeos > /tmp/grr/a/b/deep.txt; echo other > /tmp/grr/a/other.txt
+check "recursive"      "2"  "$(grep -rl claudeos /tmp/grr | wc -l)"
+rm -rf /tmp/grr
 # A recursive search with no path searches the working directory. Standard
 # input is taken away here so that reading it instead comes back empty rather
 # than waiting for a line nothing is going to type.
