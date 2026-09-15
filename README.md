@@ -1072,10 +1072,12 @@ search of standard input is not something that can be asked for.
 `make test` boots the OS once per suite and requires each to report zero
 failures.
 
-- `tests/suite.sh` runs **261 checks** inside the OS, driving the shell through
+- `tests/suite.sh` runs **313 checks** inside the OS, driving the shell through
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
-  subprocesses and `/proc`. The device checks include `/dev/urandom`: that two
+  subprocesses and `/proc`. One of the pipeline checks sends megabytes from
+  `seq` into a `head` that stops after a line, and requires `seq` to end
+  without printing anything, as a write to a closed pipe does on Linux. The device checks include `/dev/urandom`: that two
   reads differ and that 4 KiB of it holds nearly all 256 byte values, which is
   a check that the generator is running and not a check that it is any good.
 - The `rtest` applet, which only the test image's cbox is built with, runs
@@ -1190,7 +1192,8 @@ failures.
   directory, renames within and across directories, over a file, into the
   directory's own subdirectory and changing only case, a moved directory's
   `..`, unlink and rmdir, the modes FAT reports and `chmod` changing nothing, no
-  hard or symbolic links, a device number of its own, the modification time from
+  hard or symbolic links, a device number of its own, `df` and `mount` naming
+  the card's partition and `/data`, the modification time from
   the kernel clock, `fsync` and `sync`. While that boot pauses after its fsync
   and before its sync, the Mac reads the file out of the image. Between the
   boots the Mac compares the large file with the same `seq` output, reads every
@@ -1221,7 +1224,11 @@ failures.
   boot, backspace and Ctrl-U line editing, `Ctrl-C` on a running job, `Ctrl-Z`
   followed by `jobs`, `bg` and `kill %1`, a background `cat` stopped for
   reading the terminal and resumed with `fg`, and the clock advancing while the
-  shell is blocked in a read.
+  shell is blocked in a read. A line typed as `echo タ日本🎉x` with two
+  backspaces, which take off the `x` and the whole emoji, has to reach
+  `hexdump` as the UTF-8 bytes of タ日本, since the line editor keeps typed
+  bytes as they are; and a raw 0xff byte typed in a line is reported as it
+  arrives, which is as one U+FFFD while the shell holds lines as text.
 - The **interrupt key at a terminal** is a second session, driven through
   `scripts/run.sh` on a pseudo-terminal rather than over a socket. A socket
   hands the guest whatever byte is written to it, so it cannot say whether the
