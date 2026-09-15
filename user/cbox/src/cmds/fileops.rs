@@ -1043,20 +1043,46 @@ pub fn du(args: &[String]) -> i32 {
     status
 }
 
+/// The device and mount point of every line of /proc/mounts.
+fn mounts() -> Vec<(String, String)> {
+    fs::read_to_string("/proc/mounts")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            Some((parts.next()?.to_string(), parts.next()?.to_string()))
+        })
+        .collect()
+}
+
+/// The mount `path` is on: the entry whose mount point is the longest one
+/// that is `path` or a directory above it.
+fn mount_of<'a>(mounts: &'a [(String, String)], path: &str) -> Option<&'a (String, String)> {
+    mounts
+        .iter()
+        .filter(|(_, point)| point == "/" || path == point || path.starts_with(&format!("{}/", point)))
+        .max_by_key(|(_, point)| point.len())
+}
+
+/// `df`: for each path, or for every mount when none is given, the sizes of
+/// the filesystem it is on, named by the device and mount point /proc/mounts
+/// gives it.
 pub fn df(args: &[String]) -> i32 {
     let (flags, operands) = split_flags(args);
     let human = flags.contains('h');
-    let path = operands.first().map(|s| s.as_str()).unwrap_or("/");
-
-    let Some(stats) = crate::sys::statfs(path) else {
-        eprintln!("df: {}: cannot read filesystem statistics", path);
-        return 1;
+    let table = mounts();
+    let targets: Vec<(String, String, String)> = if operands.is_empty() {
+        table.iter().map(|(device, point)| (point.clone(), device.clone(), point.clone())).collect()
+    } else {
+        operands
+            .iter()
+            .map(|operand| {
+                let absolute = fs::canonicalize(operand).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| operand.to_string());
+                let (device, point) = mount_of(&table, &absolute).cloned().unwrap_or_else(|| (String::from("rootfs"), String::from("/")));
+                (operand.to_string(), device, point)
+            })
+            .collect()
     };
-    let kb = stats.block_size / 1024;
-    let total = stats.blocks * kb;
-    let free = stats.free * kb;
-    let used = total.saturating_sub(free);
-    let percent = if total > 0 { used * 100 / total } else { 0 };
 
     let show = |value: u64| -> String {
         if human {
@@ -1067,19 +1093,26 @@ pub fn df(args: &[String]) -> i32 {
     };
 
     println!(
-        "{:<12} {:>10} {:>10} {:>10} {:>5} {}",
+        "{:<16} {:>10} {:>10} {:>10} {:>5} {}",
         "Filesystem", "1K-blocks", "Used", "Available", "Use%", "Mounted on"
     );
-    println!(
-        "{:<12} {:>10} {:>10} {:>10} {:>4}% {}",
-        "rootfs",
-        show(total),
-        show(used),
-        show(free),
-        percent,
-        "/"
-    );
-    0
+    let mut status = 0;
+    for (path, device, point) in targets {
+        let Some(stats) = crate::sys::statfs(&path) else {
+            if !operands.is_empty() {
+                eprintln!("df: {}: cannot read filesystem statistics", path);
+                status = 1;
+            }
+            continue;
+        };
+        let kb = stats.block_size / 1024;
+        let total = stats.blocks * kb;
+        let free = stats.free * kb;
+        let used = total.saturating_sub(free);
+        let percent = if total > 0 { used * 100 / total } else { 0 };
+        println!("{:<16} {:>10} {:>10} {:>10} {:>4}% {}", device, show(total), show(used), show(free), percent, point);
+    }
+    status
 }
 
 pub fn hexdump(args: &[String]) -> i32 {

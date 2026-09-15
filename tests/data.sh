@@ -33,6 +33,8 @@ case "$datatest" in
 write)
   echo "=== /data: the first boot ==="
   check "mounted as vfat"            "1"               "$(grep -c ' /data vfat rw' /proc/mounts)"
+  check "df names its device"        "/dev/mmcblk0p2 /data" "$(df /data | tail -n 1 | busybox awk '{ print $1, $6 }')"
+  check "mount lists it"             "1"               "$(mount | grep -c '^/dev/mmcblk0p2 on /data type vfat (rw)$')"
   check "a new directory"            "0"               "$(mkdir $T; echo $?)"
   echo "<h1>first</h1>" > "$T/$LONG"
   check "long name read back"        "<h1>first</h1>"  "$(cat "$T/$LONG")"
