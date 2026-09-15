@@ -86,14 +86,17 @@ pub fn reboot(magic1: u32, magic2: u32, command: u32) -> SysResult {
     }
     match command {
         LINUX_REBOOT_CMD_RESTART => {
+            sync_data();
             println!("claudeos: restarting");
             arch::restart()
         }
         LINUX_REBOOT_CMD_HALT => {
+            sync_data();
             println!("claudeos: halting");
             arch::power_off()
         }
         LINUX_REBOOT_CMD_POWER_OFF => {
+            sync_data();
             println!("claudeos: powering off");
             arch::power_off()
         }
@@ -101,6 +104,16 @@ pub fn reboot(magic1: u32, magic2: u32, command: u32) -> SysResult {
         // key here in either setting, so there is nothing to change.
         LINUX_REBOOT_CMD_CAD_ON | LINUX_REBOOT_CMD_CAD_OFF => Ok(0),
         _ => Err(Errno::EINVAL),
+    }
+}
+
+/// Before the machine stops on request: the data volume marked clean, with its
+/// free-cluster count written, so the card reads as unmounted properly
+/// wherever it is put next. Every write is on the card already; a failure here
+/// does not keep the machine from stopping.
+fn sync_data() {
+    if let Err(error) = crate::fs::data::sync() {
+        println!("data: sync before stopping failed: {:?}", error);
     }
 }
 

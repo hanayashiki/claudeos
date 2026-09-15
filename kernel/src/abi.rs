@@ -74,6 +74,7 @@ pub enum Errno {
     EHOSTUNREACH = 113,
     EALREADY = 114,
     EINPROGRESS = 115,
+    ESTALE = 116,
 }
 
 pub type SysResult = Result<u64, Errno>;

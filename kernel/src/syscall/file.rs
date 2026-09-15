@@ -399,7 +399,7 @@ pub fn getdents64(fd: i32, out: u64, len: usize) -> SysResult {
         return Err(Errno::ENOTDIR);
     }
 
-    let entries = fs::readdir(&node);
+    let entries = fs::readdir(&node)?;
     let mut offset = file.offset.lock();
     let mut index = *offset as usize;
     let mut buf: Vec<u8> = Vec::new();
@@ -554,6 +554,12 @@ pub fn readlinkat(dirfd: i64, path_addr: u64, out: u64, len: usize) -> SysResult
 pub fn chmod(dirfd: i64, path_addr: u64, mode: u32) -> SysResult {
     let path = resolve_at(dirfd, path_addr)?;
     let node = fs::lookup(&path)?;
+    // FAT keeps no permission bits. The call succeeds and changes nothing, as
+    // Linux's vfat does when mounted with `quiet`, so that `cp -p` and `tar`
+    // can copy onto /data; stat goes on reporting 0644 and 0755.
+    if node.is_stored() {
+        return Ok(0);
+    }
     let mut inner = node.inner.lock();
     inner.mode = (inner.mode & S_IFMT) | (mode & 0o7777);
     Ok(0)
@@ -562,6 +568,9 @@ pub fn chmod(dirfd: i64, path_addr: u64, mode: u32) -> SysResult {
 pub fn fchmod(fd: i32, mode: u32) -> SysResult {
     let file = sched::current().fds.get(fd)?;
     let node = file.node().ok_or(Errno::EBADF)?;
+    if node.is_stored() {
+        return Ok(0);
+    }
     let mut inner = node.inner.lock();
     inner.mode = (inner.mode & S_IFMT) | (mode & 0o7777);
     Ok(0)
@@ -576,6 +585,40 @@ pub fn truncate(path_addr: u64, len: u64) -> SysResult {
 pub fn ftruncate(fd: i32, len: u64) -> SysResult {
     let file = sched::current().fds.get(fd)?;
     file.node().ok_or(Errno::EINVAL)?.truncate(Offset::new(len))?;
+    Ok(0)
+}
+
+/// `fsync` and `fdatasync`. For a file on the data volume, its directory entry
+/// goes to the card, and the call fails if that write does; its contents are
+/// there already, because every write reaches the card before it returns.
+/// Everything else lives in memory and has nowhere further to go.
+pub fn fsync(fd: i32) -> SysResult {
+    let file = sched::current().fds.get(fd)?;
+    if let Some(node) = file.node() {
+        if node.is_stored() {
+            fs::data::fsync(node)?;
+        }
+    }
+    Ok(0)
+}
+
+/// `sync`: the data volume unmounted and mounted again, which writes its
+/// count of free clusters and marks it clean, so another system finds it
+/// unmounted properly. The call returns nothing on Linux, so a failure is only
+/// reported in the log.
+pub fn sync() -> SysResult {
+    if let Err(error) = fs::data::sync() {
+        println!("data: sync failed: {:?}", error);
+    }
+    Ok(0)
+}
+
+/// `syncfs`: the same, for the filesystem `fd` is on, with the error returned.
+pub fn syncfs(fd: i32) -> SysResult {
+    let file = sched::current().fds.get(fd)?;
+    if file.node().is_some_and(|node| node.is_stored()) {
+        fs::data::sync()?;
+    }
     Ok(0)
 }
 
@@ -968,13 +1011,41 @@ fn fill_statfs(out: u64) -> SysResult {
 
 pub fn statfs(path_addr: u64, out: u64) -> SysResult {
     let path = resolve_at(AT_FDCWD, path_addr)?;
-    fs::lookup(&path)?;
+    let node = fs::lookup(&path)?;
+    if node.is_stored() {
+        return fill_statfs_data(&node, out);
+    }
     fill_statfs(out)
 }
 
 pub fn fstatfs(fd: i32, out: u64) -> SysResult {
-    sched::current().fds.get(fd)?;
+    let file = sched::current().fds.get(fd)?;
+    if let Some(node) = file.node() {
+        if node.is_stored() {
+            return fill_statfs_data(node, out);
+        }
+    }
     fill_statfs(out)
+}
+
+/// `struct statfs` for the data volume: vfat's magic number, and its sizes in
+/// clusters.
+fn fill_statfs_data(node: &Node, out: u64) -> SysResult {
+    const MSDOS_SUPER_MAGIC: u64 = 0x4d44;
+    let (cluster, total, free) = fs::data::statfs(node)?;
+    let mut buf = [0u8; 120];
+    let put = |buf: &mut [u8], offset: usize, value: u64| {
+        buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    };
+    put(&mut buf, 0, MSDOS_SUPER_MAGIC); // f_type
+    put(&mut buf, 8, cluster); // f_bsize
+    put(&mut buf, 16, total); // f_blocks
+    put(&mut buf, 24, free); // f_bfree
+    put(&mut buf, 32, free); // f_bavail
+    put(&mut buf, 64, 255); // f_namelen
+    put(&mut buf, 72, cluster); // f_frsize
+    uaccess::write_bytes(out, &buf)?;
+    Ok(0)
 }
 
 /// A counter two tasks can wait on. EFD_SEMAPHORE is bit 0 of the flags.
