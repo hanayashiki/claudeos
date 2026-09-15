@@ -712,7 +712,8 @@ integrity_expect() {
 
 # The image scripts/mkcard.sh puts on the card, booted under QEMU. It has to
 # reach the shell and pass its own check, its /root and /bin have to hold none
-# of the test image's own files, and its cbox has to have no rtest applet.
+# of the test image's own files, and its cbox has to have no rtest applet. Then
+# a card mkcard.sh makes on the Mac is checked and booted (see board_card).
 run_board_image() {
   banner "board image"
   if [ "$ARCH" != aarch64 ]; then
@@ -754,6 +755,13 @@ run_board_image() {
     ok=0
   fi
 
+  if [ "$(uname -s)" != Darwin ]; then
+    echo "   the card check attaches a disk image with hdiutil, which only macOS has"
+    skipped=$((skipped + 1))
+  else
+    board_card || ok=0
+  fi
+
   if [ $ok -eq 1 ]; then
     echo ">> board image: OK"
   else
@@ -761,6 +769,116 @@ run_board_image() {
     status=1
   fi
   echo
+}
+
+# A card scripts/mkcard.sh --new writes, to a disk image on the Mac. /data has
+# to hold what user/data holds and nothing else, so no file macOS makes on a
+# volume it mounts; updating the boot files has to leave /data's blocks as they
+# were. The card is then booted with the board image: the web server the seeded
+# list names has to serve the seeded page, and the quick tunnel, which has no
+# network under QEMU, has to exit and be started again.
+board_card() {
+  local dir card fatdisk="$ROOT/tools/fatdisk/target/release/fatdisk" names before output expected failed=0
+  if ! (cd "$ROOT/tools/fatdisk" && cargo build --release -q); then
+    echo "   tools/fatdisk did not build"
+    return 1
+  fi
+  dir="$(mktemp -d)"
+  card="$dir/card.img"
+  mkfile -n 1g "$card"
+  if ! "$ROOT/scripts/mkcard.sh" --new --image "$card" > "$dir/new.log" 2>&1; then
+    echo "   mkcard.sh --new --image failed:"
+    tail -n 20 "$dir/new.log" | sed 's/^/     /'
+    rm -rf "$dir"
+    return 1
+  fi
+  # Both partitions, file by file, against what went onto them.
+  board_card_files CLAUDEOS "$ROOT/build/boot" "after --new" || failed=1
+  board_card_files CLAUDEDATA "$ROOT/user/data" "after --new" || failed=1
+  for file in services.txt site/index.html; do
+    if ! "$fatdisk" cat "$card" CLAUDEDATA "/$file" | cmp -s - "$ROOT/user/data/$file"; then
+      echo "   /data/$file on the card is not user/data/$file"
+      failed=1
+    fi
+  done
+
+  before="$(data_digest "$card" CLAUDEDATA)"
+  if ! "$ROOT/scripts/mkcard.sh" --image "$card" > "$dir/update.log" 2>&1; then
+    echo "   mkcard.sh --image failed:"
+    tail -n 20 "$dir/update.log" | sed 's/^/     /'
+    failed=1
+  elif [ "$(data_digest "$card" CLAUDEDATA)" != "$before" ]; then
+    echo "   updating the boot files changed /data"
+    failed=1
+  else
+    echo "   updating the boot files left the blocks of /data as they were"
+    board_card_files CLAUDEOS "$ROOT/build/boot" "after an update" || failed=1
+  fi
+
+  # The wait is typed as one line, and its report is spelled so that the
+  # typed line itself does not match it. The substitutions are quoted: the
+  # shell splits an unquoted one in an assignment into words, and runs the
+  # second word of `exited with status 1` as a command.
+  output="$(python3 "$ROOT/tools/drive.py" --timeout 240 --initramfs "$BOARD_IMAGE" --sd "$card" -- \
+      "until:claudeos shell" "wait:1" \
+      "busybox wget -q -O - http://127.0.0.1:8080/index.html\n" "wait:2" \
+      'i=0; until grep -q "^starts: [2-9]" /run/services/tunnel || [ $i -ge 150 ]; do sleep 1; i=$((i + 1)); done; s="$(sed -n "s/^starts: //p" /run/services/tunnel)"; l="$(sed -n "s/^last run: //p" /run/services/tunnel)"; f="$(grep -c "failed to request quick Tunnel" /var/log/tunnel.log)"; echo "tunnel-""check: $s starts; $l; $f failed requests"\n' \
+      "until:tunnel-check:" "wait:0.5" \
+      "cat /run/services/tunnel; tail -n 20 /var/log/tunnel.log\n" "wait:1.5" \
+      "poweroff\n" "wait:3" 2>&1 | tr -d '\r')"
+  record_boot_id "$output"
+  echo "--- the card, booted"
+  echo "$output" | grep -E "^services:|^data:|This page is|^tunnel-check:|KERNEL PANIC" | sed 's/^/   /'
+  # The tunnel's run can also read `ended on signal 9`: cloudflared is a Go
+  # program, which may call exit_group from a thread other than its first, and
+  # the kernel then records SIGKILL for the first thread, whose status wait4
+  # reports. Either way the run ended and counts as a failure.
+  for expected in "^data: mounted partition 2 of the card, labelled CLAUDEDATA" \
+                  "^services: 1 system started; 2 user started$" \
+                  "This page is /data/site/index.html on the card" \
+                  "^tunnel-check: [2-9] starts; (exited with status [1-9][0-9]*|ended on signal 9) after [0-9]+ s; [1-9][0-9]* failed requests$"; do
+    if ! echo "$output" | grep -qE "$expected"; then
+      echo "   missing expected output: $expected"
+      failed=1
+    fi
+  done
+  if echo "$output" | grep -q "KERNEL PANIC"; then
+    echo "   the kernel panicked with the card"
+    failed=1
+  fi
+  if [ $failed -ne 0 ]; then
+    echo "   --- everything the boot with the card showed"
+    echo "$output" | sed 's/^/   /'
+  fi
+  rm -rf "$dir"
+  return $failed
+}
+
+# Every file on the volume labelled $1 of the card image $card, below the
+# directory $2, one path per line.
+card_files() {
+  local label="$1" below="${2:-}" name
+  "$fatdisk" ls "$card" "$label" "/$below" | while IFS= read -r name; do
+    case "$name" in
+      */) card_files "$label" "$below$name" ;;
+      *) printf '%s\n' "$below$name" ;;
+    esac
+  done
+}
+
+# Require the volume labelled $1 on $card to hold exactly the files under the
+# directory $2, by path, and nothing else; $3 says when.
+board_card_files() {
+  local expected actual
+  expected="$(cd "$2" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)"
+  actual="$(card_files "$1" | LC_ALL=C sort)"
+  if [ "$actual" = "$expected" ]; then
+    echo "   $1 $3 holds exactly the $(echo "$expected" | grep -c .) files under ${2#$ROOT/}"
+  else
+    echo "   $1 $3 does not hold exactly the files under ${2#$ROOT/}:"
+    diff <(echo "$expected") <(echo "$actual") | sed 's/^/     /'
+    return 1
+  fi
 }
 
 # Whether this machine gets an SNTP answer from either server the board image
