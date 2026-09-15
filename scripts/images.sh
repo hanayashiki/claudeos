@@ -26,6 +26,9 @@
 IMAGE_ITEMS='
 both   /bin/cbox          the shell, init and the applets
 both   /bin/busybox       upstream busybox, if fetched
+both   /bin/busybox-extras  httpd, telnetd and nc from Alpine, on aarch64, if fetched
+both   /lib/ld-musl-aarch64.so.1  the musl dynamic loader and libc busybox-extras runs under
+both   /bin/httpd         the web server: a link to busybox-extras on aarch64, to busybox on x86-64
 both   /bin/cloudflared   the Cloudflare tunnel client, if fetched
 test   /bin/hello_c       a C program built against musl
 test   /bin/inet          the socket suite and a small HTTP server
@@ -39,6 +42,7 @@ test   /root/go_main      the Go program under user/go, when the build makes it
 both   /etc/passwd        the root account
 both   /etc/hostname      the machine name
 both   /etc/motd          the welcome text
+both   /etc/claudeos/services  the system services init starts, from user/services
 board  /etc/ntp.conf      the time servers ntpd asks to set the clock
 both   /etc/wifi.conf     the network to join, if build/wifi.conf exists
 both   /etc/ssl           the certificate store, if Alpine was fetched
@@ -49,10 +53,14 @@ both   /lib/firmware      the WiFi firmware, if fetched
 # line: `kernel` for the kernel's own code and read-only data, or a path in the
 # image. Each image's manifest has a line for every item that image has.
 # /etc/wifi.conf is not here: it is the user's configuration, not software.
+# /etc/claudeos/services is: it decides what runs at every boot.
 CHECKSUM_ITEMS='
 kernel
 /bin/cbox
 /bin/busybox
+/bin/busybox-extras
+/lib/ld-musl-aarch64.so.1
+/etc/claudeos/services
 /lib/firmware/brcm/brcmfmac43455-sdio.bin
 /lib/firmware/brcm/brcmfmac43455-sdio.clm_blob
 /lib/firmware/brcm/brcmfmac43455-sdio.txt

@@ -18,12 +18,14 @@ pub const O_RDWR: u64 = 2;
 pub const O_CREAT: u64 = 0o100;
 pub const O_TRUNC: u64 = 0o1000;
 pub const O_APPEND: u64 = 0o2000;
+/// The same value on both machines, and the same as EPOLL_CLOEXEC.
+pub const O_CLOEXEC: u64 = 0o2000000;
 
 // The call numbers and the instruction that makes the call are the machine's
 // own. x86-64 keeps its historical table; aarch64 uses the asm-generic one,
 // which dropped every call that a later "at" form replaced, so `open`,
-// `dup2`, `fork`, `mknod` and `epoll_wait` have no number there and the shims
-// further down make the equivalent call instead.
+// `dup2`, `mknod` and `epoll_wait` have no number there and the shims further
+// down make the equivalent call instead. `fork` is musl's (see `fork`).
 #[cfg(target_arch = "x86_64")]
 mod numbers {
     pub const SYS_READ: u64 = 0;
@@ -34,7 +36,6 @@ mod numbers {
     pub const SYS_PWRITE64: u64 = 18;
     pub const SYS_PIPE2: u64 = 293;
     pub const SYS_DUP2: u64 = 33;
-    pub const SYS_FORK: u64 = 57;
     pub const SYS_EXECVE: u64 = 59;
     pub const SYS_EXIT_GROUP: u64 = 231;
     pub const SYS_WAIT4: u64 = 61;
@@ -74,7 +75,6 @@ mod numbers {
     pub const SYS_PWRITE64: u64 = 68;
     pub const SYS_PIPE2: u64 = 59;
     pub const SYS_DUP3: u64 = 24;
-    pub const SYS_CLONE: u64 = 220;
     pub const SYS_EXECVE: u64 = 221;
     pub const SYS_EXIT_GROUP: u64 = 94;
     pub const SYS_WAIT4: u64 = 260;
@@ -225,17 +225,26 @@ pub fn alarm_call(seconds: u32) -> i64 {
     unsafe { syscall1(SYS_ALARM, seconds as u64) }
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn fork() -> i64 {
-    unsafe { syscall0(SYS_FORK) }
+extern "C" {
+    #[link_name = "fork"]
+    fn musl_fork() -> i32;
 }
 
-/// aarch64 has no `fork`; a `clone` whose only flag is the signal to raise on
-/// exit is the same thing.
-#[cfg(target_arch = "aarch64")]
+/// musl's `fork`, with a failure as a negative errno like the calls above.
+///
+/// It is musl's rather than the system call itself because musl keeps the
+/// calling thread's id in its own thread descriptor, and its `fork` sets the
+/// child's there. A child made by the bare system call keeps its parent's id,
+/// and musl's `raise`, which `abort` and so every Rust panic go through, sends
+/// its signal to that id: a panic in a child init forked ended init, and the
+/// kernel powered the machine off.
 pub fn fork() -> i64 {
-    const SIGCHLD: u64 = 17;
-    unsafe { syscall4(SYS_CLONE, SIGCHLD, 0, 0, 0) }
+    let pid = unsafe { musl_fork() };
+    if pid < 0 {
+        -(std::io::Error::last_os_error().raw_os_error().unwrap_or(12) as i64)
+    } else {
+        pid as i64
+    }
 }
 
 pub fn getpid() -> i64 {
@@ -273,6 +282,19 @@ pub fn close(fd: i32) -> i64 {
 pub fn pipe() -> Result<(i32, i32), i64> {
     let mut fds = [0i32; 2];
     let rc = unsafe { syscall2(SYS_PIPE2, fds.as_mut_ptr() as u64, 0) };
+    if rc < 0 {
+        Err(rc)
+    } else {
+        Ok((fds[0], fds[1]))
+    }
+}
+
+/// A pipe whose ends are closed across `execve`. A program started from here
+/// holds one only when it is duplicated onto a descriptor of its own, since
+/// `dup2` makes the copy without the flag.
+pub fn pipe_cloexec() -> Result<(i32, i32), i64> {
+    let mut fds = [0i32; 2];
+    let rc = unsafe { syscall2(SYS_PIPE2, fds.as_mut_ptr() as u64, O_CLOEXEC) };
     if rc < 0 {
         Err(rc)
     } else {
@@ -358,6 +380,11 @@ pub fn eventfd(initial: u32, flags: u32) -> i64 {
 
 pub fn epoll_create() -> i64 {
     unsafe { syscall1(SYS_EPOLL_CREATE1, 0) }
+}
+
+/// An epoll set closed across `execve`.
+pub fn epoll_create_cloexec() -> i64 {
+    unsafe { syscall1(SYS_EPOLL_CREATE1, O_CLOEXEC) }
 }
 
 /// A `struct epoll_event`: a 4-byte mask, then 8 bytes of caller data at

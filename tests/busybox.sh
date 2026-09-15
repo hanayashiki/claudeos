@@ -102,6 +102,35 @@ check "closing it gives both back" "0" \
     "$(bb printf 'x\n' > /tmp/bb/rw3 & bb timeout 5 /bin/busybox cat /tmp/bb/rw3 > /dev/null; echo $?)"
 
 echo
+echo "-- a web server --"
+# /bin/httpd is this busybox on x86-64 and Alpine's busybox-extras on aarch64,
+# which runs under musl's dynamic loader. Either has to serve a file to
+# busybox wget over the loopback address.
+if [ -e /bin/httpd ]; then
+  bb mkdir -p /tmp/bb/www
+  bb echo "served by httpd" > /tmp/bb/www/index.html
+  /bin/httpd -f -p 8081 -h /tmp/bb/www &
+  httpd=$!
+  bb sleep 1
+  check "httpd serves a file" "served by httpd" "$(bb wget -q -O - http://127.0.0.1:8081/index.html)"
+  kill $httpd
+  bb sleep 0.2
+else
+  check "httpd is installed" "/bin/httpd" "nothing"
+fi
+if [ "$machine" = aarch64 ]; then
+  check "httpd is busybox-extras" "busybox-extras" "$(bb readlink /bin/httpd)"
+  check "busybox-extras has httpd" "1" "$(/bin/busybox-extras --list | bb grep -c '^httpd$')"
+  # The kernel hands a program with an interpreter in its program header to
+  # that interpreter, so with the loader moved aside busybox-extras cannot
+  # start, and with it back it runs again.
+  bb mv /lib/ld-musl-aarch64.so.1 /lib/ld-musl-aarch64.so.1.away
+  check "busybox-extras needs the loader" "refused" "$(/bin/busybox-extras --list > /dev/null 2>&1 || echo refused)"
+  bb mv /lib/ld-musl-aarch64.so.1.away /lib/ld-musl-aarch64.so.1
+  check "and runs with it back" "0" "$(/bin/busybox-extras --list > /dev/null 2>&1; echo $?)"
+fi
+
+echo
 echo "-- terminal --"
 check "tty"             "/dev/console" "$(bb tty)"
 check "stty size"       "24 80"       "$(bb stty size)"

@@ -57,6 +57,9 @@ fi
 if [ -x "$ROOT/build/thirdparty/busybox" ]; then
   cp "$ROOT/build/thirdparty/busybox" "$RFS/bin/busybox"
   chmod +x "$RFS/bin/busybox"
+  # The web server a service names as /bin/httpd on either machine. This
+  # busybox has httpd; on aarch64 the link is to busybox-extras.
+  ln -sf busybox "$RFS/bin/httpd"
 fi
 
 # Cloudflare's own cloudflared, if scripts/fetch-cloudflared.sh has been run.
@@ -102,6 +105,10 @@ PASSWD
 cat > "$RFS/etc/hostname" <<'HOSTNAME'
 claudeos
 HOSTNAME
+
+# The system services init starts at boot, the same list in every image.
+mkdir -p "$RFS/etc/claudeos"
+cp "$ROOT/user/services" "$RFS/etc/claudeos/services"
 
 cp "$ROOT/tests/demo.sh" "$RFS/root/demo.sh"
 

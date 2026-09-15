@@ -125,8 +125,9 @@ build/initramfs-aarch64-board.cpio   the board image, which mkcard.sh puts on
                                      the card and netboot.sh serves
 ```
 
-The board image has cbox, busybox, cloudflared, the certificate store, the WiFi
-firmware, `wifi.conf` and the files in `/etc`. It has none of what only the
+The board image has cbox, busybox, busybox-extras with musl's dynamic loader,
+cloudflared, the certificate store, the WiFi firmware, `wifi.conf` and the
+files in `/etc`. It has none of what only the
 tests use: nothing in `/root` (the suites, `demo.sh`, `hello.txt`), no
 `hello_c` or `inet` in `/bin`, and a cbox built without its `rtest` applet,
 which is a cargo feature only the test image's build turns on. A file the build
@@ -620,6 +621,202 @@ four data lines, and CMD17, CMD18, CMD24 and CMD25 for blocks, by PIO. The bus
 stays at 3.3 V, at 50 MHz when the card has high speed; 1.8 V signalling and
 UHS-I are not used. A card taken out or put in after boot is not noticed.
 
+## Services started at boot
+
+Init starts the programs two lists name, once, at boot. Nothing starts, stops
+or pauses a service while the system runs, and a change to either list takes
+effect at the next boot. The console shell is not a service: init starts it
+whatever the lists hold, because it is how the machine is reached when
+everything else is broken.
+
+- **The system list**, `/etc/claudeos/services`, is part of the image, made
+  from `user/services`. The kernel checks it at boot with the rest of the core
+  software (see "Integrity check"), so a damaged or changed list is reported
+  `DAMAGED`. It is changed in the repository and rebuilt, never on the board.
+  Its one service is the clock:
+
+  ```
+  ntpd  always  needs=/etc/ntp.conf every=6h limit=180s backoff=30s-10m  /bin/busybox ntpd -n -q
+  ```
+
+- **The user list**, `/data/services.txt`, is on the SD card and is edited with
+  any text editor, on the board or on the Mac as
+  `/Volumes/CLAUDEDATA/services.txt`. It is at the root of the volume, where it
+  is seen as soon as the card is mounted, and its name ends in `.txt` so that
+  TextEdit and Notepad open it with a double click and keep the name when they
+  save it.
+
+**The format.** One service per line:
+
+```
+# name   policy  options                    command
+site     always                             /bin/httpd -f -p 8080 -h /data/site
+setup    once                               /bin/sh /data/scripts/setup.sh
+backup   always  every=1h backoff=10s-10m   /bin/sh /data/scripts/backup.sh
+old      off                                /bin/httpd -f -p 8081 -h /data/old
+```
+
+- The name is 1 to 32 of `a-z`, `0-9`, `_` and `-`. It names the service's
+  status file and its log.
+- The policy is `always`, started at boot and again whenever it ends; `once`,
+  started at boot and never again; or `off`, listed and not started.
+- The command is the rest of the line from the first word that starts with
+  `/`, which is the program's absolute path. There is no search of `PATH` and
+  no shell: words are split at spaces and tabs, single and double quotes keep
+  what is between them in one word as it is, and nothing is expanded, so
+  `$HOME`, `*` and a backslash reach the program as they are written. A service
+  that wants a shell names one, as in `/bin/sh -c 'cd /data/site && exec
+  /bin/httpd -f'`, or a script.
+- Options come between the policy and the command, each a word with an `=`:
+  - `needs=PATH` starts the service only when PATH exists at boot. For a user
+    service it is looked up after `/data` has had its chance to mount, so it
+    can name a path on the card.
+  - `every=D`, for `always`: after a run that exits with status 0, the next
+    starts D later, rather than after a backoff wait.
+  - `limit=D` kills a run still going after D, with its whole process group,
+    and counts it as a failure.
+  - `backoff=FIRST-CAP`, for `always`: the waits between failures, in place of
+    `1s-60s`.
+
+  D is a whole number and `s`, `m` or `h`, from `1s` to `168h`.
+- `#` at the start of a word, outside quotes, starts a comment. Blank lines,
+  trailing whitespace, CRLF line endings and a UTF-8 byte order mark are
+  accepted, since the user list is often saved on a Mac or on Windows.
+
+**What a service gets.** A process group of its own, so the interrupt, quit
+and suspend keys typed at the console never reach it; standard input from
+`/dev/null`; init's environment, which holds the kernel command line's words;
+and `/root` as its working directory. Its standard output and error go through
+a pipe to the process keeping it, which appends them to `/var/log/NAME.log`.
+When a log passes 256 KiB it is cut to its last 128 KiB, from the first whole
+line in them. `/var/log` is memory, and 256 KiB for each of the 64 services two
+lists can hold is 16 MiB at most; 128 KiB is about 1500 lines of 80
+characters. Cutting to half copies the kept part once for every 128 KiB
+written, where cutting to just under the cap would copy it on every write once
+the log was full. The keeper is the only writer of the log, so no byte a
+service writes while the log is cut is lost. It adds a line of its own when a
+run ends:
+
+```
+services: 14 s after boot: flap exited with status 3 after 0 s; next start in 8 s
+```
+
+**Starting again.** A service under `always` is started again when a run ends.
+The wait after the first failure in a row is 1 second, doubling with each
+failure after it up to 60 seconds, so a service that fails at once is started
+about once a minute. Every way a run ends counts as a failure, an exit with
+status 0 included, except under `every=`. The count starts again after a run
+that lasted at least the longest wait: a service that keeps failing is started
+at most that often, so a run that long is not part of such a loop. A program
+that does not exist fails like any other, with `could not be started: No such
+file or directory (os error 2)` in its status.
+
+ntpd's options keep what init's own time keeper did before the lists: after a
+run that exits 0 the next is six hours later, after a failure it is 30 seconds
+later, doubling with each failure in a row up to ten minutes, and a run still
+going after three minutes is killed. No run lasts the ten-minute cap, so only an
+exit with status 0 starts the count again. `needs=/etc/ntp.conf` keeps ntpd
+from starting in the test images, which have no such file; the board image has
+one, naming `ntp.nict.jp` and `time.cloudflare.com`. The reason for each number
+is a comment in `user/services`.
+
+**Status.** `cat /run/services/*` shows every service:
+
+```
+name: flap
+list: user
+policy: always
+command: /bin/sh -c 'echo flap ran; exit 3'
+log: /var/log/flap.log
+state: waiting
+pid: none
+next start: 22 s after boot
+starts: 4
+last run: exited with status 3 after 0 s
+changed: 14 s after boot
+```
+
+The state is `starting`, `running`, `waiting`, `finished` for a `once` service
+that has run, `off`, or `not started:` with the reason. Times are seconds since
+boot, from the monotonic clock, because the wall clock is what ntpd changes.
+`/run/services/errors.txt` holds what was not read or not started and why, with
+the list and the line number. A service name cannot hold a period, so no
+service's status file can be that file.
+
+**At boot.** Init forks a starter and waits for it. The starter reads the
+system list and starts its services, then reads the user list and starts its
+services, and prints one line on the console, before the shell starts:
+
+```
+services: 1 system started; 3 user started, 1 not started, 2 lines skipped (see /run/services/errors.txt)
+services: 1 system started; no user list, /data is not mounted
+```
+
+The kernel holds init back until `/data` is mounted or has failed to be, for
+at most 20 seconds, so the starter reads the user list after that outcome.
+Everything else goes in `/run/services/errors.txt`, because the console is the
+user's terminal and the test harness reads it.
+
+**What the user list cannot do.** Nothing in it can stop the boot, the shell or
+a system service:
+
+- The lists are read by the starter, not by init. Init waits for the starter
+  for at most 10 seconds and then starts the shell whatever the starter is
+  doing, stuck on a card that has stopped answering or ended by a fault, and
+  prints a line of its own saying which.
+- The system services are started before the user list is opened, and every
+  service has a keeper process of its own, so a user service shares nothing
+  with a system one.
+- With `/data` not mounted, or no `/data/services.txt`, the errors file gets
+  one line and no user service starts.
+- A malformed line is skipped, with its line number and the reason in the
+  errors file: a bad name, policy or option, a quote not closed, no absolute
+  program path, bytes that are not UTF-8, a control character, a name an
+  earlier line used, or a line over 1024 bytes.
+- At most 64 KiB and 1000 lines are read, and at most 32 services are taken
+  from a list. The errors file says where reading stopped, and a line the byte
+  cap cuts is not read.
+- A user service with a system service's name is refused, whether the system
+  one is `always`, `once` or `off`, and the system one runs as its list says.
+
+**Programs from /data.** FAT has no execute bit, every file on `/data` is
+reported as mode 0644, and that stays so. A user service runs a program from
+the image with arguments that point into `/data`:
+
+```
+site     always  /bin/httpd -f -p 8080 -h /data/site
+setup    once    /bin/sh /data/scripts/start.sh
+```
+
+A script run as `/bin/sh /data/scripts/start.sh` is read by the shell rather
+than executed, so it needs no execute bit. A server has to stay in the
+foreground, as `httpd -f` does: one that puts itself in the background ends the
+run its keeper waits for, and under `always` is started again and again.
+
+`/bin/httpd` is busybox's httpd on both machines: a link to busybox on x86-64,
+whose busybox.net build has it, and to `/bin/busybox-extras` on aarch64.
+Alpine's static busybox has no httpd, telnetd or nc. Alpine builds those into
+busybox-extras and publishes it only dynamically linked, so the aarch64 images
+also hold `/lib/ld-musl-aarch64.so.1`, the interpreter its program header
+names, which is musl's libc as well, and the kernel hands the program to it.
+Both files come from Alpine 3.19, and both are boot check items.
+`scripts/fetch-busybox.sh` checks every file it downloads, and every file it
+takes out of a package, against a sha256 recorded in the script, and stops on a
+mismatch.
+
+A quick Cloudflare tunnel to that web server, which nothing starts unless the
+lines are uncommented; cloudflared puts the `trycloudflare.com` address it was
+given in `/var/log/tunnel.log`:
+
+```
+# site     always  /bin/httpd -f -p 8080 -h /data/site
+# tunnel   always  needs=/bin/cloudflared  /bin/cloudflared tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:8080
+```
+
+`--protocol http2`, because QUIC does not work here (see "Limitations"). The
+tunnel's TLS needs the date, so it fails until ntpd has set the clock, and
+`always` starts it again until then.
+
 ## What the kernel does
 
 **Boot.** A multiboot1 header and a 32-bit trampoline build the initial page
@@ -642,7 +839,9 @@ them; on x86-64, for example:
 ```
 
 The items are `CHECKSUM_ITEMS` in `scripts/images.sh`: the kernel,
-`/bin/cbox`, `/bin/busybox` and the three WiFi firmware files. Adding one is a
+`/bin/cbox`, `/bin/busybox`, on aarch64 `/bin/busybox-extras` and
+`/lib/ld-musl-aarch64.so.1`, `/etc/claudeos/services`, which decides what runs
+at every boot, and the three WiFi firmware files. Adding one is a
 line there. An item an image does not have, such as the firmware on x86-64, is
 left out of its manifest. So is `kernel` when the kernel ELF has not been
 built, with a warning, which is why the kernel is built before the userland.
@@ -726,11 +925,11 @@ clock or the tick moves when they do. A `clock_nanosleep` to a wall-clock time
 is woken by the step and works its wait out again against the new time, as on
 Linux.
 
-When the image has `/etc/ntp.conf` and `/bin/busybox`, init starts a time
-keeper in a process group of its own, which runs `busybox ntpd -n -q` with its
-output appended to `/var/log/ntpd.log`. After a run that exits 0 the next is six
-hours later; after a failure it is 30 seconds later, doubling with each failure
-in a row up to ten minutes; a run still going after three minutes is killed.
+When the image has `/etc/ntp.conf`, the system services list starts
+`busybox ntpd -n -q`, with its output appended to `/var/log/ntpd.log` (see
+"Services started at boot"). After a run that exits 0 the next is six hours
+later; after a failure it is 30 seconds later, doubling with each failure in a
+row up to ten minutes; a run still going after three minutes is killed.
 The board image has that file, naming `ntp.nict.jp` and `time.cloudflare.com`;
 the test images do not, so the suites never wait on servers across the
 internet, and the network time section adds it to a copy of its own.
@@ -1119,7 +1318,7 @@ failures.
   reads differ and that 4 KiB of it holds nearly all 256 byte values, which is
   a check that the generator is running and not a check that it is any good.
 - The `rtest` applet, which only the test image's cbox is built with, runs
-  **91 checks** against the Rust standard library, 90 on aarch64, which has
+  **92 checks** against the Rust standard library, 91 on aarch64, which has
   no `alarm` system call of its own:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
@@ -1178,15 +1377,19 @@ failures.
   no handshake, an attempt the access point ends, thirty losses 5 s after each
   join, and a day with the network gone. Each checks the waits, that every
   failure leads to another scan, and how many lines the log got.
-- `tests/busybox.sh` runs **39 checks** against an upstream busybox binary that
+- `tests/busybox.sh` runs **40 checks** against an upstream busybox binary that
   this project did not build: `awk`, `sed`, `tar` create and extract, `find`,
   `md5sum` and `sha256sum` (whose digests are compared against the ones the
-  host computes for the same input), `ps`, `df`, `xargs`, `timeout`, and
-  busybox's own `ash` shell running loops, pipelines and arithmetic. Run
-  `make busybox` first to fetch it; the suite is skipped when it is absent.
-  The x86-64 binary is busybox.net's own 1.35.0 build against musl; the aarch64
-  one is Alpine's `busybox-static` 1.36.1, because busybox.net publishes no
-  aarch64 build.
+  host computes for the same input), `ps`, `df`, `xargs`, `timeout`,
+  busybox's own `ash` shell running loops, pipelines and arithmetic, and
+  `/bin/httpd` serving a file to busybox `wget`. Run `make busybox` first to
+  fetch it; the suite is skipped when it is absent. The x86-64 binary is
+  busybox.net's own 1.35.0 build against musl; the aarch64 one is Alpine's
+  `busybox-static` 1.36.1, because busybox.net publishes no aarch64 build. On
+  aarch64 `/bin/httpd` is Alpine's dynamically linked `busybox-extras`, and
+  four more checks, for 44, require the link to point at it, its applet list
+  to hold httpd, and it to be refused with musl's loader moved aside and to run
+  with the loader back.
 - `tests/alpine.sh` runs **34 checks** inside an unmodified Alpine Linux root
   filesystem, where every program is dynamically linked and loaded by Alpine's
   own musl loader: `awk`, `sed`, `tar` with gzip, `md5sum` and `sha256sum`
@@ -1203,9 +1406,11 @@ failures.
   be. The rest check that a request leaves behind a key that is not the bytes
   it handed out.
 - The **integrity check at boot** boots the test image as built, where every
-  item in the manifest has to be reported ok, and then five copies with one
+  item in the manifest has to be reported ok, and then six copies with one
   thing wrong in each: a byte of `/bin/cbox` changed, which has to be reported
-  DAMAGED; a byte of the kernel's code changed in a copy of the kernel image,
+  DAMAGED; the last byte of `/etc/claudeos/services` changed, which has to be
+  reported DAMAGED, with the line it damaged skipped in the `services:` line;
+  a byte of the kernel's code changed in a copy of the kernel image,
   past the end of its last function so the kernel still runs, which has to be
   reported DAMAGED for `kernel`; an item taken out of the image, reported
   missing; a manifest of twelve malformed lines and one good one, where each
@@ -1263,6 +1468,34 @@ failures.
   `fsck_msdos -n` finds after a power cut at every write (see "Power cuts"),
   and `tools/fatdisk repairs` what `fsck_msdos -y` makes of a cut in the middle
   of a move.
+- **Services at boot** first runs `user/cbox`'s own tests on the Mac: quotes,
+  CRLF, comments, bad names, policies and options, lines past the length cap,
+  the line, byte and service caps, a name used twice in one list and a system
+  service's name in the user list, the backoff waits against the old time
+  keeper's, and 4000 lists of random bytes, none of which may make the reader
+  panic. Then it boots a copy of the test image with `/etc/ntp.conf` added, so
+  that the system list's ntpd starts, and with a script that prints what
+  `/run/services` and the logs say. Every boot has to print the expected
+  `services:` line before the shell, reach the shell without a panic, and show
+  ntpd started from the system list. On aarch64 a card's `/data/services.txt`,
+  in CRLF lines, starts an `always` service that exits at once, which has to
+  have been started at least three times with waits of 1, 2, 4 and 8 seconds
+  in its log; a `once` service that writes a file in `/tmp`; `/bin/httpd`
+  serving `/data/site`, from which busybox `wget` in the guest has to fetch a
+  page after a `Ctrl-C` at the prompt; a `once` service that prints 60000
+  lines, whose log has to end under 256 KiB with its last lines kept; a
+  program that does not exist, retried with its status saying why; and an
+  `off` service. Then come a list of eight malformed lines, a good one and
+  70 KiB of comments, where each malformed line has to be in
+  `/run/services/errors.txt` with its number and the line past the byte cap
+  must not run; a card with no list; the first card with `data=off`; and a list
+  that names `ntpd`, which has to be refused while the system's ntpd runs. On
+  x86-64, which has no card slot, the test image as built has to leave ntpd
+  not started for want of `/etc/ntp.conf`, and the copy has to start it and
+  skip the user list. On both, `servicetest=hang` and `servicetest=abort`,
+  which only the test image's cbox reads, stop the starter after the system
+  services: the shell has to arrive, ten seconds late for the hang, with init's
+  line saying why, ntpd running and no user service started.
 - **Two boots, two streams** compares the boot id from every boot above. Two
   the same would mean the seed did not vary, and every byte the generator
   handed out would be the same in both. It costs no boot of its own.
@@ -1292,8 +1525,8 @@ failures.
   where QEMU emulates no network card.
 - **Network time** boots x86-64 with the suites' image plus `/etc/ntp.conf`,
   every date in it an hour old and the emulated battery clock set to 2000, so
-  the clock starts from a floor an hour behind. init's time keeper runs
-  BusyBox `ntpd` against `ntp.nict.jp` and `time.cloudflare.com`; the section
+  the clock starts from a floor an hour behind. The system services list's
+  ntpd line runs BusyBox `ntpd` against `ntp.nict.jp` and `time.cloudflare.com`; the section
   requires the kernel's `clock:` line to come in the middle of a `sleep 20`
   that still lasts 20 seconds by the host's clock, the guest's `date` to agree
   with the host's within two seconds afterwards, and ntpd's `setting time to`
@@ -1342,6 +1575,11 @@ kernel/src
   trap.rs             exception and interrupt handling
 
 user/cbox             the multicall userland binary (shell, init, coreutils)
+user/cbox/src/service_list.rs
+                      the services list format, and its tests
+user/cbox/src/services.rs
+                      the starter and the keepers of the services
+user/services         the system services list, /etc/claudeos/services in both images
 user/c/hello.c        a C program linked against musl
 tools/mkcpio.py       initramfs builder
 tools/checksums.py    the manifest the boot check reads, and the kernel's digest
@@ -1379,7 +1617,8 @@ PCIe root complex on the same board is still not driven, so anything on it --
 which is where the USB controller is -- is out of reach. There is nothing on
 the board that remembers the time across a power cycle, so the clock starts
 from the newest date on the ram disk, and is as far behind as the image is old
-until BusyBox `ntpd`, which init runs when the image has `/etc/ntp.conf`, gets
+until BusyBox `ntpd`, which the system services list starts when the image has
+`/etc/ntp.conf`, gets
 an answer from a time server. A board with no network stays that far behind.
 
 The WiFi joins one kind of network: WPA2 with a passphrase, CCMP for pairwise

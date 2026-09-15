@@ -80,6 +80,20 @@ if [ -x "$ROOT/build/thirdparty/busybox-aarch64" ]; then
   chmod +x "$RFS/bin/busybox"
 fi
 
+# A web server. Alpine's busybox-static above has no httpd, telnetd or nc:
+# Alpine builds those into busybox-extras, which it publishes only dynamically
+# linked, so it comes with musl's dynamic loader, the file its program header
+# names, which is also musl's libc. /bin/httpd is the name a service uses on
+# either machine; the x86-64 build points it at busybox.net's busybox, which
+# has httpd of its own.
+if [ -x "$ROOT/build/thirdparty/busybox-extras-aarch64" ] && [ -f "$ROOT/build/thirdparty/ld-musl-aarch64.so.1" ]; then
+  mkdir -p "$RFS/lib"
+  cp "$ROOT/build/thirdparty/busybox-extras-aarch64" "$RFS/bin/busybox-extras"
+  cp "$ROOT/build/thirdparty/ld-musl-aarch64.so.1" "$RFS/lib/ld-musl-aarch64.so.1"
+  chmod +x "$RFS/bin/busybox-extras" "$RFS/lib/ld-musl-aarch64.so.1"
+  ln -sf busybox-extras "$RFS/bin/httpd"
+fi
+
 # Cloudflare's own cloudflared, if ARCH=aarch64 scripts/fetch-cloudflared.sh
 # has been run. It is a static Go program, and Go brings its own threads, its
 # own resolver and its own TLS rather than calling a libc for any of them, so
@@ -134,8 +148,9 @@ for CERTS in "$ROOT/build/alpine-rootfs-aarch64/etc/ssl/certs/ca-certificates.cr
 done
 
 # ---- network time --------------------------------------------------------
-# The servers BusyBox ntpd asks. init starts ntpd in the background when this
-# file and /bin/busybox are both in an image, which is how a board with no
+# The servers BusyBox ntpd asks. The ntpd line in user/services, the system
+# services list every image has, says needs=/etc/ntp.conf, so init starts ntpd
+# only in an image that has this file, which is how a board with no
 # battery-backed clock learns the date. scripts/images.sh puts it in the board
 # image only, so the test images the suites boot never wait on servers across
 # the internet; the network time section of scripts/test.sh adds it to a copy.
@@ -151,6 +166,10 @@ PASSWD
 cat > "$RFS/etc/hostname" <<'HOSTNAME'
 claudeos
 HOSTNAME
+
+# The system services init starts at boot, the same list in both images.
+mkdir -p "$RFS/etc/claudeos"
+cp "$ROOT/user/services" "$RFS/etc/claudeos/services"
 
 cp "$ROOT/tests/demo.sh" "$RFS/root/demo.sh"
 cp "$ROOT/tests/suite.sh" "$RFS/root/suite.sh"
