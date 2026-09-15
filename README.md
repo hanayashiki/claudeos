@@ -426,7 +426,8 @@ card that is missing, unreadable or damaged leaves the machine booting and
 running without `/data`.
 
 A card from `scripts/mkcard.sh --new` has `/data` as its partition 2, labelled
-`CLAUDEDATA`. Updating the boot files later with `scripts/mkcard.sh /dev/diskN`
+`CLAUDEDATA`, holding `services.txt` and `site/index.html` to start with (see
+"Services started at boot"). Updating the boot files later with `scripts/mkcard.sh /dev/diskN`
 rewrites partition 1 and leaves partition 2 alone. Mounted on the Mac, partition
 2 is `/Volumes/CLAUDEDATA`, which is one way to put files on it.
 
@@ -695,11 +696,19 @@ characters. Cutting to half copies the kept part once for every 128 KiB
 written, where cutting to just under the cap would copy it on every write once
 the log was full. The keeper is the only writer of the log, so no byte a
 service writes while the log is cut is lost. It adds a line of its own when a
-run ends:
+run starts and when it ends:
 
 ```
+services: 14 s after boot: flap started, pid 31
 services: 14 s after boot: flap exited with status 3 after 0 s; next start in 8 s
 ```
+
+A cut also keeps the current run's first lines when they are older than the
+newest 128 KiB: up to 64 lines and 8 KiB from its `started` line, then the line
+`services: the log was cut here, to keep it under 256 KiB`, then the newest
+part. So something a program prints once, at start, stays in the log for as
+long as that run lasts; cloudflared prints a quick tunnel's address about
+twenty lines in. The first lines of earlier runs are not kept.
 
 **Starting again.** A service under `always` is started again when a run ends.
 The wait after the first failure in a row is 1 second, doubling with each
@@ -804,18 +813,31 @@ Both files come from Alpine 3.19, and both are boot check items.
 takes out of a package, against a sha256 recorded in the script, and stops on a
 mismatch.
 
-A quick Cloudflare tunnel to that web server, which nothing starts unless the
-lines are uncommented; cloudflared puts the `trycloudflare.com` address it was
-given in `/var/log/tunnel.log`:
+**The list a new card starts with.** `scripts/mkcard.sh --new` puts
+`user/data/services.txt` and `user/data/site/index.html` on `/data`: a web
+server for `/data/site`, and a Cloudflare quick tunnel to it, which needs no
+account and gets a new `trycloudflare.com` address each time it starts.
 
 ```
-# site     always  /bin/httpd -f -p 8080 -h /data/site
-# tunnel   always  needs=/bin/cloudflared  /bin/cloudflared tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:8080
+site      always                   /bin/httpd -f -p 8080 -h /data/site
+tunnel    always  backoff=30s-5m   /bin/cloudflared tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:8080
 ```
 
-`--protocol http2`, because QUIC does not work here (see "Limitations"). The
-tunnel's TLS needs the date, so it fails until ntpd has set the clock, and
-`always` starts it again until then.
+`--protocol http2` is the transport the tunnel runs on the board were made
+with. While there is no network, or the clock is still behind the dates of the
+certificates TLS checks, cloudflared exits, and the tunnel is started again 30
+seconds later, doubling to five minutes. The address is printed once near the
+start of each run and kept through every cut of the log (see "What a service
+gets"). Over the telnet console:
+
+```
+grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /var/log/tunnel.log | tail -n 1
+```
+
+`tail -n 1`, because the log also holds the addresses of earlier runs until a
+cut removes them. Updating the card's boot files with `scripts/mkcard.sh
+/dev/diskN` leaves `/data` as it is, so an edited list stays, and replacing the
+quick tunnel with a named one is an edit to this file.
 
 ## What the kernel does
 
@@ -1420,7 +1442,15 @@ failures.
 - The **board image** boots `build/initramfs-aarch64-board.cpio` on aarch64.
   It has to reach the shell, report every item ok, list nothing under `/root`
   and none of `hello_c`, `inet` or `rtest` in `/bin`, and answer `cbox rtest`
-  with an unknown applet.
+  with an unknown applet. On a Mac, `scripts/mkcard.sh --new --image` then
+  writes a 1 GiB card image. `tools/fatdisk` has to find exactly the files
+  `mkcard.sh` assembled in `build/boot` on its partition 1, and exactly
+  `services.txt` and `site/index.html` on its `/data`, byte for byte those
+  under `user/data`, with no `._` file or `.fseventsd` on either. An update
+  with `mkcard.sh --image` has to leave the SHA-1 of `/data`'s blocks as it was
+  and partition 1 holding exactly the boot files again. The card is then booted with the board image: the web server the seeded
+  list starts has to serve the seeded page to busybox `wget`. The quick tunnel,
+  which has no network under QEMU, has to exit and be started again.
 - **/data on an SD card** runs on aarch64, and on a Mac, since its card images
   are made with macOS's `newfs_msdos` through `hdiutil`, without root; elsewhere
   it reports itself skipped. It first runs `tools/fatdisk`'s tests, which build
@@ -1483,7 +1513,8 @@ failures.
   in its log; a `once` service that writes a file in `/tmp`; `/bin/httpd`
   serving `/data/site`, from which busybox `wget` in the guest has to fetch a
   page after a `Ctrl-C` at the prompt; a `once` service that prints 60000
-  lines, whose log has to end under 256 KiB with its last lines kept; a
+  lines, whose log has to end under 256 KiB holding its started line and
+  first 63 lines once, one cut line, and its last lines; a
   program that does not exist, retried with its status saying why; and an
   `off` service. Then come a list of eight malformed lines, a good one and
   70 KiB of comments, where each malformed line has to be in
@@ -1580,6 +1611,7 @@ user/cbox/src/service_list.rs
 user/cbox/src/services.rs
                       the starter and the keepers of the services
 user/services         the system services list, /etc/claudeos/services in both images
+user/data             what scripts/mkcard.sh --new puts on a new card's /data
 user/c/hello.c        a C program linked against musl
 tools/mkcpio.py       initramfs builder
 tools/checksums.py    the manifest the boot check reads, and the kernel's digest
