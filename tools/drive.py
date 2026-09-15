@@ -80,8 +80,23 @@ class Screen:
                 self.column = (self.column // 8 + 1) * 8
             elif byte == 0x07:
                 pass
+            elif 0x20 <= byte < 0x7F:
+                self._put(chr(byte))
+            elif byte >= 0x80:
+                # UTF-8: a character of two to four bytes. One cut off at the
+                # end of this chunk waits in `pending` for the rest, as an
+                # escape sequence does; bytes that are not UTF-8 are drawn as
+                # U+FFFD.
+                need = 2 if 0xC0 <= byte < 0xE0 else 3 if 0xE0 <= byte < 0xF0 else 4 if 0xF0 <= byte < 0xF8 else 1
+                start = index - 1
+                if start + need > len(data):
+                    self.pending = data[start:]
+                    return
+                for char in data[start:start + need].decode("utf-8", errors="replace"):
+                    self._put(char)
+                index = start + need
             else:
-                self._put(chr(byte) if 0x20 <= byte < 0x7F else ".")
+                self._put(".")
 
     def _put(self, char):
         while len(self.line) <= self.column:
