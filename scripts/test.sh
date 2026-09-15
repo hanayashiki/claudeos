@@ -746,9 +746,11 @@ PY
 }
 
 # /data on the emulated Pi 4's SD card, with card images made by tools/fatdisk,
-# which needs no root. Two boots on one card go through every operation and
-# then read back what the first left; the Mac reads the image after the fsync,
-# before the sync, and after each boot, and requires the boot partition beside
+# which needs no root. First the kernel's FAT code on the Mac: tools/fatdisk's
+# tests against macOS's own FAT tools, and the fuzz seeds it keeps. Then two
+# boots on one card go through every operation and read back what the first
+# left; the Mac reads the image after the fsync, before the sync, and after
+# each boot, runs fsck_msdos -n on it, and requires the boot partition beside
 # /data to be unchanged. Then boots with no card, with data=off, with a label
 # the card does not have, with a boot partition carrying the /data label, with
 # a bad partition table and with volumes damaged on purpose each have to reach
@@ -759,6 +761,13 @@ run_data() {
   if [ "$ARCH" != aarch64 ]; then
     echo "   /data is on the Raspberry Pi 4's SD card, and $ARCH has no card slot"
     echo ">> /data on an SD card: not run on $ARCH"
+    echo
+    return
+  fi
+  if [ "$(uname -s)" != Darwin ]; then
+    echo "   the card images are made by macOS's newfs_msdos through hdiutil and checked by its fsck_msdos"
+    echo ">> /data on an SD card: skipped (needs macOS)"
+    skipped=$((skipped + 1))
     echo
     return
   fi
@@ -774,6 +783,23 @@ run_data() {
   local long="/claudeos-test/An index page with a long name, spaces, and (brackets).html"
   dir="$(mktemp -d)"
   card="$dir/card.img"
+
+  # The kernel's FAT code on the Mac, before any boot.
+  if (cd "$ROOT/tools/fatdisk" && cargo test --release -q > "$dir/host-tests" 2>&1); then
+    echo "   tools/fatdisk tests: $(grep -E '^test result' "$dir/host-tests" | awk '{ p += $4; f += $6 } END { print p " passed, " f " failed" }')"
+  else
+    echo "   tools/fatdisk tests failed:"
+    tail -n 40 "$dir/host-tests" | sed 's/^/     /'
+    ok=0
+  fi
+  if "$fatdisk" fuzz --seeds "$ROOT/tools/fatdisk/fuzz-seeds.txt" > "$dir/fuzz" 2>&1; then
+    echo "   $(tail -n 1 "$dir/fuzz")"
+  else
+    echo "   the fuzz seeds found a panic:"
+    tail -n 20 "$dir/fuzz" | sed 's/^/     /'
+    ok=0
+  fi
+
   "$fatdisk" mbr "$card" 256 CLAUDEOS:64+boot CLAUDEDATA:rest
   boot_before="$(data_digest "$card" CLAUDEOS)"
 

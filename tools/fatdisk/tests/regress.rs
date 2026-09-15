@@ -69,9 +69,21 @@ fn multibyte_names() {
     let mounted = macos::mount(&path, &dir.join("mnt"), true).unwrap();
     let seen = walk_mac(&mounted.point);
     drop(mounted);
+    let mut wrong = Vec::new();
     for name in names {
-        assert_eq!(seen.get(&nfc_one(name)), Some(&Some(name.as_bytes().to_vec())), "the Mac's view of {:?}; it has {:?}", name, seen.keys().collect::<Vec<_>>());
+        let got = seen.get(&nfc_one(name));
+        let expected = if nfc_one(name) != name {
+            // macOS looks a name up precomposed, so a name stored decomposed
+            // is in its listing and cannot be opened there.
+            Some(Some(b"the Mac lists this file and cannot open it: No such file or directory (os error 2)".to_vec()))
+        } else {
+            Some(Some(name.as_bytes().to_vec()))
+        };
+        if got.cloned() != expected {
+            wrong.push(format!("{:?}: {:?}", name, got.map(|data| data.as_ref().map(|bytes| String::from_utf8_lossy(bytes).to_string()))));
+        }
     }
+    assert!(wrong.is_empty(), "the Mac's view differs for:\n{}", wrong.join("\n"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

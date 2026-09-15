@@ -1,0 +1,7 @@
+# The seeds `fatdisk fuzz --seeds` replays. The /data section of
+# scripts/test.sh runs this list. Each seed picks a starting image (the filled
+# template, the template with looping chains, or the one with a directory
+# cycle), a kind of damage, and how much of it; see `fuzz` in src/main.rs.
+# A seed that ever made the kernel's FAT code panic is added on a line of its
+# own with what it found.
+1-5000

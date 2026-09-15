@@ -302,9 +302,45 @@ struct Tally {
     errors: u64,
 }
 
-/// Everything /data's users do, against one image. Errors are expected and
-/// counted; the only failure is a panic, which the caller catches.
-fn exercise(data: Vec<u8>, tally: &mut Tally) {
+/// Names the random operations use: 8.3 names in either case, long names,
+/// Japanese and emoji, trailing periods, and names FAT refuses.
+const NAMES: [&str; 16] = ["a", "B.TXT", "readme.txt", "Long file name number 1.html", "日本語", "🎉.txt", "sub", "Sub", "𠮷", "e.", "...", "a:b", "x", "index.html", "www", "css"];
+
+/// `count` operations picked by `random` on whatever the volume holds, results
+/// counted and otherwise ignored: paths go stale as entries move and go.
+fn random_ops(volume: &mut Volume<Memory>, random: &mut Random, dirs: &[String], files: &[(String, u32)], count: usize, note: &mut impl FnMut(bool)) {
+    let mut dirs: Vec<String> = dirs.to_vec();
+    let mut files: Vec<String> = files.iter().map(|(path, _)| path.clone()).collect();
+    for _ in 0..count {
+        let dir = dirs[random.below(dirs.len() as u64) as usize].clone();
+        let name = NAMES[random.below(NAMES.len() as u64) as usize];
+        let file = if files.is_empty() { None } else { Some(files[random.below(files.len() as u64) as usize].clone()) };
+        let ok = match (random.below(9), file) {
+            (0, _) => volume.create(&dir, name).map(|entry| files.push(join(&dir, &entry.name))).is_ok(),
+            (1, _) => volume.mkdir(&dir, name).map(|entry| dirs.push(join(&dir, &entry.name))).is_ok(),
+            (2, Some(file)) => {
+                let offset = random.below(1 << 16);
+                let data = vec![random.next() as u8; random.below(1 << 14) as usize];
+                volume.write(&file, offset, &data).is_ok()
+            }
+            (3, Some(file)) => volume.truncate(&file, random.below(1 << 16)).is_ok(),
+            (4, _) => volume.remove(&dir, name, random.below(2) == 0).is_ok(),
+            (5, _) => {
+                let target = dirs[random.below(dirs.len() as u64) as usize].clone();
+                volume.rename(&dir, name, &target, NAMES[random.below(NAMES.len() as u64) as usize]).is_ok()
+            }
+            (6, Some(file)) => volume.read(&file, random.below(1 << 16), &mut [0u8; 3000]).is_ok(),
+            (7, _) => volume.list(&dir).is_ok(),
+            _ => volume.sync().is_ok(),
+        };
+        note(ok);
+    }
+}
+
+/// Everything /data's users do, against one image, and then random
+/// operations. Errors are expected and counted; the only failure is a panic,
+/// which the caller catches.
+fn exercise(data: Vec<u8>, seed: u64, tally: &mut Tally) {
     let mut blocks = Memory { data };
     let probe = match fatdisk::fat::probe(&mut blocks) {
         Ok(probe) => probe,
@@ -390,6 +426,7 @@ fn exercise(data: Vec<u8>, tally: &mut Tally) {
     for i in 0..40 {
         note(volume.create("", &format!("many long names to grow the root {}", i)).is_ok());
     }
+    random_ops(&mut volume, &mut Random::new(seed ^ 0x5eed_0f_0e5), &dirs, &files, 200, &mut note);
     note(volume.stats().is_ok());
     note(volume.sync().is_ok());
     note(volume.list("").is_ok());
@@ -464,7 +501,7 @@ fn fuzz(seeds: &[u64]) {
         damage::damage(&mut data, mode, &mut random, count);
         let before = panics.lock().map(|p| p.len()).unwrap_or(0);
         let one = Instant::now();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exercise(data, &mut tally)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exercise(data, seed, &mut tally)));
         let took = one.elapsed().as_millis();
         if took > slowest.0 {
             slowest = (took, seed);
