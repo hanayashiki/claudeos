@@ -101,6 +101,8 @@ run_interactive() {
       "kill %1\n" "wait:1.5" \
       "cat &\n" "wait:1.5" "jobs\n" "wait:0.8" \
       "fg\n" "wait:0.8" "into-cat\n" "wait:1" "\x04" "wait:1.2" \
+      "echo タ日本🎉x" "wait:0.4" "\x7f\x7f" "wait:0.4" " | hexdump -C\n" "wait:0.8" \
+      "echo raw\xffbyte | hexdump -C\n" "wait:0.8" \
       "uptime\n" "wait:1.5" \
       "exit\n" "wait:2" "echo new-shell-works\n" "wait:0.8" \
       "poweroff\n" "wait:3" 2>&1 | tr -d '\r')"
@@ -123,6 +125,25 @@ run_interactive() {
       ok=0
     fi
   done
+  # A line typed with Japanese and an emoji, and two backspaces that take off
+  # the x and the whole emoji, reaches the command as its UTF-8 bytes:
+  # タ日本 is e3 82 bf e6 97 a5 e6 9c ac.
+  if ! echo "$output" | grep -q "^00000000  e3 82 bf e6 97 a5 e6 9c  ac 0a"; then
+    echo "   the line typed as タ日本 did not reach the command as its UTF-8 bytes"
+    ok=0
+  fi
+  # A byte that is not UTF-8, 0xff, typed in a line. The editor keeps it; the
+  # shell still takes lines as text, so it reaches the command as U+FFFD
+  # (ef bf bd), once. Either that or the byte itself is accepted, and which one
+  # is said, because the shell taking bytes is what would change it.
+  if echo "$output" | grep -q "^00000000  72 61 77 ff 62 79 74 65  0a"; then
+    echo "   a typed 0xff byte reached the command unchanged"
+  elif echo "$output" | grep -q "^00000000  72 61 77 ef bf bd 62 79  74 65 0a"; then
+    echo "   a typed 0xff byte reached the command as one U+FFFD, at the shell's text boundary"
+  else
+    echo "   a typed 0xff byte reached the command as neither itself nor one U+FFFD"
+    ok=0
+  fi
   # The clock has to advance while the shell is blocked reading. Require the
   # line to be there, so a session that never got that far fails rather than
   # passing by omission.
