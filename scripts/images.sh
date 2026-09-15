@@ -26,6 +26,9 @@
 IMAGE_ITEMS='
 both   /bin/cbox          the shell, init and the applets
 both   /bin/busybox       upstream busybox, if fetched
+both   /bin/busybox-extras  httpd, telnetd and nc from Alpine, on aarch64, if fetched
+both   /lib/ld-musl-aarch64.so.1  the musl dynamic loader and libc busybox-extras runs under
+both   /bin/httpd         the web server: a link to busybox-extras on aarch64, to busybox on x86-64
 both   /bin/cloudflared   the Cloudflare tunnel client, if fetched
 test   /bin/hello_c       a C program built against musl
 test   /bin/inet          the socket suite and a small HTTP server
@@ -55,6 +58,8 @@ CHECKSUM_ITEMS='
 kernel
 /bin/cbox
 /bin/busybox
+/bin/busybox-extras
+/lib/ld-musl-aarch64.so.1
 /etc/claudeos/services
 /lib/firmware/brcm/brcmfmac43455-sdio.bin
 /lib/firmware/brcm/brcmfmac43455-sdio.clm_blob
