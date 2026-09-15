@@ -74,7 +74,9 @@ bytes such as 0xff, on both machines.
 
 - **WiFi needs `net=wifi`.** Without it the wired port always takes DHCP and
   the default route, even with no cable, and WiFi never starts, because the
-  stack holds one interface.
+  stack holds one interface. `scripts/mkcard.sh` writes the word when the
+  board image holds `/etc/wifi.conf`, so only a hand-written command line
+  can miss it.
 - **README says QUIC does not work.** README.md says QUIC fails because
   `sendmsg` drops the destination. `sendmsg` and `recvmmsg` have since been
   fixed, and cloudflared's own pre-check reported a successful QUIC connection
@@ -95,6 +97,16 @@ bytes such as 0xff, on both machines.
   - `nanosleep` rounds up to the 100 Hz tick;
   - `CLONE_SIGHAND` copies the signal disposition table instead of sharing it;
   - one kernel fault under heavy forking, never reproduced.
+
+## Tests
+
+- **"a stopped job shows T" failed once** (tests/suite.sh, x86-64, main
+  cd228b8, 2026-09-16), while another agent's QEMU runs shared the Mac. The
+  rerun passed. The check runs `kill -STOP` on a sleeping job and then `ps` at
+  once. The stop takes effect when the stopped task next runs, as it does on
+  Linux (`do_signal_stop` runs in the task being stopped), so `ps` can read the
+  state before that. The check should wait for the state, for a bounded time,
+  rather than read it once.
 
 ## Telnet console
 
