@@ -219,7 +219,9 @@ say "RECOVERY.000 and resets the board. The new bootloader then prints its progr
 say "on the serial port and tries the network before the SD card."
 
 if [ $# -ge 2 ]; then
-  "$ROOT/scripts/mkcard.sh" --dir "$OUT" "$2"
+  # --new: a recovery card is a card erased for the purpose, and mkcard.sh
+  # without it only rewrites the boot partition of a card it made before.
+  "$ROOT/scripts/mkcard.sh" --dir "$OUT" --new "$2"
 else
   say ""
   say "no device named, so nothing was written."
