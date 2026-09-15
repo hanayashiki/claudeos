@@ -619,6 +619,7 @@ fn main() {
         "fuzz" => fuzz(&(number(2)..=number(3)).collect::<Vec<u64>>()),
         "walk" => walk(&arg(2), &arg(3)),
         "cuts" => cut::report(),
+        "repairs" => cut::repair_report(),
         other => die(&format!("{} is not a command; see the top of tools/fatdisk/src/main.rs", other)),
     }
     let _ = (MIB, SECTOR);

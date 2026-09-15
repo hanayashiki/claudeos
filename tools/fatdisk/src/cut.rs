@@ -152,6 +152,176 @@ pub fn print(outcomes: &[Outcome]) {
     }
 }
 
+/// What the Mac's `fsck_msdos -y` made of a cut in the middle of a move, and
+/// where each file of the moved subtree could be read afterwards.
+pub struct Repair {
+    pub scenario: String,
+    pub writes: usize,
+    pub exit: i32,
+    pub output: String,
+    /// fsck_msdos -n on the repaired volume.
+    pub after: Vec<String>,
+    /// For each file's contents, the paths it was read at: through this code,
+    /// and through a read-only mount on the Mac.
+    pub ours: std::collections::BTreeMap<String, Vec<String>>,
+    pub mac: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Every file under the root, through this code, by contents.
+fn where_ours(data: Vec<u8>) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut out: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut volume = match image::mount(Memory { data }) {
+        Ok(volume) => volume,
+        Err(e) => {
+            out.entry(format!("not mountable: {}", e)).or_default();
+            return out;
+        }
+    };
+    let mut pending = vec![String::new()];
+    let mut visited = 0;
+    while let Some(dir) = pending.pop() {
+        visited += 1;
+        if visited > 1000 {
+            out.entry(String::from("more than 1000 directories: a cycle")).or_default();
+            break;
+        }
+        let entries = match volume.list(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                out.entry(format!("listing /{}: {:?}", dir, e)).or_default().push(dir.clone());
+                continue;
+            }
+        };
+        for entry in entries {
+            let path = join(&dir, &entry.name);
+            if entry.is_dir {
+                pending.push(path);
+                continue;
+            }
+            let mut data = vec![0u8; entry.len as usize];
+            let text = match volume.read(&path, 0, &mut data) {
+                Ok(n) if n == data.len() => String::from_utf8_lossy(&data).to_string(),
+                Ok(n) => format!("short read of {} bytes: {}", n, String::from_utf8_lossy(&data[..n])),
+                Err(e) => format!("unreadable: {:?}", e),
+            };
+            out.entry(text).or_default().push(path);
+        }
+    }
+    out
+}
+
+/// Every file under a mount point, by contents.
+fn where_mac(root: &Path) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut out: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut pending = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, prefix)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("._") || (prefix.is_empty() && matches!(name.as_str(), ".fseventsd" | ".Spotlight-V100" | ".Trashes")) {
+                continue;
+            }
+            let path = join(&prefix, &name);
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push((entry.path(), path));
+            } else {
+                let text = std::fs::read(entry.path()).map(|d| String::from_utf8_lossy(&d).to_string()).unwrap_or_else(|e| format!("unreadable: {}", e));
+                out.entry(text).or_default().push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Cut a move part way, repair the volume with `fsck_msdos -y`, and look for
+/// every file of what was moved.
+pub fn repairs(scratch: &Path) -> Result<Vec<Repair>, String> {
+    std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+    let path = scratch.join("base.img");
+    macos::newfs_whole(&path, 40, "REPAIRS", None)?;
+    let mut setup = image::mount(Memory { data: std::fs::read(&path).map_err(|e| e.to_string())? })?;
+    let cluster = setup.layout().cluster_bytes as usize;
+    let fail = |e: FsError| format!("setting up: {:?}", e);
+    setup.mkdir("", "site").map_err(fail)?;
+    setup.mkdir("site", "moving").map_err(fail)?;
+    setup.mkdir("site/moving", "inner").map_err(fail)?;
+    setup.mkdir("", "other").map_err(fail)?;
+    for (dir, name) in [("site/moving", "page.html"), ("site/moving", "a long name for a second page.html"), ("site/moving/inner", "deep.txt"), ("site", "stays.txt"), ("", "file that moves.txt")] {
+        let mut text = format!("contents of {}/{} ", dir, name).into_bytes();
+        // Several clusters, so a truncation would show.
+        text.resize(3 * cluster + 7, b'.');
+        write_file(&mut setup, dir, name, &text).map_err(fail)?;
+    }
+    setup.sync().map_err(fail)?;
+    let base = setup.into_device().data;
+
+    type Move = Box<dyn Fn(&mut Volume<Recorder>) -> Result<String, FsError>>;
+    let scenarios: Vec<(&str, Move)> = vec![
+        ("move the directory site/moving to other/moved", Box::new(|v| v.rename("site", "moving", "other", "moved"))),
+        ("move the file `file that moves.txt` into other", Box::new(|v| v.rename("", "file that moves.txt", "other", "file that moved.txt"))),
+    ];
+    let mut out = Vec::new();
+    for (scenario, op) in scenarios {
+        let mut volume = image::mount(Recorder::new(base.clone()))?;
+        op(&mut volume).map_err(|e| format!("{}: {:?}", scenario, e))?;
+        let writes = volume.into_device().writes;
+        for count in 1..writes.len() {
+            let mut data = base.clone();
+            for (at, block) in &writes[..count] {
+                let start = (*at * SECTOR) as usize;
+                data[start..start + block.len()].copy_from_slice(block);
+            }
+            let file = scratch.join("cut.img");
+            std::fs::write(&file, &data).map_err(|e| e.to_string())?;
+            let output = std::process::Command::new("fsck_msdos").arg("-y").arg(&file).output().map_err(|e| e.to_string())?;
+            let mut text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            // A first repair can leave something a second one finds, such as
+            // the long-name entries of a short entry it removed.
+            let second = std::process::Command::new("fsck_msdos").arg("-y").arg(&file).output().map_err(|e| e.to_string())?;
+            let second = format!("{}{}", String::from_utf8_lossy(&second.stdout), String::from_utf8_lossy(&second.stderr));
+            for line in macos::findings(&second) {
+                text.push_str(&format!("\n(second pass) {}", line));
+            }
+            let after = macos::findings(&macos::fsck(&file).1);
+            let repaired = std::fs::read(&file).map_err(|e| e.to_string())?;
+            let ours = where_ours(repaired);
+            let mounted = macos::mount(&file, &scratch.join("mnt"), true)?;
+            let mac = where_mac(&mounted.point);
+            drop(mounted);
+            out.push(Repair { scenario: scenario.to_string(), writes: count, exit: output.status.code().unwrap_or(-1), output: text, after, ours, mac });
+        }
+    }
+    Ok(out)
+}
+
+pub fn print_repairs(repairs: &[Repair]) {
+    for repair in repairs {
+        println!("== {}, cut after {} of its writes; fsck_msdos -y exit {}", repair.scenario, repair.writes, repair.exit);
+        for line in macos::findings(&repair.output) {
+            println!("   fsck_msdos -y: {}", line);
+        }
+        println!("   fsck_msdos -n afterwards: {}", if repair.after.is_empty() { String::from("nothing reported") } else { repair.after.join(" / ") });
+        for (label, found) in [("this code", &repair.ours), ("the Mac", &repair.mac)] {
+            for (contents, paths) in found {
+                let shown: String = contents.chars().take(60).collect();
+                println!("   {}: {:?} at {:?}", label, shown, paths);
+            }
+        }
+    }
+}
+
+pub fn repair_report() {
+    let scratch = std::env::temp_dir().join(format!("fatdisk-repairs-{}", std::process::id()));
+    match repairs(&scratch) {
+        Ok(repairs) => print_repairs(&repairs),
+        Err(e) => {
+            eprintln!("fatdisk: {}", e);
+            std::process::exit(1);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 pub fn report() {
     let scratch = std::env::temp_dir().join(format!("fatdisk-cuts-{}", std::process::id()));
     match outcomes(&scratch) {

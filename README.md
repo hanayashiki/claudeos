@@ -416,28 +416,41 @@ appears later if the card is mounted then.
 Its block numbers count from the volume's first block, a block at or past the
 length is refused before any command is sent, and nothing else in the kernel
 can send a block command, so no number read off a damaged FAT can reach the
-boot partition or any other part of the card. The boot sector is checked
-before rust-fatfs reads it. rust-fatfs is compiled without overflow checks, so
-arithmetic on a damaged number gives a wrong number, which the bounds check
-refuses, rather than a panic, which would restart the board into the same card.
-Each operation has a budget of calls and a deadline of 30 seconds plus a second
-per MiB it moves, so a cluster chain that loops ends in an error. At most
-4 MiB of blocks are cached, 32 files kept open and 32 directories remembered.
+boot partition or any other part of the card. The FAT code above it is the
+kernel's own (`kernel/src/storage/fat`, described below), and nothing it reads
+off the card can make it panic, which would restart the board into the same
+card: every field is checked before it is used, every walk along a cluster
+chain stops at the volume's cluster count, and a volume that contradicts itself
+is EUCLEAN to the program that met it, where a card command that failed is
+EIO. At most 4 MiB of blocks are cached, 32 files kept open and 32 directories
+remembered.
 A directory found by a lookup is remembered because the kernel resolves a path
 one component at a time, so a path costs one directory scan per component
 rather than a walk from the root for each. A damaged card whose directory
 entries point back at a directory above them has a tree with no bottom, and
 `find` on it goes down until paths reach the 4096-byte limit.
 
-**What a write means.** A write system call returns once its blocks are on the
-card, and a card command that failed is EIO to the program that made the call.
-`fsync` and `fdatasync` put the file's directory entry on the card as well.
-`sync` and `syncfs` unmount the volume and mount it again, which writes its
-count of free clusters and marks it clean, and `reboot`, `halt` and `poweroff`
-do the same before the machine stops. There is no journal. A power cut during a
-write can leave that file, its directory or the FAT inconsistent, as on any FAT
-volume; the next boot mounts what is there, and the Mac's `fsck_msdos` or Disk
-Utility's First Aid repairs it.
+**What a write means.** A write system call returns once its blocks and the
+file's directory entry are on the card, and a card command that failed is EIO
+to the program that made the call, so `fsync` and `fdatasync` have nothing left
+to add. There is no journal. Every operation writes in an order chosen so that
+a power cut at any point leaves, at worst, clusters marked in use that no file
+names, which `fsck_msdos` reclaims, and never a file whose entry names clusters
+that were not written or were freed; "Power cuts" below lists what the Mac's
+`fsck_msdos -n` reports after a cut at each write.
+
+Before its first write after mounting or after a sync, the kernel marks the
+volume in use: it clears the clean-shutdown bit of FAT[1] in every FAT copy it
+writes, which is what the Mac's `fsck_msdos` and Windows look at, and sets the
+dirty bit Linux keeps in the boot sector, which is what Linux's `fsck.fat`
+looks at. `sync` and `syncfs` write FSInfo's count of free clusters and its
+next-free hint from the FAT and mark the volume clean again. `reboot`, `halt`
+and `poweroff` do the same before the machine stops, and wait for it at most 5
+seconds, so a card that has stopped answering leaves the volume marked in use
+rather than keeping the machine from stopping, which the console says. A panic
+does not touch the card. A volume that was marked in use when it was mounted,
+because the power went while it was, stays marked, and the `data:` line says
+so; `fsck_msdos -y` or Disk Utility's First Aid on the Mac clears it.
 
 **What FAT does not have, and what happens instead.**
 
@@ -447,20 +460,39 @@ Utility's First Aid repairs it.
 - Hard links, symbolic links and named pipes. Making one answers EPERM. A link
   or a rename between `/data` and the ram filesystem answers EXDEV, which makes
   `mv` copy instead.
-- Case. A name keeps the case it was created with and is found with ASCII
-  letters in any case, so two names that differ only in case are one file.
+- Case, beyond ASCII. A name keeps the case it was created with and is found
+  with ASCII letters in any case, so two names that differ only in the case of
+  ASCII letters are one file. Every other character matches only itself, code
+  point by code point, as on Linux mounted with `utf8`: `École.txt` and
+  `école.txt` are two files, and so are a name spelled with a precomposed
+  character and the same name with a combining mark. No normalisation is
+  done. The Mac stores names precomposed (Unicode form NFC) and shows them to
+  its programs decomposed, so a name the Mac wrote is found on the board by its
+  precomposed spelling, which is how programs usually spell it. A name a
+  program on the board creates decomposed is listed on the Mac but cannot be
+  opened there, so programs that write to `/data` should create names in NFC.
+- Every name. `\ / : * ? " < > |` and control characters answer EINVAL, as does
+  a name ending in a space or made only of periods; periods at the end of a
+  name are dropped, so `page.` is `page`; a name of more than 255 UTF-16 units
+  answers ENAMETOOLONG. These are Linux vfat's rules.
 - Time zones and fine timestamps. The modification time is the kernel's clock
   when the change was made, stored to FAT's two seconds as UTC. On a board
   whose clock has not been set from the network it is as far behind as the
-  clock is.
+  clock is. The Mac reads a FAT time as its own local time, so it shows these
+  shifted by its offset from UTC. A directory's time is when it was made, and a
+  file's access date when it was made.
 - Large files. A file is at most 4 GiB less one byte; a write past that answers
   EFBIG. FAT has no holes, so writing past the end of a file or truncating it
   longer writes zeros up to the new bytes.
-- An atomic rename over an existing name. It removes that name and then
-  renames, in two steps, and a power cut between them leaves the file under its
-  old name only. A rename that changes only the case of a name goes through a
-  temporary name, and a directory moved to another directory gets its `..`
-  entry pointed at the new parent.
+- An atomic rename in every case. A rename over an existing name rewrites that
+  name's entry to describe the renamed file, as Linux's vfat does, so the name
+  names one of the two files at every moment, and the replaced file's clusters
+  are freed after. A rename inside a directory whose old and new entries share
+  a sector is one write. Otherwise the new entries are written before the old
+  ones are removed, and a power cut between the two leaves the file under both
+  names, which `fsck_msdos` reports as cross-linked. A directory moved to
+  another directory gets its `..` entry pointed at the new parent, and moving a
+  directory into itself answers EINVAL.
 - A file that outlives its name. When a file is removed, or renamed over, while
   a descriptor is open on it, reads and writes through that descriptor answer
   ESTALE: FAT frees a file's clusters when its entry goes.
@@ -472,6 +504,65 @@ removes entries while it reads, as `rm -r` does, still sees each entry once.
 `/dev/mmcblk0` for a volume across the whole card, `statfs` reports vfat's
 magic number with sizes in clusters, and files on `/data` have a device number
 of their own.
+
+**The FAT code.** `kernel/src/storage/fat` is FAT32 as Microsoft's "FAT32 File
+System Specification" (fatgen103) describes it, with Linux's fs/fat followed
+where the specification leaves a choice, and nothing else: a FAT12, FAT16 or
+exFAT volume is refused with a `data:` line that names it, and the kernel never
+formats a volume. It reads 512-byte sectors, one or two FATs and clusters of up
+to 128 sectors, and follows BPB_ExtFlags: mirrored FATs are read from the first
+and written to all, and on a volume that uses one FAT only that one is read and
+written. FSInfo's free count and next-free hint are not trusted: the count is
+taken from the FAT the first time it is needed, the hint only says where to
+start looking, and both are written back at sync. A directory holds at most
+65536 entries, as the specification says. The same files build on the Mac as
+part of `tools/fatdisk`, whose tests are described under "Testing".
+
+A name is stored in long-name entries as UTF-16, with a short name made from it
+and a `~N` tail as the specification describes, unless it is already an 8.3
+name in upper case, which gets a short entry alone; this is what Linux's
+default `shortname=mixed` does. A short name read off the card is shown with
+the lower-case flags Windows keeps, and its bytes above 0x7F as code page 437.
+A name's entries are placed inside one sector when a run of free entries there
+fits them, or at the start of a new cluster when none does, which is so for
+names of up to 195 UTF-16 units, so that making a name is one write.
+
+**Power cuts.** `tools/fatdisk cuts` runs operations on one volume over blocks
+that record each write, and checks with the Mac's `fsck_msdos -n` what a card
+would hold after a cut following every one of them. Besides a stale free count
+in FSInfo and the volume being marked in use, which follow any cut between a
+first write and a sync, it reports:
+
+| operation | writes, in order | after a cut before the last one |
+|---|---|---|
+| write that grows a file | contents; FAT entries of the new clusters, then the link to them; the directory entry | orphaned clusters, or "too many clusters allocated" for a file that had some |
+| write inside a file | contents | nothing |
+| truncate longer | zeros; FAT entries; the directory entry | as for a write |
+| truncate shorter | the directory entry; the end of the chain; the freed entries | "too many clusters allocated", then orphaned clusters |
+| mkdir | the directory's first cluster; its FAT entry; its entries in the parent | orphaned clusters |
+| create in a full directory | a zeroed cluster; its FAT link; the entries | nothing |
+| unlink, rmdir | the entries marked free; the freed FAT entries | orphaned clusters |
+| rename inside one sector | one write | nothing |
+| rename over an existing name | the entries, in one write when they share a sector; the freed FAT entries | orphaned clusters |
+| move a directory to another parent | the new entries; its `..`; the old entries removed | cross-linked clusters, and "`..` entry has incorrect start cluster" before the second write |
+| sync | FSInfo and Linux's dirty bit; FAT[1] | the volume still marked in use |
+
+**Repairing a card after a cut.** Put the card in the Mac, find its device
+with `diskutil list`, unmount the volume, and run `fsck_msdos -y` on it; then
+run `fsck_msdos -n` on it, and `fsck_msdos -y` again for as long as `-n` still
+reports something. A cut in the middle of moving a directory needs the second
+pass: the first removes the old entry and leaves its long-name entries, which
+the second removes. `tools/fatdisk repairs` checks this by cutting moves part
+way, repairing the image with `fsck_msdos -y` and reading it through this code
+and through a read-only mount on the Mac. What a person sees after the repair:
+
+- A directory moved to another parent, cut after its new entry or after its
+  `..`: the directory at its new place with every file whole, and nothing
+  left at the old place. The repair corrects `..` where it has to and removes
+  the old entry as cross-linked.
+- A file moved to another directory, cut between its new entry and the
+  removal of the old one: the file whole under its old name, and an empty file
+  under its new name, which the repair truncated as cross-linked.
 
 The controller is EMMC2, `brcm,bcm2711-emmc2`, driven as Linux's
 `sdhci-iproc.c` drives it, and the card is brought up as Linux's MMC core does:
@@ -1066,8 +1157,23 @@ failures.
   It has to reach the shell, report every item ok, list nothing under `/root`
   and none of `hello_c`, `inet` or `rtest` in `/bin`, and answer `cbox rtest`
   with an unknown applet.
-- **/data on an SD card** runs on aarch64, with card images `tools/fatdisk`
-  makes on the Mac without root put in the emulated slot. A first boot runs
+- **/data on an SD card** runs on aarch64, and on a Mac, since its card images
+  are made with macOS's `newfs_msdos` through `hdiutil`, without root; elsewhere
+  it reports itself skipped. It first runs `tools/fatdisk`'s tests, which build
+  the kernel's `storage/fat` for the Mac: a corpus of Japanese names, emoji,
+  names outside the Basic Multilingual Plane, 255-unit names, a deep directory,
+  a directory of 300 names, a large file and files of one cluster and one
+  cluster and a byte, written by the kernel's code and read through a read-only
+  mount on the Mac after `fsck_msdos -n` finds nothing to report, and written
+  on the Mac and read by the kernel's code, on volumes of 512-byte and 4 KiB
+  clusters; regression tests for rust-fatfs's issues #118 and #119, `~N`
+  short names, a directory past one cluster, truncating and extending, a full
+  volume, names FAT cannot hold, case, the dirty flag, card errors, FAT copies,
+  FSInfo and timestamps; and 60 seeds of 600 random operations checked against
+  a model of the volume and by `fsck_msdos -n`. It then replays the seeds in
+  `tools/fatdisk/fuzz-seeds.txt`, each one damaged image run through every
+  operation and 200 random ones, with overflow checks on, and fails on any
+  panic. Then card images go in the emulated slot. A first boot runs
   `tests/data.sh` through long names found in any case, a file of many clusters
   appended to, rewritten and truncated, a 1.2 MiB file, 300 long names in one
   directory, renames within and across directories, over a file, into the
@@ -1092,8 +1198,11 @@ failures.
   they have to 16 levels, read it and write to it, to the end. The cards booted with `data=off`, with
   the wrong label and with the labelled boot partition have to come back
   unchanged. Beside the harness, `tools/fatdisk fuzz FIRST LAST` runs the
-  kernel's own `storage/disk.rs` and `storage/volume.rs` against one damaged
-  image per seed in a single process on the Mac, and counts panics.
+  kernel's own `storage/fat` against one damaged image per seed in a single
+  process on the Mac and counts panics, `tools/fatdisk cuts` prints what
+  `fsck_msdos -n` finds after a power cut at every write (see "Power cuts"),
+  and `tools/fatdisk repairs` what `fsck_msdos -y` makes of a cut in the middle
+  of a move.
 - **Two boots, two streams** compares the boot id from every boot above. Two
   the same would mean the seed did not vary, and every byte the generator
   handed out would be the same in both. It costs no boot of its own.
@@ -1162,7 +1271,9 @@ kernel/src
                       firmware, its control and data framing, the WPA2 supplicant
   mmc/                the SD host controller code the WiFi and the card slot share
   storage/            /data: the card slot's controller, the SD card, the choice
-                      of volume, the block cache, rust-fatfs and its checks
+                      of volume, and the nodes /data is made of
+  storage/fat/        the kernel's FAT32: block cache, boot sector, FAT, names,
+                      directories, and operations in a fixed order of writes
   signal.rs           signal dispositions and default actions
   trap.rs             exception and interrupt handling
 
@@ -1171,8 +1282,8 @@ user/c/hello.c        a C program linked against musl
 tools/mkcpio.py       initramfs builder
 tools/checksums.py    the manifest the boot check reads, and the kernel's digest
 tools/drive.py        drives the console over a socket, rendering as a terminal
-tools/fatdisk         makes, reads and damages SD card images, and fuzzes the
-                      kernel's volume code
+tools/fatdisk         makes, reads and damages SD card images with macOS's FAT
+                      tools, and tests and fuzzes the kernel's FAT code on the Mac
 scripts/images.sh     what goes in the test image and the board image, and what
                       the boot check covers
 scripts/reap-stale.sh clears QEMU instances an earlier run left behind
