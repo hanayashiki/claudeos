@@ -71,6 +71,7 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("sort", "sort lines of text"),
     ("stat", "show file status"),
     ("sync", "flush filesystem buffers"),
+    ("fsync", "put files on their storage, and fail if it cannot"),
     ("tail", "print the last lines of a file"),
     ("tee", "copy standard input to files and stdout"),
     ("test", "evaluate a condition"),

@@ -301,6 +301,29 @@ pub fn sync(_args: &[String]) -> i32 {
     0
 }
 
+/// `fsync FILE...`: ask the kernel to put each file on its storage, and fail
+/// if it cannot, as coreutils' `sync FILE` does. On /data that is the card.
+pub fn fsync(args: &[String]) -> i32 {
+    use std::os::unix::io::AsRawFd;
+    let mut status = 0;
+    for path in args.iter().skip(1) {
+        match fs::File::open(path) {
+            Ok(file) => {
+                let result = sys::fsync(file.as_raw_fd());
+                if result < 0 {
+                    eprintln!("fsync: {}: {}", path, std::io::Error::from_raw_os_error(-result as i32));
+                    status = 1;
+                }
+            }
+            Err(error) => {
+                eprintln!("fsync: {}: {}", path, error);
+                status = 1;
+            }
+        }
+    }
+    status
+}
+
 /// `reboot`, `halt` and `poweroff` ask the kernel directly. A Linux system's
 /// versions ask init to shut down first unless given `-f`; init here has
 /// nothing to shut down, so options are accepted and make no difference.

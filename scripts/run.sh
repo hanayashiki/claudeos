@@ -29,6 +29,7 @@ while [ $# -gt 0 ]; do
     --net)     NET=1; shift ;;
     --hostfwd) NET=1; HOSTFWD="$2"; shift 2 ;;
     --pcap)    NET=1; PCAP="$2";  shift 2 ;;
+    --sd)      SD="$2";   shift 2 ;;
     *) EXTRA+=("$1"); shift ;;
   esac
 done
@@ -59,6 +60,19 @@ if [ -n "$NET" ]; then
   if [ -n "$PCAP" ]; then
     ARGS+=(-object "filter-dump,id=dump0,netdev=n0,file=$PCAP")
   fi
+fi
+# --sd IMAGE puts an SD card holding IMAGE in the emulated Pi 4's card slot,
+# which is EMMC2 at 0xfe340000, as on the board. `-drive if=sd` would not: it
+# attaches the card to the bus the GPIO block hands to the controller at
+# 0xfe300000, which on a real Pi carries the WiFi chip. Of the machine's two
+# generic-sdhci devices EMMC2 is listed first, which is the one a bus path by
+# type name finds. QEMU wants the image's size to be a power of two.
+if [ -n "${SD:-}" ]; then
+  if [ "$ARCH" != aarch64 ]; then
+    echo "run.sh: --sd is for the emulated Raspberry Pi 4 only" >&2
+    exit 2
+  fi
+  ARGS+=(-drive "if=none,format=raw,id=card,file=$SD" -device "sd-card,drive=card,bus=/generic-sdhci/sd-bus")
 fi
 if [ -n "$INITRD" ]; then ARGS+=(-initrd "$INITRD"); fi
 if [ -n "$APPEND" ]; then ARGS+=(-append "$APPEND"); fi
