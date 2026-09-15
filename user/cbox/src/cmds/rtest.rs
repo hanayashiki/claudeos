@@ -290,6 +290,27 @@ fn thread_of_a_child_is_not_a_child(report: &mut Report) {
     );
 }
 
+/// A child that aborts is the process that dies of it. musl's `raise`, which
+/// `abort` and every Rust panic go through, signals the thread id musl keeps
+/// for the calling thread, and only musl's `fork` sets that id in the child.
+/// A child made by the bare system call kept its parent's id and sent its
+/// SIGABRT to the parent, which here is this suite.
+fn a_child_that_aborts_is_the_one_signalled(report: &mut Report) {
+    use crate::sys;
+    const SIGABRT: i32 = 6;
+
+    let child = sys::fork();
+    if child == 0 {
+        std::process::abort();
+    }
+    let (reaped, status) = sys::wait4(child as i32, 0);
+    report.check(
+        "a child's abort ends the child and not its parent",
+        child > 0 && reaped == child && sys::signal_of(status) == Some(SIGABRT),
+        format!("forked {} reaped {} status {:#x}", child, reaped, status),
+    );
+}
+
 /// A process blocked on something other than a child still has to learn that a
 /// child finished: the child signal is a signal, and every other one returns a
 /// sleeping task to the run queue. A shell waiting for a key is the case that
@@ -2039,6 +2060,7 @@ pub fn main(_args: &[String]) -> i32 {
     println!();
     println!("-- threads, processes and waiting --");
     thread_of_a_child_is_not_a_child(&mut report);
+    a_child_that_aborts_is_the_one_signalled(&mut report);
     a_child_exit_reaches_a_blocked_parent(&mut report);
     what_a_wait_does_with_signals(&mut report);
     a_continued_job_has_no_stop_to_report(&mut report);
