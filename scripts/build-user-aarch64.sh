@@ -120,6 +120,17 @@ for CERTS in "$ROOT/build/alpine-rootfs-aarch64/etc/ssl/certs/ca-certificates.cr
   break
 done
 
+# ---- network time --------------------------------------------------------
+# The servers BusyBox ntpd asks. init starts ntpd in the background when this
+# file and /bin/busybox are both in an image, which is how a board with no
+# battery-backed clock learns the date. scripts/images.sh puts it in the board
+# image only, so the test images the suites boot never wait on servers across
+# the internet; the network time section of scripts/test.sh adds it to a copy.
+cat > "$RFS/etc/ntp.conf" <<'NTP'
+server ntp.nict.jp
+server time.cloudflare.com
+NTP
+
 cat > "$RFS/etc/passwd" <<'PASSWD'
 root:x:0:0:root:/root:/bin/sh
 PASSWD
