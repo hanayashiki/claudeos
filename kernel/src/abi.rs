@@ -75,6 +75,10 @@ pub enum Errno {
     EALREADY = 114,
     EINPROGRESS = 115,
     ESTALE = 116,
+    /// "Structure needs cleaning": what Linux filesystems return for
+    /// on-disk structures that contradict themselves, and what /data returns
+    /// for a damaged FAT volume.
+    EUCLEAN = 117,
 }
 
 pub type SysResult = Result<u64, Errno>;

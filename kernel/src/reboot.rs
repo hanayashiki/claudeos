@@ -107,13 +107,15 @@ pub fn reboot(magic1: u32, magic2: u32, command: u32) -> SysResult {
     }
 }
 
-/// Before the machine stops on request: the data volume marked clean, with its
-/// free-cluster count written, so the card reads as unmounted properly
-/// wherever it is put next. Every write is on the card already; a failure here
-/// does not keep the machine from stopping.
+/// Before the machine stops on request: the data volume unmounted, which
+/// writes FSInfo and marks the volume dismounted cleanly, so the card reads as
+/// unmounted properly wherever it is put next. Every write is on the card
+/// already. The wait is bounded (`storage::unmount`), so a card that stops
+/// answering leaves the volume marked in use and does not keep the machine
+/// from stopping. The panic path does not come here.
 fn sync_data() {
-    if let Err(error) = crate::fs::data::sync() {
-        println!("data: sync before stopping failed: {:?}", error);
+    if let Err(why) = crate::fs::data::unmount() {
+        println!("data: {}", why);
     }
 }
 

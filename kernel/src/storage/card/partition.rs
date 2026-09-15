@@ -10,23 +10,27 @@
 //! no mistake above this file can reach the boot partition or any other part
 //! of the card.
 //!
-//! **Choosing.** Block 0 of the card is either a FAT32 boot sector, for a card
+//! **Choosing.** Block 0 of the card is either a FAT boot sector, for a card
 //! formatted as one volume with no partition table, or an MBR. Of the MBR's
-//! four primary entries, those of type 0x0B or 0x0C (FAT32) that lie inside the
-//! card are looked at in order, and the first whose label matches is taken.
-//! Looking at one means reading its boot sector and the first cluster of its
-//! root directory, for the label entry there; a volume that does not match is
-//! not mounted and nothing is written to it. A GPT card is refused whole.
+//! four primary entries, those of a FAT or exFAT type that lie inside the card
+//! are looked at in order, and the first FAT32 volume whose label matches is
+//! taken. Looking at one means reading its boot sector and the first cluster of
+//! its root directory, for the label entry there; a volume that does not match,
+//! or is FAT12, FAT16 or exFAT, is not mounted and nothing is written to it,
+//! and the one line bring-up prints says what each was. A GPT card is refused
+//! whole.
 
 use super::{Card, Identity};
-use crate::storage::disk::{Blocks, DeviceError, BLOCK};
-use crate::storage::volume::{self, Probe};
+use crate::storage::fat::{self, Blocks, DeviceError, Probe, BLOCK};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// MBR partition types that hold FAT32: with CHS addressing, and with LBA.
-const FAT32_TYPES: [u8; 2] = [0x0B, 0x0C];
+/// MBR partition types looked at: FAT12 (0x01), FAT16 (0x04, 0x06, 0x0E),
+/// FAT32 (0x0B with CHS addressing, 0x0C with LBA), and exFAT (0x07, which
+/// NTFS shares). Only FAT32 is mounted; the others are looked at so that the
+/// reason a card was refused names them.
+const FAT_TYPES: [u8; 7] = [0x01, 0x04, 0x06, 0x07, 0x0B, 0x0C, 0x0E];
 /// The type a GPT disk's protective MBR gives its one entry.
 const GPT_PROTECTIVE: u8 = 0xEE;
 /// Card errors printed one line each; the rest are counted.
@@ -98,10 +102,6 @@ impl Blocks for Partition {
             Err(why) => Err(self.report("write", block, why)),
         }
     }
-
-    fn now_ms(&self) -> u64 {
-        crate::mmc::delay::now_us() / 1000
-    }
 }
 
 /// The volume chosen, what its boot sector says, and which part of the card
@@ -126,7 +126,7 @@ pub fn choose(mut card: Card, label: &str) -> Result<Chosen, String> {
     let blocks = card.identity.blocks;
 
     let mut candidates: Vec<(u64, u64, String, Option<usize>)> = Vec::new();
-    if volume::looks_like_fat32(&sector) {
+    if fat::looks_like_boot_sector(&sector) {
         candidates.push((0, blocks, String::from("the volume across the whole card"), None));
     } else if sector[510] == 0x55 && sector[511] == 0xAA {
         let entries: Vec<&[u8]> = sector[446..510].chunks_exact(16).collect();
@@ -140,7 +140,7 @@ pub fn choose(mut card: Card, label: &str) -> Result<Chosen, String> {
             if kind == GPT_PROTECTIVE {
                 return Err(String::from("the card has a GPT partition table, and /data is only looked for in an MBR"));
             }
-            if FAT32_TYPES.contains(&kind) && start > 0 && length > 0 && start + length <= blocks {
+            if FAT_TYPES.contains(&kind) && start > 0 && length > 0 && start + length <= blocks {
                 candidates.push((start, length, format!("partition {}", slot + 1), Some(slot + 1)));
             }
         }
@@ -151,7 +151,7 @@ pub fn choose(mut card: Card, label: &str) -> Result<Chosen, String> {
     let mut seen: Vec<String> = Vec::new();
     for (first, count, what, slot) in candidates {
         let mut partition = Partition { card, first, count, errors: 0, last: None };
-        match volume::probe(&mut partition) {
+        match fat::probe(&mut partition) {
             Ok(probe) if probe.labelled(label) => return Ok(Chosen { partition, probe, what, slot }),
             Ok(probe) => seen.push(format!("{} is labelled {}", what, probe.label())),
             Err(why) => match partition.last.take() {
@@ -162,7 +162,7 @@ pub fn choose(mut card: Card, label: &str) -> Result<Chosen, String> {
         card = partition.card;
     }
     if seen.is_empty() {
-        Err(String::from("the card's partition table has no FAT32 partition"))
+        Err(String::from("the card's partition table has no FAT partition"))
     } else {
         Err(format!("no FAT32 volume on the card is labelled {} ({})", label, seen.join("; ")))
     }

@@ -7,10 +7,10 @@
 //! - `card`: the SD card's initialisation and its block commands.
 //! - `card::partition`: which volume on the card is /data, and the `Partition`
 //!   that is the only way to its blocks.
-//! - `disk`: the cache, the byte stream rust-fatfs reads, and each operation's
-//!   budget.
-//! - `volume`: rust-fatfs, the checks made before it is trusted, and what it
-//!   lacks.
+//! - `fat`: the kernel's own FAT32: the block cache, the boot sector, the FAT,
+//!   names, directories, and the operations with the order their writes reach
+//!   the card in. It uses nothing from the kernel, and `tools/fatdisk` compiles
+//!   the same files on the Mac.
 //! - `vfs`: the nodes /data is made of in the kernel's tree.
 //!
 //! **Keeping /data away from the system.** The kernel and everything it runs
@@ -18,23 +18,24 @@
 //! starts, so nothing on the data volume is needed to boot or to run. What is
 //! on the card is what a person changes by hand, and four rules follow:
 //!
-//! 1. Nothing about the card stops boot. Bring-up runs in a kernel task, init
-//!    waits for it for at most `WAIT_SECONDS`, every wait inside it is bounded,
-//!    and each way it can fail ends in one `data: /data is not mounted: ...`
-//!    line.
-//! 2. Nothing about the card panics the kernel. The boot sector is checked
-//!    before rust-fatfs sees it; rust-fatfs is built without overflow checks,
-//!    so a damaged number wraps rather than panicking (see kernel/Cargo.toml);
-//!    and every read and write rust-fatfs asks for is checked against the
-//!    volume's length and charged to a budget, so a looping cluster chain
-//!    ends. `tools/fatdisk` runs the same code against damaged images, and the
-//!    harness boots damaged cards.
+//! 1. Nothing about the card stops boot or a restart. Bring-up runs in a kernel
+//!    task, init waits for it for at most `WAIT_SECONDS`, every wait inside it
+//!    is bounded, and each way it can fail ends in one
+//!    `data: /data is not mounted: ...` line. Unmounting before a restart, halt
+//!    or power-off is waited for at most `UNMOUNT_SECONDS`, and the machine
+//!    stops when they run out whatever the card is doing.
+//! 2. Nothing about the card panics the kernel. The FAT code checks every
+//!    number it reads off the card before using it, bounds every chain walk by
+//!    the volume's cluster count, and returns an error instead: EIO when the
+//!    card fails a command, EUCLEAN when the volume contradicts itself (see
+//!    `fat/mod.rs`). `tools/fatdisk` runs the same files against damaged
+//!    images, and the harness boots damaged cards.
 //! 3. /data cannot take the system's memory: 4 MiB of cached blocks, 32 open
 //!    files, 32 remembered directories, a listing only for a directory a
 //!    descriptor is reading, and a node only for what something holds.
 //! 4. A write is on the card when the system call returns, and a failed one is
-//!    an error to the program. `fsync` puts the directory entry there too, and
-//!    `sync` leaves the volume marked clean.
+//!    an error to the program. `sync` writes FSInfo and marks the volume
+//!    dismounted cleanly.
 //!
 //! **Which volume.** The first FAT32 volume whose label is the one `data=`
 //! gives, `CLAUDEDATA` when it gives none, and never one whose root holds
@@ -43,34 +44,49 @@
 //! alone.
 
 mod card;
-pub mod disk;
 mod emmc2;
+mod fat;
 pub mod vfs;
-pub mod volume;
 
 use crate::arch;
 use crate::arch::paging::AddressSpace;
-use crate::mmc::delay::{now_us, sleep_ms};
+use crate::mmc::delay::{now_us, sleep_ms, Deadline};
 use crate::sched;
+use crate::sched::WaitQueue;
 use crate::sync::Spinlock;
 use crate::task::Task;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// The label looked for when the command line names none.
 pub const DEFAULT_LABEL: &str = "CLAUDEDATA";
 
 /// How long init is held back for the volume. A card that answers is mounted
-/// in about a second; this leaves room for a slow card, and for the budget a
-/// damaged root directory can use up while it is checked.
+/// in about a second; this leaves room for a slow card, and for a damaged root
+/// directory that is scanned to its end before it is refused.
 const WAIT_SECONDS: u64 = 20;
+
+/// How long a restart, halt or power-off waits for /data to be unmounted. The
+/// writes are FSInfo, FAT[1] in each copy and one byte of the boot sector,
+/// tens of milliseconds on a card that answers, and counting the free clusters
+/// first when no operation has counted them, which on a 32 GiB card of 32 KiB
+/// clusters is a read of about 8 MiB of FAT.
+const UNMOUNT_SECONDS: u64 = 5;
 
 /// The label, handed from boot to the task.
 static LABEL: Spinlock<Option<String>> = Spinlock::new(None);
 /// Set when bring-up has finished, whichever way it ended.
 static SETTLED: AtomicBool = AtomicBool::new(false);
+
+/// A request to the storage task to unmount, and how it went.
+static UNMOUNT_ASKED: AtomicBool = AtomicBool::new(false);
+static UNMOUNT_QUEUE: WaitQueue = WaitQueue::new();
+static UNMOUNT_OUTCOME: AtomicU8 = AtomicU8::new(PENDING);
+const PENDING: u8 = 0;
+const UNMOUNTED: u8 = 1;
+const UNMOUNT_FAILED: u8 = 2;
 
 /// What `data=` asks for: a label, or nothing for `data=off`. The last such
 /// word before `--` counts, as for every other word the kernel reads.
@@ -143,8 +159,50 @@ extern "C" fn task_main() -> ! {
         crate::println!("data: {}; {}", line, found.join("; "));
     }
     SETTLED.store(true, Ordering::Relaxed);
+    // What is left for this task is unmounting when the machine is about to
+    // stop. It is done here rather than in the task that asks, so that the
+    // asking task can stop waiting when the card does not answer.
     loop {
-        sleep_ms(60_000);
+        UNMOUNT_QUEUE.wait_until(|| UNMOUNT_ASKED.load(Ordering::Relaxed));
+        UNMOUNT_ASKED.store(false, Ordering::Relaxed);
+        let outcome = if vfs::sync().is_ok() { UNMOUNTED } else { UNMOUNT_FAILED };
+        UNMOUNT_OUTCOME.store(outcome, Ordering::Relaxed);
+    }
+}
+
+/// Unmount /data before the machine stops: FSInfo written and the volume
+/// marked dismounted cleanly, by the storage task, waited for at most
+/// `UNMOUNT_SECONDS`. Called by `reboot` for restart, halt and power-off, and
+/// never on the panic path. Returns why the volume is left marked in use.
+pub fn unmount() -> Result<(), String> {
+    if !vfs::mounted() {
+        return Ok(());
+    }
+    UNMOUNT_OUTCOME.store(PENDING, Ordering::Relaxed);
+    UNMOUNT_ASKED.store(true, Ordering::Relaxed);
+    UNMOUNT_QUEUE.wake_all();
+    let deadline = Deadline::after_ms(UNMOUNT_SECONDS * 1000);
+    loop {
+        match UNMOUNT_OUTCOME.load(Ordering::Relaxed) {
+            UNMOUNTED => return Ok(()),
+            UNMOUNT_FAILED => {
+                return Err(String::from("unmounting /data failed, so the volume is left marked in use; stopping anyway"))
+            }
+            _ => {}
+        }
+        if deadline.expired() {
+            return Err(format!("/data was not unmounted within {} s, so the volume is left marked in use; stopping anyway", UNMOUNT_SECONDS));
+        }
+        sleep_ms(10);
+    }
+}
+
+/// What a failure of the FAT code says about the volume, for the bring-up line.
+fn failure(error: fat::FsError) -> &'static str {
+    match error {
+        fat::FsError::Io => "the card failed a read",
+        fat::FsError::Corrupt => "its structures are damaged",
+        _ => "an operation on it failed",
     }
 }
 
@@ -182,20 +240,18 @@ fn bring_up(label: &str, found: &mut Vec<String>) -> Result<String, String> {
     }
 
     let chosen = card::choose(card, label)?;
-    let geometry = chosen.probe.geometry;
+    let layout = chosen.probe.layout;
     let found_label = chosen.probe.label();
     let what = chosen.what.clone();
     let device = match chosen.slot {
         Some(slot) => format!("/dev/mmcblk0p{}", slot),
         None => String::from("/dev/mmcblk0"),
     };
-    let state = disk::share(chosen.partition);
-    let clock = volume::Clock { now: crate::time::unix_time };
-    let mut volume = volume::Volume::mount(state, geometry, clock)
-        .map_err(|e| format!("{} is labelled {} but rust-fatfs could not mount it: {:?}", what, found_label, e))?;
+    let mut volume = fat::Volume::mount(chosen.partition, layout, crate::time::unix_time)
+        .map_err(|e| format!("{} is labelled {} but could not be mounted: {}", what, found_label, failure(e)))?;
 
-    // Looked at before anything may be written: the volume is read-only until
-    // `allow_writes`, and dropping it on the way out writes nothing.
+    // Looked at before anything may be written: the volume refuses writes
+    // until `allow_writes`.
     match volume.boot_file() {
         Ok(Some(name)) => {
             return Err(format!(
@@ -204,16 +260,22 @@ fn bring_up(label: &str, found: &mut Vec<String>) -> Result<String, String> {
             ))
         }
         Ok(None) => {}
-        Err(e) => return Err(format!("the root directory of {} could not be listed: {:?}", what, e)),
+        Err(e) => return Err(format!("the root directory of {} could not be listed: {}", what, failure(e))),
     }
+    let unclean = volume.dirty_at_mount();
     volume.allow_writes();
     vfs::publish(volume, device);
     Ok(format!(
-        "{} of the card, labelled {}, {} MiB in {} clusters of {} bytes",
+        "{} of the card, labelled {}, {} MiB in {} clusters of {} bytes{}",
         what,
         found_label,
-        geometry.sectors / 2048,
-        geometry.clusters,
-        geometry.cluster_blocks as u64 * 512
+        layout.sectors / 2048,
+        layout.clusters,
+        layout.cluster_bytes,
+        if unclean {
+            ", which FAT[1] says was not dismounted cleanly and stays marked so until fsck_msdos repairs it"
+        } else {
+            ""
+        }
     ))
 }

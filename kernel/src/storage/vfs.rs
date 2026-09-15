@@ -27,7 +27,7 @@ use crate::abi::*;
 use crate::fs::{DirEntry, Node, NodeRef, Offset};
 use crate::sched::WaitQueue;
 use crate::storage::card::Partition;
-use crate::storage::volume::{join, Entry, FsError, Volume};
+use crate::storage::fat::{join, Entry, FsError, Volume};
 use crate::sync::Spinlock;
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -113,7 +113,8 @@ fn errno(error: FsError) -> Errno {
         FsError::NameTooLong => Errno::ENAMETOOLONG,
         FsError::BadName | FsError::Invalid => Errno::EINVAL,
         FsError::TooBig => Errno::EFBIG,
-        FsError::Io | FsError::Offline => Errno::EIO,
+        FsError::Io => Errno::EIO,
+        FsError::Corrupt => Errno::EUCLEAN,
         FsError::ReadOnly => Errno::EROFS,
     }
 }

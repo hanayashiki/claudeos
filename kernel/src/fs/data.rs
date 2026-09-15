@@ -24,6 +24,8 @@ pub struct Stored {
 }
 
 #[cfg(target_arch = "aarch64")]
+pub use crate::storage::unmount;
+#[cfg(target_arch = "aarch64")]
 pub use crate::storage::vfs::{create, fsync, lookup, mkdir, mounts, read, readdir, rename, statfs, sync, truncate, unlink, write};
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -67,6 +69,9 @@ mod absent {
         Ok(())
     }
     pub fn sync() -> Result<(), Errno> {
+        Ok(())
+    }
+    pub fn unmount() -> Result<(), String> {
         Ok(())
     }
     pub fn statfs(_node: &Node) -> Result<(u64, u64, u64), Errno> {

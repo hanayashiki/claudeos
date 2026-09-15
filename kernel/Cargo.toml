@@ -24,14 +24,6 @@ pbkdf2 = { version = "=0.12.2", default-features = false, features = ["hmac"] }
 aes = { version = "=0.8.4", default-features = false, features = ["zeroize"] }
 aes-kw = { version = "=0.2.1", default-features = false }
 
-# FAT32 for /data, the volume on the Pi's SD card (src/storage). Only aarch64
-# has a card to read: x86-64 has no block device, so the crate would be built
-# there for nothing. The crates.io release, 0.3.6, does not build without std
-# on stable Rust, so this is the repository at a pinned commit. `alloc` and
-# `lfn` give long file names; the default features would bring std, chrono and
-# logging.
-fatfs = { git = "https://github.com/rafalh/rust-fatfs", rev = "2aefc2a027ce94ed0671752814dac203f0450e11", default-features = false, features = ["alloc", "lfn"] }
-
 [profile.dev]
 panic = "abort"
 opt-level = 1
@@ -49,16 +41,3 @@ opt-level = 2
 debug = true
 lto = false
 codegen-units = 1
-
-# The one exception to overflow checks. rust-fatfs computes cluster and sector
-# numbers from what is on the card, and on a damaged card some of that
-# arithmetic overflows: a FAT entry naming cluster 1 is subtracted from and
-# wraps. Checked, that is a panic, the panic restarts the board, and the board
-# reads the same card again. Unchecked, it is a wrong number, and every
-# position rust-fatfs computes from one is checked against the volume's length
-# in src/storage/disk.rs before anything is read or written.
-[profile.release.package.fatfs]
-overflow-checks = false
-
-[profile.dev.package.fatfs]
-overflow-checks = false
