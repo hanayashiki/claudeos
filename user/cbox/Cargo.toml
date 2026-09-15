@@ -7,6 +7,12 @@ edition = "2021"
 name = "cbox"
 path = "src/main.rs"
 
+[features]
+# The `rtest` applet, the Rust standard library checks the test harness boots
+# into. The test image's cbox is built with it and the board's without; which
+# image gets it is a line in scripts/images.sh.
+rtest = []
+
 [profile.release]
 opt-level = "z"
 lto = true

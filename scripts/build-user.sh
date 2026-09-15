@@ -15,9 +15,15 @@ ln -sf "$LLVMBIN/rust-lld" "$ROOT/build/toolchain/ld.lld"
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$ROOT/build/toolchain/ld.lld"
 export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static -C relocation-model=static"
 
-cd "$ROOT/user/cbox"
-cargo build --release --target "$TARGET"
-CBOX="$ROOT/user/cbox/target/$TARGET/release/cbox"
+# ---- which image gets what -----------------------------------------------
+# The list, and the steps that make an image out of the staging tree below,
+# are in scripts/images.sh, shared with the aarch64 build. This machine has
+# only the test image: the board image is for the Raspberry Pi 4. cbox is built
+# there, with the features the list gives the image.
+. "$ROOT/scripts/images.sh"
+check_image_items
+print_image_items
+echo
 
 # Sockets, through the standard library rather than through this project's own
 # code: `inet` on its own is the socket test, `inet serve` an HTTP server.
@@ -25,25 +31,13 @@ cd "$ROOT/user/inet"
 cargo build --release --target "$TARGET"
 INET="$ROOT/user/inet/target/$TARGET/release/inet"
 
-# ---- assemble the root filesystem ----------------------------------------
-RFS="$ROOT/build/rootfs"
+# ---- stage everything the image can have ---------------------------------
+RFS="$ROOT/build/stage"
 rm -rf "$RFS"
 mkdir -p "$RFS"/{bin,etc,root,tmp,dev,proc}
 
-cp "$CBOX" "$RFS/bin/cbox"
-chmod +x "$RFS/bin/cbox"
-
 cp "$INET" "$RFS/bin/inet"
 chmod +x "$RFS/bin/inet"
-
-# One symlink per applet, busybox style.
-APPLETS=$("$ROOT/scripts/list-applets.sh" "$ROOT/user/cbox/src/main.rs")
-for applet in $APPLETS; do
-  [ "$applet" = "cbox" ] && continue
-  ln -sf cbox "$RFS/bin/$applet"
-done
-# "[" cannot appear in the applet table's identifier list.
-ln -sf cbox "$RFS/bin/["
 
 
 # A C program built against musl, to show the ABI is not Rust-specific.
@@ -88,18 +82,6 @@ if [ -f "$CERTS" ]; then
   ln -sf certs/ca-certificates.crt "$RFS/etc/ssl/cert.pem"
 fi
 
-cat > "$RFS/etc/motd" <<'MOTD'
-Welcome to claudeos.
-
-This is a kernel written from scratch in Rust that implements enough of the
-Linux system call interface to run unmodified static Linux binaries. The
-userland you are talking to was built for x86_64-unknown-linux-musl.
-
-Try:  ls -l /bin | head      ps      free      cat /proc/cpuinfo
-      echo hi | tr a-z A-Z   sh /root/demo.sh
-      rtest                  hello_c 60
-MOTD
-
 cat > "$RFS/etc/passwd" <<'PASSWD'
 root:x:0:0:root:/root:/bin/sh
 PASSWD
@@ -126,5 +108,11 @@ for script in "$RFS"/root/*.sh; do
   chmod +x "$script"
 done
 
-python3 "$ROOT/tools/mkcpio.py" "$RFS" "$ROOT/build/initramfs.cpio"
+# ---- the image -------------------------------------------------------------
+# The kernel is built before this, by scripts/test.sh and by hand alike, so its
+# digest in the manifest is the kernel's that boots with it.
+check_staged "$RFS"
+assemble_image test "$RFS" "$ROOT/build/rootfs" "$ROOT/build/initramfs.cpio" \
+    "$ROOT/build/kernel.elf"
+echo
 ls -la "$ROOT/build/initramfs.cpio"

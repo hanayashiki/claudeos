@@ -1,6 +1,10 @@
 //! A multicall binary: the program it runs is chosen by the name it is
 //! invoked under, the way busybox does it.
 
+// Without the rtest applet, the system call wrappers in sys.rs that only it
+// calls are unused, and the board image's build would warn about each one.
+#![cfg_attr(not(feature = "rtest"), allow(dead_code))]
+
 mod cmds;
 mod edit;
 mod regex;
@@ -55,6 +59,9 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("readlink", "print what a symbolic link points at"),
     ("reboot", "restart the machine"),
     ("rm", "remove files"),
+    // scripts/list-applets.sh reads this attribute too, so an image whose cbox
+    // is built without the feature gets no /bin/rtest link.
+    #[cfg(feature = "rtest")]
     ("rtest", "exercise the Rust standard library"),
     ("rmdir", "remove empty directories"),
     ("rev", "reverse each line"),

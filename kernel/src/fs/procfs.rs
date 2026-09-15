@@ -15,6 +15,8 @@ pub enum Generated {
     Filesystems,
     Loadavg,
     Tasks,
+    /// What the boot-time integrity check found.
+    Integrity,
     PidStat(u32),
     PidStatus(u32),
     PidCmdline(u32),
@@ -33,6 +35,9 @@ pub fn populate() {
         PROC_ROOT.store(root.ino, core::sync::atomic::Ordering::Relaxed);
     }
     let _ = mkdir_p("/proc");
+    // This kernel's own status files, in a directory of their own rather than
+    // among the names Linux programs look for at the top of /proc.
+    let _ = mkdir_p("/proc/claudeos");
     let entries = [
         ("/proc/meminfo", Generated::MemInfo),
         ("/proc/uptime", Generated::Uptime),
@@ -42,6 +47,7 @@ pub fn populate() {
         ("/proc/filesystems", Generated::Filesystems),
         ("/proc/loadavg", Generated::Loadavg),
         ("/proc/tasks", Generated::Tasks),
+        ("/proc/claudeos/integrity", Generated::Integrity),
     ];
     for (path, kind) in entries {
         let node = Node::new(NodeKind::Generated(kind), S_IFREG | 0o444);
@@ -215,6 +221,7 @@ pub fn render(kind: Generated) -> String {
             });
             out
         }
+        Generated::Integrity => crate::integrity::report(),
         Generated::PidStat(pid) => crate::sched::with_task(pid, |task| {
             // Readers skip to fields by counting separators, so all 52
             // fields Linux documents have to be present.

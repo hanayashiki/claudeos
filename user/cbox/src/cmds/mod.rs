@@ -1,6 +1,7 @@
 //! The coreutils applets.
 
 mod fileops;
+#[cfg(feature = "rtest")]
 pub mod rtest;
 mod misc;
 mod sed;
@@ -74,6 +75,7 @@ pub fn run(name: &str, args: &[String]) -> Option<i32> {
         "printf" => misc::printf(args),
         "chmod" => misc::chmod(args),
         "expr" => misc::expr(args),
+        #[cfg(feature = "rtest")]
         "rtest" => rtest::main(args),
 
         _ => return None,

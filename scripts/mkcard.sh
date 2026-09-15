@@ -43,11 +43,25 @@ fetch_firmware() {
   done
 }
 
+# The board image, which scripts/build-user-aarch64.sh builds beside the test
+# image and which has none of the test suites or the programs they drive.
+IMAGE=initramfs-aarch64-board.cpio
+
 assemble() {
   [ -f "$ROOT/build/kernel8.img" ] \
     || die "build/kernel8.img is missing; run ARCH=aarch64 ./scripts/build.sh"
-  [ -f "$ROOT/build/initramfs-aarch64.cpio" ] \
-    || die "build/initramfs-aarch64.cpio is missing; run ./scripts/build-user-aarch64.sh"
+  [ -f "$ROOT/build/$IMAGE" ] \
+    || die "build/$IMAGE is missing; run ./scripts/build-user-aarch64.sh"
+
+  # The image carries the digest of the kernel it was built after, and the
+  # kernel checks itself against it at every boot. A kernel rebuilt since would
+  # report itself DAMAGED on every boot of the card, so refuse the pair here.
+  local manifest="$ROOT/build/rootfs-aarch64-board/etc/claudeos/checksums" built recorded
+  built="$(python3 "$ROOT/tools/checksums.py" kernel "$ROOT/build/kernel-aarch64.elf")" \
+    || die "cannot take the digest of build/kernel-aarch64.elf; run ARCH=aarch64 ./scripts/build.sh"
+  recorded="$(sed -n 's/^\([0-9a-f]*\)  kernel$/\1/p' "$manifest" 2>/dev/null)"
+  [ "$built" = "$recorded" ] \
+    || die "build/$IMAGE was built against a different kernel than build/kernel8.img; run ./scripts/build-user-aarch64.sh"
 
   fetch_firmware
 
@@ -57,7 +71,7 @@ assemble() {
     cp "$CACHE/$file" "$BOOT/$file"
   done
   cp "$ROOT/build/kernel8.img" "$BOOT/kernel8.img"
-  cp "$ROOT/build/initramfs-aarch64.cpio" "$BOOT/initramfs-aarch64.cpio"
+  cp "$ROOT/build/$IMAGE" "$BOOT/$IMAGE"
 
   # The firmware reads this before it loads anything else.
   #
@@ -70,12 +84,12 @@ assemble() {
   #              word takes a space rather than an equals sign, which is a
   #              quirk of this file rather than a mistake here. `followkernel`
   #              places it directly after the kernel image.
-  cat > "$BOOT/config.txt" <<'EOF'
+  cat > "$BOOT/config.txt" <<EOF
 arm_64bit=1
 enable_uart=1
 dtoverlay=disable-bt
 kernel=kernel8.img
-initramfs initramfs-aarch64.cpio followkernel
+initramfs $IMAGE followkernel
 EOF
 
   # Passed to the kernel as its command line, through the device tree.
