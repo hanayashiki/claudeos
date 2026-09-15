@@ -83,12 +83,14 @@ ARCH=aarch64 ./scripts/run.sh --initrd build/initramfs-aarch64.cpio \
     --append 'init=/bin/init'
 ARCH=aarch64 make busybox                # an aarch64 busybox to test against
 ARCH=aarch64 make alpine                 # an aarch64 Alpine root filesystem
-ARCH=aarch64 ./scripts/test.sh           # every section but the telnet console
+ARCH=aarch64 ./scripts/test.sh           # every section but telnet and network time
 ```
 
 Both third-party images are fetched for the machine `ARCH` names, so the same
-nine sections run on either one. x86-64 runs a tenth, the telnet console, which
-needs the network card that QEMU's `raspi4b` does not emulate. busybox.net has no aarch64 build among its
+nine sections run on either one. x86-64 runs two more, the telnet console and
+network time, which need the network card that QEMU's `raspi4b` does not
+emulate; network time also needs the internet, and reports that it did not run
+when neither time server answers. busybox.net has no aarch64 build among its
 prebuilt binaries, so that one comes from Alpine's `busybox-static` package
 instead; `scripts/fetch-busybox.sh` refuses anything that is not a static ELF
 for the machine asked for, since a dynamically linked one has no interpreter to
@@ -391,6 +393,25 @@ tick: aarch64 states it in `cntfrq_el0`, and x86-64, which states it nowhere, is
 measured against a channel of the interval timer counting down. Neither answer
 comes through the tick, so the tick's own length can be checked against it. The
 tick still drives scheduling and timeouts.
+
+The wall clock is the monotonic clock plus a base in nanoseconds: the time
+since the epoch at which the monotonic clock read zero. At boot the base comes
+from the machine's battery-backed clock, raised to the newest date on the ram
+disk when that is later; the Pi has no battery-backed clock, so it starts from
+the ram disk's date. `clock_settime` and `settimeofday` replace the base in one
+store and print a `clock:` line with the new time, the program that set it, the
+old time and how far the clock was out. Nothing measured with the monotonic
+clock or the tick moves when they do. A `clock_nanosleep` to a wall-clock time
+is woken by the step and works its wait out again against the new time, as on
+Linux.
+
+When the image has `/etc/ntp.conf` and `/bin/busybox`, init starts a time
+keeper in a process group of its own, which runs `busybox ntpd -n -q` with its
+output appended to `/var/log/ntpd.log`. After a run that exits 0 the next is six
+hours later; after a failure it is 30 seconds later, doubling with each failure
+in a row up to ten minutes; a run still going after three minutes is killed.
+`NTP_CONF=1` makes either build script write that file, naming `ntp.nict.jp`
+and `time.cloudflare.com`.
 
 **Random numbers.** `/dev/random`, `/dev/urandom`, `getrandom`, the `AT_RANDOM`
 bytes a program's libc is handed and TCP's initial sequence numbers all come
@@ -773,7 +794,8 @@ failures.
   subprocesses and `/proc`. The device checks include `/dev/urandom`: that two
   reads differ and that 4 KiB of it holds nearly all 256 byte values, which is
   a check that the generator is running and not a check that it is any good.
-- The `rtest` applet runs **66 checks** against the Rust standard library:
+- The `rtest` applet runs **91 checks** against the Rust standard library, 90
+  on aarch64, which has no `alarm` system call of its own:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
   thread sleep against the monotonic clock, the tick measured against that same
@@ -786,7 +808,13 @@ failures.
   waking promptly when a write arrives, and a walk of the system call numbers
   past the end of the table, every one of which has to answer ENOSYS, and
   `reboot` given magic numbers or a command it does not know, which has to
-  answer EINVAL. Two of
+  answer EINVAL. The wall clock is set with `clock_settime`, with musl's
+  `settimeofday` and with the `settimeofday` system call by number, forward,
+  back past the boot floor and with arguments that have to be refused; across
+  those steps the monotonic clock has to run straight on, a one-second sleep
+  has to last a second, and a sleep to a wall-clock time has to end when the
+  clock is stepped past it and run on when it is stepped back. The clock is put
+  back afterwards. Two of
   them run a thread alongside a sibling failing an exec over and over, which is
   a smoke test for a race rather than proof of its absence.
 - The **network protocols** run against a card that only records what it is
@@ -864,6 +892,16 @@ failures.
   the next connection works. A second boot with `telnet=off` has to bring the
   network up with nothing answering on port 23. It does not run on aarch64,
   where QEMU emulates no network card.
+- **Network time** boots x86-64 with the suites' image plus `/etc/ntp.conf`,
+  every date in it an hour old and the emulated battery clock set to 2000, so
+  the clock starts from a floor an hour behind. init's time keeper runs
+  BusyBox `ntpd` against `ntp.nict.jp` and `time.cloudflare.com`; the section
+  requires the kernel's `clock:` line to come in the middle of a `sleep 20`
+  that still lasts 20 seconds by the host's clock, the guest's `date` to agree
+  with the host's within two seconds afterwards, and ntpd's `setting time to`
+  in `/var/log/ntpd.log`. It needs the internet: when the host itself gets no
+  answer from either server, it reports `not run: no internet` and counts as a
+  skip. It does not run on aarch64.
 
 Every suite is an ordinary Linux program. Nothing in them is aware that they
 are not running on Linux.
@@ -927,7 +965,9 @@ written against Linux's driver and u-boot's and has to be taken on that. The
 PCIe root complex on the same board is still not driven, so anything on it --
 which is where the USB controller is -- is out of reach. There is nothing on
 the board that remembers the time across a power cycle, so the clock starts
-from the newest date on the ram disk rather than from the real one.
+from the newest date on the ram disk, and is as far behind as the image is old
+until BusyBox `ntpd`, which init runs when the image has `/etc/ntp.conf`, gets
+an answer from a time server. A board with no network stays that far behind.
 
 The WiFi joins one kind of network: WPA2 with a passphrase, CCMP for pairwise
 and group traffic, and management frame protection not required. A network
