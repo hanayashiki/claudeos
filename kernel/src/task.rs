@@ -178,6 +178,12 @@ pub struct Task {
     exe_path: Spinlock<String>,
 
     pub exit_code: Cell<i32>,
+    /// The status `exit_group` ended the thread group with, once a thread has
+    /// called it. One cell for the whole group, the way Linux keeps
+    /// `group_exit_code` in the signal struct its threads share: every thread
+    /// the call ends leaves with this status, not with the SIGKILL that ended
+    /// it. A forked child starts with none.
+    pub group_exit: Arc<Spinlock<Option<i32>>>,
     /// Registers only this architecture has, carried across context switches.
     cpu: Cell<TaskContext>,
     pub clear_child_tid: Cell<u64>,
@@ -286,6 +292,7 @@ impl Task {
             name: Spinlock::new(name.to_string()),
             exe_path: Spinlock::new(String::new()),
             exit_code: Cell::new(0),
+            group_exit: Arc::new(Spinlock::new(None)),
             cpu: Cell::new(TaskContext::new()),
             clear_child_tid: Cell::new(0),
             set_child_tid: Cell::new(0),

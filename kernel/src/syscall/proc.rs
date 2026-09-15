@@ -71,9 +71,11 @@ pub fn fork(
         parent.fds.clone_table()
     };
     // Interval timers belong to the process: a thread shares its process's,
-    // and a forked child keeps the none-armed set it was made with.
+    // and a forked child keeps the none-armed set it was made with. The status
+    // `exit_group` ends the process with belongs to it the same way.
     if is_thread {
         child.itimers = parent.itimers.clone();
+        child.group_exit = parent.group_exit.clone();
     }
     child.set_exe_path(parent.exe_path());
     child.set_name(parent.name());
