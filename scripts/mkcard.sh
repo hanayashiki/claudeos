@@ -216,21 +216,43 @@ confirm() {
 # Writing
 # ---------------------------------------------------------------------------
 
-# Copy the boot files onto the partition $1, mounting it if it is not mounted.
+# Where the partition $1 is mounted on macOS, mounting it if it is not.
+mount_point() {
+  local partition="$1" mount
+  mount="$(volume_field "$partition" MountPoint)"
+  if [ -z "$mount" ]; then
+    diskutil mount "$partition" > /dev/null
+    mount="$(volume_field "$partition" MountPoint)"
+  fi
+  [ -n "$mount" ] && [ -d "$mount" ] || die "$partition did not mount"
+  echo "$mount"
+}
+
+# Delete what macOS put on the FAT volume at $2 while writing to it, and
+# unmount the partition $1. The board and its firmware would see these as files:
+# a `._NAME` beside a file, holding extended attributes, and .fseventsd,
+# .Spotlight-V100 and .Trashes. Copying with -X keeps the source files'
+# attributes from being copied, and still a card written that way had a `._`
+# file beside every boot file. Unmounting straight after the deletion leaves
+# nothing time to write them again; the board image section of scripts/test.sh
+# lists both partitions of a card made this way and requires exactly the files
+# copied.
+tidy_and_unmount() {
+  local partition="$1" mount="$2"
+  find "$mount" -name '._*' -type f -exec rm -f {} +
+  rm -rf "$mount/.fseventsd" "$mount/.Spotlight-V100" "$mount/.Trashes"
+  sync
+  diskutil unmount "$partition" > /dev/null
+}
+
+# Copy the boot files onto the partition $1, and unmount it.
 copy_boot() {
   local partition="$1" mount
   case "$(uname -s)" in
     Darwin)
-      mount="$(volume_field "$partition" MountPoint)"
-      if [ -z "$mount" ]; then
-        diskutil mount "$partition" > /dev/null
-        mount="$(volume_field "$partition" MountPoint)"
-      fi
-      [ -n "$mount" ] && [ -d "$mount" ] || die "$partition did not mount"
-      # -X: without it, a file with extended attributes gets a second file
-      # beside it on FAT, `._` and its name, holding them.
+      mount="$(mount_point "$partition")"
       cp -RX "$BOOT"/ "$mount"/
-      sync
+      tidy_and_unmount "$partition" "$mount"
       ;;
     Linux)
       mount="$(mktemp -d)"
@@ -251,25 +273,9 @@ seed_data() {
   local partition="$1" mount
   case "$(uname -s)" in
     Darwin)
-      mount="$(volume_field "$partition" MountPoint)"
-      if [ -z "$mount" ]; then
-        diskutil mount "$partition" > /dev/null
-        mount="$(volume_field "$partition" MountPoint)"
-      fi
-      [ -n "$mount" ] && [ -d "$mount" ] || die "$partition did not mount"
-      # macOS puts files of its own on a FAT volume it writes, which the board
-      # would list among the user's: `._NAME` beside a file, holding extended
-      # attributes, and .fseventsd. -X keeps the source files' attributes from
-      # being copied, and still a `._` file appears beside every file on the
-      # boot partition, which copy_boot writes with -X too. So they are
-      # removed after the copy, and the volume unmounted straight after; the
-      # board image section of scripts/test.sh lists /data on a card made this
-      # way and requires only the files under user/data.
+      mount="$(mount_point "$partition")"
       cp -RX "$DATA_SEED"/ "$mount"/
-      find "$mount" -name '._*' -exec rm -f {} +
-      rm -rf "$mount/.fseventsd" "$mount/.Spotlight-V100" "$mount/.Trashes"
-      sync
-      diskutil unmount "$partition" > /dev/null
+      tidy_and_unmount "$partition" "$mount"
       ;;
     Linux)
       mount="$(mktemp -d)"
