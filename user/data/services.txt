@@ -1,0 +1,21 @@
+# The user services: what init starts at every boot, after the system
+# services, from /data/services.txt on the SD card. Edit this file on the Mac
+# or over the telnet console; a change takes effect at the next boot.
+#
+# One service per line: a name, a policy (always, once or off), any options,
+# and the command, which starts with the program's absolute path. The README
+# describes the format under "Services started at boot".
+#
+# See what runs with:     cat /run/services/*
+# A service's output is:  /var/log/NAME.log
+# The tunnel's address:   grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /var/log/tunnel.log
+#
+# site serves /data/site. tunnel is a Cloudflare quick tunnel to it, with no
+# account: it gets a new trycloudflare.com address at every start. It fails
+# and exits while there is no network or the clock is not yet set, and is
+# started again after 30 s, doubling to 5 minutes. --protocol http2 is the
+# transport the board's tunnel runs were made with.
+#
+# name    policy  options          command
+site      always                   /bin/httpd -f -p 8080 -h /data/site
+tunnel    always  backoff=30s-5m   /bin/cloudflared tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:8080

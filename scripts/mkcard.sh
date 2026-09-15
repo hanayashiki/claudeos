@@ -4,7 +4,8 @@
 #
 #   scripts/mkcard.sh                    assemble build/boot and stop
 #   scripts/mkcard.sh --new /dev/disk4   assemble, erase the whole card, make its
-#                                        two partitions, and write the boot one
+#                                        two partitions, write the boot one,
+#                                        and put user/data on /data
 #   scripts/mkcard.sh /dev/disk4         assemble, and rewrite only the boot
 #                                        partition of a card made with --new;
 #                                        the /data partition is not touched
@@ -23,10 +24,13 @@
 #      first FAT partition and nothing else, finding files by name, so there is
 #      no boot sector to install and nothing to mark bootable.
 #   2  FAT32, labelled CLAUDEDATA, the rest of the card: /data, which the
-#      kernel mounts read-write (README.md, "/data on the SD card").
+#      kernel mounts read-write (README.md, "/data on the SD card"). --new
+#      puts the files under user/data on it: services.txt, the user services
+#      list, and site/index.html, the page its web server serves.
 #
 # Updating a card rewrites partition 1 and nothing else, so what is on /data
-# stays. The whole card is erased only with --new.
+# stays. The whole card is erased, and /data given its first files, only with
+# --new.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -239,7 +243,47 @@ copy_boot() {
   esac
 }
 
-# Erase the whole disk $1, make both partitions and write the boot files.
+# What a new card's /data starts with (README.md, "Services started at boot").
+DATA_SEED="$ROOT/user/data"
+
+# Copy the files under user/data onto the partition $1, and unmount it.
+seed_data() {
+  local partition="$1" mount
+  case "$(uname -s)" in
+    Darwin)
+      mount="$(volume_field "$partition" MountPoint)"
+      if [ -z "$mount" ]; then
+        diskutil mount "$partition" > /dev/null
+        mount="$(volume_field "$partition" MountPoint)"
+      fi
+      [ -n "$mount" ] && [ -d "$mount" ] || die "$partition did not mount"
+      # macOS puts files of its own on a FAT volume it writes, which the board
+      # would list among the user's: `._NAME` beside a file, holding extended
+      # attributes, and .fseventsd. -X keeps the source files' attributes from
+      # being copied, and still a `._` file appears beside every file on the
+      # boot partition, which copy_boot writes with -X too. So they are
+      # removed after the copy, and the volume unmounted straight after; the
+      # board image section of scripts/test.sh lists /data on a card made this
+      # way and requires only the files under user/data.
+      cp -RX "$DATA_SEED"/ "$mount"/
+      find "$mount" -name '._*' -exec rm -f {} +
+      rm -rf "$mount/.fseventsd" "$mount/.Spotlight-V100" "$mount/.Trashes"
+      sync
+      diskutil unmount "$partition" > /dev/null
+      ;;
+    Linux)
+      mount="$(mktemp -d)"
+      command mount "$partition" "$mount"
+      cp -R "$DATA_SEED"/. "$mount"/
+      sync
+      umount "$mount"
+      rmdir "$mount"
+      ;;
+  esac
+}
+
+# Erase the whole disk $1, make both partitions, write the boot files, and put
+# the files under user/data on /data.
 write_new() {
   local device="$1" p1 p2
   case "$(uname -s)" in
@@ -249,6 +293,7 @@ write_new() {
       diskutil partitionDisk "$device" 2 MBR \
         FAT32 "$BOOT_LABEL" "$BOOT_SIZE" FAT32 "$DATA_LABEL" R
       copy_boot "${device}s1"
+      seed_data "${device}s2"
       diskutil eject "$device"
       ;;
     Linux)
@@ -262,6 +307,7 @@ write_new() {
       mkfs.vfat -F 32 -n "$BOOT_LABEL" "$p1"
       mkfs.vfat -F 32 -n "$DATA_LABEL" "$p2"
       copy_boot "$p1"
+      seed_data "$p2"
       ;;
   esac
 }
