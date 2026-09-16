@@ -394,8 +394,8 @@ fn an_exit_from_a_thread_is_the_process_status(report: &mut Report) {
 }
 
 /// A process with a second thread that a signal from outside ends still
-/// reports that signal: nothing called `exit_group`, so the thread group has no
-/// status of its own to report in its place.
+/// reports that signal. The signal ends the thread group with the signal as
+/// the group's status, and no `exit_group` call gave it another one.
 fn a_signal_from_outside_is_still_reported(report: &mut Report) {
     use crate::sys;
     const SIGKILL: i32 = 9;
@@ -1881,10 +1881,15 @@ fn read_timer(which: i32) -> (i32, ItimerVal) {
 /// Wait for a child, killing it if it has not finished within `limit`, so a
 /// kernel that never delivers what the child is waiting for fails the check
 /// instead of hanging the suite.
+///
+/// The kill is followed by a continue: a kernel that leaves a stopped thread
+/// stopped with the kill pending would otherwise hold the wait below for good,
+/// and a continue is what makes such a thread take the kill.
 fn wait_or_kill(child: i64, limit: Duration) -> (i64, i32) {
     use crate::sys;
     const WNOHANG: u64 = 1;
     const SIGKILL: i32 = 9;
+    const SIGCONT: i32 = 18;
     let started = Instant::now();
     loop {
         let (pid, status) = sys::wait4(child as i32, WNOHANG);
@@ -1893,6 +1898,7 @@ fn wait_or_kill(child: i64, limit: Duration) -> (i64, i32) {
         }
         if started.elapsed() > limit {
             sys::kill(child as i32, SIGKILL);
+            sys::kill(child as i32, SIGCONT);
             return sys::wait4(child as i32, 0);
         }
         std::thread::sleep(Duration::from_millis(10));

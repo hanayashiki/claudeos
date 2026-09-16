@@ -924,6 +924,13 @@ page table hierarchy whose upper half is shared with the kernel. `fork` is
 copy-on-write: the two sides share every writable page read-only until one of
 them writes, and the fault handler hands out the private copy. `clone` with
 `CLONE_VM` shares the address space outright, which is what threads use.
+Threads made with `CLONE_THREAD` are one process to signals, exits and waits,
+as on Linux. `kill` sends to the process, and any thread that does not block
+the signal takes it; `tkill` and `tgkill` send to one thread. A signal whose
+action is to terminate, a fault, or `exit_group` from any thread ends every
+thread, a stopped one included, and SIGSTOP stops every thread. `wait4`
+reports a process once its last thread has exited, with the status
+`exit_group` or the killing signal gave it.
 Scheduling is round-robin, preemptive, driven by the 100 Hz timer tick.
 Anonymous memory is demand-paged: `mmap` and `brk` record a region and the
 page fault handler supplies pages on first touch.
@@ -1340,7 +1347,7 @@ failures.
   reads differ and that 4 KiB of it holds nearly all 256 byte values, which is
   a check that the generator is running and not a check that it is any good.
 - The `rtest` applet, which only the test image's cbox is built with, runs
-  **92 checks** against the Rust standard library, 91 on aarch64, which has
+  **104 checks** against the Rust standard library, 103 on aarch64, which has
   no `alarm` system call of its own:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
@@ -1349,7 +1356,12 @@ failures.
   a sleep that still wakes on time while another thread sits inside a 32 MiB
   write, file read/write/seek/append, directory iteration,
   `std::process::Command` capturing a child's output through pipes, signal
-  handlers running and returning, a `UnixStream` pair carrying bytes both ways,
+  handlers running and returning, child processes with several threads ended
+  by an abort, a SIGSEGV or a fault in one thread, by SIGKILL or SIGTERM from
+  outside, stopped and then killed, or whose first thread exits alone, each
+  reported with its status and leaving no thread behind, a signal for a
+  process taken by the thread that does not block it,
+  a `UnixStream` pair carrying bytes both ways,
   an epoll set woken by a counter and a socket, timing out when it should and
   waking promptly when a write arrives, and a walk of the system call numbers
   past the end of the table, every one of which has to answer ENOSYS, and
