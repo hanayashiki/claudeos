@@ -11,6 +11,11 @@
 # internet. `-n -q` keeps ntpd in the foreground and makes it exit once the
 # clock has been set or found within a second.
 #
+# busybox is on the card, as /usr/bin/busybox. With /data not mounted it does
+# not exist, and ntpd is reported as could not be started and tried again
+# after each backoff wait, so a card that is mounted late still gets the clock
+# set. It is not a needs= option, which is looked at once, at boot.
+#
 # every=6h: after a run that exits 0, the next is six hours later. A board's
 # crystal keeps to some tens of parts per million, a second or two over six
 # hours, so the clock is back around the second ntpd -q does not correct.
@@ -26,4 +31,4 @@
 # when unanswered, so a run ends on its own within about ninety seconds. Three
 # minutes is that with room, and it is short against the ten-minute cap, so no
 # run lasts long enough to reset the count of failures.
-ntpd  always  needs=/etc/ntp.conf every=6h limit=180s backoff=30s-10m  /bin/busybox ntpd -n -q
+ntpd  always  needs=/etc/ntp.conf every=6h limit=180s backoff=30s-10m  /usr/bin/busybox ntpd -n -q

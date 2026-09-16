@@ -2,11 +2,13 @@
 # image in the emulated Pi 4's slot. Which part runs comes from `datatest=PART`,
 # given on the kernel command line or in front of the command:
 #
-#   write     the first boot: every operation, then an fsync, a pause in which
-#             the harness reads the image from the Mac, and a sync
+#   write     the first boot: every operation, programs run from the card,
+#             /usr and /root on it, then an fsync, a pause in which the harness
+#             reads the image from the Mac, and a sync
 #   verify    the second boot on the same image: what the first left is there
-#   damaged   a card damaged on purpose: walk it, read it and write to it,
-#             and reach the end whatever happens
+#   damaged   a card damaged on purpose, or no card: say what /usr and /root
+#             are, walk /data, read it and write to it, and reach the end
+#             whatever happens
 
 pass=0
 fail=0
@@ -26,8 +28,21 @@ near() {
   if [ $(($1 - $2)) -le "$3" ] && [ $(($2 - $1)) -le "$3" ]; then echo 1; else echo 0; fi
 }
 
+# What /usr or /root is: a link into /data, or a directory in memory and the
+# names it holds.
+where() {
+  if [ -L "$1" ]; then
+    echo "a link to $(readlink "$1")"
+  elif [ -d "$1" ] && [ "$(stat -c %d "$1")" = "$(stat -c %d /)" ]; then
+    echo "a directory in memory holding [$(ls -A "$1" | tr '\n' ' ' | sed 's/ $//')]"
+  else
+    echo "neither a link nor a directory in memory"
+  fi
+}
+
 T=/data/claudeos-test
 LONG="An index page with a long name, spaces, and (brackets).html"
+LOADER=/lib/ld-musl-aarch64.so.1
 
 case "$datatest" in
 write)
@@ -97,13 +112,53 @@ write)
   rmdir $T/d1
   check "rmdir"                      "1"               "$(test -d $T/d1; echo $?)"
 
-  check "a file's mode"              "-rw-r--r--"      "$(ls -l $T/sub/B.TXT | cut -c 1-10)"
-  check "a directory's mode"         "drwxr-xr-x"      "$(ls -ld $T/sub | cut -c 1-10)"
-  check "chmod succeeds"             "0"               "$(chmod 777 $T/sub/B.TXT; echo $?)"
-  check "and changes nothing"        "-rw-r--r--"      "$(ls -l $T/sub/B.TXT | cut -c 1-10)"
+  check "a file's mode"              "-rwxrwxrwx"      "$(ls -l $T/sub/B.TXT | cut -c 1-10)"
+  check "a directory's mode"         "drwxrwxrwx"      "$(ls -ld $T/sub | cut -c 1-10)"
+  # vfat without `quiet`: EPERM for setuid, setgid and sticky and for another
+  # owner or group, and success that changes nothing for every other mode.
+  check "chmod to the mode it has"   "0"               "$(chmod 777 $T/sub/B.TXT; echo $?)"
+  check "chmod to another mode"      "0"               "$(chmod 644 $T/sub/B.TXT; echo $?)"
+  check "a directory to another"     "0"               "$(chmod 755 $T/sub; echo $?)"
+  check "no write bits"              "0"               "$(chmod 555 $T/sub/B.TXT; echo $?)"
+  check "setuid"                     "EPERM"           "$(chmod 4777 $T/sub/B.TXT 2>&1 | grep -q 'Operation not permitted' && echo EPERM)"
+  check "setgid"                     "EPERM"           "$(chmod 2777 $T/sub/B.TXT 2>&1 | grep -q 'Operation not permitted' && echo EPERM)"
+  check "sticky, on a directory"     "EPERM"           "$(chmod 1777 $T/sub 2>&1 | grep -q 'Operation not permitted' && echo EPERM)"
+  check "and the modes are as they were" "-rwxrwxrwx drwxrwxrwx" "$(ls -l $T/sub/B.TXT | cut -c 1-10) $(ls -ld $T/sub | cut -c 1-10)"
+  check "chown to root"              "0"               "$(busybox chown 0:0 $T/sub/B.TXT; echo $?)"
+  check "chown to another owner"     "EPERM"           "$(busybox chown 1 $T/sub/B.TXT 2>&1 | grep -q 'Operation not permitted' && echo EPERM)"
+  check "chgrp to another group"     "EPERM"           "$(busybox chgrp 1 $T/sub/B.TXT 2>&1 | grep -q 'Operation not permitted' && echo EPERM)"
+  printf 'copied\n' > /tmp/mode644.txt
+  chmod 644 /tmp/mode644.txt
+  check "cp -p from memory"          "0 copied"        "$(busybox cp -p /tmp/mode644.txt $T/cp-p.txt 2>&1; echo $? $(cat $T/cp-p.txt))"
+  check "mv from memory"             "0 1 copied"      "$(busybox mv /tmp/mode644.txt $T/mv.txt 2>&1; s=$?; test -e /tmp/mode644.txt; gone=$?; echo $s $gone $(cat $T/mv.txt))"
+  check "and they read 0777"         "-rwxrwxrwx -rwxrwxrwx" "$(ls -l $T/cp-p.txt | cut -c 1-10) $(ls -l $T/mv.txt | cut -c 1-10)"
   check "no hard links"              "1"               "$(ln $T/sub/B.TXT $T/link 2>/dev/null; echo $?)"
   check "no symbolic links"          "1"               "$(ln -s B.TXT $T/sub/sym 2>/dev/null; echo $?)"
   check "a directory on the card is not /" "0"         "$(test "$(stat -c %d /data)" != "$(stat -c %d /)"; echo $?)"
+
+  # Programs kept on the card, run from it: a static one and a script.
+  cp /bin/busybox $T/busybox
+  check "a static program on /data"  "run from the card" "$($T/busybox echo run from the card)"
+  printf '#!/bin/sh\necho "a script on the card, given $1"\n' > $T/script
+  check "a script on /data"          "a script on the card, given one" "$($T/script one)"
+
+  # /usr and /root are the card's.
+  check "/usr"                       "a link to /data/usr"  "$(where /usr)"
+  check "/root"                      "a link to /data/root" "$(where /root)"
+  echo "kept at home" > /root/claudeos-test-home.txt
+  check "a file in /root is on /data" "kept at home"   "$(cat /data/root/claudeos-test-home.txt)"
+
+  # A dynamic program on the card whose loader is on the card, reached as the
+  # board image reaches it: the test image's own loader moved aside and its
+  # path made a link to /usr/lib.
+  mkdir -p /usr/bin /usr/lib
+  cp /bin/busybox-extras /usr/bin/busybox-extras
+  cp $LOADER /usr/lib/ld-musl-aarch64.so.1
+  mv $LOADER /tmp/ld-musl.image
+  ln -s /usr/lib/ld-musl-aarch64.so.1 $LOADER
+  check "a dynamic program and its loader on /data" "1" "$(/usr/bin/busybox-extras --list | grep -c '^httpd$')"
+  rm $LOADER
+  mv /tmp/ld-musl.image $LOADER
 
   echo "survives a reboot" > $T/persist.txt
   modified="$(stat -c %Y $T/persist.txt)"
@@ -134,6 +189,8 @@ verify)
   check "the file renamed over"      "new"             "$(cat $T/target)"
   check "the truncated file"         "0"               "$(wc -c < $T/lines.txt)"
   check "nothing removed came back"  "1 1 1"           "$(test -e $T/doomed; a=$?; test -e $T/d1; b=$?; test -e $T/a.txt; echo $a $b $?)"
+  check "the program on /data"       "run again"       "$($T/busybox echo run again)"
+  check "/root, still the card's"    "kept at home"    "$(cat /root/claudeos-test-home.txt)"
   rm $T/d2/moved/f
   rmdir $T/d2/moved
   rmdir $T/d2
@@ -145,6 +202,10 @@ verify)
 
 damaged)
   echo "=== /data: a damaged card ==="
+  # What the harness compares with the data: line: links into /data when the
+  # volume was mounted, in-memory directories when it was not.
+  echo "data-test: /usr is $(where /usr)"
+  echo "data-test: /root is $(where /root)"
   # Whatever is on the card, all of this has to come to an end, with errors
   # or without. Nothing is checked but that the end is reached. The walks stop
   # 16 levels down: damaged directory entries can point back at a directory

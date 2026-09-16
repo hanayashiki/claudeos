@@ -1,0 +1,4 @@
+#!/bin/sh
+# busybox's web server, an applet of /usr/bin/busybox-extras. FAT has no
+# symbolic links, so this runs the applet by name (scripts/images.sh, CARD_ITEMS).
+exec /usr/bin/busybox-extras httpd "$@"

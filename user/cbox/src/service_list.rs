@@ -4,8 +4,8 @@
 //!
 //! ```text
 //! # name  policy  options                          command
-//! ntpd    always  needs=/etc/ntp.conf every=6h limit=180s backoff=30s-10m  /bin/busybox ntpd -n -q
-//! site    always  /bin/busybox httpd -f -p 8080 -h /data/site
+//! ntpd    always  needs=/etc/ntp.conf every=6h limit=180s backoff=30s-10m  /usr/bin/busybox ntpd -n -q
+//! site    always  /usr/bin/httpd -f -p 8080 -h /data/site
 //! ```
 //!
 //! The command starts at the first word that begins with `/`, and every word

@@ -134,6 +134,10 @@ pub const S_IFBLK: u32 = 0o060000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFCHR: u32 = 0o020000;
 pub const S_IFIFO: u32 = 0o010000;
+// The permission bits above rwx.
+pub const S_ISUID: u32 = 0o4000;
+pub const S_ISGID: u32 = 0o2000;
+pub const S_ISVTX: u32 = 0o1000;
 /// `linkat`: resolve the last component of the source if it is a symlink.
 pub const AT_SYMLINK_FOLLOW: u32 = 0x400;
 

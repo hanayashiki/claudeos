@@ -554,7 +554,12 @@ run_ntp() {
   # The same two lines as /etc/ntp.conf in the board image, which
   # scripts/build-user-aarch64.sh writes.
   printf 'server ntp.nict.jp\nserver time.cloudflare.com\n' > "$dir/rootfs/etc/ntp.conf"
-  cat > "$dir/rootfs/root/ntp.sh" <<'SCRIPT'
+  # The system list runs /usr/bin/busybox, which a board has on its card. This
+  # machine has no card slot, so nothing replaces the image's /usr, and the
+  # program goes there.
+  mkdir -p "$dir/rootfs/usr/bin"
+  cp "$BUSYBOX" "$dir/rootfs/usr/bin/busybox"
+  cat > "$dir/rootfs/tests/ntp.sh" <<'SCRIPT'
 #!/bin/sh
 echo "ntp-check: booted at $(date +%s)"
 echo "ntp-check: sleep-start"
@@ -569,7 +574,7 @@ echo "ntp-check: now $(date +%s)"
 echo "--- /var/log/ntpd.log"
 cat /var/log/ntpd.log
 SCRIPT
-  chmod +x "$dir/rootfs/root/ntp.sh"
+  chmod +x "$dir/rootfs/tests/ntp.sh"
   floor="$(python3 - "$dir/rootfs" <<'PY'
 import os, sys, time
 stamp = int(time.time()) - 3600
@@ -584,7 +589,7 @@ PY
 
   # Every console line, prefixed with the time this machine received it.
   "$ROOT/scripts/run.sh" --timeout 120 --net --initrd "$dir/ntp.cpio" \
-      --append /root/ntp.sh -rtc base=2000-01-01T00:00:00 < /dev/null 2>&1 |
+      --append /tests/ntp.sh -rtc base=2000-01-01T00:00:00 < /dev/null 2>&1 |
     python3 -u -c '
 import sys, time
 for line in iter(sys.stdin.buffer.readline, b""):
@@ -710,10 +715,12 @@ integrity_expect() {
   return $missing
 }
 
-# The image scripts/mkcard.sh puts on the card, booted under QEMU. It has to
-# reach the shell and pass its own check, its /root and /bin have to hold none
-# of the test image's own files, and its cbox has to have no rtest applet. Then
-# a card mkcard.sh makes on the Mac is checked and booted (see board_card).
+# The image scripts/mkcard.sh puts on the card, booted under QEMU with no card.
+# It has to reach the shell and pass its own check; its /bin has to hold none of
+# the test image's programs and none of the card's; there has to be no /tests,
+# /root and /usr have to be empty directories, and the loader's path a link to
+# /usr/lib; and its cbox has to have no rtest applet. Then a card mkcard.sh
+# makes on the Mac is checked and booted (see board_card).
 run_board_image() {
   banner "board image"
   if [ "$ARCH" != aarch64 ]; then
@@ -725,7 +732,8 @@ run_board_image() {
   local output ok=1 unwanted
   output="$(python3 "$ROOT/tools/drive.py" --timeout 90 --initramfs "$BOARD_IMAGE" -- \
       "until:claudeos shell" "wait:0.5" \
-      "find /root /bin\n" "wait:1.5" \
+      "find /root /usr /bin /tests\n" "wait:1.5" \
+      "echo loader-link: \$(readlink /lib/ld-musl-aarch64.so.1)\n" "wait:0.5" \
       "cbox rtest\n" "wait:1" \
       "cat /proc/claudeos/integrity\n" "wait:1" \
       "poweroff\n" "wait:3" 2>&1 | tr -d '\r')"
@@ -733,7 +741,8 @@ run_board_image() {
   echo
   record_boot_id "$output"
 
-  for expected in "claudeos shell" "^/root$" "^/bin/cbox$" "^/bin/sh$" \
+  for expected in "claudeos shell" "^/root$" "^/usr$" "^/bin/cbox$" "^/bin/sh$" \
+                  "^loader-link: /usr/lib/ld-musl-aarch64.so.1$" \
                   "cbox: rtest: unknown applet" \
                   "^integrity: [1-9][0-9]* ok, 0 damaged, 0 missing, 0 malformed lines skipped" \
                   "powering off"; do
@@ -742,11 +751,12 @@ run_board_image() {
       ok=0
     fi
   done
-  # What the test image has that this one must not: anything at all in /root,
-  # and the test programs and the rtest link in /bin.
-  unwanted="$(echo "$output" | grep -E "^/root/.|^/bin/(hello_c|inet|rtest|go_main)$")"
+  # What this image must not hold: the test image's files, anything in /root,
+  # and in /usr anything but the /usr/bin init makes, and in /bin a program
+  # that is the card's.
+  unwanted="$(echo "$output" | grep -E "^/root/.|^/usr/.|^/tests|^/bin/(hello_c|inet|rtest|go_main|busybox|busybox-extras|httpd|cloudflared)$" | grep -v '^/usr/bin$')"
   if [ -n "$unwanted" ]; then
-    echo "   the board image holds test files:"
+    echo "   the board image holds files it should not:"
     echo "$unwanted" | sed 's/^/     /'
     ok=0
   fi
@@ -772,13 +782,19 @@ run_board_image() {
 }
 
 # A card scripts/mkcard.sh --new writes, to a disk image on the Mac. /data has
-# to hold what user/data holds and nothing else, so no file macOS makes on a
-# volume it mounts; updating the boot files has to leave /data's blocks as they
-# were. The card is then booted with the board image: the web server the seeded
-# list names has to serve the seeded page, and the quick tunnel, which has no
-# network under QEMU, has to exit and be started again.
+# to hold what build/data-aarch64 holds, the programs under usr among it, and
+# nothing else, so no file macOS makes on a volume it mounts; updating the boot
+# files has to leave /data's blocks as they were. `mkcard.sh --usr` has to put
+# back a program in /data/usr that was changed, keep one the build does not
+# have, and leave every file outside /data/usr byte for byte as it was. The
+# card is then booted with the board image: /usr and /root have to be links to
+# the card, ntpd has to run /usr/bin/busybox from it, the web server the seeded
+# list names has to serve the seeded page through /usr/bin/httpd and the loader
+# on the card, and the quick tunnel, which has no network under QEMU, has to
+# exit and be started again from /usr/bin/cloudflared.
 board_card() {
   local dir card fatdisk="$ROOT/tools/fatdisk/target/release/fatdisk" names before output expected failed=0
+  local seed="$ROOT/build/data-aarch64" file outside
   if ! (cd "$ROOT/tools/fatdisk" && cargo build --release -q); then
     echo "   tools/fatdisk did not build"
     return 1
@@ -794,13 +810,17 @@ board_card() {
   fi
   # Both partitions, file by file, against what went onto them.
   board_card_files CLAUDEOS "$ROOT/build/boot" "after --new" || failed=1
-  board_card_files CLAUDEDATA "$ROOT/user/data" "after --new" || failed=1
-  for file in services.txt site/index.html; do
-    if ! "$fatdisk" cat "$card" CLAUDEDATA "/$file" | cmp -s - "$ROOT/user/data/$file"; then
-      echo "   /data/$file on the card is not user/data/$file"
+  board_card_files CLAUDEDATA "$seed" "after --new" || failed=1
+  while IFS= read -r file; do
+    if ! "$fatdisk" cat "$card" CLAUDEDATA "/$file" | cmp -s - "$seed/$file"; then
+      echo "   /data/$file on the card is not build/data-aarch64/$file"
       failed=1
     fi
-  done
+  done < <(cd "$seed" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
+  if [ "$("$fatdisk" ls "$card" CLAUDEDATA / | grep -c '^root/$')" != 1 ]; then
+    echo "   /data/root is not a directory on the card"
+    failed=1
+  fi
 
   before="$(data_digest "$card" CLAUDEDATA)"
   if ! "$ROOT/scripts/mkcard.sh" --image "$card" > "$dir/update.log" 2>&1; then
@@ -815,29 +835,72 @@ board_card() {
     board_card_files CLAUDEOS "$ROOT/build/boot" "after an update" || failed=1
   fi
 
+  # --usr on a card whose /data the user has changed: a line added to the
+  # list, a file in /root, a program of their own, and one of the build's
+  # programs overwritten.
+  "$fatdisk" put "$card" CLAUDEDATA /services.txt "$(cat "$seed/services.txt")
+# a line of the user's" || failed=1
+  "$fatdisk" put "$card" CLAUDEDATA /root/keep.txt "kept at home" || failed=1
+  "$fatdisk" put "$card" CLAUDEDATA /usr/bin/extra "#!/bin/sh
+echo the program the user added" || failed=1
+  "$fatdisk" put "$card" CLAUDEDATA /usr/bin/httpd "stale" || failed=1
+  outside="$(board_card_outside_usr)"
+  if ! "$ROOT/scripts/mkcard.sh" --usr --image "$card" > "$dir/usr.log" 2>&1; then
+    echo "   mkcard.sh --usr --image failed:"
+    tail -n 20 "$dir/usr.log" | sed 's/^/     /'
+    failed=1
+  else
+    if [ "$(board_card_outside_usr)" != "$outside" ]; then
+      echo "   mkcard.sh --usr changed a file outside /data/usr"
+      failed=1
+    elif ! "$fatdisk" cat "$card" CLAUDEDATA /usr/bin/httpd | cmp -s - "$seed/usr/bin/httpd"; then
+      echo "   mkcard.sh --usr did not put /data/usr/bin/httpd back"
+      failed=1
+    elif [ "$("$fatdisk" cat "$card" CLAUDEDATA /usr/bin/extra 2>&1 | tail -n 1)" != "echo the program the user added" ]; then
+      echo "   mkcard.sh --usr did not keep a program the build does not have"
+      failed=1
+    elif [ -n "$(card_files CLAUDEDATA | grep -E '(^|/)\._|^\.fseventsd/')" ]; then
+      echo "   mkcard.sh --usr left macOS files on /data:"
+      card_files CLAUDEDATA | grep -E '(^|/)\._|^\.fseventsd/' | sed 's/^/     /'
+      failed=1
+    else
+      echo "   --usr put back the changed program, kept the user's, and left the $(echo "$outside" | grep -c .) files outside /data/usr as they were"
+    fi
+  fi
+
   # The wait is typed as one line, and its report is spelled so that the
   # typed line itself does not match it. The substitutions are quoted: the
   # shell splits an unquoted one in an assignment into words, and runs the
   # second word of `exited with status 1` as a command.
   output="$(python3 "$ROOT/tools/drive.py" --timeout 240 --initramfs "$BOARD_IMAGE" --sd "$card" -- \
       "until:claudeos shell" "wait:1" \
+      "echo layout-check: \$(readlink /usr) \$(readlink /root) \$(cat /root/keep.txt), \$(/usr/bin/extra)\n" "wait:1" \
       "busybox wget -q -O - http://127.0.0.1:8080/index.html\n" "wait:2" \
+      'echo "ntpd-""check: $(sed -n "s/^starts: //p" /run/services/ntpd) starts; $(sed -n "s/^last run: //p" /run/services/ntpd)"\n' "wait:1" \
       'i=0; until grep -q "^starts: [2-9]" /run/services/tunnel || [ $i -ge 150 ]; do sleep 1; i=$((i + 1)); done; s="$(sed -n "s/^starts: //p" /run/services/tunnel)"; l="$(sed -n "s/^last run: //p" /run/services/tunnel)"; f="$(grep -c "failed to request quick Tunnel" /var/log/tunnel.log)"; echo "tunnel-""check: $s starts; $l; $f failed requests"\n' \
       "until:tunnel-check:" "wait:0.5" \
       "cat /run/services/tunnel; tail -n 20 /var/log/tunnel.log\n" "wait:1.5" \
       "poweroff\n" "wait:3" 2>&1 | tr -d '\r')"
   record_boot_id "$output"
   echo "--- the card, booted"
-  echo "$output" | grep -E "^services:|^data:|This page is|^tunnel-check:|KERNEL PANIC" | sed 's/^/   /'
-  for expected in "^data: mounted partition 2 of the card, labelled CLAUDEDATA" \
+  echo "$output" | grep -E "^services:|^data:|^layout-check:|This page is|^ntpd-check:|^tunnel-check:|KERNEL PANIC" | sed 's/^/   /'
+  for expected in "^data: mounted partition 2 of the card, labelled CLAUDEDATA, .*; /usr is a link to /data/usr; /root is a link to /data/root; " \
                   "^services: 1 system started; 2 user started$" \
+                  "^layout-check: /data/usr /data/root kept at home, the program the user added$" \
                   "This page is /data/site/index.html on the card" \
+                  "^ntpd-check: [1-9][0-9]* starts; " \
                   "^tunnel-check: [2-9] starts; exited with status [1-9][0-9]* after [0-9]+ s; [1-9][0-9]* failed requests$"; do
     if ! echo "$output" | grep -qE "$expected"; then
       echo "   missing expected output: $expected"
       failed=1
     fi
   done
+  # ntpd's program is on the card, so a run that could not be started means
+  # /usr/bin/busybox was not reached.
+  if echo "$output" | grep -q "^ntpd-check: .*could not be started"; then
+    echo "   ntpd could not be started from /usr/bin/busybox"
+    failed=1
+  fi
   if echo "$output" | grep -q "KERNEL PANIC"; then
     echo "   the kernel panicked with the card"
     failed=1
@@ -848,6 +911,15 @@ board_card() {
   fi
   rm -rf "$dir"
   return $failed
+}
+
+# Every file on /data of the card image $card outside /data/usr, one per line,
+# after the SHA-1 of its contents.
+board_card_outside_usr() {
+  local name
+  card_files CLAUDEDATA | grep -v '^usr/' | LC_ALL=C sort | while IFS= read -r name; do
+    printf '%s  %s\n' "$("$fatdisk" cat "$card" CLAUDEDATA "/$name" | shasum | cut -c 1-40)" "$name"
+  done
 }
 
 # Every file on the volume labelled $1 of the card image $card, below the
@@ -905,7 +977,9 @@ PY
 # the card does not have, with a boot partition carrying the /data label, with
 # a bad partition table and with volumes damaged on purpose each have to reach
 # the shell with one `data:` line before it and no panic, and walk whatever
-# /data they have to the end.
+# /data they have to the end; with no card, with data=off and with a label the
+# card lacks, /usr and /root have to be in-memory directories, and on a card
+# that mounts, links into /data.
 run_data() {
   banner "/data on an SD card"
   if [ "$ARCH" != aarch64 ]; then
@@ -956,7 +1030,7 @@ run_data() {
   # The first boot runs in the background, so that the image can be read in
   # the pause the guest makes between its fsync and its sync.
   "$ROOT/scripts/run.sh" --timeout 240 --sd "$card" --initrd "$IMAGE" \
-      --append "/root/data.sh datatest=write" > "$dir/write" 2>&1 < /dev/null &
+      --append "/tests/data.sh datatest=write" > "$dir/write" 2>&1 < /dev/null &
   qemu=$!
   if data_wait "$dir/write" "^data-test: fsync done" 200; then
     "$fatdisk" cat "$card" CLAUDEDATA /claudeos-test/fsync.txt > "$dir/after-fsync" 2>&1
@@ -991,7 +1065,7 @@ run_data() {
   data_check "$card" after-write || ok=0
 
   "$ROOT/scripts/run.sh" --timeout 120 --sd "$card" --initrd "$IMAGE" \
-      --append "/root/data.sh datatest=verify" > "$dir/verify" 2>&1 < /dev/null
+      --append "/tests/data.sh datatest=verify" > "$dir/verify" 2>&1 < /dev/null
   data_suite verify || ok=0
   data_check "$card" after-verify || ok=0
   if [ "$(data_digest "$card" CLAUDEOS)" != "$boot_before" ]; then
@@ -1001,18 +1075,24 @@ run_data() {
     echo "   partition 1, the boot partition beside /data, is unchanged after both boots"
   fi
 
-  # No card in the slot.
+  # No card in the slot: /usr and /root are the in-memory directories, /usr
+  # holding the /usr/bin init makes.
   data_boot nocard "" ""
-  data_expect nocard "^data: /data is not mounted: nothing answered in the card slot" || ok=0
+  data_expect nocard "^data: /data is not mounted: nothing answered in the card slot" \
+      "^data-test: /usr is a directory in memory holding \[bin\]$" \
+      "^data-test: /root is a directory in memory holding \[\]$" || ok=0
 
-  # data=off leaves the card alone.
+  # data=off leaves the card alone, and /usr and /root in memory.
   whole_before="$(shasum "$card" | cut -c 1-40)"
   data_boot off "$card" "data=off"
-  data_expect off "^data: off, from the command line" || ok=0
+  data_expect off "^data: off, from the command line" \
+      "^data-test: /usr is a directory in memory holding \[bin\]$" \
+      "^data-test: /root is a directory in memory holding \[\]$" || ok=0
 
   # A label no volume on the card has: nothing is mounted and nothing written.
   data_boot label "$card" "data=ELSEWHERE"
-  data_expect label "^data: /data is not mounted: no FAT32 volume on the card is labelled ELSEWHERE" || ok=0
+  data_expect label "^data: /data is not mounted: no FAT32 volume on the card is labelled ELSEWHERE" \
+      "^data-test: /root is a directory in memory holding \[\]$" || ok=0
   if [ "$(shasum "$card" | cut -c 1-40)" != "$whole_before" ]; then
     echo "   the card changed in a boot with data=off or a label it does not have"
     ok=0
@@ -1064,7 +1144,8 @@ run_data() {
   cp "$dir/template.img" "$dir/loops.img"
   "$fatdisk" damage "$dir/loops.img" CLAUDEDATA loops 0
   data_boot loops "$dir/loops.img" ""
-  data_expect loops "^data: mounted partition 2 of the card, labelled CLAUDEDATA" || ok=0
+  data_expect loops "^data: mounted partition 2 of the card, labelled CLAUDEDATA" \
+      "^data-test: /usr is a link to /data/usr$" "^data-test: /root is a link to /data/root$" || ok=0
   rm -f "$dir/loops.img"
 
   # www/css pointed at the root directory, so the tree under it has no bottom
@@ -1162,7 +1243,7 @@ data_suite() {
 # tests/data.sh, and power off. What the console showed is kept as $dir/$1.
 data_boot() {
   local steps=("until:claudeos shell" "wait:0.5"
-      "datatest=damaged sh /root/data.sh\n"
+      "datatest=damaged sh /tests/data.sh\n"
       "until:the damaged card was walked to the end" "until:the damaged card was walked to the end"
       "until:the damaged card was walked to the end" "until:the damaged card was walked to the end"
       "wait:0.5" "poweroff\n" "wait:3")
@@ -1215,10 +1296,12 @@ data_expect() {
 # Services at boot: the system list in the image, /etc/claudeos/services, and
 # the user list on the card, /data/services.txt. The image booted is the test
 # image with /etc/ntp.conf added, so that the system list's ntpd starts, and
-# with /root/services.sh, which prints what /run/services and the logs say.
+# with /tests/services.sh, which prints what /run/services and the logs say.
 # Every boot has to reach the shell with the expected summary line before it,
 # or with none and init's line saying why, and show ntpd started from the
-# system list.
+# system list. ntpd's program, /usr/bin/busybox, is on a board's card, and
+# neither these images nor these cards have it, so ntpd's runs cannot start
+# and it waits between them; the boot with data=off requires exactly that.
 #
 # On aarch64 the cards hold: a list of an always service that exits at once,
 # a once service writing to /tmp, busybox httpd serving /data/site, a once
@@ -1246,7 +1329,7 @@ run_services() {
 
   cp -R "$TREE" "$dir/services-tree"
   printf 'server ntp.nict.jp\nserver time.cloudflare.com\n' > "$dir/services-tree/etc/ntp.conf"
-  cat > "$dir/services-tree/root/services.sh" <<'SCRIPT'
+  cat > "$dir/services-tree/tests/services.sh" <<'SCRIPT'
 #!/bin/sh
 # Run at the shell by the services section of scripts/test.sh; $1 names the boot.
 field() {
@@ -1262,6 +1345,13 @@ for name in ntpd flap note site chatty missing spare good late other; do
   fi
 done
 echo "svc-ntpd-command: $(field ntpd command)"
+for dir in /usr /root; do
+  if [ -L "$dir" ]; then
+    echo "svc-layout: $dir is a link to $(readlink "$dir")"
+  else
+    echo "svc-layout: $dir is a directory in memory holding [$(ls -A "$dir" | tr '\n' ' ' | sed 's/ $//')]"
+  fi
+done
 sed 's/^/svc-errors: /' /run/services/errors.txt
 case "$1" in
 main)
@@ -1301,9 +1391,9 @@ SCRIPT
         '^state: not started: it needs /etc/ntp.conf, which does not exist$' \
         '^/data/services.txt: /data is not mounted, so no user services were started$' || ok=0
 
-    services_boot system "$dir/services.cpio" "" "" "wait:2" "sh /root/services.sh system\n" "until:svc-done"
+    services_boot system "$dir/services.cpio" "" "" "wait:2" "sh /tests/services.sh system\n" "until:svc-done"
     services_expect system "services: 1 system started; no user list, /data is not mounted" \
-        "$system_ntpd" '^svc-ntpd-command: /bin/busybox ntpd -n -q$' \
+        "$system_ntpd" '^svc-ntpd-command: /usr/bin/busybox ntpd -n -q$' \
         '^svc-errors: /data/services.txt: /data is not mounted, so no user services were started$' || ok=0
   elif [ "$(uname -s)" != Darwin ]; then
     echo "   the card images are made by macOS's newfs_msdos through hdiutil"
@@ -1325,7 +1415,7 @@ SCRIPT
     # Ctrl-C at the prompt ends the sleep and reaches no service; the rest of
     # the wait lets flap fail four times.
     services_boot main "$dir/services.cpio" "$card" "" \
-        "wait:1" "sleep 5\n" "wait:1.5" "\x03" "wait:10" "sh /root/services.sh main\n" "until:svc-done"
+        "wait:1" "sleep 5\n" "wait:1.5" "\x03" "wait:10" "sh /tests/services.sh main\n" "until:svc-done"
     services_expect main "services: 1 system started; 5 user started, 1 not started" \
         "$system_ntpd" \
         '^svc-status: flap list=user state=(running|waiting) starts=([3-9]|[1-9][0-9]) last=exited with status 3 after 0 s$' \
@@ -1357,7 +1447,7 @@ SCRIPT
         "$(printf 'web      always  /bin/echo \033[2J')" \
         "$filler" \
         "late     once    /bin/sh -c 'echo late > /tmp/late.txt'")" || ok=0
-    services_boot bad "$dir/services.cpio" "$dir/bad.img" "" "wait:2" "sh /root/services.sh bad\n" "until:svc-done"
+    services_boot bad "$dir/services.cpio" "$dir/bad.img" "" "wait:2" "sh /tests/services.sh bad\n" "until:svc-done"
     services_expect bad "services: 1 system started; 1 user started, 8 lines skipped, the end of the file not read (see /run/services/errors.txt)" \
         "$system_ntpd" \
         '^svc-errors: /data/services.txt line 1: the name `Web` is not 1 to 32 of the characters a-z, 0-9, _ and -$' \
@@ -1373,23 +1463,28 @@ SCRIPT
     rm -f "$dir/bad.img"
 
     services_card nofile "" || ok=0
-    services_boot nofile "$dir/services.cpio" "$dir/nofile.img" "" "wait:2" "sh /root/services.sh nofile\n" "until:svc-done"
+    services_boot nofile "$dir/services.cpio" "$dir/nofile.img" "" "wait:2" "sh /tests/services.sh nofile\n" "until:svc-done"
     services_expect nofile "services: 1 system started; no user list, /data/services.txt does not exist" \
         "$system_ntpd" \
         '^svc-errors: /data/services.txt: it does not exist, so no user services were started$' || ok=0
     rm -f "$dir/nofile.img"
 
-    services_boot off "$dir/services.cpio" "$card" "data=off" "wait:2" "sh /root/services.sh off\n" "until:svc-done"
+    services_boot off "$dir/services.cpio" "$card" "data=off" "wait:2" "sh /tests/services.sh off\n" "until:svc-done"
+    # With /data not mounted, /usr is in memory and holds no busybox, so ntpd
+    # is started and reported as could not be started, to be tried again.
     services_expect off "services: 1 system started; no user list, /data is not mounted" \
-        "$system_ntpd" '^svc-status: site absent$' \
+        '^svc-status: ntpd list=system state=waiting starts=[1-9][0-9]* last=could not be started: No such file or directory \(os error 2\)$' \
+        '^svc-layout: /usr is a directory in memory holding \[bin\]$' \
+        '^svc-layout: /root is a directory in memory holding \[\]$' \
+        '^svc-status: site absent$' \
         '^svc-errors: /data/services.txt: /data is not mounted, so no user services were started$' || ok=0
 
     services_card ntpd "$(printf '%s\n' \
         "ntpd     always  /bin/sh -c 'echo impostor > /tmp/impostor.txt'" \
         "other    once    /bin/sh -c 'echo other > /tmp/other.txt'")" || ok=0
-    services_boot ntpd "$dir/services.cpio" "$dir/ntpd.img" "" "wait:2" "sh /root/services.sh ntpd\n" "until:svc-done"
+    services_boot ntpd "$dir/services.cpio" "$dir/ntpd.img" "" "wait:2" "sh /tests/services.sh ntpd\n" "until:svc-done"
     services_expect ntpd "services: 1 system started; 1 user started, 1 line skipped (see /run/services/errors.txt)" \
-        "$system_ntpd" '^svc-ntpd-command: /bin/busybox ntpd -n -q$' \
+        "$system_ntpd" '^svc-ntpd-command: /usr/bin/busybox ntpd -n -q$' \
         '^svc-errors: /data/services.txt line 1: ntpd is the name of a system service, which runs as the system list has it, and a user service cannot replace or disable it$' \
         '^svc-other: ran$' '^svc-impostor: did not run$' || ok=0
     rm -f "$dir/ntpd.img"
@@ -1398,11 +1493,11 @@ SCRIPT
   # The starter stopped after the system services and before the user list,
   # with the first card in the slot on aarch64, whose services it would
   # otherwise start.
-  services_boot hang "$dir/services.cpio" "$card" "servicetest=hang" "wait:1" "sh /root/services.sh hang\n" "until:svc-done"
+  services_boot hang "$dir/services.cpio" "$card" "servicetest=hang" "wait:1" "sh /tests/services.sh hang\n" "until:svc-done"
   services_expect hang none \
       '^init: the service starter has not finished after 10 s; starting the shell, and the starter carries on$' \
       "$system_ntpd" '^svc-status: site absent$' || ok=0
-  services_boot abort "$dir/services.cpio" "$card" "servicetest=abort" "wait:1" "sh /root/services.sh abort\n" "until:svc-done"
+  services_boot abort "$dir/services.cpio" "$card" "servicetest=abort" "wait:1" "sh /tests/services.sh abort\n" "until:svc-done"
   services_expect abort none \
       '^init: the service starter ended on signal 6 before it finished; the services it had not started are not running$' \
       "$system_ntpd" '^svc-status: site absent$' || ok=0
@@ -1517,7 +1612,7 @@ run_boot_ids() {
   echo
 }
 
-run_suite "userland and shell" "/root/suite.sh" 240
+run_suite "userland and shell" "/tests/suite.sh" 240
 run_suite "rust standard library" "init=/bin/rtest" 300
 # The protocols against a card that only records what it is asked to send:
 # frames in by hand, frames out compared byte for byte.
@@ -1528,7 +1623,7 @@ run_suite "internet sockets" "init=/bin/inet" 120
 # The two suites below run software this project did not build. Both images
 # are fetched for the machine ARCH names, so both run on either one.
 if [ -x "$BUSYBOX" ]; then
-  run_suite "upstream busybox" "/root/busybox.sh" 300
+  run_suite "upstream busybox" "/tests/busybox.sh" 300
 else
   echo ">> upstream busybox: skipped (run ARCH=$ARCH scripts/fetch-busybox.sh)"
   skipped=$((skipped + 1))

@@ -4,7 +4,8 @@
 #
 # One service per line: a name, a policy (always, once or off), any options,
 # and the command, which starts with the program's absolute path. The README
-# describes the format under "Services started at boot".
+# describes the format under "Services started at boot". Programs kept on this
+# card are in /usr/bin, which is /data/usr/bin.
 #
 # See what runs with:     cat /run/services/*
 # A service's output is:  /var/log/NAME.log
@@ -17,5 +18,5 @@
 # transport the board's tunnel runs were made with.
 #
 # name    policy  options          command
-site      always                   /bin/httpd -f -p 8080 -h /data/site
-tunnel    always  backoff=30s-5m   /bin/cloudflared tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:8080
+site      always                   /usr/bin/httpd -f -p 8080 -h /data/site
+tunnel    always  backoff=30s-5m   /usr/bin/cloudflared tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:8080

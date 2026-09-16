@@ -13,10 +13,11 @@
 //!   the same files on the Mac.
 //! - `vfs`: the nodes /data is made of in the kernel's tree.
 //!
-//! **Keeping /data away from the system.** The kernel and everything it runs
-//! come from the initramfs, which the firmware has loaded before this kernel
-//! starts, so nothing on the data volume is needed to boot or to run. What is
-//! on the card is what a person changes by hand, and four rules follow:
+//! **Keeping /data away from the system.** The kernel, init and the shell, and
+//! what they need to reach the network and the console, come from the
+//! initramfs, which the firmware has loaded before this kernel starts, so
+//! nothing on the data volume is needed to boot or to reach the machine. What
+//! is on the card is what a person changes by hand, and four rules follow:
 //!
 //! 1. Nothing about the card stops boot or a restart. Bring-up runs in a kernel
 //!    task, init waits for it for at most `WAIT_SECONDS`, every wait inside it
@@ -42,6 +43,21 @@
 //! `start4.elf` or `kernel8.img`: that is a boot partition, and a `data=` that
 //! names one by mistake must not make it writable. `data=off` leaves the card
 //! alone.
+//!
+//! **/usr and /root.** Programs that are not needed to boot live on the card
+//! in /data/usr, and the home directory in /data/root. Once the volume is
+//! mounted, and before `data:` is printed, bring-up makes either directory
+//! on the card if it is missing and replaces the empty in-memory /usr and
+//! /root with symbolic links to them. It is done here rather than by init
+//! because this is the one place that knows whether and when the volume was
+//! mounted, including a mount that ends after init has been started, and so
+//! every boot gets the same layout whatever program is init. Links rather
+//! than a second mount of a subdirectory, because the tree already resolves
+//! links, the program loader included, so a PT_INTERP of
+//! /lib/ld-musl-aarch64.so.1 that links to /usr/lib reaches the card with no
+//! code of its own, and `rmdir` or `mv` of /data/usr needs no refusal: the link
+//! is left dangling, as on Linux. A directory that cannot be made, or a file
+//! in its place, leaves that one in memory, and the `data:` line says so.
 
 mod card;
 mod emmc2;
@@ -150,7 +166,7 @@ extern "C" fn task_main() -> ! {
     // says what it is.
     let mut found = Vec::new();
     let line = match bring_up(&label, &mut found) {
-        Ok(what) => format!("mounted {} at /data, in {} ms", what, (now_us() - started) / 1000),
+        Ok((what, layout)) => format!("mounted {} at /data, in {} ms; {}", what, (now_us() - started) / 1000, layout),
         Err(why) => format!("/data is not mounted: {}", why),
     };
     if found.is_empty() {
@@ -206,7 +222,9 @@ fn failure(error: fat::FsError) -> &'static str {
     }
 }
 
-fn bring_up(label: &str, found: &mut Vec<String>) -> Result<String, String> {
+/// Mount the volume and put /usr and /root on it. Returns what was mounted, and
+/// where /usr and /root are.
+fn bring_up(label: &str, found: &mut Vec<String>) -> Result<(String, String), String> {
     let mut controller = emmc2::find()?;
     let (mut host, from_caps, from_firmware) = controller.host()?;
     found.push(format!(
@@ -264,18 +282,55 @@ fn bring_up(label: &str, found: &mut Vec<String>) -> Result<String, String> {
     }
     let unclean = volume.dirty_at_mount();
     volume.allow_writes();
+    let on_card: Vec<(&str, Result<(), &str>)> = ON_CARD.iter().map(|&name| (name, card_directory(&mut volume, name))).collect();
     vfs::publish(volume, device);
-    Ok(format!(
-        "{} of the card, labelled {}, {} MiB in {} clusters of {} bytes{}",
-        what,
-        found_label,
-        layout.sectors / 2048,
-        layout.clusters,
-        layout.cluster_bytes,
-        if unclean {
-            ", which FAT[1] says was not dismounted cleanly and stays marked so until fsck_msdos repairs it"
-        } else {
-            ""
+    let mut linked = Vec::new();
+    let mut in_memory = Vec::new();
+    for (name, outcome) in on_card {
+        match outcome {
+            Ok(()) => {
+                vfs::link_to_card(name);
+                linked.push(format!("/{} is a link to /data/{}", name, name));
+            }
+            Err(why) => in_memory.push(format!("/{} stays in memory: /data/{} {}", name, name, why)),
         }
+    }
+    linked.extend(in_memory);
+    Ok((
+        format!(
+            "{} of the card, labelled {}, {} MiB in {} clusters of {} bytes{}",
+            what,
+            found_label,
+            layout.sectors / 2048,
+            layout.clusters,
+            layout.cluster_bytes,
+            if unclean {
+                ", which FAT[1] says was not dismounted cleanly and stays marked so until fsck_msdos repairs it"
+            } else {
+                ""
+            }
+        ),
+        linked.join("; "),
     ))
+}
+
+/// The directories of the root filesystem kept on the card, as their names
+/// under / and at the root of the volume.
+const ON_CARD: [&str; 2] = ["usr", "root"];
+
+/// Make the directory `name` at the root of the volume unless it is there,
+/// and say why it cannot be used when it is not a directory by the end.
+fn card_directory(volume: &mut fat::Volume<card::Partition>, name: &str) -> Result<(), &'static str> {
+    let made = match volume.lookup("", name) {
+        Ok(entry) if entry.is_dir => return Ok(()),
+        Ok(_) => return Err("is a file"),
+        Err(fat::FsError::NotFound) => volume.mkdir("", name).map(|_| ()),
+        Err(e) => Err(e),
+    };
+    made.map_err(|e| match e {
+        fat::FsError::Io => "could not be made: the card failed a command",
+        fat::FsError::Corrupt => "could not be made: the volume's structures are damaged",
+        fat::FsError::NoSpace => "could not be made: the volume is full",
+        _ => "could not be made",
+    })
 }

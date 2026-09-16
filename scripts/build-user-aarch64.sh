@@ -3,7 +3,9 @@
 #
 # The same rootfs as scripts/build-user.sh, for the other machine. It writes
 # build/rootfs-aarch64 and build/initramfs-aarch64.cpio, so the x86-64 image
-# stays where it is and the two can be built side by side.
+# stays where it is and the two can be built side by side. It also writes the
+# board image, build/initramfs-aarch64-board.cpio, and build/data-aarch64,
+# what a new card's /data starts with.
 #
 # No cross toolchain is needed beyond rustup's: the musl libc, the C runtime
 # objects and rust-lld all come out of the aarch64-unknown-linux-musl target's
@@ -46,7 +48,7 @@ INET="$ROOT/user/inet/target/$TARGET/release/inet"
 # ---- stage everything either image can have ------------------------------
 RFS="$ROOT/build/stage-aarch64"
 rm -rf "$RFS"
-mkdir -p "$RFS"/{bin,etc,root,tmp,dev,proc}
+mkdir -p "$RFS"/{bin,etc,tests,tmp,dev,proc}
 
 cp "$INET" "$RFS/bin/inet"
 chmod +x "$RFS/bin/inet"
@@ -83,9 +85,11 @@ fi
 # A web server. Alpine's busybox-static above has no httpd, telnetd or nc:
 # Alpine builds those into busybox-extras, which it publishes only dynamically
 # linked, so it comes with musl's dynamic loader, the file its program header
-# names, which is also musl's libc. /bin/httpd is the name a service uses on
-# either machine; the x86-64 build points it at busybox.net's busybox, which
-# has httpd of its own.
+# names, which is also musl's libc. In the test image /bin/httpd is the name
+# the suites use on either machine; the x86-64 build points it at busybox.net's
+# busybox, which has httpd of its own. A card gets these under /usr instead,
+# with /usr/bin/httpd a script, and the board image a link from the path the
+# program header names to /usr/lib (scripts/images.sh).
 if [ -x "$ROOT/build/thirdparty/busybox-extras-aarch64" ] && [ -f "$ROOT/build/thirdparty/ld-musl-aarch64.so.1" ]; then
   mkdir -p "$RFS/lib"
   cp "$ROOT/build/thirdparty/busybox-extras-aarch64" "$RFS/bin/busybox-extras"
@@ -123,10 +127,10 @@ fi
 # that fails to build is left out with a warning rather than failing the
 # image, since the test harness builds this image before every run.
 if command -v go >/dev/null 2>&1; then
-  mkdir -p "$RFS/root"
+  mkdir -p "$RFS/tests"
   if ! (cd "$ROOT/user/go" && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-        go build -trimpath -o "$RFS/root/go_main" .); then
-    echo "warning: user/go did not build; /root/go_main left out" >&2
+        go build -trimpath -o "$RFS/tests/go_main" .); then
+    echo "warning: user/go did not build; /tests/go_main left out" >&2
   fi
 fi
 
@@ -171,18 +175,18 @@ HOSTNAME
 mkdir -p "$RFS/etc/claudeos"
 cp "$ROOT/user/services" "$RFS/etc/claudeos/services"
 
-cp "$ROOT/tests/demo.sh" "$RFS/root/demo.sh"
-cp "$ROOT/tests/suite.sh" "$RFS/root/suite.sh"
-cp "$ROOT/tests/busybox.sh" "$RFS/root/busybox.sh"
+cp "$ROOT/tests/demo.sh" "$RFS/tests/demo.sh"
+cp "$ROOT/tests/suite.sh" "$RFS/tests/suite.sh"
+cp "$ROOT/tests/busybox.sh" "$RFS/tests/busybox.sh"
 # Only the Pi 4 has a card slot, so only this image has the /data suite.
-cp "$ROOT/tests/data.sh" "$RFS/root/data.sh"
+cp "$ROOT/tests/data.sh" "$RFS/tests/data.sh"
 
-cat > "$RFS/root/hello.txt" <<'HELLO'
+cat > "$RFS/tests/hello.txt" <<'HELLO'
 This file came from the initramfs, unpacked by the kernel at boot.
 HELLO
 
 # Scripts need the execute bit and a #! line to run as ./script.
-for script in "$RFS"/root/*.sh; do
+for script in "$RFS"/tests/*.sh; do
   if ! head -n 1 "$script" | grep -q '^#!'; then
     printf '#!/bin/sh\n%s' "$(cat "$script")" > "$script.tmp"
     mv "$script.tmp" "$script"
@@ -190,7 +194,7 @@ for script in "$RFS"/root/*.sh; do
   chmod +x "$script"
 done
 
-# ---- the two images --------------------------------------------------------
+# ---- the two images, and the card ------------------------------------------
 # The kernel is built before this, by scripts/test.sh and by hand alike, so its
 # digest in the manifests is the kernel's that boots with them.
 check_staged "$RFS"
@@ -198,6 +202,8 @@ assemble_image test "$RFS" "$TEST_TREE" "$ROOT/build/initramfs-aarch64.cpio" \
     "$ROOT/build/kernel-aarch64.elf"
 assemble_image board "$RFS" "$BOARD_TREE" "$ROOT/build/initramfs-aarch64-board.cpio" \
     "$ROOT/build/kernel-aarch64.elf"
+# What scripts/mkcard.sh --new puts on /data, and --usr puts on /data/usr.
+assemble_card "$RFS" "$ROOT/build/data-aarch64"
 echo
 ls -la "$ROOT/build/initramfs-aarch64.cpio" "$ROOT/build/initramfs-aarch64-board.cpio"
 

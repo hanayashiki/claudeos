@@ -171,8 +171,10 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::CHMOD => file::chmod(AT_FDCWD, args[0], args[1] as u32),
         nr::FCHMOD => file::fchmod(args[0] as i32, args[1] as u32),
         nr::FCHMODAT => file::chmod(args[0] as i64, args[1], args[2] as u32),
-        // Everything runs as root on a single-user system.
-        nr::CHOWN | nr::FCHOWN | nr::LCHOWN | nr::FCHOWNAT => Ok(0),
+        nr::CHOWN => file::chown(AT_FDCWD, args[0], args[1] as u32, args[2] as u32, 0),
+        nr::LCHOWN => file::chown(AT_FDCWD, args[0], args[1] as u32, args[2] as u32, AT_SYMLINK_NOFOLLOW),
+        nr::FCHOWN => file::fchown(args[0] as i32, args[1] as u32, args[2] as u32),
+        nr::FCHOWNAT => file::chown(args[0] as i64, args[1], args[2] as u32, args[3] as u32, args[4] as u32),
         nr::FSYNC | nr::FDATASYNC => file::fsync(args[0] as i32),
         nr::SYNC => file::sync(),
         nr::SYNCFS => file::syncfs(args[0] as i32),

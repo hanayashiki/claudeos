@@ -830,7 +830,16 @@ impl Task {
         if into < file.length {
             let want = (file.length - into).min(PAGE_SIZE_U64) as usize;
             let from = (file.offset + into) as usize;
-            let filled = {
+            let filled = if file.node.kind == crate::fs::NodeKind::DataFile {
+                // A program kept on the data volume: the page comes from the
+                // card, through the volume's sleeping lock, as a read would.
+                // A page the card cannot give is a fault the program is not
+                // served, the same as an address with nothing mapped.
+                match crate::fs::data::read(&file.node, crate::fs::Offset::new(from as u64), &mut fresh.bytes()[..want]) {
+                    Ok(n) => n,
+                    Err(_) => return false,
+                }
+            } else {
                 let data = file.node.inner.lock();
                 let available = data.data.len().saturating_sub(from).min(want);
                 fresh.bytes()[..available].copy_from_slice(&data.data[from..from + available]);
@@ -1235,23 +1244,15 @@ pub fn read_executable(
     if node.mode() & 0o111 == 0 {
         return Err(Errno::EACCES);
     }
-    let shebang = {
-        let inner = node.inner.lock();
-        let data = &inner.data;
-        if data.starts_with(b"#!") {
-            let line_end = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
-            let line = core::str::from_utf8(&data[2..line_end]).map_err(|_| Errno::ENOEXEC)?;
-            let line = line.trim();
-            let mut parts = line.splitn(2, char::is_whitespace);
-            let interp = parts.next().unwrap_or("").trim().to_string();
-            let arg = parts.next().map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
-            if interp.is_empty() {
-                return Err(Errno::ENOEXEC);
-            }
-            Some((interp, arg))
-        } else {
-            None
-        }
+    let shebang = if node.kind == crate::fs::NodeKind::DataFile {
+        // A file on the data volume holds nothing in its node, so its first
+        // bytes are read from the card: as many as Linux's BINPRM_BUF_SIZE,
+        // which is the longest `#!` line Linux reads.
+        let mut head = [0u8; 256];
+        let n = crate::fs::data::read(&node, crate::fs::Offset::START, &mut head)?;
+        shebang_of(&head[..n])?
+    } else {
+        shebang_of(&node.inner.lock().data)?
     };
     if let Some((interp, arg)) = shebang {
         let interp_node = crate::fs::lookup(&interp)?;
@@ -1261,6 +1262,24 @@ pub fn read_executable(
         return Ok((interp_node, Some((interp, arg))));
     }
     Ok((node, None))
+}
+
+/// The interpreter a `#!` line at the start of `data` names, and the one
+/// argument that may follow it.
+fn shebang_of(data: &[u8]) -> Result<Option<(String, Option<String>)>, Errno> {
+    if !data.starts_with(b"#!") {
+        return Ok(None);
+    }
+    let line_end = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
+    let line = core::str::from_utf8(&data[2..line_end]).map_err(|_| Errno::ENOEXEC)?;
+    let line = line.trim();
+    let mut parts = line.splitn(2, char::is_whitespace);
+    let interp = parts.next().unwrap_or("").trim().to_string();
+    let arg = parts.next().map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
+    if interp.is_empty() {
+        return Err(Errno::ENOEXEC);
+    }
+    Ok(Some((interp, arg)))
 }
 
 /// Entry point for a task created by the kernel rather than by fork: load the

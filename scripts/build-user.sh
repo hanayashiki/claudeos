@@ -34,7 +34,7 @@ INET="$ROOT/user/inet/target/$TARGET/release/inet"
 # ---- stage everything the image can have ---------------------------------
 RFS="$ROOT/build/stage"
 rm -rf "$RFS"
-mkdir -p "$RFS"/{bin,etc,root,tmp,dev,proc}
+mkdir -p "$RFS"/{bin,etc,tests,tmp,dev,proc}
 
 cp "$INET" "$RFS/bin/inet"
 chmod +x "$RFS/bin/inet"
@@ -57,7 +57,7 @@ fi
 if [ -x "$ROOT/build/thirdparty/busybox" ]; then
   cp "$ROOT/build/thirdparty/busybox" "$RFS/bin/busybox"
   chmod +x "$RFS/bin/busybox"
-  # The web server a service names as /bin/httpd on either machine. This
+  # The web server the suites name as /bin/httpd on either machine. This
   # busybox has httpd; on aarch64 the link is to busybox-extras.
   ln -sf busybox "$RFS/bin/httpd"
 fi
@@ -77,10 +77,10 @@ fi
 # that fails to build is left out with a warning rather than failing the
 # image, since the test harness builds this image before every run.
 if command -v go >/dev/null 2>&1; then
-  mkdir -p "$RFS/root"
+  mkdir -p "$RFS/tests"
   if ! (cd "$ROOT/user/go" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-        go build -trimpath -o "$RFS/root/go_main" .); then
-    echo "warning: user/go did not build; /root/go_main left out" >&2
+        go build -trimpath -o "$RFS/tests/go_main" .); then
+    echo "warning: user/go did not build; /tests/go_main left out" >&2
   fi
 fi
 
@@ -110,17 +110,17 @@ HOSTNAME
 mkdir -p "$RFS/etc/claudeos"
 cp "$ROOT/user/services" "$RFS/etc/claudeos/services"
 
-cp "$ROOT/tests/demo.sh" "$RFS/root/demo.sh"
+cp "$ROOT/tests/demo.sh" "$RFS/tests/demo.sh"
 
-cat > "$RFS/root/hello.txt" <<'HELLO'
+cat > "$RFS/tests/hello.txt" <<'HELLO'
 This file came from the initramfs, unpacked by the kernel at boot.
 HELLO
 
-cp "$ROOT/tests/suite.sh" "$RFS/root/suite.sh"
-cp "$ROOT/tests/busybox.sh" "$RFS/root/busybox.sh"
+cp "$ROOT/tests/suite.sh" "$RFS/tests/suite.sh"
+cp "$ROOT/tests/busybox.sh" "$RFS/tests/busybox.sh"
 
 # Scripts need the execute bit and a #! line to run as ./script.
-for script in "$RFS"/root/*.sh; do
+for script in "$RFS"/tests/*.sh; do
   if ! head -n 1 "$script" | grep -q '^#!'; then
     printf '#!/bin/sh\n%s' "$(cat "$script")" > "$script.tmp"
     mv "$script.tmp" "$script"
