@@ -573,23 +573,29 @@ pub fn readlinkat(dirfd: i64, path_addr: u64, out: u64, len: usize) -> SysResult
 /// Change a file's permission bits, keeping its type bits.
 pub fn chmod(dirfd: i64, path_addr: u64, mode: u32) -> SysResult {
     let path = resolve_at(dirfd, path_addr)?;
-    let node = fs::lookup(&path)?;
-    // FAT keeps no permission bits. The call succeeds and changes nothing, as
-    // Linux's vfat does when mounted with `quiet`, so that `cp -p` and `tar`
-    // can copy onto /data; stat goes on reporting 0644 and 0755.
-    if node.is_stored() {
-        return Ok(0);
-    }
-    let mut inner = node.inner.lock();
-    inner.mode = (inner.mode & S_IFMT) | (mode & 0o7777);
-    Ok(0)
+    set_mode(&fs::lookup(&path)?, mode)
 }
 
 pub fn fchmod(fd: i32, mode: u32) -> SysResult {
     let file = sched::current().fds.get(fd)?;
-    let node = file.node().ok_or(Errno::EBADF)?;
+    set_mode(file.node().ok_or(Errno::EBADF)?, mode)
+}
+
+/// Give `node` the permission bits `mode`.
+///
+/// FAT keeps no permission bits, and every file and directory on /data
+/// reports 0777. Asking for that mode succeeds and asking for any other is
+/// EPERM, so a chmod that returns 0 has left the file with the mode it asked
+/// for. Linux's vfat, mounted without `quiet`, answers EPERM in `fat_setattr`
+/// for bits it has no place for, setuid, setgid and sticky, and a mode that
+/// clears every write bit sets the FAT read-only attribute; a change to the
+/// other bits it cannot store it lets through as success without effect
+/// ("We don't return -EPERM here. Yes, strange, but this is too old
+/// behavior."). Here those are EPERM as well, and the read-only attribute is
+/// not used.
+fn set_mode(node: &fs::NodeRef, mode: u32) -> SysResult {
     if node.is_stored() {
-        return Ok(0);
+        return if mode & 0o7777 == node.mode() & 0o7777 { Ok(0) } else { Err(Errno::EPERM) };
     }
     let mut inner = node.inner.lock();
     inner.mode = (inner.mode & S_IFMT) | (mode & 0o7777);

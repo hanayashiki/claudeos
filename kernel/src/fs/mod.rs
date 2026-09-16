@@ -170,9 +170,11 @@ impl Node {
 
     /// A node for an entry on the data volume, with the inode number the
     /// volume's code gives its path. Files on FAT have no owner or permission
-    /// bits, so every one is root's, 0644 for a file and 0755 for a directory.
+    /// bits, so every one is root's with mode 0777, file and directory alike,
+    /// as Linux's vfat reports them when mounted with `umask=0`. That is what
+    /// lets a program kept on the card, in /usr/bin, be run.
     pub fn new_stored(ino: u64, is_dir: bool, path: String, len: u64, mtime: i64) -> NodeRef {
-        let (kind, mode) = if is_dir { (NodeKind::DataDir, S_IFDIR | 0o755) } else { (NodeKind::DataFile, S_IFREG | 0o644) };
+        let (kind, mode) = if is_dir { (NodeKind::DataDir, S_IFDIR | 0o777) } else { (NodeKind::DataFile, S_IFREG | 0o777) };
         Arc::new(Node {
             ino,
             kind,

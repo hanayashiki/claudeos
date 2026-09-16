@@ -2,6 +2,7 @@
 
 use crate::abi::Errno;
 use crate::arch::paging::{AddressSpace, FreshPage, NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::fs::NodeKind;
 use crate::mm::{page_align_down, PAGE_SIZE_U64};
 use alloc::collections::{BTreeMap, BTreeSet};
 
@@ -87,6 +88,26 @@ pub struct ProgramHeader {
     pub p_align: u64,
 }
 
+impl ProgramHeader {
+    /// The entry that starts at `base` in `data`.
+    fn parse(data: &[u8], base: usize) -> Result<ProgramHeader, Errno> {
+        Ok(ProgramHeader {
+            p_type: rd32(data, base)?,
+            p_flags: rd32(data, base + 4)?,
+            p_offset: rd64(data, base + 8)?,
+            p_vaddr: rd64(data, base + 16)?,
+            p_filesz: rd64(data, base + 32)?,
+            p_memsz: rd64(data, base + 40)?,
+            p_align: rd64(data, base + 48)?,
+        })
+    }
+}
+
+/// The largest program header table the loader reads, the bound Linux's
+/// `elf_read_phdrs` puts on it. A table from memory is read in place, but one
+/// on the card is copied out first, and its size is two numbers from the file.
+const MAX_PHDR_BYTES: u64 = 65536;
+
 /// The ELF header, and how long the file was when it was read.
 ///
 /// The node's lock masks interrupts, so it is taken for these sixty-four bytes
@@ -95,6 +116,13 @@ pub struct ProgramHeader {
 /// and stays what it was.
 fn head_of(node: &crate::fs::NodeRef) -> Result<([u8; 64], usize), Errno> {
     let mut head = [0u8; 64];
+    if node.kind == NodeKind::DataFile {
+        let size = node.size() as usize;
+        if size < 64 || read_into(node, 0, &mut head)? < 64 {
+            return Err(Errno::ENOEXEC);
+        }
+        return Ok((head, size));
+    }
     let inner = node.inner.lock();
     if inner.data.len() < 64 {
         return Err(Errno::ENOEXEC);
@@ -165,26 +193,29 @@ impl Headers {
         // e_phoff is a 64-bit number from the file, so the end of the table is
         // a sum that wraps: one near the top of the range plus a table of any
         // size is a small number, and a small number is inside the file.
-        if sum(&[phoff, phnum * phent])? > size as u64 {
+        if phnum * phent > MAX_PHDR_BYTES || sum(&[phoff, phnum * phent])? > size as u64 {
             return Err(Errno::ENOEXEC);
         }
         // Room for the table is asked for before the file is locked: the
         // allocator is the slow half of this, and it has a lock of its own.
         let mut phdrs = alloc::vec::Vec::with_capacity(phnum as usize);
+        if node.kind == NodeKind::DataFile {
+            // Copied out through the volume, whose lock sleeps, rather than
+            // read under the node's.
+            let mut table = alloc::vec![0u8; (phnum * phent) as usize];
+            if read_into(node, phoff, &mut table)? < table.len() {
+                return Err(Errno::ENOEXEC);
+            }
+            for i in 0..phnum {
+                phdrs.push(ProgramHeader::parse(&table, (i * phent) as usize)?);
+            }
+            return Ok(Headers { size, e_type, e_entry, phoff, phent, phnum, phdrs });
+        }
         let inner = node.inner.lock();
         for i in 0..phnum {
             // A file shortened since its length was read fails here, because
             // every field is taken from the buffer the file has now.
-            let base = (phoff + i * phent) as usize;
-            phdrs.push(ProgramHeader {
-                p_type: rd32(&inner.data, base)?,
-                p_flags: rd32(&inner.data, base + 4)?,
-                p_offset: rd64(&inner.data, base + 8)?,
-                p_vaddr: rd64(&inner.data, base + 16)?,
-                p_filesz: rd64(&inner.data, base + 32)?,
-                p_memsz: rd64(&inner.data, base + 40)?,
-                p_align: rd64(&inner.data, base + 48)?,
-            });
+            phdrs.push(ProgramHeader::parse(&inner.data, (phoff + i * phent) as usize)?);
         }
         drop(inner);
         Ok(Headers { size, e_type, e_entry, phoff, phent, phnum, phdrs })
@@ -198,12 +229,18 @@ impl Headers {
 /// were read gives back less than was asked for, and the rest of the page
 /// stays as the fresh frame was, which is zero. That is what the fault handler
 /// does with a page of the same image that arrives later.
-fn read_into(node: &crate::fs::NodeRef, off: u64, dst: &mut [u8]) -> usize {
+///
+/// A file on the data volume is read through the volume instead, with no
+/// node lock held, and a card that fails the read fails the load.
+fn read_into(node: &crate::fs::NodeRef, off: u64, dst: &mut [u8]) -> Result<usize, Errno> {
+    if node.kind == NodeKind::DataFile {
+        return crate::fs::data::read(node, crate::fs::Offset::new(off), dst);
+    }
     let inner = node.inner.lock();
     let start = off as usize;
     let n = inner.data.len().saturating_sub(start).min(dst.len());
     dst[..n].copy_from_slice(&inner.data[start..start + n]);
-    n
+    Ok(n)
 }
 
 /// The sum of numbers that came out of the file.
@@ -418,7 +455,7 @@ pub fn load_at(
             if let Some(fresh) = fresh.get_mut(&page) {
                 let at = (address - page) as usize;
                 let end = at + chunk as usize;
-                let n = read_into(node, extent.file_offset + offset, &mut fresh.bytes()[at..end]);
+                let n = read_into(node, extent.file_offset + offset, &mut fresh.bytes()[at..end])?;
                 // These bytes are about to be executed, and on some machines
                 // writing them is not enough to make them fetchable. What the
                 // maintenance names is the address they were written through,
@@ -471,7 +508,7 @@ pub fn load_at(
             // p_filesz is a number from the file like any other, and what it
             // measures here is a path, so no more than a path's worth is read.
             let mut name = alloc::vec![0u8; (ph.p_filesz as usize).min(4096)];
-            let read = read_into(node, ph.p_offset, &mut name);
+            let read = read_into(node, ph.p_offset, &mut name)?;
             if let Ok(text) = core::str::from_utf8(&name[..read]) {
                 interp = Some(alloc::string::String::from(text.trim_end_matches('\0')));
             }
