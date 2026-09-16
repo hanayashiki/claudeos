@@ -1369,8 +1369,9 @@ failures.
   reads differ and that 4 KiB of it holds nearly all 256 byte values, which is
   a check that the generator is running and not a check that it is any good.
 - The `rtest` applet, which only the test image's cbox is built with, runs
-  **112 checks** against the Rust standard library, 111 on aarch64, which has
-  no `alarm` system call of its own:
+  **117 checks** against the Rust standard library on either machine: one for
+  `alarm` on x86-64 only, because aarch64 has no such system call, and one on
+  aarch64 only that the auxiliary vector does not claim `HWCAP_CPUID`:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
   thread sleep against the monotonic clock, the tick measured against that same
@@ -1392,7 +1393,9 @@ failures.
   waking promptly when a write arrives, and a walk of the system call numbers
   past the end of the table, every one of which has to answer ENOSYS, and
   `reboot` given magic numbers or a command it does not know, which has to
-  answer EINVAL. The wall clock is set with `clock_settime`, with musl's
+  answer EINVAL, and `/proc/self/auxv` read as pairs ending with `AT_NULL`
+  whose `AT_HWCAP`, `AT_PAGESZ` and `AT_ENTRY` are what musl's `getauxval`
+  returns, with a non-zero `AT_HWCAP`. The wall clock is set with `clock_settime`, with musl's
   `settimeofday` and with the `settimeofday` system call by number, forward,
   back past the boot floor and with arguments that have to be refused; across
   those steps the monotonic clock has to run straight on, a one-second sleep
