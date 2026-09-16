@@ -99,14 +99,6 @@ bytes such as 0xff, on both machines.
   them on. aarch64 already does the equivalent, and the copy-on-write repair
   masks explicitly either way.
 - **`fork` does not copy the parent's signal mask**; Linux does.
-- **A fatal signal ends one thread, not the process.** A SIGKILL sent from
-  outside, a fault, or a signal whose default action is to terminate ends only
-  the thread that takes it: `check_signals` and `kill_current` call
-  `exit_current`, and `kill` signals only the task with that pid. The other
-  threads keep running. Linux ends the whole thread group.
-- **A stopped thread survives `exit_group`.** The call marks SIGKILL pending
-  on the other threads with `add_pending` rather than `post_signal`, so a
-  stopped thread is not woken to take it.
 - **Carried over from the 2026-09-14 notes, not re-checked since:**
   - `openat(AT_FDCWD, "")` returns the current directory, where Linux returns
     ENOENT;

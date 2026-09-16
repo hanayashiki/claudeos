@@ -528,6 +528,193 @@ fn a_first_thread_that_exits_alone_is_not_the_process(report: &mut Report) {
     );
 }
 
+/// Fork a child for the checks on a whole thread group. The child sends its
+/// first thread's id down a pipe and runs `body` with the pipe's writing end;
+/// `body` starts the child's other threads, each of which sends its own id.
+/// Returns the child's pid and the `threads` ids, first thread's first, once
+/// they have all arrived, which says the threads have all started.
+fn thread_group_child(threads: usize, body: impl FnOnce(i32)) -> Result<(i64, Vec<i32>), String> {
+    use crate::sys;
+
+    let Ok((reader, writer)) = sys::pipe() else {
+        return Err("no pipe for the thread ids".to_string());
+    };
+    let child = sys::fork();
+    if child == 0 {
+        sys::close(reader);
+        send_tid(writer);
+        body(writer);
+        // Every body ends the process before this, or is meant to.
+        sys::exit_group(99);
+    }
+    sys::close(writer);
+    if child < 0 {
+        sys::close(reader);
+        return Err(format!("fork returned {}", child));
+    }
+    let tids = read_tids(reader, threads);
+    sys::close(reader);
+    if tids.len() != threads {
+        return Err(format!("forked {}, {} of {} thread ids arrived", child, tids.len(), threads));
+    }
+    Ok((child, tids))
+}
+
+/// Wait for a child `thread_group_child` made, for two seconds at most, and
+/// say what is wrong if the process did not end whole, promptly, killed by
+/// `signum`: a wait that took longer, another status, or any of its threads
+/// still in /proc/tasks after the wait reported it.
+fn ended_by_signal(child: i64, tids: &[i32], signum: i32) -> Option<String> {
+    use crate::sys;
+    let started = Instant::now();
+    let (reaped, status) = wait_or_kill(child, Duration::from_secs(2));
+    let waited = started.elapsed();
+    let left = tasks_listed(tids);
+    let signalled = sys::signal_of(status) == Some(signum);
+    if reaped == child && signalled && waited < Duration::from_secs(2) && left.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "forked {} reaped {} status {:#x} after {:?}, still listed {:?}",
+        child, reaped, status, waited, left
+    ))
+}
+
+/// The same check over `rounds` children made by `make`, reported as `name`.
+fn every_child_ends_by_signal(
+    report: &mut Report,
+    name: &str,
+    rounds: usize,
+    signum: i32,
+    mut make: impl FnMut() -> Result<(i64, Vec<i32>), String>,
+) {
+    let mut wrong = Vec::new();
+    for _ in 0..rounds {
+        match make() {
+            Ok((child, tids)) => wrong.extend(ended_by_signal(child, &tids, signum)),
+            Err(err) => wrong.push(err),
+        }
+    }
+    report.check(
+        name,
+        wrong.is_empty(),
+        format!("{} of {} children: {}", wrong.len(), rounds, wrong.join("; ")),
+    );
+}
+
+/// A thread that aborts ends its whole process. Only the thread that took
+/// SIGABRT used to end: the first thread slept on, the parent's wait was not
+/// answered, and nothing of the process that aborted was told to anyone. Linux
+/// ends the thread group for a signal whose action is to terminate, and so
+/// does this now.
+fn a_thread_that_aborts_ends_its_process(report: &mut Report) {
+    const SIGABRT: i32 = 6;
+    every_child_ends_by_signal(
+        report,
+        "a thread's abort ends its whole process",
+        20,
+        SIGABRT,
+        || {
+            thread_group_child(2, |writer| {
+                std::thread::spawn(move || {
+                    send_tid(writer);
+                    std::process::abort();
+                });
+                std::thread::sleep(Duration::from_secs(10));
+            })
+        },
+    );
+}
+
+/// A thread that takes SIGSEGV with its default action ends its whole process,
+/// both when the signal is sent to the thread and when the thread faults.
+///
+/// The first is what the Go runtime does with a fault it cannot handle: it
+/// puts the default action back and sends the signal to its own thread with
+/// `tgkill`, to die of it. The second is the kernel's own kill for a fault,
+/// which no handler is asked about. Each ended only the thread; the rest of
+/// the process ran on and was never reported. A fault prints some eighty lines
+/// of registers and regions, so it gets one round: past the way the signal
+/// arrives, it ends the group through the same code the twenty rounds of the
+/// first form go through.
+fn a_thread_that_takes_sigsegv_ends_its_process(report: &mut Report) {
+    use crate::sys;
+    const SIGSEGV: i32 = 11;
+    const SIG_DFL: usize = 0;
+
+    every_child_ends_by_signal(
+        report,
+        "a thread that sends itself SIGSEGV ends its whole process",
+        20,
+        SIGSEGV,
+        || {
+            thread_group_child(2, |writer| {
+                std::thread::spawn(move || {
+                    send_tid(writer);
+                    unsafe { signal(SIGSEGV, SIG_DFL) };
+                    sys::tgkill(sys::getpid() as i32, sys::gettid() as i32, SIGSEGV);
+                    std::thread::sleep(Duration::from_secs(10));
+                });
+                std::thread::sleep(Duration::from_secs(10));
+            })
+        },
+    );
+    every_child_ends_by_signal(
+        report,
+        "a thread that faults ends its whole process",
+        1,
+        SIGSEGV,
+        || {
+            thread_group_child(2, |writer| {
+                std::thread::spawn(move || {
+                    send_tid(writer);
+                    let address = std::hint::black_box(16usize) as *mut u8;
+                    unsafe { std::ptr::write_volatile(address, 1) };
+                    std::thread::sleep(Duration::from_secs(10));
+                });
+                std::thread::sleep(Duration::from_secs(10));
+            })
+        },
+    );
+}
+
+/// SIGKILL sent to a process with several threads ends all of them. It used to
+/// end the task whose id is the process's, the one a wait reports, so the
+/// parent was told of a kill while the other threads ran on. One of them spins
+/// in user mode and two sleep; they finish by themselves after five seconds,
+/// so a kernel that leaves them running still finishes the suite.
+fn a_kill_ends_every_thread(report: &mut Report) {
+    use crate::sys;
+    const SIGKILL: i32 = 9;
+
+    every_child_ends_by_signal(
+        report,
+        "SIGKILL to a process ends every thread of it",
+        20,
+        SIGKILL,
+        || {
+            let made = thread_group_child(4, |writer| {
+                for spin in [true, false, false] {
+                    std::thread::spawn(move || {
+                        send_tid(writer);
+                        let started = Instant::now();
+                        while started.elapsed() < Duration::from_secs(5) {
+                            if !spin {
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                        }
+                    });
+                }
+                std::thread::sleep(Duration::from_secs(10));
+            });
+            if let Ok((child, _)) = &made {
+                sys::kill(*child as i32, SIGKILL);
+            }
+            made
+        },
+    );
+}
+
 /// A process blocked on something other than a child still has to learn that a
 /// child finished: the child signal is a signal, and every other one returns a
 /// sleeping task to the run queue. A shell waiting for a key is the case that
@@ -2282,6 +2469,9 @@ pub fn main(_args: &[String]) -> i32 {
     an_exit_from_a_thread_is_the_process_status(&mut report);
     a_signal_from_outside_is_still_reported(&mut report);
     a_first_thread_that_exits_alone_is_not_the_process(&mut report);
+    a_thread_that_aborts_ends_its_process(&mut report);
+    a_thread_that_takes_sigsegv_ends_its_process(&mut report);
+    a_kill_ends_every_thread(&mut report);
     a_child_exit_reaches_a_blocked_parent(&mut report);
     what_a_wait_does_with_signals(&mut report);
     a_continued_job_has_no_stop_to_report(&mut report);

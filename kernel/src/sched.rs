@@ -391,28 +391,50 @@ pub fn handle_user_page_fault(fault: &arch::PageFault) -> bool {
     current().fault_in(fault.address)
 }
 
-/// Terminate every task in `tgid`'s thread group except the caller, then the
-/// caller itself.
+/// Terminate every task in the caller's thread group except the caller, then
+/// the caller itself.
 ///
-/// `status` becomes the thread group's, as Linux's `do_group_exit` stores it in
-/// `group_exit_code`. The other threads are ended by SIGKILL and leave through
-/// `exit_current`, which gives each of them this status rather than the signal.
-/// The leader is the task a wait reports, and a program ends itself from
-/// whichever thread it is on -- Go from the one that ran `os.Exit` -- so when
-/// the leader recorded the signal, a parent was told that a process which
-/// exited with 1 had been killed by signal 9. The first thread to get here sets
-/// the status; a second caller leaves with that one, as in Linux.
+/// This is how a process ends, whichever way it is ended: the `exit_group`
+/// system call, a signal whose action is to terminate, a fault. Linux's
+/// `get_signal` ends the thread group for a fatal signal through the same
+/// `do_group_exit` the system call uses. Ending only the thread that took the
+/// signal left the rest of the process running, and its parent never told.
 pub fn exit_group(status: i32) -> ! {
-    let status = *current().group_exit.lock().get_or_insert(status);
-    let tgid = current().tgid;
-    let me = current().pid;
-    for_each(|task, table| {
-        if task.tgid == tgid && task.pid != me && task.state() != State::Zombie {
+    let status = with_tasks(|table| end_thread_group(&current(), status, table));
+    exit_current(status)
+}
+
+/// Record `status` as the thread group's and make SIGKILL pending on every live
+/// thread of the group that `member` belongs to, waking each. Returns the
+/// status the group ends with.
+///
+/// The calling thread is among them when it is in the group. One that is on
+/// its way out through `exit_current` never looks at the kill; one that sent
+/// SIGKILL to its own process takes it on the way back to user mode, as it
+/// would on Linux.
+///
+/// The status becomes the group's as Linux's `do_group_exit` stores it in
+/// `group_exit_code`, and the first to set it keeps it: the threads this ends
+/// leave through `exit_current`, which gives each the group's status rather
+/// than the SIGKILL. The leader is the task a wait reports, and a program ends
+/// itself from whichever thread it is on -- Go from the one that ran
+/// `os.Exit` -- so when the leader recorded the signal, a parent was told that
+/// a process which exited with 1 had been killed by signal 9.
+///
+/// A stopped thread is restarted to take the kill, as Linux's SIGKILL wakes a
+/// task in `TASK_STOPPED`. Marking the kill pending does not return a stopped
+/// task to the run queue, so a stopped thread outlived the rest of its
+/// process.
+fn end_thread_group(member: &Task, status: i32, table: &Held) -> i32 {
+    let status = *member.group_exit.lock().get_or_insert(status);
+    table.for_each(|task| {
+        if task.tgid == member.tgid && task.state() != State::Zombie {
+            task.restart_for_kill(table.irq());
             task.add_pending(SIGKILL.bit());
             task.wake(table.irq());
         }
     });
-    exit_current(status)
+    status
 }
 
 /// Terminate the current task. `status` is already encoded the way wait4
@@ -505,12 +527,14 @@ pub fn exit_current(status: i32) -> ! {
     }
 }
 
-/// Terminate the current task as if `signal` had killed it.
+/// Terminate the current task's process as if `signal` had killed it: a fault
+/// the kernel cannot repair ends the thread group the way the signal's default
+/// action would, not only the thread that faulted.
 pub fn kill_current(signal: Signal) -> ! {
     let name = current().name();
     let pid = current().pid;
     crate::println!("[kernel] pid {} ({}) killed by signal {}", pid, name, signal.number());
-    exit_current(signal.number())
+    exit_group(signal.number())
 }
 
 /// Raise a signal on the running task.
@@ -530,8 +554,11 @@ pub fn raise_on_current(signal: Signal) {
 /// the parent is found.
 pub fn post_signal(task: &Task, signal: Signal, table: &Held) {
     const STOPS: u64 = SIGSTOP.bit() | SIGTSTP.bit() | SIGTTIN.bit() | SIGTTOU.bit();
+    // SIGKILL ends the whole thread group from here, stopped threads included,
+    // as Linux's `complete_signal` does for a signal that is fatal to it.
     if signal == SIGKILL {
-        task.restart_for_kill(table.irq());
+        end_thread_group(task, SIGKILL.number(), table);
+        return;
     }
     if signal == SIGCONT {
         task.drop_pending(STOPS);
@@ -677,74 +704,91 @@ pub fn has_pending_signal_except(ignore: u64) -> bool {
 
 /// Act on pending signals before returning to user mode. Called once the
 /// syscall result has been stored, so a handler may run on the way out.
+///
+/// A signal whose action is to terminate ends the whole thread group, as
+/// Linux's `get_signal` does through `do_group_exit`, whether it was sent to
+/// the process or to this one thread: a Go program that meets a fault it cannot
+/// handle resets the handler and sends the signal to its own thread to die of
+/// it, and the process has to die with it.
 pub fn check_signals() {
     if !has_current() {
         return;
     }
     let task = current();
-    if task.pending() == 0 {
-        return;
-    }
 
-    for signal in Signal::all() {
-        let bit = signal.bit();
-        if task.pending() & bit == 0 {
-            continue;
+    // A stop is the one action after which there can be more to do: whatever
+    // continued the task can have left a signal of its own behind, SIGKILL
+    // among them, and Linux's `get_signal` goes round again for it rather than
+    // letting the task back into user mode first.
+    'scan: loop {
+        if task.pending() == 0 {
+            return;
         }
-        let blocked = task.blocked() & bit != 0;
-        if blocked && signal != SIGKILL && signal != SIGSTOP {
-            continue;
-        }
-        // Taken rather than dropped: only a take that finds the bit still set
-        // goes on to act on the signal.
-        if task.take_pending(bit) == 0 {
-            continue;
-        }
+        for signal in Signal::all() {
+            let bit = signal.bit();
+            if task.pending() & bit == 0 {
+                continue;
+            }
+            let blocked = task.blocked() & bit != 0;
+            if blocked && signal != SIGKILL && signal != SIGSTOP {
+                continue;
+            }
+            // Taken rather than dropped: only a take that finds the bit still
+            // set goes on to act on the signal.
+            if task.take_pending(bit) == 0 {
+                continue;
+            }
 
-        if signal == SIGKILL {
-            exit_current(signal.number());
-        }
+            if signal == SIGKILL {
+                exit_group(signal.number());
+            }
 
-        // Stopping and running a handler both leave the kernel in the middle
-        // of whatever it was doing, so both wait until the task is on its way
-        // back to user mode; until then the signal stays pending.
-        let stops = signal == SIGSTOP || {
+            // Stopping and running a handler both leave the kernel in the
+            // middle of whatever it was doing, so both wait until the task is
+            // on its way back to user mode; until then the signal stays
+            // pending.
+            let stops = signal == SIGSTOP || {
+                let action = task.action(signal);
+                signal.stops() && action.handler == crate::signal::SIG_DFL
+            };
+            if stops {
+                let frame = unsafe { &mut *task.trap_frame() };
+                if !frame.from_user() {
+                    task.add_pending(bit);
+                    return;
+                }
+                stop_current(signal);
+                continue 'scan;
+            }
+
             let action = task.action(signal);
-            signal.stops() && action.handler == crate::signal::SIG_DFL
-        };
-        if stops {
+            match action.handler {
+                crate::signal::SIG_IGN => continue,
+                crate::signal::SIG_DFL => {
+                    if crate::signal::default_is_ignore(signal) {
+                        continue;
+                    }
+                    exit_group(signal.number());
+                }
+                _ => {}
+            }
+
+            // A handler can only run on the way back to user mode.
             let frame = unsafe { &mut *task.trap_frame() };
             if !frame.from_user() {
                 task.add_pending(bit);
                 return;
             }
-            stop_current(signal);
-            return;
-        }
-
-        let action = task.action(signal);
-        match action.handler {
-            crate::signal::SIG_IGN => continue,
-            crate::signal::SIG_DFL => {
-                if crate::signal::default_is_ignore(signal) {
-                    continue;
-                }
-                exit_current(signal.number());
+            if action.flags & crate::signal::SA_RESETHAND != 0 {
+                task.set_action(signal, crate::signal::SigAction::default());
             }
-            _ => {}
-        }
-
-        // A handler can only run on the way back to user mode.
-        let frame = unsafe { &mut *task.trap_frame() };
-        if !frame.from_user() {
-            task.add_pending(bit);
+            // A frame that cannot be written is SIGSEGV with its default
+            // action, which Linux's `force_sigsegv` makes it, so it too ends
+            // the thread group.
+            if !crate::signal::deliver(&task, signal, &action, frame) {
+                exit_group(SIGSEGV.number());
+            }
             return;
-        }
-        if action.flags & crate::signal::SA_RESETHAND != 0 {
-            task.set_action(signal, crate::signal::SigAction::default());
-        }
-        if !crate::signal::deliver(&task, signal, &action, frame) {
-            exit_current(SIGSEGV.number());
         }
         return;
     }
