@@ -2251,6 +2251,60 @@ fn spin_until(counter: &AtomicUsize, before: usize, limit: Duration) -> Duration
     }
 }
 
+/// The alarm is the process's, and so is the SIGALRM it raises: a thread that
+/// unblocks the signal after it fired takes it. The child's first thread
+/// blocks SIGALRM, and so does the second, which it starts with that mask; the
+/// alarm fires a second in, while both block it, and half a second later the
+/// second thread unblocks it and has to run the handler. The signal was made
+/// pending on one chosen thread when it fired, the first when every thread
+/// blocked it, and there it waited while the second thread would have taken it.
+///
+/// The child's exit status says what happened: 0 when the handler ran in the
+/// second thread, 1 when it did not run, 2 when it ran in another thread.
+fn an_alarm_is_taken_by_a_thread_that_unblocks_it(report: &mut Report) {
+    use crate::sys;
+    use std::sync::atomic::AtomicI32;
+
+    static HANDLED_BY: AtomicI32 = AtomicI32::new(0);
+    extern "C" fn note_the_thread(_: i32) {
+        HANDLED_BY.store(crate::sys::gettid() as i32, Ordering::SeqCst);
+    }
+
+    let child = sys::fork();
+    if child == 0 {
+        unsafe { signal(SIGALRM, note_the_thread as extern "C" fn(i32) as usize) };
+        let set = 1u64 << (SIGALRM - 1);
+        sys::sigprocmask(sys::SIG_BLOCK, set);
+        let taker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            sys::sigprocmask(sys::SIG_UNBLOCK, set);
+            let started = Instant::now();
+            while HANDLED_BY.load(Ordering::SeqCst) == 0
+                && started.elapsed() < Duration::from_secs(1)
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            sys::gettid() as i32
+        });
+        unsafe { alarm(1) };
+        let taker = taker.join().unwrap_or(-1);
+        let handled_by = HANDLED_BY.load(Ordering::SeqCst);
+        sys::exit_group(if handled_by == taker {
+            0
+        } else if handled_by == 0 {
+            1
+        } else {
+            2
+        });
+    }
+    let (reaped, status) = wait_or_kill(child, Duration::from_secs(5));
+    report.check(
+        "an alarm is taken by a thread that unblocks it after it fired",
+        reaped == child && status == 0,
+        format!("forked {} reaped {} status {:#x}", child, reaped, status),
+    );
+}
+
 /// setitimer, getitimer and alarm. BusyBox wget bounds each step of a fetch
 /// with alarm, and the call used to be missing.
 fn interval_timers(report: &mut Report) {
@@ -2947,6 +3001,7 @@ pub fn main(_args: &[String]) -> i32 {
     println!();
     println!("-- interval timers --");
     interval_timers(&mut report);
+    an_alarm_is_taken_by_a_thread_that_unblocks_it(&mut report);
     signals_raised_while_others_are_taken(&mut report);
 
     println!();
