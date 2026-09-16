@@ -237,10 +237,19 @@ mount_point() {
 # nothing time to write them again; the board image section of scripts/test.sh
 # lists both partitions of a card made this way and requires exactly the files
 # copied.
+#
+# On a real card, Spotlight indexes the volume as soon as it is mounted, and
+# macOS refuses a program without Full Disk Access both entry to
+# .Spotlight-V100 and its deletion. Whatever cannot be deleted is named here
+# and left: the bootloader and the kernel find their files by name, and
+# nothing reads a directory of the boot partition.
 tidy_and_unmount() {
-  local partition="$1" mount="$2"
-  find "$mount" -name '._*' -type f -exec rm -f {} +
-  rm -rf "$mount/.fseventsd" "$mount/.Spotlight-V100" "$mount/.Trashes"
+  local partition="$1" mount="$2" left
+  find "$mount" \( -name '.Spotlight-V100' -o -name '.fseventsd' -o -name '.Trashes' \) -prune \
+    -o -name '._*' -type f -exec rm -f {} + 2>/dev/null || true
+  rm -rf "$mount/.fseventsd" "$mount/.Spotlight-V100" "$mount/.Trashes" 2>/dev/null || true
+  left="$(ls -A "$mount" | grep -E '^(\._|\.fseventsd$|\.Spotlight-V100$|\.Trashes$)' || true)"
+  [ -z "$left" ] || say "  macOS keeps on $(basename "$mount"): $(echo "$left" | tr '\n' ' ')"
   sync
   diskutil unmount "$partition" > /dev/null
 }
