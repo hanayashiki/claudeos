@@ -13,6 +13,7 @@ use core::arch::global_asm;
 mod atags;
 mod clock;
 mod gic;
+mod hwcap;
 mod signal_frame;
 mod syscall;
 mod task;
@@ -43,6 +44,7 @@ global_asm!(include_str!("switch.s"), FRAME_SIZE = const task::SWITCH_FRAME_SIZE
 // portable half today; they are listed here because this file is the contract.
 #[allow(unused_imports)]
 pub use clock::{counter_frequency, cycle_counter, read_wall_clock, WallClock};
+pub use hwcap::elf_hwcaps;
 pub use signal_frame::{
     enter_signal_handler, leave_signal_handler, map_signal_trampoline, MIN_ALT_STACK,
 };

@@ -382,6 +382,30 @@ pub fn hardware_random() -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
+// What a program is told about the processor
+// ---------------------------------------------------------------------------
+
+/// AT_HWCAP and AT_HWCAP2 for a program on this processor.
+///
+/// AT_HWCAP is the boot processor's CPUID leaf 1 EDX, which is what Linux's
+/// `ELF_HWCAP` is: `boot_cpu_data.x86_capability[CPUID_1_EDX]`. A program can
+/// run CPUID itself on this machine, so the word only repeats what it could
+/// ask for.
+///
+/// AT_HWCAP2 is not a CPUID word. It carries the features Linux has turned on
+/// for user mode, and x86's uapi/asm/hwcap2.h has two: HWCAP2_RING3MPL, which
+/// Linux sets only after enabling ring-3 MWAIT through
+/// MSR_MISC_FEATURES_ENABLES on a Xeon Phi, and HWCAP2_FSGSBASE, which it sets
+/// only after setting CR4.FSGSBASE, with a context switch that saves the bases
+/// a program writes with those instructions. This kernel does neither: it
+/// never writes that MSR, and CR4 gets PAE and PGE from `boot.s` and OSFXSR
+/// and OSXMMEXCPT from `init_sse` and nothing else. So the word is zero,
+/// whatever the processor could do.
+pub fn elf_hwcaps() -> (u64, u64) {
+    (cpu::cpuid(1, 0).edx as u64, 0)
+}
+
+// ---------------------------------------------------------------------------
 // Reporting and shutdown
 // ---------------------------------------------------------------------------
 

@@ -2759,6 +2759,72 @@ fn setting_the_wall_clock(report: &mut Report) {
     );
 }
 
+/// /proc/self/auxv holds the auxiliary vector this program was started with:
+/// pairs of unsigned longs in the machine's byte order, through the AT_NULL
+/// pair, as Linux's file does. Go's golang.org/x/sys/cpu reads the processor's
+/// features there when it runs before the Go runtime hands the vector over,
+/// and without the file it reads the ID registers itself, which on aarch64 is
+/// an undefined instruction under this kernel. The file has to say what the
+/// stack said, which is what musl's `getauxval` reads.
+fn the_auxiliary_vector(report: &mut Report) {
+    extern "C" {
+        fn getauxval(kind: u64) -> u64;
+    }
+    const AT_NULL: u64 = 0;
+    const AT_PAGESZ: u64 = 6;
+    const AT_ENTRY: u64 = 9;
+    const AT_HWCAP: u64 = 16;
+    const AT_HWCAP2: u64 = 26;
+
+    let bytes = match std::fs::read("/proc/self/auxv") {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            report.check("/proc/self/auxv reads", false, format!("{}", err));
+            return;
+        }
+    };
+    let pairs: Vec<(u64, u64)> = bytes
+        .chunks_exact(16)
+        .map(|pair| {
+            let key = u64::from_ne_bytes(pair[..8].try_into().unwrap_or([0; 8]));
+            let value = u64::from_ne_bytes(pair[8..].try_into().unwrap_or([0; 8]));
+            (key, value)
+        })
+        .collect();
+    let first_null = pairs.iter().position(|&(key, _)| key == AT_NULL);
+    report.check(
+        "/proc/self/auxv is pairs ending with AT_NULL",
+        bytes.len() % 16 == 0 && pairs.len() > 1 && first_null == Some(pairs.len() - 1),
+        format!("{} bytes, {} pairs, AT_NULL at {:?}", bytes.len(), pairs.len(), first_null),
+    );
+
+    let find = |kind: u64| pairs.iter().find(|&&(key, _)| key == kind).map(|&(_, value)| value);
+    for (name, kind) in [("AT_HWCAP", AT_HWCAP), ("AT_PAGESZ", AT_PAGESZ), ("AT_ENTRY", AT_ENTRY)] {
+        let from_libc = unsafe { getauxval(kind) };
+        report.check(
+            &format!("/proc/self/auxv {} is what getauxval says", name),
+            find(kind) == Some(from_libc),
+            format!("file {:x?}, getauxval {:#x}", find(kind), from_libc),
+        );
+    }
+
+    let hwcap = find(AT_HWCAP).unwrap_or(0);
+    let hwcap2 = find(AT_HWCAP2).map_or("absent".to_string(), |value| format!("{:#x}", value));
+    println!("      AT_HWCAP {:#x} AT_HWCAP2 {}", hwcap, hwcap2);
+    // Floating point alone makes the word non-zero on either machine: FPU is
+    // bit 0 of CPUID leaf 1 EDX, and HWCAP_FP bit 0 of the aarch64 word.
+    report.check("AT_HWCAP names the processor's features", hwcap != 0, format!("{:#x}", hwcap));
+    // Linux sets HWCAP_CPUID when it emulates reads of the ID registers from
+    // user mode. This kernel does not, and a program told otherwise reads one
+    // and takes SIGILL.
+    #[cfg(target_arch = "aarch64")]
+    report.check(
+        "AT_HWCAP does not claim HWCAP_CPUID",
+        hwcap & (1 << 11) == 0,
+        format!("{:#x}", hwcap),
+    );
+}
+
 pub fn main(_args: &[String]) -> i32 {
     let mut report = Report { passed: 0, failed: 0 };
     println!("=== Rust standard library on claudeos ===");
@@ -3021,6 +3087,7 @@ pub fn main(_args: &[String]) -> i32 {
 
     let args: Vec<String> = std::env::args().collect();
     report.check("argv[0] present", !args.is_empty(), format!("{:?}", args));
+    the_auxiliary_vector(&mut report);
 
     println!();
     println!("-- setting the wall clock --");

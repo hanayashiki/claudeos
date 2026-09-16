@@ -1076,6 +1076,18 @@ program's own entry in `AT_ENTRY`, and starts execution in the interpreter,
 which then relocates and runs the program. That is what lets Alpine's musl
 loader bring up Alpine's userland.
 
+`AT_HWCAP` and `AT_HWCAP2` are read from the processor once at boot, and the
+boot log prints them as `cpu: hwcap 0x... hwcap2 0x...`. On x86-64 `AT_HWCAP`
+is CPUID leaf 1 EDX and `AT_HWCAP2` is zero, because the kernel turns on
+neither of the two things it could report. On aarch64 both come from the ID
+registers by the rules of Linux's `arm64_elf_hwcaps`, keeping only the
+features a program can use under this kernel: `HWCAP_CPUID` is never set,
+because reads of the ID registers from user mode are not emulated, and
+`kernel/src/arch/aarch64/hwcap.rs` lists the other bits left out and why.
+`/proc/<pid>/auxv` holds the vector exec wrote onto the program's stack, word
+for word through the `AT_NULL` pair, which is where Go's `golang.org/x/sys/cpu`
+looks for the features before it would read those registers itself.
+
 **Signals.** A handler installed with `rt_sigaction` is really entered: the
 kernel writes the same `rt_sigframe` Linux does onto the user stack, points the
 return address at the address the handler returns through, and `rt_sigreturn`
@@ -1357,8 +1369,9 @@ failures.
   reads differ and that 4 KiB of it holds nearly all 256 byte values, which is
   a check that the generator is running and not a check that it is any good.
 - The `rtest` applet, which only the test image's cbox is built with, runs
-  **112 checks** against the Rust standard library, 111 on aarch64, which has
-  no `alarm` system call of its own:
+  **117 checks** against the Rust standard library on either machine: one for
+  `alarm` on x86-64 only, because aarch64 has no such system call, and one on
+  aarch64 only that the auxiliary vector does not claim `HWCAP_CPUID`:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
   thread sleep against the monotonic clock, the tick measured against that same
@@ -1380,7 +1393,9 @@ failures.
   waking promptly when a write arrives, and a walk of the system call numbers
   past the end of the table, every one of which has to answer ENOSYS, and
   `reboot` given magic numbers or a command it does not know, which has to
-  answer EINVAL. The wall clock is set with `clock_settime`, with musl's
+  answer EINVAL, and `/proc/self/auxv` read as pairs ending with `AT_NULL`
+  whose `AT_HWCAP`, `AT_PAGESZ` and `AT_ENTRY` are what musl's `getauxval`
+  returns, with a non-zero `AT_HWCAP`. The wall clock is set with `clock_settime`, with musl's
   `settimeofday` and with the `settimeofday` system call by number, forward,
   back past the boot floor and with arguments that have to be refused; across
   those steps the monotonic clock has to run straight on, a one-second sleep
@@ -1615,6 +1630,7 @@ kernel/src
   syscall/            the Linux system call implementations
   fs/                 in-memory filesystem, devices, pipes, cpio, /proc
   elf.rs              ELF64 loader for static and static-PIE executables
+  hwcap.rs            the AT_HWCAP and AT_HWCAP2 words, read once at boot
   rng.rs              ChaCha20, the entropy pool, and what seeds it
   task.rs             task control block, user stack and auxiliary vector
   sched.rs            round-robin scheduler, exit and reaping
