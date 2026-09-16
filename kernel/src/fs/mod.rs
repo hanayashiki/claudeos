@@ -417,8 +417,10 @@ pub fn root() -> NodeRef {
 pub fn init() {
     let root = Node::new_dir();
     *ROOT.lock() = Some(root);
-    // A minimal skeleton; the initramfs fills in the rest.
-    for dir in ["dev", "proc", "tmp", "bin", "etc", "sys", "root"] {
+    // A minimal skeleton; the initramfs fills in the rest. /usr and /root are
+    // replaced by links into /data when the card's volume is mounted (see
+    // `storage::bring_up`), and stay these empty directories otherwise.
+    for dir in ["dev", "proc", "tmp", "bin", "etc", "sys", "root", "usr"] {
         let _ = mkdir(&alloc::format!("/{}", dir), 0o755);
     }
     dev::populate();

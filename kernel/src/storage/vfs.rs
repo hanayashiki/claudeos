@@ -209,6 +209,17 @@ pub fn publish(volume: Volume<Partition>, device: String) {
     crate::fs::root().inner.lock().children.insert(String::from("data"), root);
 }
 
+/// Replace `/NAME` in the tree with a symbolic link to `/data/NAME`. What was
+/// at `/NAME` is dropped: the empty directory `fs::init` made, and, when the
+/// mount ended after init had started, whatever was put in it since.
+pub fn link_to_card(name: &str) {
+    let link = Node::new_symlink(&format!("/data/{}", name));
+    // Let go of with the root unlocked: the lock masks interrupts, and a
+    // directory filled before the mount ended is freed entry by entry.
+    let replaced = crate::fs::root().inner.lock().children.insert(String::from(name), link);
+    drop(replaced);
+}
+
 pub fn mounted() -> bool {
     ROOT.lock().is_some()
 }
