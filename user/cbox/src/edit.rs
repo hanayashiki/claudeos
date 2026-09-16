@@ -179,6 +179,8 @@ impl Editor {
                         },
                         Some(Key::Left) => cursor = step_left(&buffer, cursor),
                         Some(Key::Right) => cursor = step_right(&buffer, cursor),
+                        Some(Key::WordLeft) => cursor = word_left(&buffer, cursor),
+                        Some(Key::WordRight) => cursor = word_right(&buffer, cursor),
                         Some(Key::Home) => cursor = 0,
                         Some(Key::End) => cursor = buffer.len(),
                         Some(Key::Delete) => {
@@ -206,11 +208,14 @@ impl Editor {
     }
 }
 
+#[derive(Debug, PartialEq)]
 enum Key {
     Up,
     Down,
     Left,
     Right,
+    WordLeft,
+    WordRight,
     Home,
     End,
     Delete,
@@ -357,38 +362,108 @@ fn read_byte() -> Option<u8> {
 
 /// Decode the tail of an escape sequence that has already consumed ESC.
 fn read_escape() -> Option<Key> {
-    let second = read_byte()?;
-    if second != b'[' && second != b'O' {
-        return None;
-    }
-    let third = read_byte()?;
-    match third {
-        b'A' => Some(Key::Up),
-        b'B' => Some(Key::Down),
-        b'C' => Some(Key::Right),
-        b'D' => Some(Key::Left),
-        b'H' => Some(Key::Home),
-        b'F' => Some(Key::End),
-        b'0'..=b'9' => {
-            // A numbered sequence such as ESC [ 3 ~ for Delete.
-            let mut number = (third - b'0') as u32;
-            loop {
-                let next = read_byte()?;
-                match next {
-                    b'0'..=b'9' => number = number * 10 + (next - b'0') as u32,
-                    b'~' => break,
-                    _ => return None,
+    parse_escape(&mut read_byte)
+}
+
+/// The key an escape sequence names, reading its bytes after ESC from `next`.
+///
+/// Option+Left and Option+Right arrive in one of three forms, depending on the
+/// terminal: `ESC b` and `ESC f`, the Meta keys readline moves by word with;
+/// an xterm cursor key with a modifier parameter, `ESC [ 1 ; 3 D`, whose
+/// second parameter is 1 plus 1 for Shift, 2 for Alt, 4 for Ctrl and 8 for
+/// Meta; or ESC before a plain cursor key. A control sequence not listed here
+/// is read to its final byte and dropped, so none of its bytes reach the line.
+fn parse_escape(next: &mut dyn FnMut() -> Option<u8>) -> Option<Key> {
+    match next()? {
+        b'b' => Some(Key::WordLeft),
+        b'f' => Some(Key::WordRight),
+        0x1B => match parse_escape(next)? {
+            Key::Left => Some(Key::WordLeft),
+            Key::Right => Some(Key::WordRight),
+            key => Some(key),
+        },
+        b'O' => match next()? {
+            b'A' => Some(Key::Up),
+            b'B' => Some(Key::Down),
+            b'C' => Some(Key::Right),
+            b'D' => Some(Key::Left),
+            b'H' => Some(Key::Home),
+            b'F' => Some(Key::End),
+            _ => None,
+        },
+        b'[' => {
+            // Parameters are digits separated by semicolons; any other byte
+            // below 0x40 is a marker or an intermediate and is passed over.
+            // The final byte is from 0x40 to 0x7E.
+            let mut params: Vec<u32> = vec![0];
+            let last = loop {
+                let byte = next()?;
+                match byte {
+                    b'0'..=b'9' => {
+                        let value = params.last_mut()?;
+                        *value = value.saturating_mul(10).saturating_add((byte - b'0') as u32);
+                    }
+                    b';' => params.push(0),
+                    0x40..=0x7E => break byte,
+                    _ => {}
                 }
-            }
-            match number {
-                1 | 7 => Some(Key::Home),
-                3 => Some(Key::Delete),
-                4 | 8 => Some(Key::End),
+            };
+            let modifier = params.get(1).copied().unwrap_or(1);
+            let by_word = modifier > 1 && (modifier - 1) & (2 | 4 | 8) != 0;
+            match last {
+                b'A' => Some(Key::Up),
+                b'B' => Some(Key::Down),
+                b'C' if by_word => Some(Key::WordRight),
+                b'D' if by_word => Some(Key::WordLeft),
+                b'C' => Some(Key::Right),
+                b'D' => Some(Key::Left),
+                b'H' => Some(Key::Home),
+                b'F' => Some(Key::End),
+                b'~' => match params[0] {
+                    1 | 7 => Some(Key::Home),
+                    3 => Some(Key::Delete),
+                    4 | 8 => Some(Key::End),
+                    _ => None,
+                },
                 _ => None,
             }
         }
         _ => None,
     }
+}
+
+/// Whether a byte is part of a word for moving by word: an ASCII letter or
+/// digit, or any byte of a character beyond ASCII, as readline counts letters
+/// in a UTF-8 locale. Every byte of such a character counts, so a word
+/// boundary never falls inside one.
+fn word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte >= 0x80
+}
+
+/// Where moving one word left from `at` stops: past any separators, then to
+/// the start of the word, as readline's backward-word does.
+fn word_left(buffer: &[u8], at: usize) -> usize {
+    let mut at = at.min(buffer.len());
+    while at > 0 && !word_byte(buffer[at - 1]) {
+        at -= 1;
+    }
+    while at > 0 && word_byte(buffer[at - 1]) {
+        at -= 1;
+    }
+    at
+}
+
+/// Where moving one word right from `at` stops: past any separators, then to
+/// the end of the word, as readline's forward-word does.
+fn word_right(buffer: &[u8], at: usize) -> usize {
+    let mut at = at.min(buffer.len());
+    while at < buffer.len() && !word_byte(buffer[at]) {
+        at += 1;
+    }
+    while at < buffer.len() && word_byte(buffer[at]) {
+        at += 1;
+    }
+    at
 }
 
 /// Draw the prompt and the line's bytes as they are, and put the cursor after
@@ -507,4 +582,51 @@ fn read_cooked_line(prompt: &str) -> Option<String> {
         out.push(byte[0]);
     }
     Some(String::from_utf8_lossy(&out).to_string())
+}
+
+#[cfg(test)]
+mod word_tests {
+    use super::{parse_escape, word_left, word_right, Key};
+
+    fn key(bytes: &[u8]) -> Option<Key> {
+        let mut rest = bytes.iter().copied();
+        parse_escape(&mut || rest.next())
+    }
+
+    #[test]
+    fn option_arrows_in_every_form_move_by_word() {
+        assert_eq!(key(b"b"), Some(Key::WordLeft));
+        assert_eq!(key(b"f"), Some(Key::WordRight));
+        assert_eq!(key(b"[1;3D"), Some(Key::WordLeft));
+        assert_eq!(key(b"[1;3C"), Some(Key::WordRight));
+        assert_eq!(key(b"[1;5D"), Some(Key::WordLeft));
+        assert_eq!(key(b"[1;9C"), Some(Key::WordRight));
+        assert_eq!(key(b"\x1b[D"), Some(Key::WordLeft));
+        assert_eq!(key(b"[D"), Some(Key::Left));
+        assert_eq!(key(b"[1;2D"), Some(Key::Left));
+        assert_eq!(key(b"[3~"), Some(Key::Delete));
+        assert_eq!(key(b"OH"), Some(Key::Home));
+    }
+
+    #[test]
+    fn an_unknown_sequence_is_read_to_its_end() {
+        let bytes = b"[1;3Qrest";
+        let mut rest = bytes.iter().copied();
+        assert_eq!(parse_escape(&mut || rest.next()), None);
+        assert_eq!(rest.collect::<Vec<u8>>(), b"rest".to_vec());
+    }
+
+    #[test]
+    fn words_are_letters_digits_and_whole_characters() {
+        let line = b"ls -la /data/site";
+        assert_eq!(word_left(line, line.len()), 13);
+        assert_eq!(word_left(line, 13), 8);
+        assert_eq!(word_left(line, 8), 4);
+        assert_eq!(word_left(line, 4), 0);
+        assert_eq!(word_right(line, 0), 2);
+        assert_eq!(word_right(line, 2), 6);
+        let text = "echo タ日本 x".as_bytes();
+        assert_eq!(word_left(text, text.len() - 2), 5);
+        assert_eq!(word_right(text, 4), text.len() - 2);
+    }
 }
