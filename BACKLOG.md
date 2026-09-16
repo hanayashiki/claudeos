@@ -138,6 +138,14 @@ bytes such as 0xff, on both machines.
 
 ## Networking
 
+- **No netlink sockets.** `AF_NETLINK` returns EAFNOSUPPORT, so Go's
+  `net.Interfaces()` and `InterfaceAddrs()` fail (`route ip+net: netlinkrib:
+  address family not supported by protocol`). `tailscaled` 1.102.4 exits at
+  start for this on the board (2026-09-17); in QEMU only `--version` had been
+  run, which exits before that. Fix: a read-only `NETLINK_ROUTE` socket that
+  dumps links, addresses and routes from the stack, and accepts change
+  subscriptions. The card's /data/services.txt has a `tailscale` line that
+  restarts with backoff until then.
 - **WiFi needs `net=wifi`.** Without it the wired port always takes DHCP and
   the default route, even with no cable, and WiFi never starts, because the
   stack holds one interface. `scripts/mkcard.sh` writes the word when the
