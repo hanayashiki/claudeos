@@ -200,6 +200,12 @@ pub struct Task {
     /// interrupt between the read and the write had its signal written over
     /// with the copy that was read before it arrived, and the signal was lost.
     pending_signals: AtomicU64,
+    /// Signals sent to the process rather than to one of its threads, and not
+    /// yet taken: one set for the whole thread group, as Linux keeps
+    /// `shared_pending` in the signal struct its threads share. Whichever
+    /// thread does not block a signal takes it from here. A forked child starts
+    /// with an empty one.
+    shared_pending: Arc<AtomicU64>,
     /// The scheduling nice value. Round robin does not act on it, but a
     /// program that sets it reads it back.
     pub nice: Cell<i32>,
@@ -298,6 +304,7 @@ impl Task {
             set_child_tid: Cell::new(0),
             robust_list: Cell::new(0),
             pending_signals: AtomicU64::new(0),
+            shared_pending: Arc::new(AtomicU64::new(0)),
             nice: Cell::new(0),
             stop_signal: Cell::new(None),
             report_stop: Cell::new(false),
@@ -372,27 +379,58 @@ impl Task {
         self.sig_stack.set(crate::abi::SigAltStack::default());
     }
 
-    /// The signals pending on this task, as one reading.
+    /// The signals this task could take: its own pending set and its thread
+    /// group's, as one reading of each.
     pub fn pending(&self) -> u64 {
+        self.own_pending() | self.shared_pending()
+    }
+
+    /// The signals sent to this thread alone.
+    pub fn own_pending(&self) -> u64 {
         self.pending_signals.load(Ordering::Acquire)
     }
 
-    /// Add signals to the pending set, in one step.
+    /// The signals sent to the thread group and not yet taken by any thread.
+    pub fn shared_pending(&self) -> u64 {
+        self.shared_pending.load(Ordering::Acquire)
+    }
+
+    /// Add signals to this thread's own pending set, in one step.
     pub fn add_pending(&self, signals: u64) {
         self.pending_signals.fetch_or(signals, Ordering::AcqRel);
     }
 
-    /// Remove signals from the pending set, in one step.
-    pub fn drop_pending(&self, signals: u64) {
-        self.pending_signals.fetch_and(!signals, Ordering::AcqRel);
+    /// Add signals to the thread group's pending set, in one step.
+    pub fn add_shared_pending(&self, signals: u64) {
+        self.shared_pending.fetch_or(signals, Ordering::AcqRel);
     }
 
-    /// Remove `signals` from the pending set and return which of them were in
-    /// it, in one step. A delivery takes its signal this way, so that two
-    /// deliveries cannot both find the same bit and both act on it, and a bit
-    /// raised again after the take stays raised.
+    /// Remove signals from both pending sets, one step each.
+    pub fn drop_pending(&self, signals: u64) {
+        self.pending_signals.fetch_and(!signals, Ordering::AcqRel);
+        self.shared_pending.fetch_and(!signals, Ordering::AcqRel);
+    }
+
+    /// Remove `signals` from the pending sets and return which of them were
+    /// there, one step per set. A delivery takes its signal this way, so that
+    /// two deliveries cannot both find the same bit and both act on it, and a
+    /// bit raised again after the take stays raised. This thread's own set is
+    /// taken from first and the group's only for what that did not hold, the
+    /// order Linux's `dequeue_signal` uses, so a signal sent both ways is
+    /// taken twice.
     pub fn take_pending(&self, signals: u64) -> u64 {
-        self.pending_signals.fetch_and(!signals, Ordering::AcqRel) & signals
+        let own = self.pending_signals.fetch_and(!signals, Ordering::AcqRel) & signals;
+        let rest = signals & !own;
+        if rest == 0 {
+            return own;
+        }
+        own | (self.shared_pending.fetch_and(!rest, Ordering::AcqRel) & rest)
+    }
+
+    /// Share `other`'s thread-group pending set, which is what a thread is
+    /// given. Only for a task that has not been admitted yet.
+    pub fn share_pending_of(&mut self, other: &Task) {
+        self.shared_pending = other.shared_pending.clone();
     }
 
     /// The signals this task blocks, as one reading.

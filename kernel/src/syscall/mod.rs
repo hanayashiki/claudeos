@@ -203,9 +203,11 @@ fn handle(number: u64, args: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::EXIT => sched::exit_current((args[0] as i32 & 0xFF) << 8),
         nr::EXIT_GROUP => sched::exit_group((args[0] as i32 & 0xFF) << 8),
         nr::WAIT4 => proc::wait4(args[0] as i64, args[1], args[2] as u64),
-        nr::KILL => proc::kill(args[0] as i64, args[1] as i32),
-        nr::TKILL => proc::kill(args[0] as i64, args[1] as i32),
-        nr::TGKILL => proc::kill(args[1] as i64, args[2] as i32),
+        // The ids and the signal are `int`s, so only the low half of each
+        // register is the value, as on Linux.
+        nr::KILL => proc::kill(args[0] as i32, args[1] as i32),
+        nr::TKILL => proc::tgkill(None, args[0] as i32, args[1] as i32),
+        nr::TGKILL => proc::tgkill(Some(args[0] as i32), args[1] as i32, args[2] as i32),
         nr::GETPID => Ok(sched::current().tgid as u64),
         nr::GETTID => Ok(sched::current().pid as u64),
         nr::GETPPID => Ok(sched::current().ppid.get() as u64),

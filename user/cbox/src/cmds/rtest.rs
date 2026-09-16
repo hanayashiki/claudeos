@@ -560,18 +560,36 @@ fn thread_group_child(threads: usize, body: impl FnOnce(i32)) -> Result<(i64, Ve
     Ok((child, tids))
 }
 
+/// How a process is expected to end.
+#[derive(Clone, Copy)]
+enum Ending {
+    /// Killed by this signal.
+    Signal(i32),
+    /// Exited with this code.
+    Code(i32),
+}
+
+impl Ending {
+    fn is(self, status: i32) -> bool {
+        use crate::sys;
+        match self {
+            Ending::Signal(signum) => sys::signal_of(status) == Some(signum),
+            Ending::Code(code) => status & 0x7F == 0 && sys::exit_code_of(status) == code,
+        }
+    }
+}
+
 /// Wait for a child `thread_group_child` made, for two seconds at most, and
-/// say what is wrong if the process did not end whole, promptly, killed by
-/// `signum`: a wait that took longer, another status, or any of its threads
-/// still in /proc/tasks after the wait reported it.
-fn ended_by_signal(child: i64, tids: &[i32], signum: i32) -> Option<String> {
-    use crate::sys;
+/// say what is wrong if the process did not end whole, promptly, the way
+/// `expected` says: a wait that took longer, another status, or any of its
+/// threads still in /proc/tasks after the wait reported it.
+fn ended(child: i64, tids: &[i32], expected: Ending) -> Option<String> {
     let started = Instant::now();
     let (reaped, status) = wait_or_kill(child, Duration::from_secs(2));
     let waited = started.elapsed();
     let left = tasks_listed(tids);
-    let signalled = sys::signal_of(status) == Some(signum);
-    if reaped == child && signalled && waited < Duration::from_secs(2) && left.is_empty() {
+    let prompt = waited < Duration::from_secs(2);
+    if reaped == child && expected.is(status) && prompt && left.is_empty() {
         return None;
     }
     Some(format!(
@@ -581,17 +599,17 @@ fn ended_by_signal(child: i64, tids: &[i32], signum: i32) -> Option<String> {
 }
 
 /// The same check over `rounds` children made by `make`, reported as `name`.
-fn every_child_ends_by_signal(
+fn every_child_ends(
     report: &mut Report,
     name: &str,
     rounds: usize,
-    signum: i32,
+    expected: Ending,
     mut make: impl FnMut() -> Result<(i64, Vec<i32>), String>,
 ) {
     let mut wrong = Vec::new();
     for _ in 0..rounds {
         match make() {
-            Ok((child, tids)) => wrong.extend(ended_by_signal(child, &tids, signum)),
+            Ok((child, tids)) => wrong.extend(ended(child, &tids, expected)),
             Err(err) => wrong.push(err),
         }
     }
@@ -609,11 +627,11 @@ fn every_child_ends_by_signal(
 /// does this now.
 fn a_thread_that_aborts_ends_its_process(report: &mut Report) {
     const SIGABRT: i32 = 6;
-    every_child_ends_by_signal(
+    every_child_ends(
         report,
         "a thread's abort ends its whole process",
         20,
-        SIGABRT,
+        Ending::Signal(SIGABRT),
         || {
             thread_group_child(2, |writer| {
                 std::thread::spawn(move || {
@@ -642,11 +660,11 @@ fn a_thread_that_takes_sigsegv_ends_its_process(report: &mut Report) {
     const SIGSEGV: i32 = 11;
     const SIG_DFL: usize = 0;
 
-    every_child_ends_by_signal(
+    every_child_ends(
         report,
         "a thread that sends itself SIGSEGV ends its whole process",
         20,
-        SIGSEGV,
+        Ending::Signal(SIGSEGV),
         || {
             thread_group_child(2, |writer| {
                 std::thread::spawn(move || {
@@ -659,11 +677,11 @@ fn a_thread_that_takes_sigsegv_ends_its_process(report: &mut Report) {
             })
         },
     );
-    every_child_ends_by_signal(
+    every_child_ends(
         report,
         "a thread that faults ends its whole process",
         1,
-        SIGSEGV,
+        Ending::Signal(SIGSEGV),
         || {
             thread_group_child(2, |writer| {
                 std::thread::spawn(move || {
@@ -687,11 +705,11 @@ fn a_kill_ends_every_thread(report: &mut Report) {
     use crate::sys;
     const SIGKILL: i32 = 9;
 
-    every_child_ends_by_signal(
+    every_child_ends(
         report,
         "SIGKILL to a process ends every thread of it",
         20,
-        SIGKILL,
+        Ending::Signal(SIGKILL),
         || {
             let made = thread_group_child(4, |writer| {
                 for spin in [true, false, false] {
@@ -709,6 +727,169 @@ fn a_kill_ends_every_thread(report: &mut Report) {
             });
             if let Ok((child, _)) = &made {
                 sys::kill(*child as i32, SIGKILL);
+            }
+            made
+        },
+    );
+}
+
+/// A signal whose default action is to terminate, sent to a process whose first
+/// thread is waiting to join a second one that spins, ends the process: every
+/// thread of it, promptly. The signal is the process's, and either thread may
+/// take it; whichever does ends the thread group.
+fn a_signal_from_outside_ends_every_thread(report: &mut Report) {
+    use crate::sys;
+    const SIGTERM: i32 = 15;
+
+    every_child_ends(
+        report,
+        "SIGTERM to a process whose first thread is joining ends every thread",
+        20,
+        Ending::Signal(SIGTERM),
+        || {
+            let made = thread_group_child(2, |writer| {
+                let spinner = std::thread::spawn(move || {
+                    send_tid(writer);
+                    let started = Instant::now();
+                    while started.elapsed() < Duration::from_secs(5) {}
+                });
+                let _ = spinner.join();
+            });
+            if let Ok((child, _)) = &made {
+                sys::kill(*child as i32, SIGTERM);
+            }
+            made
+        },
+    );
+}
+
+/// Wait up to two seconds for a stop of `child` to be reported, and return the
+/// signal that stopped it.
+fn stop_reported(child: i64) -> Option<i32> {
+    use crate::sys;
+    let started = Instant::now();
+    loop {
+        let (pid, status) = sys::wait4(child as i32, sys::WNOHANG | sys::WUNTRACED);
+        if pid == child {
+            return sys::stop_signal_of(status);
+        }
+        if pid != 0 || started.elapsed() > Duration::from_secs(2) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A process with three threads, stopped with SIGSTOP and then killed with
+/// SIGKILL, is reaped promptly with signal 9 and leaves no thread behind.
+///
+/// SIGSTOP stops every thread of the process, as Linux's group stop does, and
+/// the check waits until /proc/tasks shows all three stopped before it sends
+/// the kill. Each of them has to be restarted to die: a stopped thread was not
+/// returned to the run queue by a kill marked pending on it, and outlived its
+/// process. SIGSTOP used to reach the first thread alone, so this also checks
+/// that the other two stop.
+fn a_stopped_process_with_threads_is_killed(report: &mut Report) {
+    use crate::sys;
+    const SIGKILL: i32 = 9;
+    const SIGSTOP: i32 = 19;
+
+    let all_stopped = |tids: &[i32]| {
+        let listed = tasks_listed(tids);
+        listed.len() == tids.len() && listed.iter().all(|line| line.split(' ').nth(3) == Some("T"))
+    };
+    every_child_ends(
+        report,
+        "a stopped process with threads is killed whole",
+        20,
+        Ending::Signal(SIGKILL),
+        || {
+            let (child, tids) = thread_group_child(3, |writer| {
+                for _ in 0..2 {
+                    std::thread::spawn(move || {
+                        send_tid(writer);
+                        let started = Instant::now();
+                        while started.elapsed() < Duration::from_secs(5) {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    });
+                }
+                std::thread::sleep(Duration::from_secs(10));
+            })?;
+            sys::kill(child as i32, SIGSTOP);
+            let stop = stop_reported(child);
+            let started = Instant::now();
+            while !all_stopped(&tids) && started.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let listed = tasks_listed(&tids);
+            let stopped = all_stopped(&tids);
+            sys::kill(child as i32, SIGKILL);
+            if stop != Some(SIGSTOP) || !stopped {
+                let (reaped, status) = wait_or_kill(child, Duration::from_secs(2));
+                return Err(format!(
+                    "forked {}: stop reported as {:?}, threads {:?}; then reaped {} status {:#x}",
+                    child, stop, listed, reaped, status
+                ));
+            }
+            Ok((child, tids))
+        },
+    );
+}
+
+/// A signal sent to a process whose first thread blocks it is taken by a thread
+/// that does not, and the process carries on. The signal went to the task
+/// whose id is the process's alone, where it waited for good: the handler never
+/// ran, although another thread would have taken it at once.
+///
+/// The child's first thread blocks SIGUSR1 before it starts the second, which
+/// unblocks it for itself, since a thread starts with the mask of the thread
+/// that made it. The second thread waits two seconds at most for the handler,
+/// and the child's exit status says what happened: 0 when the handler ran in
+/// the second thread, 1 when it did not run, 2 when it ran in the first.
+fn a_signal_for_the_process_reaches_a_thread_that_takes_it(report: &mut Report) {
+    use crate::sys;
+    use std::sync::atomic::AtomicI32;
+
+    static TAKER: AtomicI32 = AtomicI32::new(0);
+    static HANDLED_BY: AtomicI32 = AtomicI32::new(0);
+    extern "C" fn note_the_thread(_: i32) {
+        HANDLED_BY.store(crate::sys::gettid() as i32, Ordering::SeqCst);
+    }
+
+    every_child_ends(
+        report,
+        "a signal for a process is taken by a thread that does not block it",
+        20,
+        Ending::Code(0),
+        || {
+            let made = thread_group_child(2, |writer| {
+                unsafe { signal(SIGUSR1, note_the_thread as extern "C" fn(i32) as usize) };
+                let set = 1u64 << (SIGUSR1 - 1);
+                sys::sigprocmask(sys::SIG_BLOCK, set);
+                let taker = std::thread::spawn(move || {
+                    sys::sigprocmask(sys::SIG_UNBLOCK, set);
+                    TAKER.store(sys::gettid() as i32, Ordering::SeqCst);
+                    send_tid(writer);
+                    let started = Instant::now();
+                    while HANDLED_BY.load(Ordering::SeqCst) == 0
+                        && started.elapsed() < Duration::from_secs(2)
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                });
+                let _ = taker.join();
+                let handled_by = HANDLED_BY.load(Ordering::SeqCst);
+                sys::exit_group(if handled_by == TAKER.load(Ordering::SeqCst) {
+                    0
+                } else if handled_by == 0 {
+                    1
+                } else {
+                    2
+                });
+            });
+            if let Ok((child, _)) = &made {
+                sys::kill(*child as i32, SIGUSR1);
             }
             made
         },
@@ -2472,6 +2653,9 @@ pub fn main(_args: &[String]) -> i32 {
     a_thread_that_aborts_ends_its_process(&mut report);
     a_thread_that_takes_sigsegv_ends_its_process(&mut report);
     a_kill_ends_every_thread(&mut report);
+    a_signal_from_outside_ends_every_thread(&mut report);
+    a_stopped_process_with_threads_is_killed(&mut report);
+    a_signal_for_the_process_reaches_a_thread_that_takes_it(&mut report);
     a_child_exit_reaches_a_blocked_parent(&mut report);
     what_a_wait_does_with_signals(&mut report);
     a_continued_job_has_no_stop_to_report(&mut report);

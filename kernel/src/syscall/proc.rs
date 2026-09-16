@@ -72,10 +72,12 @@ pub fn fork(
     };
     // Interval timers belong to the process: a thread shares its process's,
     // and a forked child keeps the none-armed set it was made with. The status
-    // `exit_group` ends the process with belongs to it the same way.
+    // `exit_group` ends the process with belongs to it the same way, and so do
+    // the signals sent to the process and not yet taken.
     if is_thread {
         child.itimers = parent.itimers.clone();
         child.group_exit = parent.group_exit.clone();
+        child.share_pending_of(&parent);
     }
     child.set_exe_path(parent.exe_path());
     child.set_name(parent.name());
@@ -408,31 +410,66 @@ pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
     }
 }
 
-pub fn kill(pid: i64, signal: i32) -> SysResult {
-    // Signal zero sends nothing and reports whether the target is there,
-    // which is how a program watches something it did not fork. Any other
-    // number has to name a signal: one that does not is refused here rather
-    // than folded into the range further in.
-    let send = match signal {
-        0 => None,
-        number => Some(Signal::from_number(number).ok_or(Errno::EINVAL)?),
-    };
-    let mut delivered = false;
-    let me = sched::current().pid;
+/// The signal a `kill`, `tkill` or `tgkill` names: `None` for signal zero,
+/// which sends nothing and reports whether the target is there, which is how a
+/// program watches something it did not fork. Any other number has to name a
+/// signal: one that does not is refused here rather than folded into the range
+/// further in.
+fn signal_to_send(signal: i32) -> Result<Option<Signal>, Errno> {
+    match signal {
+        0 => Ok(None),
+        number => Signal::from_number(number).map(Some).ok_or(Errno::EINVAL),
+    }
+}
+
+/// `kill`: a signal for a process, or for each process of a group, never for
+/// one thread.
+///
+/// Above zero `pid` names a process, and the signal goes to its thread group,
+/// where any thread that does not block it takes it; a thread id that is not
+/// the leader's names the process that thread is in, as on Linux. Zero is the
+/// caller's process group, minus one every process but init and the caller's
+/// own, and below that the process group its negation names. A process whose
+/// every thread has exited is not there to be signalled.
+pub fn kill(pid: i32, signal: i32) -> SysResult {
+    let send = signal_to_send(signal)?;
+    let me = sched::current().tgid;
     let my_pgid = sched::current_pgid();
-    sched::for_each(|task, table| {
-        let target = match pid {
-            p if p > 0 => task.pid == p as u32,
-            0 => task.pgid.get() == my_pgid,
-            -1 => task.pid != me && task.pid != 0,
-            p => task.pgid.get() == (-p) as u32,
-        };
-        if target && task.state() != State::Zombie && task.pid != 0 {
+    let mut delivered = false;
+    sched::with_tasks(|table| {
+        let mut deliver = |leader: &Task| {
+            if table.group_exited(leader.tgid) {
+                return;
+            }
             if let Some(signal) = send {
-                sched::post_signal(task, signal, table);
+                sched::post_process_signal(leader, signal, table);
             }
             delivered = true;
+        };
+        if pid > 0 {
+            let leader = table.find(pid as u32).and_then(|task| table.find(task.tgid));
+            if let Some(leader) = leader {
+                deliver(leader);
+            }
+            return;
         }
+        // Each process once, through its leader, which stays in the table until
+        // every thread of it has exited. A process group's members are its
+        // processes: sent to every task in the group, a process took the
+        // signal once per thread.
+        table.for_each(|task| {
+            if task.pid != task.tgid || task.pid == 0 {
+                return;
+            }
+            let chosen = match pid {
+                0 => task.pgid.get() == my_pgid,
+                -1 => task.tgid != 1 && task.tgid != me,
+                p => task.pgid.get() == p.unsigned_abs(),
+            };
+            if chosen {
+                deliver(task);
+            }
+        });
     });
     if !delivered {
         return Err(Errno::ESRCH);
@@ -444,6 +481,31 @@ pub fn kill(pid: i64, signal: i32) -> SysResult {
     // its signal number in, so the handler was entered with the result in place
     // of the signal and this call returned whatever its first argument was.
     Ok(0)
+}
+
+/// `tkill` and `tgkill`: a signal for the one thread `tid`, which `tgkill`
+/// also requires to be a thread of the process `tgid`. The signal is that
+/// thread's alone, as Linux sends it: no other thread takes it, and it waits
+/// for this one to unblock it.
+pub fn tgkill(tgid: Option<i32>, tid: i32, signal: i32) -> SysResult {
+    if tid <= 0 || tgid.map_or(false, |tgid| tgid <= 0) {
+        return Err(Errno::EINVAL);
+    }
+    let send = signal_to_send(signal)?;
+    let found = sched::with_tasks(|table| {
+        let task = table.find(tid as u32)?;
+        if task.state() == State::Zombie || tgid.map_or(false, |tgid| task.tgid != tgid as u32) {
+            return None;
+        }
+        if let Some(signal) = send {
+            sched::post_signal(task, signal, table);
+        }
+        Some(())
+    });
+    match found {
+        Some(()) => Ok(0),
+        None => Err(Errno::ESRCH),
+    }
 }
 
 /// Run `f` on the task a priority call names. `which` is PRIO_PROCESS,
@@ -962,10 +1024,17 @@ pub fn rt_sigprocmask(how: u32, set: u64, old: u64) -> SysResult {
     }
     if set != 0 {
         let value = uaccess::read_u64_in(&task, set)?;
+        let before = task.blocked();
         match how {
             0 => task.block(value),       // SIG_BLOCK
             1 => task.unblock(value),     // SIG_UNBLOCK
             _ => task.set_blocked(value), // SIG_SETMASK
+        }
+        // A signal sent to the process may be waiting for this thread to take
+        // it, and this thread has just said it will not.
+        let newly_blocked = task.blocked() & !before;
+        if newly_blocked & task.shared_pending() != 0 {
+            sched::with_tasks(|table| sched::retarget_shared_pending(&task, newly_blocked, table));
         }
     }
     Ok(0)

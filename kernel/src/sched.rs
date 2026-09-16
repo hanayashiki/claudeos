@@ -518,7 +518,12 @@ pub fn exit_current(status: i32) -> ! {
                 table.notify_parent(1);
             }
 
-            current().become_zombie(table);
+            // A signal sent to the process that this thread was woken to take
+            // goes to a thread that is still there to take it.
+            let task = current();
+            retarget_shared_pending(&task, !task.blocked(), table);
+
+            task.become_zombie(table);
         });
     }
     loop {
@@ -545,29 +550,127 @@ pub fn raise_on_current(signal: Signal) {
     current().add_pending(signal.bit());
 }
 
-/// Make `signal` pending on `task`.
-///
-/// Two of the job-control rules act on the task rather than on the handler: a
-/// continue restarts a stopped task and discards a stop that has not been
-/// taken yet, and a stop discards a continue the same way. Restarting is what
-/// the parent has to be told about, and the table is held here, which is where
-/// the parent is found.
+/// Make `signal` pending on the one thread `task`: what `tkill` and `tgkill`
+/// send, and what the kernel raises for something one thread did.
 pub fn post_signal(task: &Task, signal: Signal, table: &Held) {
-    const STOPS: u64 = SIGSTOP.bit() | SIGTSTP.bit() | SIGTTIN.bit() | SIGTTOU.bit();
-    // SIGKILL ends the whole thread group from here, stopped threads included,
-    // as Linux's `complete_signal` does for a signal that is fatal to it.
-    if signal == SIGKILL {
-        end_thread_group(task, SIGKILL.number(), table);
+    if !prepare_signal(task, signal, table) {
         return;
-    }
-    if signal == SIGCONT {
-        task.drop_pending(STOPS);
-        task.continue_after_stop(table);
-    } else if signal.stops() {
-        task.drop_pending(SIGCONT.bit());
     }
     task.add_pending(signal.bit());
     task.wake(table.irq());
+}
+
+/// Make `signal` pending on the process `member` is a thread of: what `kill`
+/// sends, to one process or to each process of a group.
+///
+/// It goes into the pending set the thread group shares, and whichever thread
+/// does not block it takes it, as Linux's `kill` does. One thread is woken to take
+/// it, chosen the way Linux's `complete_signal` chooses: `member` when it can,
+/// otherwise the first thread that can. When every thread blocks it, none is
+/// woken, and it waits in the set until one unblocks it. Sent to one task
+/// alone, a signal the first thread blocked waited for that thread even while
+/// another would have taken it at once.
+pub fn post_process_signal(member: &Task, signal: Signal, table: &Held) {
+    if !prepare_signal(member, signal, table) {
+        return;
+    }
+    member.add_shared_pending(signal.bit());
+    if can_take(member, signal) {
+        member.wake(table.irq());
+        return;
+    }
+    let mut woken = false;
+    table.for_each(|task| {
+        if !woken && task.tgid == member.tgid && can_take(task, signal) {
+            task.wake(table.irq());
+            woken = true;
+        }
+    });
+}
+
+/// True when `task` could take `signal` now: it is running or asleep rather
+/// than stopped or exited, and does not block the signal. Linux's
+/// `wants_signal`, less its preference for a thread with nothing pending.
+fn can_take(task: &Task, signal: Signal) -> bool {
+    let running = matches!(task.state(), State::Runnable | State::Sleeping);
+    let unblockable = signal == SIGKILL || signal == SIGSTOP;
+    running && (unblockable || task.blocked() & signal.bit() == 0)
+}
+
+/// What a signal does to the thread group it reaches before any thread takes
+/// it, whichever way it was addressed. Returns false when that is all it does
+/// and nothing is left to make pending.
+///
+/// Linux's `prepare_signal` applies the job-control rules to every thread of
+/// the group: a continue restarts each stopped thread and discards every stop
+/// not taken yet, and a stop discards every continue the same way. Restarting
+/// is what the parent has to be told about, and the table is held here, which
+/// is where the parent is found.
+///
+/// SIGKILL ends the whole group here, stopped threads included, as
+/// `complete_signal` does for a signal that is fatal to it.
+///
+/// A stop whose action is to stop is made pending on every thread rather than
+/// once, and each thread stops when it next looks, which is the part of
+/// Linux's group stop that leaves no thread of a stopped process running. The
+/// leader's stop is the one its parent is told about. Taken once by whichever
+/// thread got to it, a stop left the rest of the process running, and when
+/// that thread was not the leader the parent was not told at all.
+fn prepare_signal(member: &Task, signal: Signal, table: &Held) -> bool {
+    const STOPS: u64 = SIGSTOP.bit() | SIGTSTP.bit() | SIGTTIN.bit() | SIGTTOU.bit();
+    let tgid = member.tgid;
+    if signal == SIGKILL {
+        end_thread_group(member, SIGKILL.number(), table);
+        return false;
+    }
+    if signal == SIGCONT {
+        table.for_each(|task| {
+            if task.tgid == tgid {
+                task.drop_pending(STOPS);
+                task.continue_after_stop(table);
+            }
+        });
+        return true;
+    }
+    if !signal.stops() {
+        return true;
+    }
+    table.for_each(|task| {
+        if task.tgid == tgid {
+            task.drop_pending(SIGCONT.bit());
+        }
+    });
+    if signal != SIGSTOP && member.action(signal).handler != crate::signal::SIG_DFL {
+        return true;
+    }
+    table.for_each(|task| {
+        if task.tgid == tgid && task.state() != State::Zombie {
+            task.add_pending(signal.bit());
+            task.wake(table.irq());
+        }
+    });
+    false
+}
+
+/// Wake another thread of `task`'s group for the signals in `leaving` that are
+/// waiting in the group's set, because `task` will not take them: it is
+/// exiting, or has just blocked them. Linux's `retarget_shared_pending`. The
+/// thread woken when the signal was sent may be this one, and without this the
+/// signal waits until some other thread wakes for a reason of its own.
+pub fn retarget_shared_pending(task: &Task, leaving: u64, table: &Held) {
+    let mut left = task.shared_pending() & leaving;
+    table.for_each(|other| {
+        if left == 0 || other.tgid != task.tgid || other.pid == task.pid {
+            return;
+        }
+        if !matches!(other.state(), State::Runnable | State::Sleeping) {
+            return;
+        }
+        if left & !other.blocked() != 0 {
+            left &= other.blocked();
+            other.wake(table.irq());
+        }
+    });
 }
 
 /// Stop the running task until something sends it SIGCONT.
@@ -642,20 +745,31 @@ pub fn stop_if_requested() -> bool {
     false
 }
 
-/// Mark every task in the foreground group as having a pending signal.
+/// Send `signal` to every process in the foreground group.
 pub fn signal_foreground(signal: Signal) {
     signal_group(foreground(), signal);
 }
 
-/// Mark every task in `pgid` as having a pending signal.
+/// Send `signal` to every process in `pgid` but init, once each.
+///
+/// Each process is reached through its leader, which stays in the table until
+/// every thread of it has exited, and its pgid is the process's. Sent to every
+/// task in the group, a process with several threads took the signal once per
+/// thread: a handler ran that many times, where Linux's `kill_pgrp` sends it to
+/// each process once.
 pub fn signal_group(pgid: u32, signal: Signal) {
     if pgid == 0 {
         return;
     }
-    for_each(|task, table| {
-        if task.pgid.get() == pgid && task.pid != 1 && task.state() != State::Zombie {
-            post_signal(task, signal, table);
-        }
+    with_tasks(|table| {
+        table.for_each(|task| {
+            let leader = task.pid == task.tgid;
+            if leader && task.pgid.get() == pgid && task.tgid != 1 {
+                if !table.group_exited(task.tgid) {
+                    post_process_signal(task, signal, table);
+                }
+            }
+        });
     });
 }
 
