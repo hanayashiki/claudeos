@@ -145,14 +145,14 @@ def discover(port, receive_buffer):
                              % (port, address, hardware))
             return address, sock
         fail(2, "none of the Raspberry Pis in this Mac's ARP table answers on port %d: %s\n"
-                "Give the board's address instead: scripts/console.py 192.168.1.23\n"
+                "Give the board's own address instead: scripts/console.py ADDRESS\n"
                 "The board prints it on the serial console at boot, on the line "
                 "beginning 'telnet: the console is on'."
                 % (port, ", ".join("%s (%s)" % pi for pi in pis)))
     else:
         fail(2, "no Raspberry Pi, a hardware address beginning dc:a6:32, is in this "
                 "Mac's ARP table.\n"
-                "Give the board's address instead: scripts/console.py 192.168.1.23\n"
+                "Give the board's own address instead: scripts/console.py ADDRESS\n"
                 "The board prints it on the serial console at boot, on the line "
                 "beginning 'telnet: the console is on', and the DHCP server lists it "
                 "among its leases. The ARP table holds the board only after this Mac "
