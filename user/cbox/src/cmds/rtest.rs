@@ -264,6 +264,49 @@ fn reboot_refuses_what_it_does_not_know(report: &mut Report) {
     );
 }
 
+/// A signal a thread blocks waits until the thread unblocks it, and is taken
+/// then. The set a program hands `rt_sigprocmask` has signal n at bit n - 1,
+/// as Linux's `sigset_t` does. Read with n at bit n, blocking SIGUSR2 set the
+/// bit for SIGSEGV instead, and SIGUSR2 was delivered at once.
+///
+/// In a forked child, so the mask this suite runs with is not the one changed.
+/// The child's exit status says what it saw: 1 when the handler ran while the
+/// signal was blocked, 2 when it had not run once by the time the signal was
+/// unblocked.
+fn a_blocked_signal_waits_to_be_unblocked(report: &mut Report) {
+    use crate::sys;
+
+    let child = sys::fork();
+    if child == 0 {
+        unsafe { signal(SIGUSR2, handle_signal as extern "C" fn(i32) as usize) };
+        let set = 1u64 << (SIGUSR2 - 1);
+        sys::sigprocmask(sys::SIG_BLOCK, set);
+        let before = SIGNAL_TOTAL.load(Ordering::SeqCst);
+        // To this thread, so that the only thread that could take it is the
+        // one blocking it.
+        sys::tgkill(sys::getpid() as i32, sys::gettid() as i32, SIGUSR2);
+        let while_blocked = SIGNAL_TOTAL.load(Ordering::SeqCst) - before;
+        // Taken on the way out of this call.
+        sys::sigprocmask(sys::SIG_UNBLOCK, set);
+        let unblocked = SIGNAL_TOTAL.load(Ordering::SeqCst) - before;
+        let code = if while_blocked != 0 {
+            1
+        } else if unblocked != SIGUSR2 as usize {
+            2
+        } else {
+            0
+        };
+        sys::exit_group(code);
+    }
+    let (reaped, status) = sys::wait4(child as i32, 0);
+    report.check(
+        "a blocked signal waits until it is unblocked",
+        child > 0 && reaped == child && sys::signal_of(status).is_none()
+            && sys::exit_code_of(status) == 0,
+        format!("forked {} reaped {} status {:#x}", child, reaped, status),
+    );
+}
+
 /// A thread of a child process is not a child of this one. It is given its
 /// process's parent as its own so that an orphan is adopted the same way, and
 /// a wait that matches on that alone hands back a task id this process never
@@ -2101,6 +2144,7 @@ pub fn main(_args: &[String]) -> i32 {
         SIGNAL_TOTAL.load(Ordering::SeqCst) - before == (SIGUSR1 + SIGUSR2) as usize,
         "handler ran while ignored".into(),
     );
+    a_blocked_signal_waits_to_be_unblocked(&mut report);
 
     println!();
     println!("-- interval timers --");

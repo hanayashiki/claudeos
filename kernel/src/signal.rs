@@ -33,8 +33,16 @@ impl Signal {
     }
 
     /// The bit this signal occupies in a pending or blocked set.
+    ///
+    /// Signal n is bit n - 1, as in Linux's `sigset_t`. A program hands the
+    /// kernel its sets in that layout -- the mask `rt_sigprocmask` changes, the
+    /// one `rt_sigaction` blocks for a handler, `uc_sigmask` in a signal frame
+    /// -- and they are stored as they arrive, so a bit that is not the one the
+    /// program meant is a signal it did not name. With n at bit n, a thread
+    /// that blocked SIGUSR1 set the bit this kernel read as SIGKILL, which
+    /// cannot be blocked, and SIGUSR1 stayed deliverable.
     pub const fn bit(self) -> u64 {
-        1u64 << self.0
+        1u64 << (self.0 - 1)
     }
 
     /// Where this signal's disposition sits in a task's table.
