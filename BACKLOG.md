@@ -104,10 +104,6 @@ bytes such as 0xff, on both machines.
   the thread that takes it: `check_signals` and `kill_current` call
   `exit_current`, and `kill` signals only the task with that pid. The other
   threads keep running. Linux ends the whole thread group.
-- **A thread-group leader can be reaped while its threads run.** `wait4`
-  reaps a leader as soon as it exits, even with other threads still running;
-  Linux waits until the group is empty. A parent that reaps it early never
-  sees the status a later `exit_group` sets.
 - **A stopped thread survives `exit_group`.** The call marks SIGKILL pending
   on the other threads with `add_pending` rather than `post_signal`, so a
   stopped thread is not woken to take it.

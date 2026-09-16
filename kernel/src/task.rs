@@ -916,9 +916,13 @@ impl Task {
     ///
     /// This takes the task off the run queue for good, so everything owed on
     /// its behalf is owed now: a parent in vfork that has been holding the
-    /// address space open, and, for a process rather than one of the threads
-    /// inside one, the parent that may be in wait4. A thread's exit is not a
-    /// child exit; whoever joins it is woken through its cleared tid word.
+    /// address space open, and, when this was the last thread of its process
+    /// still running, the parent that may be in wait4. A process ends with its
+    /// last thread, whichever thread that is: Linux's `exit_notify` tells the
+    /// parent at the leader's exit only when the thread group is empty, and
+    /// `release_task` tells it at the last other thread's exit when the leader
+    /// went first. Any other thread's exit is not a child exit; whoever joins
+    /// it is woken through its cleared tid word.
     pub fn become_zombie(&self, table: &crate::sched::Held) {
         self.state.set(State::Zombie);
         if let Some(parent_pid) = self.vfork_parent.take() {
@@ -926,8 +930,10 @@ impl Task {
                 parent.wake(table.irq());
             }
         }
-        if self.pid == self.tgid {
-            table.notify_parent(self.ppid.get());
+        if table.group_exited(self.tgid) {
+            if let Some(leader) = table.find(self.tgid) {
+                table.notify_parent(leader.ppid.get());
+            }
         }
     }
 

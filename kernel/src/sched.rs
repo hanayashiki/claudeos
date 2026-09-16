@@ -84,6 +84,11 @@ impl<'a> Held<'a> {
         }
     }
 
+    /// True when every thread of the thread group `tgid` has exited.
+    pub fn group_exited(&self, tgid: u32) -> bool {
+        group_exited(self.tasks, tgid)
+    }
+
     /// Tell `ppid` that one of its children changed state, and wake it if it
     /// is blocked.
     pub fn notify_parent(&self, ppid: u32) {
@@ -482,7 +487,7 @@ pub fn exit_current(status: i32) -> ! {
             table.for_each(|other| {
                 if other.ppid.get() == pid {
                     other.ppid.set(1);
-                    if other.state() == State::Zombie {
+                    if other.pid == other.tgid && table.group_exited(other.tgid) {
                         adopted_zombie = true;
                     }
                 }
@@ -773,46 +778,82 @@ fn matches_want(task: &Task, want: i32) -> bool {
     }
 }
 
+/// True when every task in thread group `tgid` has exited.
+///
+/// A process has finished only then. Its first thread can exit alone, with
+/// the `exit` system call, while the others run on, and Linux's `wait` passes
+/// over such a leader until its thread group is empty (`delay_group_leader`).
+fn group_exited(tasks: &[TaskPtr], tgid: u32) -> bool {
+    tasks.iter().all(|t| {
+        let task = t.get();
+        task.tgid != tgid || task.state() == State::Zombie
+    })
+}
+
+/// True when `task` is a process that `wait4` can collect: its leader, with
+/// every thread of it exited.
+fn finished_process(tasks: &[TaskPtr], task: &Task) -> bool {
+    task.state() == State::Zombie && group_exited(tasks, task.tgid)
+}
+
 /// Collect a finished child. Returns (pid, exit code).
 pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
-    let mut found: Option<(u32, i32, *mut Task)> = None;
-    {
-        let tasks = TASKS.lock();
-        for entry in tasks.iter() {
-            let task = entry.get();
-            if !is_child_process(task, parent_pid) || task.state() != State::Zombie {
-                continue;
-            }
-            if !matches_want(task, want) {
-                continue;
-            }
-            // A leader that left before the group was ended -- its own `exit`
-            // while other threads ran on -- holds a code that is not the
-            // process's. Linux's wait reports `group_exit_code` whenever the
-            // group was ended by `exit_group`.
-            let status = (*task.group_exit.lock()).unwrap_or(task.exit_code.get());
-            found = Some((task.pid, status, entry.0));
-            break;
-        }
-    }
-    let (pid, code, ptr) = found?;
-    {
+    let mut group = Vec::new();
+    let (pid, code) = {
         let mut tasks = TASKS.lock();
-        tasks.retain(|t| t.0 != ptr);
-    }
-    crate::fs::procfs::remove_process(pid);
-    unsafe {
-        let mut task = Box::from_raw(ptr);
-        // The task being reaped is already out of the table, so this asks
-        // whether anything else still names the address space it ran in.
-        if !space_in_use(task.space()) {
-            task.space().destroy();
-        }
-        task.free_kernel_stack();
-        task.mark_dead();
-        drop(task);
-    }
+        let leader = tasks.iter().map(|entry| entry.get()).find(|task| {
+            is_child_process(task, parent_pid)
+                && matches_want(task, want)
+                && finished_process(&tasks, task)
+        })?;
+        // A leader that left before the group was ended -- its own `exit`
+        // while other threads ran on -- holds a code that is not the
+        // process's. Linux's wait reports `group_exit_code` whenever the
+        // group was ended by `exit_group`.
+        let status = (*leader.group_exit.lock()).unwrap_or(leader.exit_code.get());
+        let (pid, tgid) = (leader.pid, leader.tgid);
+        // The leader and whichever of its threads have not been released yet,
+        // all exited, found and taken out under one hold of the table. Another
+        // thread of the parent waiting for the same child would otherwise find
+        // it in between and free it a second time, and a thread left behind
+        // would keep its kernel stack and its entry in /proc until the next
+        // task was made or exited.
+        tasks.retain(|entry| {
+            let member = entry.get().tgid == tgid;
+            if member {
+                group.push(entry.0);
+            }
+            !member
+        });
+        (pid, status)
+    };
+    release(group);
     Some((pid, code))
+}
+
+/// Hand back what tasks taken out of the table hold: the entry in /proc, the
+/// kernel stack, the task itself, and the address space once nothing names
+/// it.
+///
+/// Tasks released together can run on one address space, and each of them is
+/// already out of the table when it is looked at, so the table alone would say
+/// the space is free for every one of them; only the last of them to name it
+/// may destroy it.
+fn release(dead: Vec<*mut Task>) {
+    for (i, &ptr) in dead.iter().enumerate() {
+        unsafe {
+            let mut task = Box::from_raw(ptr);
+            crate::fs::procfs::remove_process(task.pid);
+            let space = task.space();
+            let named_later = dead[i + 1..].iter().any(|&other| (*other).space() == space);
+            if !named_later && !space_in_use(space) {
+                space.destroy();
+            }
+            task.free_kernel_stack();
+            task.mark_dead();
+            drop(task);
+        }
+    }
 }
 
 /// Release the tasks of threads that have finished.
@@ -840,20 +881,7 @@ pub fn reap_dead_threads() {
             !finished
         });
     }
-    for ptr in dead {
-        unsafe {
-            let mut task = Box::from_raw(ptr);
-            crate::fs::procfs::remove_process(task.pid);
-            // Out of the table already, so this asks whether anything else --
-            // the process, or another of its threads -- still names the space.
-            if !space_in_use(task.space()) {
-                task.space().destroy();
-            }
-            task.free_kernel_stack();
-            task.mark_dead();
-            drop(task);
-        }
-    }
+    release(dead);
 }
 
 /// Report a child that stopped or was continued since the last report. The
@@ -905,7 +933,7 @@ pub fn child_event_pending(
         if !matches_want(task, want) {
             return false;
         }
-        task.state() == State::Zombie
+        finished_process(&tasks, task)
             || (untraced && task.report_stop.get())
             || (continued && task.report_continue.get())
     })
