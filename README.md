@@ -111,36 +111,48 @@ ARCH=aarch64 ./scripts/build.sh
 ./scripts/mkcard.sh                      # assemble build/boot and stop
 ./scripts/mkcard.sh --new /dev/disk4     # erase that card, partition it, write it
 ./scripts/mkcard.sh /dev/disk4           # later: rewrite its boot partition only
+./scripts/mkcard.sh --usr /dev/disk4     # later: copy the programs into /data/usr
 ```
 
 The userland build makes two images out of one list, `IMAGE_ITEMS` in
 `scripts/images.sh`, and prints the list as it builds. Each line names the
 images an item goes in (`both`, `test` or `board`), so moving an item from one
-image to the other is a change to one word.
+image to the other is a change to one word. A second list there, `CARD_ITEMS`,
+is what a new card's `/data` starts with (see "Programs on the card").
 
 ```
 build/initramfs-aarch64.cpio         the test image, which scripts/test.sh and
                                      make run boot under QEMU
 build/initramfs-aarch64-board.cpio   the board image, which mkcard.sh puts on
                                      the card and netboot.sh serves
+build/data-aarch64                   the files mkcard.sh --new puts on /data
 ```
 
-The board image has cbox, busybox, busybox-extras with musl's dynamic loader,
-cloudflared, the certificate store, the WiFi firmware, `wifi.conf` and the
-files in `/etc`. It has none of what only the
-tests use: nothing in `/root` (the suites, `demo.sh`, `hello.txt`), no
-`hello_c` or `inet` in `/bin`, and a cbox built without its `rtest` applet,
-which is a cargo feature only the test image's build turns on. A file the build
-makes that no line of the list names stops the build, so nothing can drop out
-of both images unnoticed. x86-64 has only the test image.
+The board image holds what the kernel and init need to boot and to reach the
+network and the console with no card: cbox as init, the shell and the applets,
+the files in `/etc` (the root account, the host name, the time servers, the
+system services list, the boot check's manifest, `wifi.conf` and the
+certificate store), the WiFi firmware in `/lib/firmware`, and a link from
+`/lib/ld-musl-aarch64.so.1` to `/usr/lib`. busybox, busybox-extras, musl's
+loader and cloudflared are on the card. It has none of what only the tests use:
+no `/tests` (the suites, `demo.sh`, `hello.txt`), no `hello_c` or `inet` in
+`/bin`, and a cbox built without its `rtest` applet, which is a cargo feature
+only the test image's build turns on. A file the build makes that no line of
+either list names stops the build, so nothing can drop out unnoticed. x86-64
+has only the test image. The test images keep busybox and cloudflared in
+`/bin`, and on aarch64 busybox-extras in `/bin` and the loader itself at
+`/lib/ld-musl-aarch64.so.1`, where the suites run them without a card.
 
 Run it once with no argument first and look at what it assembled. `--new`
 erases the whole card and makes two MBR partitions: partition 1, FAT32 labelled
 `CLAUDEOS`, 512 MiB, which gets the files below, and partition 2, FAT32
 labelled `CLAUDEDATA`, the rest of the card, which is `/data` (see "/data on
-the SD card"). A device named without `--new` erases partition 1 alone and
-writes the files again, leaving `/data` as it was; it refuses a card whose
-partition 1 is not labelled `CLAUDEOS` with a partition 2 after it. Either way
+the SD card") and gets `build/data-aarch64`. A device named without `--new`
+erases partition 1 alone and writes the files again, leaving `/data` as it
+was; it refuses a card whose partition 1 is not labelled `CLAUDEOS` with a
+partition 2 after it. `--usr` copies `build/data-aarch64/usr` into `/data/usr`
+over files of the same names and writes nothing else; it refuses a card whose
+partitions are not labelled `CLAUDEOS` and `CLAUDEDATA`. Every way
 it refuses anything that is not a removable whole disk and asks you to type the
 path again before it writes. Find the path with `diskutil list` on macOS or
 `lsblk` on Linux, and check the size against the card in your hand: naming the
@@ -419,17 +431,20 @@ own is sent as CR NUL.
 ## /data on the SD card
 
 On the Raspberry Pi 4 the kernel mounts a FAT32 volume on the microSD card at
-`/data`, read-write, for files that have to outlive a reboot, such as the pages
-a web server serves. Everything the system boots and runs still comes from the
-ram disk the firmware loaded, so nothing on `/data` is needed for either. A
-card that is missing, unreadable or damaged leaves the machine booting and
-running without `/data`.
+`/data`, read-write, for files that have to outlive a reboot: the pages a web
+server serves, the programs in `/usr`, and the home directory, `/root`. What
+the system needs to boot and to be reached, over the serial console and over
+the network, comes from the ram disk the firmware loaded, so nothing on
+`/data` is needed for that. A card that is missing, unreadable or damaged
+leaves the machine booting to a shell and the telnet console without `/data`,
+and without the programs kept there.
 
 A card from `scripts/mkcard.sh --new` has `/data` as its partition 2, labelled
-`CLAUDEDATA`, holding `services.txt` and `site/index.html` to start with (see
-"Services started at boot"). Updating the boot files later with `scripts/mkcard.sh /dev/diskN`
-rewrites partition 1 and leaves partition 2 alone. Mounted on the Mac, partition
-2 is `/Volumes/CLAUDEDATA`, which is one way to put files on it.
+`CLAUDEDATA`, holding `services.txt`, `site/index.html`, `root` and the
+programs under `usr` to start with (see "Programs on the card" and "Services
+started at boot"). Updating the boot files later with `scripts/mkcard.sh
+/dev/diskN` rewrites partition 1 and leaves partition 2 alone. Mounted on the
+Mac, partition 2 is `/Volumes/CLAUDEDATA`, which is one way to put files on it.
 
 **Which volume.** `data=LABEL` on the kernel command line names the label to
 look for, `CLAUDEDATA` when the word is absent, and `data=off` leaves the card
@@ -444,7 +459,7 @@ that is a boot partition. The outcome is one line, which also says what the
 card and the controller are:
 
 ```
-data: mounted partition 2 of the card, labelled CLAUDEDATA, 191 MiB in 385142 clusters of 512 bytes at /data, in 85 ms; EMMC2 at 0xfe340000, ...; card from manufacturer ...
+data: mounted partition 2 of the card, labelled CLAUDEDATA, 191 MiB in 385118 clusters of 512 bytes at /data, in 88 ms; /usr is a link to /data/usr; /root is a link to /data/root; EMMC2 at 0xfe340000, ...; card from manufacturer ...
 data: /data is not mounted: nothing answered in the card slot, which is empty or holds no SD memory card; EMMC2 at 0xfe340000, ...
 ```
 
@@ -505,9 +520,14 @@ so; `fsck_msdos -y` or Disk Utility's First Aid on the Mac clears it.
 
 **What FAT does not have, and what happens instead.**
 
-- Owners and permission bits. Every file reports root and mode 0644, every
-  directory root and 0755. `chmod` and `fchmod` succeed and change nothing, so
-  that `cp -p` and `tar` can copy onto `/data`.
+- Owners and permission bits. Every file and every directory reports root and
+  mode 0777, as Linux's vfat does mounted with `umask=0`, so a program kept
+  there can be run. `chmod` and `fchmod` to 0777 succeed, and to any other
+  mode answer EPERM, so a `chmod` that succeeds has left the file with the
+  mode it asked for. Linux's vfat without `quiet` answers EPERM only for the
+  setuid, setgid and sticky bits, and lets other modes it cannot keep through
+  as success without effect. A program that sets the mode of a file it copies
+  onto `/data`, such as busybox `cp -p`, gets EPERM for any mode but 0777.
 - Hard links, symbolic links and named pipes. Making one answers EPERM. A link
   or a rename between `/data` and the ram filesystem answers EXDEV, which makes
   `mv` copy instead.
@@ -622,6 +642,103 @@ four data lines, and CMD17, CMD18, CMD24 and CMD25 for blocks, by PIO. The bus
 stays at 3.3 V, at 50 MHz when the card has high speed; 1.8 V signalling and
 UHS-I are not used. A card taken out or put in after boot is not noticed.
 
+## Programs on the card
+
+The board image holds the system that has to work with no card: the kernel on
+the boot partition, and in the ram disk cbox, which is init, the shell and the
+applets, the files in `/etc`, and the WiFi firmware, which the kernel loads
+before there is a network. Every other program is on `/data`, and `/usr` and
+`/root` are there too:
+
+```
+the boot partition   kernel8.img                                      checked at boot
+the ram disk         /bin/cbox and its applet links                   checked at boot
+                     /etc/claudeos/services, the WiFi firmware        checked at boot
+                     /etc/passwd, hostname, ntp.conf, wifi.conf, ssl  not checked
+                     /lib/ld-musl-aarch64.so.1 -> /usr/lib/ld-musl-aarch64.so.1
+memory               /tmp, /var, /run; /proc and /dev are the kernel's
+the card             /usr -> /data/usr, /root -> /data/root,          not checked
+                     /data/services.txt, /data/site
+```
+
+A card from `scripts/mkcard.sh --new` starts with what `CARD_ITEMS` in
+`scripts/images.sh` lists, which the aarch64 build assembles in
+`build/data-aarch64`:
+
+```
+/data/usr/bin/busybox                 Alpine's busybox-static 1.36.1: ntpd, wget, tar and the other applets
+/data/usr/bin/busybox-extras          Alpine's busybox-extras: httpd, telnetd and nc
+/data/usr/bin/httpd                   a script that runs busybox-extras httpd
+/data/usr/bin/cloudflared             Cloudflare's tunnel client
+/data/usr/lib/ld-musl-aarch64.so.1    musl's dynamic loader and libc, which busybox-extras names
+/data/root                            the home directory, empty
+/data/services.txt, /data/site        the user services list and the page it serves
+```
+
+busybox has no applet links on the card, so its applets are run as `busybox
+wget` and the like; `PATH` is `/bin:/usr/bin`. FAT has no symbolic links, so
+`/usr/bin/httpd` is a two-line script, `exec /usr/bin/busybox-extras httpd
+"$@"`, rather than a link: a copy of busybox-extras would be a second file to
+keep in step with the first, and a link in the image would put the card's
+layout in the image. busybox-extras is dynamically linked and its program
+header names `/lib/ld-musl-aarch64.so.1`, which the board image makes a link
+to `/usr/lib/ld-musl-aarch64.so.1`; the kernel follows links when it looks
+the interpreter up, as for any other path. `scripts/fetch-busybox.sh` checks
+every file it downloads, and every file it takes out of a package, against a
+sha256 recorded in the script, and stops on a mismatch.
+
+**How /usr and /root get there.** Once the kernel has mounted `/data`, and
+before it prints the `data:` line, it makes `/data/usr` and `/data/root` if
+they are missing and replaces the empty `/usr` and `/root` of the ram disk
+with symbolic links to them, so `ls -l /` shows `usr -> /data/usr`. The kernel
+does it rather than init because the kernel is what knows whether and when the
+volume was mounted, including a mount that ends after init has started, and
+every boot then gets the same layout whatever program is init. Links rather
+than a second mount of each directory, because path lookup, the program loader
+included, already follows links, and a `mv` or `rmdir` of `/data/usr` needs no
+refusal of its own: the link is left pointing at nothing, as on Linux. No item
+of either image may be under `/usr` or `/root`; `scripts/images.sh` refuses
+one, since a mounted card would hide it.
+
+**Without the card.** With no card, a volume that does not mount, or
+`data=off`, `/usr` and `/root` stay empty directories in memory, init makes
+`/usr/bin` in `/usr`, and the shell and the telnet console come up as usual. A
+service whose program is on the card, ntpd from the system list among them,
+fails with `could not be started: No such file or directory (os error 2)` in
+its status and is tried again after its backoff wait, so it starts if the card
+is mounted late. A `/data/usr` or `/data/root` that is a file, or that cannot
+be made, leaves that one in memory, and the `data:` line says why.
+
+**What is checked.** The boot check covers what is in the image (see
+"Integrity check"). Nothing on the card is: the check runs before the card is
+mounted, and a program in `/data/usr` that is damaged or replaced runs as it
+is. To compare the card's programs with the build, run `busybox sha1sum
+/usr/bin/* /usr/lib/*` on the board and `shasum build/data-aarch64/usr/bin/*
+build/data-aarch64/usr/lib/*` on the Mac.
+
+**Adding or updating a program.** With the card in the Mac,
+`scripts/mkcard.sh --usr /dev/diskN` copies `build/data-aarch64/usr` over the
+files of the same names in `/data/usr` and writes nothing else, so a program
+added there, `services.txt` and the site stay as they are. A program the build
+should carry to every new card gets a line in `CARD_ITEMS` and a copy into the
+staging tree in `scripts/build-user-aarch64.sh`. Over the telnet console, fetch
+the new file under another name and rename it into place:
+
+```
+busybox wget -O /usr/bin/tailscaled.new http://ADDRESS:PORT/tailscaled
+mv /usr/bin/tailscaled.new /usr/bin/tailscaled
+sync
+```
+
+and name it in `/data/services.txt`, which takes effect at the next boot. A
+running program reads each page of its file when it first reaches it, and
+opening that file for writing is not refused with ETXTBSY. A rename over the
+file of a running program frees the old file's clusters, so the program is
+killed by a fault on the next page it had not yet read, and a service under
+`always` is then started again from the new file. Copying over the file in
+place instead leaves the running program reading pages of the new file at the
+old one's offsets, which is why the rename.
+
 ## Services started at boot
 
 Init starts the programs two lists name, once, at boot. Nothing starts, stops
@@ -637,7 +754,7 @@ everything else is broken.
   Its one service is the clock:
 
   ```
-  ntpd  always  needs=/etc/ntp.conf every=6h limit=180s backoff=30s-10m  /bin/busybox ntpd -n -q
+  ntpd  always  needs=/etc/ntp.conf every=6h limit=180s backoff=30s-10m  /usr/bin/busybox ntpd -n -q
   ```
 
 - **The user list**, `/data/services.txt`, is on the SD card and is edited with
@@ -651,10 +768,10 @@ everything else is broken.
 
 ```
 # name   policy  options                    command
-site     always                             /bin/httpd -f -p 8080 -h /data/site
+site     always                             /usr/bin/httpd -f -p 8080 -h /data/site
 setup    once                               /bin/sh /data/scripts/setup.sh
 backup   always  every=1h backoff=10s-10m   /bin/sh /data/scripts/backup.sh
-old      off                                /bin/httpd -f -p 8081 -h /data/old
+old      off                                /usr/bin/httpd -f -p 8081 -h /data/old
 ```
 
 - The name is 1 to 32 of `a-z`, `0-9`, `_` and `-`. It names the service's
@@ -667,7 +784,7 @@ old      off                                /bin/httpd -f -p 8081 -h /data/old
   what is between them in one word as it is, and nothing is expanded, so
   `$HOME`, `*` and a backslash reach the program as they are written. A service
   that wants a shell names one, as in `/bin/sh -c 'cd /data/site && exec
-  /bin/httpd -f'`, or a script.
+  /usr/bin/httpd -f'`, or a script.
 - Options come between the policy and the command, each a word with an `=`:
   - `needs=PATH` starts the service only when PATH exists at boot. For a user
     service it is looked up after `/data` has had its chance to mount, so it
@@ -687,7 +804,8 @@ old      off                                /bin/httpd -f -p 8081 -h /data/old
 **What a service gets.** A process group of its own, so the interrupt, quit
 and suspend keys typed at the console never reach it; standard input from
 `/dev/null`; init's environment, which holds the kernel command line's words;
-and `/root` as its working directory. Its standard output and error go through
+and `/root`, which is `/data/root` while the card is mounted, as its working
+directory. Its standard output and error go through
 a pipe to the process keeping it, which appends them to `/var/log/NAME.log`.
 When a log passes 256 KiB it is cut to its last 128 KiB, from the first whole
 line in them. `/var/log` is memory, and 256 KiB for each of the 64 services two
@@ -788,30 +906,18 @@ a system service:
 - A user service with a system service's name is refused, whether the system
   one is `always`, `once` or `off`, and the system one runs as its list says.
 
-**Programs from /data.** FAT has no execute bit, every file on `/data` is
-reported as mode 0644, and that stays so. A user service runs a program from
-the image with arguments that point into `/data`:
+**Programs from /data.** A service's program is a path in `/usr/bin`, which is
+on the card (see "Programs on the card"), or anywhere else on `/data`, since
+every file there is mode 0777; a script with a `#!` line runs as well:
 
 ```
-site     always  /bin/httpd -f -p 8080 -h /data/site
-setup    once    /bin/sh /data/scripts/start.sh
+site     always  /usr/bin/httpd -f -p 8080 -h /data/site
+setup    once    /data/scripts/start.sh
 ```
 
-A script run as `/bin/sh /data/scripts/start.sh` is read by the shell rather
-than executed, so it needs no execute bit. A server has to stay in the
-foreground, as `httpd -f` does: one that puts itself in the background ends the
-run its keeper waits for, and under `always` is started again and again.
-
-`/bin/httpd` is busybox's httpd on both machines: a link to busybox on x86-64,
-whose busybox.net build has it, and to `/bin/busybox-extras` on aarch64.
-Alpine's static busybox has no httpd, telnetd or nc. Alpine builds those into
-busybox-extras and publishes it only dynamically linked, so the aarch64 images
-also hold `/lib/ld-musl-aarch64.so.1`, the interpreter its program header
-names, which is musl's libc as well, and the kernel hands the program to it.
-Both files come from Alpine 3.19, and both are boot check items.
-`scripts/fetch-busybox.sh` checks every file it downloads, and every file it
-takes out of a package, against a sha256 recorded in the script, and stops on a
-mismatch.
+A server has to stay in the foreground, as `httpd -f` does: one that puts
+itself in the background ends the run its keeper waits for, and under `always`
+is started again and again.
 
 **The list a new card starts with.** `scripts/mkcard.sh --new` puts
 `user/data/services.txt` and `user/data/site/index.html` on `/data`: a web
@@ -819,8 +925,8 @@ server for `/data/site`, and a Cloudflare quick tunnel to it, which needs no
 account and gets a new `trycloudflare.com` address each time it starts.
 
 ```
-site      always                   /bin/httpd -f -p 8080 -h /data/site
-tunnel    always  backoff=30s-5m   /bin/cloudflared tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:8080
+site      always                   /usr/bin/httpd -f -p 8080 -h /data/site
+tunnel    always  backoff=30s-5m   /usr/bin/cloudflared tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:8080
 ```
 
 `--protocol http2` is the transport the tunnel runs on the board were made
@@ -855,18 +961,20 @@ makes. Each line is a SHA-1 digest, two spaces and a name, as `shasum` prints
 them; on x86-64, for example:
 
 ```
-8f381dfc881e1e2ed27075a946a8f98d31dd6c70  kernel
-7f2f52086e855810103b7b7b853bf2f3a6183c8e  /bin/cbox
-434b3b60c0514192558a00c8dc7542721ed7fe43  /bin/busybox
+f0f05cd16c6d762aafdf2e755ace4d233d7977bb  kernel
+cacccb244e157cea90abf89e84ae7854a7223a68  /bin/cbox
+2b2ba069d11a8bdcc05d3a8a4f97d1aab544c9e4  /etc/claudeos/services
 ```
 
-The items are `CHECKSUM_ITEMS` in `scripts/images.sh`: the kernel,
-`/bin/cbox`, `/bin/busybox`, on aarch64 `/bin/busybox-extras` and
-`/lib/ld-musl-aarch64.so.1`, `/etc/claudeos/services`, which decides what runs
-at every boot, and the three WiFi firmware files. Adding one is a
-line there. An item an image does not have, such as the firmware on x86-64, is
-left out of its manifest. So is `kernel` when the kernel ELF has not been
-built, with a warning, which is why the kernel is built before the userland.
+The items are `CHECKSUM_ITEMS` in `scripts/images.sh`, which are what the
+image holds of the software: the kernel, `/bin/cbox`,
+`/etc/claudeos/services`, which decides what runs at every boot, and the three
+WiFi firmware files. Adding one is a line there. An item an image does not
+have, such as the firmware on x86-64, is left out of its manifest. So is
+`kernel` when the kernel ELF has not been built, with a warning, which is why
+the kernel is built before the userland. Nothing on the card is checked: the
+check runs before `/data` is mounted, and the programs in `/usr` are the
+user's to replace (see "Programs on the card").
 
 For each item the console and the kernel log get `integrity: /bin/cbox ok`,
 `integrity: /bin/cbox DAMAGED: expected ..., got ...` or
@@ -892,8 +1000,8 @@ current builds that range is 576 KiB on x86-64 and 796 KiB on aarch64.
 kernel digest from `build/kernel-aarch64.elf`, since that card would report its
 kernel damaged at every boot.
 
-Under QEMU the check took 17.3 ms on x86-64 for its three items, 2.5 MiB in
-all, and 12.5 ms on aarch64 for its six, 3.2 MiB. It runs with interrupts
+Under QEMU the check of the aarch64 board image took 8.8 ms for its six items,
+2.1 MiB in all. It runs with interrupts
 masked, as boot has them up to that point, so the board's watchdog, which
 allows 15 seconds, is not fed while it runs.
 
@@ -1481,17 +1589,30 @@ failures.
   no manifest at all. Every one of those boots has to reach the shell without
   a panic, and `/proc/claudeos/integrity` has to hold what the console showed.
 - The **board image** boots `build/initramfs-aarch64-board.cpio` on aarch64.
-  It has to reach the shell, report every item ok, list nothing under `/root`
-  and none of `hello_c`, `inet` or `rtest` in `/bin`, and answer `cbox rtest`
-  with an unknown applet. On a Mac, `scripts/mkcard.sh --new --image` then
-  writes a 1 GiB card image. `tools/fatdisk` has to find exactly the files
-  `mkcard.sh` assembled in `build/boot` on its partition 1, and exactly
-  `services.txt` and `site/index.html` on its `/data`, byte for byte those
-  under `user/data`, with no `._` file or `.fseventsd` on either. An update
-  with `mkcard.sh --image` has to leave the SHA-1 of `/data`'s blocks as it was
-  and partition 1 holding exactly the boot files again. The card is then booted with the board image: the web server the seeded
-  list starts has to serve the seeded page to busybox `wget`. The quick tunnel,
-  which has no network under QEMU, has to exit and be started again.
+  With no card it has to reach the shell, report every item ok, have no
+  `/tests`, nothing under `/root` and nothing under `/usr` but the `/usr/bin`
+  init makes, none of `hello_c`, `inet`, `rtest`, `busybox`, `busybox-extras`,
+  `httpd` or `cloudflared` in `/bin`, and `/lib/ld-musl-aarch64.so.1` a link to
+  `/usr/lib`, and answer `cbox rtest` with an unknown applet. On a Mac,
+  `scripts/mkcard.sh --new --image` then writes a 1 GiB card image.
+  `tools/fatdisk` has to find exactly the files `mkcard.sh` assembled in
+  `build/boot` on its partition 1, and exactly the files in
+  `build/data-aarch64`, programs included, byte for byte, and a `root`
+  directory on its `/data`, with no `._` file or `.fseventsd` on either. An
+  update with `mkcard.sh --image` has to leave the SHA-1 of `/data`'s blocks as
+  it was and partition 1 holding exactly the boot files again. Then, with a
+  line added to `services.txt`, a file in `/root`, a program of the user's in
+  `/usr/bin` and `/usr/bin/httpd` overwritten, `mkcard.sh --usr --image` has to
+  put `httpd` back, keep the user's program, leave every file outside
+  `/data/usr` with the SHA-1 it had, and leave no `._` file or `.fseventsd`.
+  The card is then booted with the board image: the `data:` line has to say
+  `/usr` and `/root` are links to the card, `/root` has to hold the file put
+  there and the user's program has to run from `/usr/bin`, ntpd has to have
+  been started from `/usr/bin/busybox` rather than fail to start, and the web
+  server the seeded list starts through `/usr/bin/httpd` and the loader on the
+  card has to serve the seeded page to busybox `wget`. The quick tunnel, run
+  from `/usr/bin/cloudflared`, which has no network under QEMU, has to exit and
+  be started again.
 - **/data on an SD card** runs on aarch64, and on a Mac, since its card images
   are made with macOS's `newfs_msdos` through `hdiutil`, without root; elsewhere
   it reports itself skipped. It first runs `tools/fatdisk`'s tests, which build
@@ -1513,15 +1634,21 @@ failures.
   appended to, rewritten and truncated, a 1.2 MiB file, 300 long names in one
   directory, renames within and across directories, over a file, into the
   directory's own subdirectory and changing only case, a moved directory's
-  `..`, unlink and rmdir, the modes FAT reports and `chmod` changing nothing, no
-  hard or symbolic links, a device number of its own, `df` and `mount` naming
-  the card's partition and `/data`, the modification time from
-  the kernel clock, `fsync` and `sync`. While that boot pauses after its fsync
+  `..`, unlink and rmdir, the mode 0777 FAT files and directories report,
+  `chmod` succeeding to that mode and answering EPERM for another, no hard or
+  symbolic links, a device number of its own, `df` and `mount` naming the
+  card's partition and `/data`, busybox copied onto `/data` and run from there,
+  a `#!` script run from there, `/usr` and `/root` as links to `/data/usr` and
+  `/data/root` with a file written in `/root` found in `/data/root`,
+  busybox-extras run from `/usr/bin` with the test image's loader moved aside
+  and `/lib/ld-musl-aarch64.so.1` made a link to a copy in `/usr/lib`, the
+  modification time from the kernel clock, `fsync` and `sync`. While that boot pauses after its fsync
   and before its sync, the Mac reads the file out of the image. Between the
   boots the Mac compares the large file with the same `seq` output, reads every
   file to its length, and requires no cluster to belong to two files. A second
   boot on the same image reads back what the first left, the modification time
-  to FAT's two seconds, and removes the directory of 300 files with `rm -r`,
+  to FAT's two seconds, runs the busybox left on `/data` again, finds the file
+  left in `/root`, and removes the directory of 300 files with `rm -r`,
   and the boot partition beside `/data` has to be unchanged after both. Then
   boots with no card, with `data=off`, with a label the card does not have,
   with a boot partition labelled `CLAUDEDATA`, with a partition table whose boot
@@ -1531,7 +1658,10 @@ failures.
   with 200000 random bytes anywhere in a 128 MiB image for each of 12 seeds
   (`DATA_SEEDS` sets the number) each have to print exactly one `data:` line
   before the shell, reach the shell without a panic, and walk whatever `/data`
-  they have to 16 levels, read it and write to it, to the end. The cards booted with `data=off`, with
+  they have to 16 levels, read it and write to it, to the end. With no card,
+  with `data=off` and with the wrong label, `/usr` and `/root` have to be
+  directories in memory, `/root` empty and `/usr` holding only `bin`; on the
+  card whose chains loop, links to `/data/usr` and `/data/root`. The cards booted with `data=off`, with
   the wrong label and with the labelled boot partition have to come back
   unchanged. Beside the harness, `tools/fatdisk fuzz FIRST LAST` runs the
   kernel's own `storage/fat` against one damaged image per seed in a single
@@ -1560,8 +1690,13 @@ failures.
   `off` service. Then come a list of eight malformed lines, a good one and
   70 KiB of comments, where each malformed line has to be in
   `/run/services/errors.txt` with its number and the line past the byte cap
-  must not run; a card with no list; the first card with `data=off`; and a list
-  that names `ntpd`, which has to be refused while the system's ntpd runs. On
+  must not run; a card with no list; the first card with `data=off`, where
+  `/usr` and `/root` have to be directories in memory and ntpd, whose
+  `/usr/bin/busybox` is then absent, has to be waiting after a run that could
+  not be started; and a list that names `ntpd`, which has to be refused while
+  the system's ntpd runs. None of these images or cards holds
+  `/usr/bin/busybox`, so in every boot ntpd is started by its keeper and its
+  runs cannot start. On
   x86-64, which has no card slot, the test image as built has to leave ntpd
   not started for want of `/etc/ntp.conf`, and the copy has to start it and
   skip the user list. On both, `servicetest=hang` and `servicetest=abort`,
@@ -1653,15 +1788,16 @@ user/cbox/src/service_list.rs
 user/cbox/src/services.rs
                       the starter and the keepers of the services
 user/services         the system services list, /etc/claudeos/services in both images
-user/data             what scripts/mkcard.sh --new puts on a new card's /data
+user/data             the files of a new card's /data that are not built: the
+                      user services list, the site, /usr/bin/httpd
 user/c/hello.c        a C program linked against musl
 tools/mkcpio.py       initramfs builder
 tools/checksums.py    the manifest the boot check reads, and the kernel's digest
 tools/drive.py        drives the console over a socket, rendering as a terminal
 tools/fatdisk         makes, reads and damages SD card images with macOS's FAT
                       tools, and tests and fuzzes the kernel's FAT code on the Mac
-scripts/images.sh     what goes in the test image and the board image, and what
-                      the boot check covers
+scripts/images.sh     what goes in the test image, the board image and a new
+                      card's /data, and what the boot check covers
 scripts/reap-stale.sh clears QEMU instances an earlier run left behind
 scripts/mkcard.sh     assembles the boot partition for a Pi, and prepares or
                       updates a card
@@ -1670,6 +1806,7 @@ scripts/fetch-wifi-firmware.sh
 scripts/console.py    a telnet client for the telnet console, interactive or scripted
 scripts/lossy-transfer.sh
                       megabytes each way through the card over a lossy link
+tests/                the suites and demo.sh, in /tests in the test images
 tests/suite.sh        in-OS shell and userland test suite
 tests/busybox.sh      in-OS suite driving an upstream busybox
 tests/alpine.sh       in-OS suite run inside an Alpine root filesystem

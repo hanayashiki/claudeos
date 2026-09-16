@@ -213,10 +213,6 @@ bytes such as 0xff, on both machines.
   address at every start. A fixed address needs a named tunnel: a Cloudflare
   account, a credentials file on /data, and a changed `tunnel` line in
   /data/services.txt, with no new image.
-- **Programs on /data.** FAT has no execute bit, and the kernel reports files
-  on /data as mode 0644, so a program kept there, including one a user service
-  names, may not be executable. Not checked; the services in use all run from
-  the image.
 
 ## Over-the-air updates of the card, so no card reader is needed
 
