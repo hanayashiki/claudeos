@@ -200,6 +200,16 @@ pub struct Task {
     /// interrupt between the read and the write had its signal written over
     /// with the copy that was read before it arrived, and the signal was lost.
     pending_signals: AtomicU64,
+    /// Signals sent to the process rather than to one of its threads, and not
+    /// yet taken: one set for the whole thread group, as Linux keeps
+    /// `shared_pending` in the signal struct its threads share. Whichever
+    /// thread does not block a signal takes it from here. A forked child starts
+    /// with an empty one.
+    shared_pending: Arc<AtomicU64>,
+    /// The fault the kernel raised a signal pending on this task for, until
+    /// that signal is taken: what its handler is told in `si_code` and
+    /// `si_addr`.
+    pub fault: Cell<Option<crate::signal::Fault>>,
     /// The scheduling nice value. Round robin does not act on it, but a
     /// program that sets it reads it back.
     pub nice: Cell<i32>,
@@ -237,6 +247,12 @@ pub struct Task {
     pending_exec: Spinlock<Option<(String, Vec<String>, Vec<String>)>>,
     /// Parent blocked in vfork, to be woken when this task execs or exits.
     pub vfork_parent: Cell<Option<u32>>,
+    /// Set on a process's leader when its last thread exits and its parent
+    /// has said it will not wait for it: SIGCHLD ignored, or `SA_NOCLDWAIT`.
+    /// Nothing reports such a process to `wait4`, and its tasks are released
+    /// without one, as Linux's `exit_notify` releases a task
+    /// `do_notify_parent` says to reap itself.
+    pub released_at_exit: Cell<bool>,
 }
 
 unsafe impl Send for Task {}
@@ -298,6 +314,8 @@ impl Task {
             set_child_tid: Cell::new(0),
             robust_list: Cell::new(0),
             pending_signals: AtomicU64::new(0),
+            shared_pending: Arc::new(AtomicU64::new(0)),
+            fault: Cell::new(None),
             nice: Cell::new(0),
             stop_signal: Cell::new(None),
             report_stop: Cell::new(false),
@@ -312,6 +330,7 @@ impl Task {
             started: Cell::new(false),
             pending_exec: Spinlock::new(None),
             vfork_parent: Cell::new(None),
+            released_at_exit: Cell::new(false),
         }))
     }
 
@@ -372,27 +391,58 @@ impl Task {
         self.sig_stack.set(crate::abi::SigAltStack::default());
     }
 
-    /// The signals pending on this task, as one reading.
+    /// The signals this task could take: its own pending set and its thread
+    /// group's, as one reading of each.
     pub fn pending(&self) -> u64 {
+        self.own_pending() | self.shared_pending()
+    }
+
+    /// The signals sent to this thread alone.
+    pub fn own_pending(&self) -> u64 {
         self.pending_signals.load(Ordering::Acquire)
     }
 
-    /// Add signals to the pending set, in one step.
+    /// The signals sent to the thread group and not yet taken by any thread.
+    pub fn shared_pending(&self) -> u64 {
+        self.shared_pending.load(Ordering::Acquire)
+    }
+
+    /// Add signals to this thread's own pending set, in one step.
     pub fn add_pending(&self, signals: u64) {
         self.pending_signals.fetch_or(signals, Ordering::AcqRel);
     }
 
-    /// Remove signals from the pending set, in one step.
-    pub fn drop_pending(&self, signals: u64) {
-        self.pending_signals.fetch_and(!signals, Ordering::AcqRel);
+    /// Add signals to the thread group's pending set, in one step.
+    pub fn add_shared_pending(&self, signals: u64) {
+        self.shared_pending.fetch_or(signals, Ordering::AcqRel);
     }
 
-    /// Remove `signals` from the pending set and return which of them were in
-    /// it, in one step. A delivery takes its signal this way, so that two
-    /// deliveries cannot both find the same bit and both act on it, and a bit
-    /// raised again after the take stays raised.
+    /// Remove signals from both pending sets, one step each.
+    pub fn drop_pending(&self, signals: u64) {
+        self.pending_signals.fetch_and(!signals, Ordering::AcqRel);
+        self.shared_pending.fetch_and(!signals, Ordering::AcqRel);
+    }
+
+    /// Remove `signals` from the pending sets and return which of them were
+    /// there, one step per set. A delivery takes its signal this way, so that
+    /// two deliveries cannot both find the same bit and both act on it, and a
+    /// bit raised again after the take stays raised. This thread's own set is
+    /// taken from first and the group's only for what that did not hold, the
+    /// order Linux's `dequeue_signal` uses, so a signal sent both ways is
+    /// taken twice.
     pub fn take_pending(&self, signals: u64) -> u64 {
-        self.pending_signals.fetch_and(!signals, Ordering::AcqRel) & signals
+        let own = self.pending_signals.fetch_and(!signals, Ordering::AcqRel) & signals;
+        let rest = signals & !own;
+        if rest == 0 {
+            return own;
+        }
+        own | (self.shared_pending.fetch_and(!rest, Ordering::AcqRel) & rest)
+    }
+
+    /// Share `other`'s thread-group pending set, which is what a thread is
+    /// given. Only for a task that has not been admitted yet.
+    pub fn share_pending_of(&mut self, other: &Task) {
+        self.shared_pending = other.shared_pending.clone();
     }
 
     /// The signals this task blocks, as one reading.
@@ -916,9 +966,13 @@ impl Task {
     ///
     /// This takes the task off the run queue for good, so everything owed on
     /// its behalf is owed now: a parent in vfork that has been holding the
-    /// address space open, and, for a process rather than one of the threads
-    /// inside one, the parent that may be in wait4. A thread's exit is not a
-    /// child exit; whoever joins it is woken through its cleared tid word.
+    /// address space open, and, when this was the last thread of its process
+    /// still running, the parent that may be in wait4. A process ends with its
+    /// last thread, whichever thread that is: Linux's `exit_notify` tells the
+    /// parent at the leader's exit only when the thread group is empty, and
+    /// `release_task` tells it at the last other thread's exit when the leader
+    /// went first. Any other thread's exit is not a child exit; whoever joins
+    /// it is woken through its cleared tid word.
     pub fn become_zombie(&self, table: &crate::sched::Held) {
         self.state.set(State::Zombie);
         if let Some(parent_pid) = self.vfork_parent.take() {
@@ -926,22 +980,18 @@ impl Task {
                 parent.wake(table.irq());
             }
         }
-        if self.pid == self.tgid {
-            table.notify_parent(self.ppid.get());
+        if table.group_exited(self.tgid) {
+            if let Some(leader) = table.find(self.tgid) {
+                table.notify_parent_of_exit(leader);
+            }
         }
-    }
-
-    /// Record that a child of this task changed state, and put it back on the
-    /// run queue if it was asleep.
-    ///
-    /// Any sleep, not only a wait for a child. This is a signal, and every
-    /// other signal returns a sleeping task to the run queue; a shell blocked
-    /// reading its terminal has a handler for this one and would otherwise not
-    /// learn that a background job had finished until the next key was
-    /// pressed.
-    pub fn child_changed_state(&self, irq: NoInterrupts) {
-        self.add_pending(SIGCHLD.bit());
-        self.wake(irq);
+        // Nothing will wait for a thread: the next task out of a system call
+        // releases this one, which is still on the stack that would be handed
+        // back. `notify_parent_of_exit` asks the same for a process whose
+        // parent will not wait for it.
+        if self.pid != self.tgid {
+            crate::sched::tasks_to_release();
+        }
     }
 
     /// The timer found this task's deadline passed.

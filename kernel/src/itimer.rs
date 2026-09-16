@@ -18,7 +18,7 @@
 use crate::abi::Errno;
 use crate::sched;
 use crate::signal::{SIGALRM, SIGPROF, SIGVTALRM};
-use crate::task::{State, Task};
+use crate::task::Task;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const ITIMER_REAL: i32 = 0;
@@ -218,36 +218,41 @@ fn charge_running_task(from_user: bool) {
         }
         raised
     };
+    // The timers are the process's, and so are the signals they raise: they
+    // go into the thread group's pending set, where any thread that does not
+    // block them takes them, as Linux's `check_cpu_itimer` sends them to the
+    // thread group. The thread the tick charged is the one woken if it can
+    // take them.
     if raised != 0 {
-        task.add_pending(raised);
+        sched::with_tasks(|table| {
+            for signal in [SIGVTALRM, SIGPROF] {
+                if raised & signal.bit() != 0 {
+                    sched::post_process_signal(&task, signal, table);
+                }
+            }
+        });
     }
 }
 
 /// Raise SIGALRM for each process whose real timer is due.
 ///
-/// The timers belong to the process and the signal is taken by one of its
-/// tasks: the first in the table that is not a zombie and does not block
-/// SIGALRM, or, when every live one blocks it, the first live one, where it
-/// stays pending until it is unblocked. A process whose tasks are all zombies
-/// has nobody to take it, and nothing is raised.
+/// The timer belongs to the process and so does the signal: it goes into the
+/// thread group's pending set, as Linux's `it_real_fn` sends it to the thread
+/// group, and whichever thread does not block it takes it. Chosen from the
+/// threads at the moment it fired, it stayed with the first live one when every
+/// thread blocked it, and a different thread unblocking it later did not take
+/// it. Each process is reached through its leader, which stays in the table
+/// until every thread of it has exited. A process whose threads have all
+/// exited has nobody to take it, and nothing is raised.
 fn fire_real_timers(now: u64) {
     sched::with_tasks(|table| {
-        // Two walks, because a task that blocks the signal can come before one
-        // that does not, and which of them takes it is known only after looking
-        // at both.
-        table.for_each(|task| {
-            let blocks = task.blocked() & SIGALRM.bit() != 0;
-            if task.state() != State::Zombie && !blocks && take_if_due(task, now) {
-                sched::post_signal(task, SIGALRM, table);
-            }
-        });
         let mut earliest = u64::MAX;
         table.for_each(|task| {
-            if task.state() == State::Zombie {
+            if task.pid != task.tgid || table.group_exited(task.tgid) {
                 return;
             }
             if take_if_due(task, now) {
-                sched::post_signal(task, SIGALRM, table);
+                sched::post_process_signal(task, SIGALRM, table);
             }
             let due = task.itimers.lock().real.due_ns;
             if due != 0 {
@@ -258,7 +263,6 @@ fn fire_real_timers(now: u64) {
     });
 }
 
-/// Move `task`'s real timer on if it is due at `now`, and say whether it was.
 fn take_if_due(task: &Task, now: u64) -> bool {
     let mut timers = task.itimers.lock();
     if !timers.real.is_due(now) {

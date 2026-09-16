@@ -255,7 +255,7 @@ pub fn render(kind: Generated) -> String {
             // signal blocked sigignore sigcatch wchan nswap cnswap
             out.push_str(&format!(
                 "{} {} 0 0 0 0 0 ",
-                task.pending(),
+                task.own_pending(),
                 task.blocked()
             ));
             // exit_signal processor rt_priority policy delayacct_blkio
@@ -272,7 +272,7 @@ pub fn render(kind: Generated) -> String {
                 "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n\
                  Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\n\
                  VmSize:\t{} kB\nVmRSS:\t{} kB\nVmData:\t{} kB\n\
-                 SigPnd:\t{:016x}\nSigBlk:\t{:016x}\n",
+                 SigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\n",
                 task.name(),
                 state_char(task.state()),
                 match task.state() {
@@ -288,7 +288,8 @@ pub fn render(kind: Generated) -> String {
                 task.virtual_size() / 1024,
                 task.resident_pages() * 4,
                 (task.brk().saturating_sub(task.brk_start())) / 1024,
-                task.pending(),
+                task.own_pending(),
+                task.shared_pending(),
                 task.blocked(),
             )
         })

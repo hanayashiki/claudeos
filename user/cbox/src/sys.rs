@@ -59,6 +59,10 @@ mod numbers {
     pub const SYS_TIMES: u64 = 100;
     pub const SYS_CLOCK_GETRES: u64 = 229;
     pub const SYS_REBOOT: u64 = 169;
+    pub const SYS_EXIT: u64 = 60;
+    pub const SYS_GETTID: u64 = 186;
+    pub const SYS_TGKILL: u64 = 234;
+    pub const SYS_RT_SIGPROCMASK: u64 = 14;
 
     /// `struct epoll_event` is declared packed on x86-64, so the 8-byte data
     /// word follows the 4-byte mask with no gap.
@@ -98,6 +102,10 @@ mod numbers {
     pub const SYS_TIMES: u64 = 153;
     pub const SYS_CLOCK_GETRES: u64 = 114;
     pub const SYS_REBOOT: u64 = 142;
+    pub const SYS_EXIT: u64 = 93;
+    pub const SYS_GETTID: u64 = 178;
+    pub const SYS_TGKILL: u64 = 131;
+    pub const SYS_RT_SIGPROCMASK: u64 = 135;
 
     /// `struct epoll_event` is not packed here, so the data word is aligned to
     /// 8 and the structure is 16 bytes.
@@ -336,6 +344,42 @@ pub fn pwrite(fd: i32, data: &[u8], offset: u64) -> i64 {
 
 pub fn kill(pid: i32, signal: i32) -> i64 {
     unsafe { syscall2(SYS_KILL, pid as u64, signal as u64) }
+}
+
+/// The calling thread's id. Only in a process's first thread is it the pid.
+pub fn gettid() -> i64 {
+    unsafe { syscall0(SYS_GETTID) }
+}
+
+/// End the calling thread and nothing else: the `exit` system call, which
+/// musl's and Rust's exits never make, since both end the whole process with
+/// `exit_group`.
+pub fn exit_thread(code: i32) -> ! {
+    unsafe {
+        syscall1(SYS_EXIT, code as u64);
+    }
+    unreachable!()
+}
+
+/// Send `signal` to the one thread `tid` of the process `tgid`, rather than to
+/// the process.
+pub fn tgkill(tgid: i32, tid: i32, signal: i32) -> i64 {
+    unsafe { syscall3(SYS_TGKILL, tgid as u64, tid as u64, signal as u64) }
+}
+
+pub const SIG_BLOCK: i32 = 0;
+pub const SIG_UNBLOCK: i32 = 1;
+
+/// `rt_sigprocmask` on the calling thread, with the set as the kernel takes it
+/// on both machines: one 64-bit word, signal n at bit n - 1. Returns the call's
+/// result and the mask as it stood before.
+pub fn sigprocmask(how: i32, set: u64) -> (i64, u64) {
+    let mut old = 0u64;
+    let rc = unsafe {
+        syscall4(SYS_RT_SIGPROCMASK, how as u64, &set as *const u64 as u64,
+                 &mut old as *mut u64 as u64, 8)
+    };
+    (rc, old)
 }
 
 /// Install a handler with the restorer field left empty.

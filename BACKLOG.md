@@ -40,9 +40,12 @@ in git).
   forks a child per connection, sets SIGCHLD to `SIG_IGN` (outside inetd
   mode, as its source is remembered; confirm) and never waits. On Linux a
   process ignoring SIGCHLD, or with `SA_NOCLDWAIT`, has its children reaped at
-  exit (`do_notify_parent`). Here `SIG_IGN` on SIGCHLD only keeps a pending
+  exit (`do_notify_parent`). Here `SIG_IGN` on SIGCHLD only kept a pending
   SIGCHLD from interrupting calls (`sched.rs` `has_pending_signal_except`);
-  exit never checks it, so each connection leaves a zombie.
+  exit never checked it, so each connection left a zombie. Fixed on branch
+  worktree-agent-a65bd54ce6a84aa3e: such a child is released as its last
+  thread exits, and `wait4` in its parent fails with ECHILD once no child is
+  left.
 - Kernel heap 45 MiB in use of 69.8 MiB (16 MiB at boot).
 - The board did not answer ping while TCP to port 23 worked.
 - `madvise` returns 0 and does nothing (syscall/mod.rs).
@@ -50,12 +53,13 @@ in git).
 **Work in progress.** Branch worktree-agent-a65bd54ce6a84aa3e ("threadgroup",
 not merged) has: signal sets read at bit n - 1 (a real bug: blocking SIGUSR1
 blocked SIGKILL), reaping a process when its last thread exits, a fatal signal
-or fault ending the whole thread group, and kill(pid) to the group. It does not
-yet deliver SIGSEGV for faults to a handler.
+or fault ending the whole thread group, kill(pid) to the group, and children of
+a parent ignoring SIGCHLD released at exit, and a fault's signal delivered to
+the handler the program installed, with `si_code` and `si_addr`.
 
-**Next.** Deliver fault signals to handlers so the next crash leaves Go's
-trace; then find what overwrites user memory. The user plans to review the
-kernel's unsafe code, which mostly mirrors C, in an overhaul.
+**Next.** Find what overwrites user memory; the next crash should leave Go's
+trace in the tunnel's log. The user plans to review the kernel's unsafe code,
+which mostly mirrors C, in an overhaul.
 
 ## Paths, arguments and environment are text, where Linux has bytes
 
@@ -152,18 +156,11 @@ bytes such as 0xff, on both machines.
   them on. aarch64 already does the equivalent, and the copy-on-write repair
   masks explicitly either way.
 - **`fork` does not copy the parent's signal mask**; Linux does.
-- **A fatal signal ends one thread, not the process.** A SIGKILL sent from
-  outside, a fault, or a signal whose default action is to terminate ends only
-  the thread that takes it: `check_signals` and `kill_current` call
-  `exit_current`, and `kill` signals only the task with that pid. The other
-  threads keep running. Linux ends the whole thread group.
-- **A thread-group leader can be reaped while its threads run.** `wait4`
-  reaps a leader as soon as it exits, even with other threads still running;
-  Linux waits until the group is empty. A parent that reaps it early never
-  sees the status a later `exit_group` sets.
-- **A stopped thread survives `exit_group`.** The call marks SIGKILL pending
-  on the other threads with `add_pending` rather than `post_signal`, so a
-  stopped thread is not woken to take it.
+- **Stopping a process with threads is only partly Linux's group stop.** A
+  stop is made pending on every thread and each stops when it next looks at
+  its signals, but only the leader's stop is reported to `wait4`, so a process
+  whose first thread has already exited is never reported stopped. Linux
+  reports the stop once every thread has stopped (`do_signal_stop`).
 - **Carried over from the 2026-09-14 notes, not re-checked since:**
   - `openat(AT_FDCWD, "")` returns the current directory, where Linux returns
     ENOENT;

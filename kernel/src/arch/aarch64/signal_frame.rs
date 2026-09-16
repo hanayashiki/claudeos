@@ -25,7 +25,7 @@ use super::task::VECTOR_BYTES;
 use super::trap::TrapFrame;
 use crate::abi::{Errno, SysResult, MAP_PRIVATE, PROT_EXEC, PROT_READ};
 use crate::mm::{PAGE_SIZE_U64, USER_TRAMPOLINE};
-use crate::signal::{SigAction, Signal, SA_NODEFER, SA_ONSTACK};
+use crate::signal::{Fault, SigAction, Signal, SA_NODEFER, SA_ONSTACK};
 use crate::task::Task;
 use crate::uaccess;
 
@@ -184,12 +184,14 @@ fn restore_alt_stack(task: &Task, buf: &[u8], sp: u64) {
 
 /// Build a signal frame on the user stack and redirect `frame` into
 /// `action.handler`. Returns false if the user stack could not be written, in
-/// which case the caller should kill the task.
+/// which case the caller should kill the task. `fault` is what the signal was
+/// raised for, when a fault raised it.
 pub fn enter_signal_handler(
     task: &Task,
     signal: Signal,
     action: &SigAction,
     frame: &mut TrapFrame,
+    fault: Option<Fault>,
 ) -> bool {
     // A disposition that asked for its own stack gets it, unless a handler is
     // already running on it -- nesting continues down the same stack rather
@@ -202,10 +204,16 @@ pub fn enter_signal_handler(
 
     let mut buf = [0u8; WRITTEN_SIZE];
 
-    // siginfo: si_signo, si_errno, si_code.
+    // siginfo: si_signo, si_errno, si_code, and for a fault `si_addr`, the
+    // first word of the union after the three ints and their padding. A
+    // handler for a fault reads what went wrong and where from here: Go's
+    // prints "unexpected fault address" with it, and tells a nil dereference
+    // it can turn into a panic from a signal sent with kill by the code.
+    let (code, address) = fault.map_or((0, 0), |fault| (fault.code, fault.address));
     put32(&mut buf, INFO, signal.number() as u32);
     put32(&mut buf, INFO + 4, 0);
-    put32(&mut buf, INFO + 8, 0);
+    put32(&mut buf, INFO + 8, code as u32);
+    put64(&mut buf, INFO + 16, address);
 
     put64(&mut buf, UC_FLAGS, 0);
     put64(&mut buf, UC_LINK, 0);

@@ -84,11 +84,61 @@ impl<'a> Held<'a> {
         }
     }
 
-    /// Tell `ppid` that one of its children changed state, and wake it if it
-    /// is blocked.
+    /// True when every thread of the thread group `tgid` has exited.
+    pub fn group_exited(&self, tgid: u32) -> bool {
+        group_exited(self.tasks, tgid)
+    }
+
+    /// Tell the process `ppid` that one of its children changed state.
+    ///
+    /// SIGCHLD goes to the process, as Linux's `do_notify_parent` sends it,
+    /// and wakes a thread that can take it: a shell blocked reading its
+    /// terminal has a handler for it and would otherwise not learn that a
+    /// background job had finished until the next key was pressed. Every
+    /// thread of the process waiting in `wait4` is woken to look again, since
+    /// the child is the whole process's to collect and not only the thread's
+    /// that forked it (`__wake_up_parent`).
     pub fn notify_parent(&self, ppid: u32) {
         if let Some(parent) = self.find(ppid) {
-            parent.child_changed_state(self.irq);
+            post_process_signal(parent, SIGCHLD, self);
+            self.wake_waiters(parent.tgid);
+        }
+    }
+
+    /// Wake every thread of the process `tgid` that is waiting in `wait4`.
+    fn wake_waiters(&self, tgid: u32) {
+        self.for_each(|task| {
+            if task.tgid == tgid && task.waiting_for.get().is_some() {
+                task.wake(self.irq);
+            }
+        });
+    }
+
+    /// Tell the parent of the process `leader` leads that every thread of it
+    /// has exited, the way Linux's `do_notify_parent` does.
+    ///
+    /// A parent that ignores SIGCHLD, or asked for `SA_NOCLDWAIT`, will not
+    /// wait for the child, so the child is released at once rather than left a
+    /// zombie: busybox httpd ignores SIGCHLD, forks a child per connection and
+    /// never waits, and every connection left a zombie behind for good. An
+    /// ignored SIGCHLD is not sent; one with `SA_NOCLDWAIT` and a handler is,
+    /// and the handler runs. Either way the parent is woken, so a `wait4` it
+    /// is blocked in looks again and fails with ECHILD once it has no children
+    /// left.
+    pub fn notify_parent_of_exit(&self, leader: &Task) {
+        let Some(parent) = self.find(leader.ppid.get()) else {
+            return;
+        };
+        let action = parent.action(SIGCHLD);
+        let ignored = action.handler == crate::signal::SIG_IGN;
+        if ignored || action.flags & crate::signal::SA_NOCLDWAIT != 0 {
+            leader.released_at_exit.set(true);
+            tasks_to_release();
+        }
+        if ignored {
+            self.wake_waiters(parent.tgid);
+        } else {
+            self.notify_parent(parent.pid);
         }
     }
 }
@@ -386,28 +436,50 @@ pub fn handle_user_page_fault(fault: &arch::PageFault) -> bool {
     current().fault_in(fault.address)
 }
 
-/// Terminate every task in `tgid`'s thread group except the caller, then the
-/// caller itself.
+/// Terminate every task in the caller's thread group except the caller, then
+/// the caller itself.
 ///
-/// `status` becomes the thread group's, as Linux's `do_group_exit` stores it in
-/// `group_exit_code`. The other threads are ended by SIGKILL and leave through
-/// `exit_current`, which gives each of them this status rather than the signal.
-/// The leader is the task a wait reports, and a program ends itself from
-/// whichever thread it is on -- Go from the one that ran `os.Exit` -- so when
-/// the leader recorded the signal, a parent was told that a process which
-/// exited with 1 had been killed by signal 9. The first thread to get here sets
-/// the status; a second caller leaves with that one, as in Linux.
+/// This is how a process ends, whichever way it is ended: the `exit_group`
+/// system call, a signal whose action is to terminate, a fault. Linux's
+/// `get_signal` ends the thread group for a fatal signal through the same
+/// `do_group_exit` the system call uses. Ending only the thread that took the
+/// signal left the rest of the process running, and its parent never told.
 pub fn exit_group(status: i32) -> ! {
-    let status = *current().group_exit.lock().get_or_insert(status);
-    let tgid = current().tgid;
-    let me = current().pid;
-    for_each(|task, table| {
-        if task.tgid == tgid && task.pid != me && task.state() != State::Zombie {
+    let status = with_tasks(|table| end_thread_group(&current(), status, table));
+    exit_current(status)
+}
+
+/// Record `status` as the thread group's and make SIGKILL pending on every live
+/// thread of the group that `member` belongs to, waking each. Returns the
+/// status the group ends with.
+///
+/// The calling thread is among them when it is in the group. One that is on
+/// its way out through `exit_current` never looks at the kill; one that sent
+/// SIGKILL to its own process takes it on the way back to user mode, as it
+/// would on Linux.
+///
+/// The status becomes the group's as Linux's `do_group_exit` stores it in
+/// `group_exit_code`, and the first to set it keeps it: the threads this ends
+/// leave through `exit_current`, which gives each the group's status rather
+/// than the SIGKILL. The leader is the task a wait reports, and a program ends
+/// itself from whichever thread it is on -- Go from the one that ran
+/// `os.Exit` -- so when the leader recorded the signal, a parent was told that
+/// a process which exited with 1 had been killed by signal 9.
+///
+/// A stopped thread is restarted to take the kill, as Linux's SIGKILL wakes a
+/// task in `TASK_STOPPED`. Marking the kill pending does not return a stopped
+/// task to the run queue, so a stopped thread outlived the rest of its
+/// process.
+fn end_thread_group(member: &Task, status: i32, table: &Held) -> i32 {
+    let status = *member.group_exit.lock().get_or_insert(status);
+    table.for_each(|task| {
+        if task.tgid == member.tgid && task.state() != State::Zombie {
+            task.restart_for_kill(table.irq());
             task.add_pending(SIGKILL.bit());
             task.wake(table.irq());
         }
     });
-    exit_current(status)
+    status
 }
 
 /// Terminate the current task. `status` is already encoded the way wait4
@@ -456,7 +528,6 @@ pub fn exit_current(status: i32) -> ! {
             task.space().free_user_memory();
             task.clear_vmas();
         }
-        let ppid = task.ppid.get();
         let pid = task.pid;
 
         if pid == 1 {
@@ -474,24 +545,31 @@ pub fn exit_current(status: i32) -> ! {
         // it: a tick in between hands the CPU to something else and never
         // hands it back.
         with_tasks(|table| {
-            // Orphans are adopted by init. One that has already exited still
-            // needs reaping, and init is normally asleep in wait4, so it has
-            // to be woken here; nothing else will report the adopted zombie
-            // to it.
-            let mut adopted_zombie = false;
-            table.for_each(|other| {
-                if other.ppid.get() == pid {
-                    other.ppid.set(1);
-                    if other.state() == State::Zombie {
-                        adopted_zombie = true;
-                    }
-                }
-            });
-            if adopted_zombie && ppid != 1 {
-                table.notify_parent(1);
-            }
+            // A signal sent to the process that this thread was woken to take
+            // goes to a thread that is still there to take it.
+            let task = current();
+            retarget_shared_pending(&task, !task.blocked(), table);
 
-            current().become_zombie(table);
+            task.become_zombie(table);
+
+            // A child's parent is the process, so its children are handed on
+            // only once every thread of it has exited; until then any thread
+            // left can wait for them, as Linux's `forget_original_parent`
+            // hands them to a live thread of the group first. Orphans are
+            // adopted by init. One that has already exited still needs
+            // reaping, and init is normally asleep in wait4, so it has to be
+            // told here; nothing else will report the adopted zombie to it.
+            if table.group_exited(task.tgid) {
+                table.for_each(|other| {
+                    if other.ppid.get() == task.tgid {
+                        other.ppid.set(1);
+                        let exited = other.pid == other.tgid && table.group_exited(other.tgid);
+                        if exited && !other.released_at_exit.get() {
+                            table.notify_parent_of_exit(other);
+                        }
+                    }
+                });
+            }
         });
     }
     loop {
@@ -500,12 +578,38 @@ pub fn exit_current(status: i32) -> ! {
     }
 }
 
-/// Terminate the current task as if `signal` had killed it.
-pub fn kill_current(signal: Signal) -> ! {
-    let name = current().name();
-    let pid = current().pid;
-    crate::println!("[kernel] pid {} ({}) killed by signal {}", pid, name, signal.number());
-    exit_current(signal.number())
+/// Send the running thread the signal for a fault the kernel could not repair,
+/// and act on it before the thread returns to user mode, as Linux's
+/// `force_sig_fault` does.
+///
+/// A handler the program installed runs, told the fault's code and address,
+/// on a frame holding the registers at the faulting instruction: Go's handler
+/// turns a nil dereference into a panic, and prints "unexpected fault address"
+/// and every goroutine's stack for one it cannot. A signal the thread blocks or
+/// ignores cannot be left to wait, because returning would take the same fault
+/// again, so its action is put back to the default and it is unblocked, which
+/// ends the thread group. Only the thread that faulted can take it.
+pub fn force_fault(fault: crate::signal::Fault) {
+    let task = current();
+    let signal = fault.signal;
+    crate::println!(
+        "[kernel] pid {} ({}) sent signal {} (code {}) for a fault at {:#x}",
+        task.pid,
+        task.name(),
+        signal.number(),
+        fault.code,
+        fault.address
+    );
+    let action = task.action(signal);
+    let blocked = task.blocked() & signal.bit() != 0;
+    if blocked || action.handler == crate::signal::SIG_IGN {
+        let default = crate::signal::SigAction { handler: crate::signal::SIG_DFL, ..action };
+        task.set_action(signal, default);
+        task.unblock(signal.bit());
+    }
+    task.fault.set(Some(fault));
+    task.add_pending(signal.bit());
+    check_signals();
 }
 
 /// Raise a signal on the running task.
@@ -516,26 +620,127 @@ pub fn raise_on_current(signal: Signal) {
     current().add_pending(signal.bit());
 }
 
-/// Make `signal` pending on `task`.
-///
-/// Two of the job-control rules act on the task rather than on the handler: a
-/// continue restarts a stopped task and discards a stop that has not been
-/// taken yet, and a stop discards a continue the same way. Restarting is what
-/// the parent has to be told about, and the table is held here, which is where
-/// the parent is found.
+/// Make `signal` pending on the one thread `task`: what `tkill` and `tgkill`
+/// send, and what the kernel raises for something one thread did.
 pub fn post_signal(task: &Task, signal: Signal, table: &Held) {
-    const STOPS: u64 = SIGSTOP.bit() | SIGTSTP.bit() | SIGTTIN.bit() | SIGTTOU.bit();
-    if signal == SIGKILL {
-        task.restart_for_kill(table.irq());
-    }
-    if signal == SIGCONT {
-        task.drop_pending(STOPS);
-        task.continue_after_stop(table);
-    } else if signal.stops() {
-        task.drop_pending(SIGCONT.bit());
+    if !prepare_signal(task, signal, table) {
+        return;
     }
     task.add_pending(signal.bit());
     task.wake(table.irq());
+}
+
+/// Make `signal` pending on the process `member` is a thread of: what `kill`
+/// sends, to one process or to each process of a group.
+///
+/// It goes into the pending set the thread group shares, and whichever thread
+/// does not block it takes it, as Linux's `kill` does. One thread is woken to take
+/// it, chosen the way Linux's `complete_signal` chooses: `member` when it can,
+/// otherwise the first thread that can. When every thread blocks it, none is
+/// woken, and it waits in the set until one unblocks it. Sent to one task
+/// alone, a signal the first thread blocked waited for that thread even while
+/// another would have taken it at once.
+pub fn post_process_signal(member: &Task, signal: Signal, table: &Held) {
+    if !prepare_signal(member, signal, table) {
+        return;
+    }
+    member.add_shared_pending(signal.bit());
+    if can_take(member, signal) {
+        member.wake(table.irq());
+        return;
+    }
+    let mut woken = false;
+    table.for_each(|task| {
+        if !woken && task.tgid == member.tgid && can_take(task, signal) {
+            task.wake(table.irq());
+            woken = true;
+        }
+    });
+}
+
+/// True when `task` could take `signal` now: it is running or asleep rather
+/// than stopped or exited, and does not block the signal. Linux's
+/// `wants_signal`, less its preference for a thread with nothing pending.
+fn can_take(task: &Task, signal: Signal) -> bool {
+    let running = matches!(task.state(), State::Runnable | State::Sleeping);
+    let unblockable = signal == SIGKILL || signal == SIGSTOP;
+    running && (unblockable || task.blocked() & signal.bit() == 0)
+}
+
+/// What a signal does to the thread group it reaches before any thread takes
+/// it, whichever way it was addressed. Returns false when that is all it does
+/// and nothing is left to make pending.
+///
+/// Linux's `prepare_signal` applies the job-control rules to every thread of
+/// the group: a continue restarts each stopped thread and discards every stop
+/// not taken yet, and a stop discards every continue the same way. Restarting
+/// is what the parent has to be told about, and the table is held here, which
+/// is where the parent is found.
+///
+/// SIGKILL ends the whole group here, stopped threads included, as
+/// `complete_signal` does for a signal that is fatal to it.
+///
+/// A stop whose action is to stop is made pending on every thread rather than
+/// once, and each thread stops when it next looks, which is the part of
+/// Linux's group stop that leaves no thread of a stopped process running. The
+/// leader's stop is the one its parent is told about. Taken once by whichever
+/// thread got to it, a stop left the rest of the process running, and when
+/// that thread was not the leader the parent was not told at all.
+fn prepare_signal(member: &Task, signal: Signal, table: &Held) -> bool {
+    const STOPS: u64 = SIGSTOP.bit() | SIGTSTP.bit() | SIGTTIN.bit() | SIGTTOU.bit();
+    let tgid = member.tgid;
+    if signal == SIGKILL {
+        end_thread_group(member, SIGKILL.number(), table);
+        return false;
+    }
+    if signal == SIGCONT {
+        table.for_each(|task| {
+            if task.tgid == tgid {
+                task.drop_pending(STOPS);
+                task.continue_after_stop(table);
+            }
+        });
+        return true;
+    }
+    if !signal.stops() {
+        return true;
+    }
+    table.for_each(|task| {
+        if task.tgid == tgid {
+            task.drop_pending(SIGCONT.bit());
+        }
+    });
+    if signal != SIGSTOP && member.action(signal).handler != crate::signal::SIG_DFL {
+        return true;
+    }
+    table.for_each(|task| {
+        if task.tgid == tgid && task.state() != State::Zombie {
+            task.add_pending(signal.bit());
+            task.wake(table.irq());
+        }
+    });
+    false
+}
+
+/// Wake another thread of `task`'s group for the signals in `leaving` that are
+/// waiting in the group's set, because `task` will not take them: it is
+/// exiting, or has just blocked them. Linux's `retarget_shared_pending`. The
+/// thread woken when the signal was sent may be this one, and without this the
+/// signal waits until some other thread wakes for a reason of its own.
+pub fn retarget_shared_pending(task: &Task, leaving: u64, table: &Held) {
+    let mut left = task.shared_pending() & leaving;
+    table.for_each(|other| {
+        if left == 0 || other.tgid != task.tgid || other.pid == task.pid {
+            return;
+        }
+        if !matches!(other.state(), State::Runnable | State::Sleeping) {
+            return;
+        }
+        if left & !other.blocked() != 0 {
+            left &= other.blocked();
+            other.wake(table.irq());
+        }
+    });
 }
 
 /// Stop the running task until something sends it SIGCONT.
@@ -610,20 +815,31 @@ pub fn stop_if_requested() -> bool {
     false
 }
 
-/// Mark every task in the foreground group as having a pending signal.
+/// Send `signal` to every process in the foreground group.
 pub fn signal_foreground(signal: Signal) {
     signal_group(foreground(), signal);
 }
 
-/// Mark every task in `pgid` as having a pending signal.
+/// Send `signal` to every process in `pgid` but init, once each.
+///
+/// Each process is reached through its leader, which stays in the table until
+/// every thread of it has exited, and its pgid is the process's. Sent to every
+/// task in the group, a process with several threads took the signal once per
+/// thread: a handler ran that many times, where Linux's `kill_pgrp` sends it to
+/// each process once.
 pub fn signal_group(pgid: u32, signal: Signal) {
     if pgid == 0 {
         return;
     }
-    for_each(|task, table| {
-        if task.pgid.get() == pgid && task.pid != 1 && task.state() != State::Zombie {
-            post_signal(task, signal, table);
-        }
+    with_tasks(|table| {
+        table.for_each(|task| {
+            let leader = task.pid == task.tgid;
+            if leader && task.pgid.get() == pgid && task.tgid != 1 {
+                if !table.group_exited(task.tgid) {
+                    post_process_signal(task, signal, table);
+                }
+            }
+        });
     });
 }
 
@@ -672,74 +888,100 @@ pub fn has_pending_signal_except(ignore: u64) -> bool {
 
 /// Act on pending signals before returning to user mode. Called once the
 /// syscall result has been stored, so a handler may run on the way out.
+///
+/// A signal whose action is to terminate ends the whole thread group, as
+/// Linux's `get_signal` does through `do_group_exit`, whether it was sent to
+/// the process or to this one thread: a Go program that meets a fault it cannot
+/// handle resets the handler and sends the signal to its own thread to die of
+/// it, and the process has to die with it.
 pub fn check_signals() {
     if !has_current() {
         return;
     }
     let task = current();
-    if task.pending() == 0 {
-        return;
-    }
 
-    for signal in Signal::all() {
-        let bit = signal.bit();
-        if task.pending() & bit == 0 {
-            continue;
+    // A stop is the one action after which there can be more to do: whatever
+    // continued the task can have left a signal of its own behind, SIGKILL
+    // among them, and Linux's `get_signal` goes round again for it rather than
+    // letting the task back into user mode first.
+    'scan: loop {
+        if task.pending() == 0 {
+            return;
         }
-        let blocked = task.blocked() & bit != 0;
-        if blocked && signal != SIGKILL && signal != SIGSTOP {
-            continue;
-        }
-        // Taken rather than dropped: only a take that finds the bit still set
-        // goes on to act on the signal.
-        if task.take_pending(bit) == 0 {
-            continue;
-        }
+        // A signal raised for a fault is taken before any other, as Linux's
+        // `dequeue_synchronous_signal` takes it: a handler for another signal
+        // run first would return to the faulting instruction, which faults
+        // again.
+        let first = task.fault.get().map(|fault| fault.signal);
+        for signal in first.into_iter().chain(Signal::all()) {
+            let bit = signal.bit();
+            if task.pending() & bit == 0 {
+                continue;
+            }
+            let blocked = task.blocked() & bit != 0;
+            if blocked && signal != SIGKILL && signal != SIGSTOP {
+                continue;
+            }
+            // Taken rather than dropped: only a take that finds the bit still
+            // set goes on to act on the signal.
+            if task.take_pending(bit) == 0 {
+                continue;
+            }
 
-        if signal == SIGKILL {
-            exit_current(signal.number());
-        }
+            if signal == SIGKILL {
+                exit_group(signal.number());
+            }
 
-        // Stopping and running a handler both leave the kernel in the middle
-        // of whatever it was doing, so both wait until the task is on its way
-        // back to user mode; until then the signal stays pending.
-        let stops = signal == SIGSTOP || {
+            // Stopping and running a handler both leave the kernel in the
+            // middle of whatever it was doing, so both wait until the task is
+            // on its way back to user mode; until then the signal stays
+            // pending.
+            let stops = signal == SIGSTOP || {
+                let action = task.action(signal);
+                signal.stops() && action.handler == crate::signal::SIG_DFL
+            };
+            if stops {
+                let frame = unsafe { &mut *task.trap_frame() };
+                if !frame.from_user() {
+                    task.add_pending(bit);
+                    return;
+                }
+                stop_current(signal);
+                continue 'scan;
+            }
+
             let action = task.action(signal);
-            signal.stops() && action.handler == crate::signal::SIG_DFL
-        };
-        if stops {
+            match action.handler {
+                crate::signal::SIG_IGN => continue,
+                crate::signal::SIG_DFL => {
+                    if crate::signal::default_is_ignore(signal) {
+                        continue;
+                    }
+                    exit_group(signal.number());
+                }
+                _ => {}
+            }
+
+            // A handler can only run on the way back to user mode.
             let frame = unsafe { &mut *task.trap_frame() };
             if !frame.from_user() {
                 task.add_pending(bit);
                 return;
             }
-            stop_current(signal);
-            return;
-        }
-
-        let action = task.action(signal);
-        match action.handler {
-            crate::signal::SIG_IGN => continue,
-            crate::signal::SIG_DFL => {
-                if crate::signal::default_is_ignore(signal) {
-                    continue;
-                }
-                exit_current(signal.number());
+            if action.flags & crate::signal::SA_RESETHAND != 0 {
+                task.set_action(signal, crate::signal::SigAction::default());
             }
-            _ => {}
-        }
-
-        // A handler can only run on the way back to user mode.
-        let frame = unsafe { &mut *task.trap_frame() };
-        if !frame.from_user() {
-            task.add_pending(bit);
+            // A frame that cannot be written is SIGSEGV with its default
+            // action, which Linux's `force_sigsegv` makes it, so it too ends
+            // the thread group.
+            let fault = task.fault.get().filter(|fault| fault.signal == signal);
+            if fault.is_some() {
+                task.fault.set(None);
+            }
+            if !crate::signal::deliver(&task, signal, &action, frame, fault) {
+                exit_group(SIGSEGV.number());
+            }
             return;
-        }
-        if action.flags & crate::signal::SA_RESETHAND != 0 {
-            task.set_action(signal, crate::signal::SigAction::default());
-        }
-        if !crate::signal::deliver(&task, signal, &action, frame) {
-            exit_current(SIGSEGV.number());
         }
         return;
     }
@@ -755,8 +997,12 @@ pub fn check_signals() {
 /// thread's status, while the process it is actually waiting for is still
 /// running. A thread is reported to a joiner inside the process and to nothing
 /// else.
+///
+/// A process released at its exit, because its parent will not wait for it, is
+/// not a child either: Linux takes it off the parent's list of children as it
+/// exits.
 fn is_child_process(task: &Task, parent_pid: u32) -> bool {
-    task.ppid.get() == parent_pid && task.pid == task.tgid
+    task.ppid.get() == parent_pid && task.pid == task.tgid && !task.released_at_exit.get()
 }
 
 /// Does `task` match the pid argument `wait4` was given?
@@ -773,87 +1019,137 @@ fn matches_want(task: &Task, want: i32) -> bool {
     }
 }
 
+/// True when every task in thread group `tgid` has exited.
+///
+/// A process has finished only then. Its first thread can exit alone, with
+/// the `exit` system call, while the others run on, and Linux's `wait` passes
+/// over such a leader until its thread group is empty (`delay_group_leader`).
+fn group_exited(tasks: &[TaskPtr], tgid: u32) -> bool {
+    tasks.iter().all(|t| {
+        let task = t.get();
+        task.tgid != tgid || task.state() == State::Zombie
+    })
+}
+
+/// True when `task` is a process that `wait4` can collect: its leader, with
+/// every thread of it exited.
+fn finished_process(tasks: &[TaskPtr], task: &Task) -> bool {
+    task.state() == State::Zombie && group_exited(tasks, task.tgid)
+}
+
 /// Collect a finished child. Returns (pid, exit code).
 pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
-    let mut found: Option<(u32, i32, *mut Task)> = None;
-    {
-        let tasks = TASKS.lock();
-        for entry in tasks.iter() {
-            let task = entry.get();
-            if !is_child_process(task, parent_pid) || task.state() != State::Zombie {
-                continue;
-            }
-            if !matches_want(task, want) {
-                continue;
-            }
-            // A leader that left before the group was ended -- its own `exit`
-            // while other threads ran on -- holds a code that is not the
-            // process's. Linux's wait reports `group_exit_code` whenever the
-            // group was ended by `exit_group`.
-            let status = (*task.group_exit.lock()).unwrap_or(task.exit_code.get());
-            found = Some((task.pid, status, entry.0));
-            break;
-        }
-    }
-    let (pid, code, ptr) = found?;
-    {
+    let mut group = Vec::new();
+    let (pid, code) = {
         let mut tasks = TASKS.lock();
-        tasks.retain(|t| t.0 != ptr);
-    }
-    crate::fs::procfs::remove_process(pid);
-    unsafe {
-        let mut task = Box::from_raw(ptr);
-        // The task being reaped is already out of the table, so this asks
-        // whether anything else still names the address space it ran in.
-        if !space_in_use(task.space()) {
-            task.space().destroy();
-        }
-        task.free_kernel_stack();
-        task.mark_dead();
-        drop(task);
-    }
+        let leader = tasks.iter().map(|entry| entry.get()).find(|task| {
+            is_child_process(task, parent_pid)
+                && matches_want(task, want)
+                && finished_process(&tasks, task)
+        })?;
+        // A leader that left before the group was ended -- its own `exit`
+        // while other threads ran on -- holds a code that is not the
+        // process's. Linux's wait reports `group_exit_code` whenever the
+        // group was ended by `exit_group`.
+        let status = (*leader.group_exit.lock()).unwrap_or(leader.exit_code.get());
+        let (pid, tgid) = (leader.pid, leader.tgid);
+        // The leader and whichever of its threads have not been released yet,
+        // all exited, found and taken out under one hold of the table. Another
+        // thread of the parent waiting for the same child would otherwise find
+        // it in between and free it a second time, and a thread left behind
+        // would keep its kernel stack and its entry in /proc until the next
+        // task was made or exited.
+        tasks.retain(|entry| {
+            let member = entry.get().tgid == tgid;
+            if member {
+                group.push(entry.0);
+            }
+            !member
+        });
+        (pid, status)
+    };
+    release(group);
     Some((pid, code))
 }
 
-/// Release the tasks of threads that have finished.
+/// Hand back what tasks taken out of the table hold: the entry in /proc, the
+/// kernel stack, the task itself, and the address space once nothing names
+/// it.
 ///
-/// Nothing waits for a thread, so no `wait4` ever takes its entry out of the
-/// table: the kernel stack, the task itself and the share it holds of the
-/// process's region list would stay taken for as long as the machine ran.
-/// Called where threads are made and where one exits, so a program that starts
-/// and joins them in a loop leaves at most the one that has not finished
-/// switching away yet.
-pub fn reap_dead_threads() {
-    let mut dead = Vec::new();
-    {
-        let cur = unsafe { CURRENT };
-        let mut tasks = TASKS.lock();
-        tasks.retain(|entry| {
-            let task = entry.get();
-            // The running task is in the middle of its own exit and is still on
-            // the stack this would hand back.
-            let finished =
-                task.state() == State::Zombie && task.pid != task.tgid && entry.0 != cur;
-            if finished {
-                dead.push(entry.0);
-            }
-            !finished
-        });
-    }
-    for ptr in dead {
+/// Tasks released together can run on one address space, and each of them is
+/// already out of the table when it is looked at, so the table alone would say
+/// the space is free for every one of them; only the last of them to name it
+/// may destroy it.
+fn release(dead: Vec<*mut Task>) {
+    for (i, &ptr) in dead.iter().enumerate() {
         unsafe {
             let mut task = Box::from_raw(ptr);
             crate::fs::procfs::remove_process(task.pid);
-            // Out of the table already, so this asks whether anything else --
-            // the process, or another of its threads -- still names the space.
-            if !space_in_use(task.space()) {
-                task.space().destroy();
+            let space = task.space();
+            let named_later = dead[i + 1..].iter().any(|&other| (*other).space() == space);
+            if !named_later && !space_in_use(space) {
+                space.destroy();
             }
             task.free_kernel_stack();
             task.mark_dead();
             drop(task);
         }
     }
+}
+
+/// Set when a task has exited that no `wait4` will take out of the table.
+static RELEASE_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Record that a task has exited that `reap_dead_threads` is to release.
+pub fn tasks_to_release() {
+    RELEASE_PENDING.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Release finished tasks that nothing will wait for, if any exited since the
+/// last time. For the way out of a system call, where the kernel holds nothing.
+pub fn release_if_pending() {
+    if RELEASE_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        reap_dead_threads();
+    }
+}
+
+/// Release the tasks that have finished and that no `wait4` will take out of
+/// the table: threads, and processes whose parent will not wait for them.
+///
+/// Without this the kernel stack, the task itself, its entry in /proc and the
+/// share it holds of the process's region list would stay taken for as long as
+/// the machine ran. Called where tasks are made and where one exits, and on the
+/// way out of the next system call after a task that needs it has exited, so a
+/// program that starts and joins threads in a loop, or a server that forks a
+/// child per connection and ignores SIGCHLD, leaves at most the one that has
+/// not finished switching away yet.
+pub fn reap_dead_threads() {
+    let mut dead = Vec::new();
+    let mut unfinished = false;
+    {
+        let cur = unsafe { CURRENT };
+        let mut tasks = TASKS.lock();
+        tasks.retain(|entry| {
+            let task = entry.get();
+            let unwaited = task.pid != task.tgid || task.released_at_exit.get();
+            if task.state() != State::Zombie || !unwaited {
+                return true;
+            }
+            // The running task is in the middle of its own exit and is still on
+            // the stack this would hand back. Whoever runs next releases it.
+            if entry.0 == cur {
+                unfinished = true;
+                return true;
+            }
+            dead.push(entry.0);
+            false
+        });
+    }
+    if unfinished {
+        tasks_to_release();
+    }
+    release(dead);
 }
 
 /// Report a child that stopped or was continued since the last report. The
@@ -905,7 +1201,7 @@ pub fn child_event_pending(
         if !matches_want(task, want) {
             return false;
         }
-        task.state() == State::Zombie
+        finished_process(&tasks, task)
             || (untraced && task.report_stop.get())
             || (continued && task.report_continue.get())
     })
