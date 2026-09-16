@@ -69,6 +69,15 @@ bytes such as 0xff, on both machines.
   the access point it joined until that one drops the link.
 - **Group key rekey unobserved.** It has only been exercised by the self test,
   never seen on the board: the router did not rekey in about two hours.
+- **The strongest access point refused a join.** On the board's first boot
+  from the card (main fad1632, 2026-09-16) the scan chose the strongest BSS
+  with the configured name, on channel 36, and the firmware then reported
+  about thirty DEAUTH events with reason 7 (a class 3 frame from a station
+  that is not associated) until the attempt ran out. The retry 4 s later chose
+  channel 6 and had the link up 2.6 s after the join request, 9 s after boot's
+  first attempt. Cause not established: the router may be steering bands, or
+  that BSS may want something the driver does not send. Worth deciding whether
+  an attempt that a BSSID refuses should make the next attempt skip it.
 
 ## Networking
 
