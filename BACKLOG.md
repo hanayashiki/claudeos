@@ -42,16 +42,16 @@ in git).
   process ignoring SIGCHLD, or with `SA_NOCLDWAIT`, has its children reaped at
   exit (`do_notify_parent`). Here `SIG_IGN` on SIGCHLD only kept a pending
   SIGCHLD from interrupting calls (`sched.rs` `has_pending_signal_except`);
-  exit never checked it, so each connection left a zombie. Fixed on branch
-  worktree-agent-a65bd54ce6a84aa3e: such a child is released as its last
+  exit never checked it, so each connection left a zombie. Fixed in main
+  1d8298e: such a child is released as its last
   thread exits, and `wait4` in its parent fails with ECHILD once no child is
   left.
 - Kernel heap 45 MiB in use of 69.8 MiB (16 MiB at boot).
 - The board did not answer ping while TCP to port 23 worked.
 - `madvise` returns 0 and does nothing (syscall/mod.rs).
 
-**Work in progress.** Branch worktree-agent-a65bd54ce6a84aa3e ("threadgroup",
-not merged) has: signal sets read at bit n - 1 (a real bug: blocking SIGUSR1
+**Merged into main as 1d8298e** (verified by the Rust standard library suite
+on both machines and the userland suite on x86-64, not the full suites): signal sets read at bit n - 1 (a real bug: blocking SIGUSR1
 blocked SIGKILL), reaping a process when its last thread exits, a fatal signal
 or fault ending the whole thread group, kill(pid) to the group, and children of
 a parent ignoring SIGCHLD released at exit, and a fault's signal delivered to
