@@ -99,6 +99,29 @@ bytes such as 0xff, on both machines.
   them on. aarch64 already does the equivalent, and the copy-on-write repair
   masks explicitly either way.
 - **`fork` does not copy the parent's signal mask**; Linux does.
+- **A fault is never offered to a handler.** kernel/src/trap.rs calls
+  `kill_current` for a user page fault it cannot repair and for any other user
+  exception, so the process ends with SIGSEGV, SIGILL or SIGFPE whatever
+  handler it installed. Linux sends the signal to the faulting thread
+  (`force_sig_fault`), and a handler runs. The Go runtime turns a nil pointer
+  dereference, and on x86-64 an integer division by zero, into a panic from its
+  handler, which a program can recover from; here the process dies.
+- **A child's parent is the thread that forked it.** `fork` sets the child's
+  `ppid` to the forking task's id, which for a thread other than the first is
+  not the process's. The child's `getppid` returns that thread id, `wait4` in
+  another thread of the parent finds no such child (it matches `ppid` against
+  the caller's own id), and when that thread exits `exit_current` hands its
+  children to init while the parent process runs on. Linux's parent is the
+  process: any thread can wait for the child, and a thread's exit hands its
+  children to another thread of the group.
+- **Stopping a process with threads is only partly Linux's group stop.** A
+  stop is made pending on every thread and each stops when it next looks at
+  its signals, but only the leader's stop is reported to `wait4`, so a process
+  whose first thread has already exited is never reported stopped. Linux
+  reports the stop once every thread has stopped (`do_signal_stop`).
+- **A process whose threads have all exited cannot be signalled.** Until it is
+  reaped, `kill` answers ESRCH, and so do `tkill` and `tgkill` for its leader;
+  Linux answers 0.
 - **Carried over from the 2026-09-14 notes, not re-checked since:**
   - `openat(AT_FDCWD, "")` returns the current directory, where Linux returns
     ENOENT;
