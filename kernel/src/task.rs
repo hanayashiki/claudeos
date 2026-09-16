@@ -206,6 +206,10 @@ pub struct Task {
     /// thread does not block a signal takes it from here. A forked child starts
     /// with an empty one.
     shared_pending: Arc<AtomicU64>,
+    /// The fault the kernel raised a signal pending on this task for, until
+    /// that signal is taken: what its handler is told in `si_code` and
+    /// `si_addr`.
+    pub fault: Cell<Option<crate::signal::Fault>>,
     /// The scheduling nice value. Round robin does not act on it, but a
     /// program that sets it reads it back.
     pub nice: Cell<i32>,
@@ -311,6 +315,7 @@ impl Task {
             robust_list: Cell::new(0),
             pending_signals: AtomicU64::new(0),
             shared_pending: Arc::new(AtomicU64::new(0)),
+            fault: Cell::new(None),
             nice: Cell::new(0),
             stop_signal: Cell::new(None),
             report_stop: Cell::new(false),

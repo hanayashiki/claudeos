@@ -54,12 +54,12 @@ in git).
 not merged) has: signal sets read at bit n - 1 (a real bug: blocking SIGUSR1
 blocked SIGKILL), reaping a process when its last thread exits, a fatal signal
 or fault ending the whole thread group, kill(pid) to the group, and children of
-a parent ignoring SIGCHLD released at exit. It does not yet deliver SIGSEGV for
-faults to a handler.
+a parent ignoring SIGCHLD released at exit, and a fault's signal delivered to
+the handler the program installed, with `si_code` and `si_addr`.
 
-**Next.** Deliver fault signals to handlers so the next crash leaves Go's
-trace; then find what overwrites user memory. The user plans to review the
-kernel's unsafe code, which mostly mirrors C, in an overhaul.
+**Next.** Find what overwrites user memory; the next crash should leave Go's
+trace in the tunnel's log. The user plans to review the kernel's unsafe code,
+which mostly mirrors C, in an overhaul.
 
 ## Paths, arguments and environment are text, where Linux has bytes
 
@@ -156,13 +156,6 @@ bytes such as 0xff, on both machines.
   them on. aarch64 already does the equivalent, and the copy-on-write repair
   masks explicitly either way.
 - **`fork` does not copy the parent's signal mask**; Linux does.
-- **A fault is never offered to a handler.** kernel/src/trap.rs calls
-  `kill_current` for a user page fault it cannot repair and for any other user
-  exception, so the process ends with SIGSEGV, SIGILL or SIGFPE whatever
-  handler it installed. Linux sends the signal to the faulting thread
-  (`force_sig_fault`), and a handler runs. The Go runtime turns a nil pointer
-  dereference, and on x86-64 an integer division by zero, into a panic from its
-  handler, which a program can recover from; here the process dies.
 - **A child's parent is the thread that forked it.** `fork` sets the child's
   `ppid` to the forking task's id, which for a thread other than the first is
   not the process's. The child's `getppid` returns that thread id, `wait4` in

@@ -9,7 +9,6 @@
 //! same way whichever of the four arrived.
 
 use super::gic;
-use crate::abi::{SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -474,16 +473,23 @@ pub fn exception_name(vector: u64) -> &'static str {
     }
 }
 
-/// The signal a user-mode program is killed by when it takes exception
-/// `vector`.
-pub fn exception_signal(vector: u64) -> crate::signal::Signal {
-    match vector {
-        0x00 | 0x0E | 0x18 => SIGILL,
-        0x22 | 0x26 => SIGILL,
-        0x28 | 0x2C => SIGFPE,
-        0x30..=0x35 | 0x3C => SIGTRAP,
-        _ => SIGSEGV,
-    }
+/// The signal a user-mode program is sent when it takes the exception `frame`
+/// describes, with the code and address a handler is told, as Linux's
+/// arch/arm64/kernel/traps.c and fault.c raise them: an undefined or trapped
+/// instruction is SIGILL at the instruction, a misaligned program counter or
+/// stack pointer SIGBUS, a floating point trap SIGFPE, and a breakpoint
+/// SIGTRAP.
+pub fn exception_fault(frame: &TrapFrame) -> crate::signal::Fault {
+    use crate::signal::*;
+    let at = frame.elr;
+    let (signal, code, address) = match frame.vector {
+        0x00 | 0x0E | 0x18 => (SIGILL, ILL_ILLOPC, at),
+        0x22 | 0x26 => (SIGBUS, BUS_ADRALN, at),
+        0x28 | 0x2C => (SIGFPE, FPE_FLTUNK, at),
+        0x30..=0x35 | 0x3C => (SIGTRAP, TRAP_BRKPT, at),
+        _ => (SIGSEGV, SI_KERNEL, 0),
+    };
+    Fault { signal, code, address }
 }
 
 /// What the processor says about a fault on a translation.

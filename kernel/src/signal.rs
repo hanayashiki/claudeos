@@ -73,6 +73,7 @@ pub const SIGQUIT: Signal = Signal(3);
 pub const SIGILL: Signal = Signal(4);
 pub const SIGTRAP: Signal = Signal(5);
 pub const SIGABRT: Signal = Signal(6);
+pub const SIGBUS: Signal = Signal(7);
 pub const SIGFPE: Signal = Signal(8);
 pub const SIGKILL: Signal = Signal(9);
 pub const SIGSEGV: Signal = Signal(11);
@@ -98,6 +99,32 @@ pub const SA_ONSTACK: u64 = 0x0800_0000;
 pub const SA_NODEFER: u64 = 0x4000_0000;
 pub const SA_RESETHAND: u64 = 0x8000_0000;
 
+/// `si_code` values for a signal the kernel raises for a fault, the same on
+/// both machines.
+pub const SEGV_MAPERR: i32 = 1;
+pub const SEGV_ACCERR: i32 = 2;
+pub const BUS_ADRALN: i32 = 1;
+pub const ILL_ILLOPC: i32 = 1;
+pub const ILL_ILLOPN: i32 = 2;
+pub const FPE_INTDIV: i32 = 1;
+pub const FPE_FLTUNK: i32 = 14;
+pub const TRAP_BRKPT: i32 = 1;
+/// Raised by the kernel for a reason the other codes have no name for, as
+/// Linux reports a general protection fault.
+pub const SI_KERNEL: i32 = 0x80;
+
+/// A fault the kernel could not repair, turned into the signal the faulting
+/// thread is sent: what a handler reads back as `si_signo`, `si_code` and
+/// `si_addr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fault {
+    pub signal: Signal,
+    pub code: i32,
+    /// The address the fault was about: the one the access was to for a page
+    /// fault, the instruction for an undefined one, zero where there is none.
+    pub address: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SigAction {
     pub handler: u64,
@@ -113,13 +140,16 @@ pub fn default_is_ignore(signal: Signal) -> bool {
 
 /// Redirect `frame` into `action.handler`. Returns false if the user stack
 /// could not be written, in which case the caller should kill the task.
+/// `fault` is the fault the signal was raised for, if it was, and is what the
+/// handler's `siginfo` describes.
 pub fn deliver(
     task: &crate::task::Task,
     signal: Signal,
     action: &SigAction,
     frame: &mut crate::arch::TrapFrame,
+    fault: Option<Fault>,
 ) -> bool {
-    crate::arch::enter_signal_handler(task, signal, action, frame)
+    crate::arch::enter_signal_handler(task, signal, action, frame, fault)
 }
 
 /// Restore the register state a handler was entered with.

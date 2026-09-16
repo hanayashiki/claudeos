@@ -3,7 +3,6 @@
 
 use super::cpu::idt::{self, EXCEPTION_NAMES};
 use super::cpu::{pic, pit, read_cr2};
-use crate::abi::{SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
 
 pub use super::cpu::idt::{Handler, TrapFrame};
 
@@ -87,16 +86,25 @@ pub fn exception_name(vector: u64) -> &'static str {
     EXCEPTION_NAMES.get(vector as usize).copied().unwrap_or("unknown")
 }
 
-/// The signal a user-mode program is killed by when it takes exception
-/// `vector`.
-pub fn exception_signal(vector: u64) -> crate::signal::Signal {
-    match vector {
-        0 => SIGFPE,
-        3 => SIGTRAP,
-        4 => SIGFPE,
-        6 => SIGILL,
-        _ => SIGSEGV,
-    }
+/// The signal a user-mode program is sent when it takes the exception `frame`
+/// describes, with the code and address a handler is told, as Linux's
+/// arch/x86/kernel/traps.c raises them: a divide error is SIGFPE at the
+/// instruction, an invalid opcode SIGILL at the instruction, a general
+/// protection fault SIGSEGV from the kernel with no address, and a missing or
+/// bad stack segment or an alignment check SIGBUS.
+pub fn exception_fault(frame: &TrapFrame) -> crate::signal::Fault {
+    use crate::signal::*;
+    let at = frame.rip;
+    let (signal, code, address) = match frame.vector {
+        0 => (SIGFPE, FPE_INTDIV, at),
+        1 | 3 => (SIGTRAP, TRAP_BRKPT, at),
+        6 => (SIGILL, ILL_ILLOPN, at),
+        16 | 19 => (SIGFPE, FPE_FLTUNK, at),
+        11 | 12 => (SIGBUS, SI_KERNEL, 0),
+        17 => (SIGBUS, BUS_ADRALN, at),
+        _ => (SIGSEGV, SI_KERNEL, 0),
+    };
+    Fault { signal, code, address }
 }
 
 /// What the CPU says about a page fault.

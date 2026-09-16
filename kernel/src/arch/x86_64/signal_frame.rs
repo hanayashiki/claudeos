@@ -14,7 +14,7 @@ use super::cpu::idt::TrapFrame;
 use super::paging::AddressSpace;
 use super::task::FPU_STATE_SIZE;
 use crate::abi::{Errno, SysResult};
-use crate::signal::{SigAction, Signal, SA_NODEFER, SA_ONSTACK};
+use crate::signal::{Fault, SigAction, Signal, SA_NODEFER, SA_ONSTACK};
 use crate::task::Task;
 use crate::uaccess;
 
@@ -62,6 +62,8 @@ const SC_RSP: usize = 120;
 const SC_RIP: usize = 128;
 const SC_EFLAGS: usize = 136;
 const SC_CS: usize = 144;
+/// The fault address, which Linux also copies here for a page fault.
+const SC_CR2: usize = 176;
 /// Where `struct sigcontext` keeps the pointer to the saved x87/SSE image.
 const SC_FPSTATE: usize = 184;
 
@@ -103,11 +105,13 @@ fn restore_alt_stack(task: &Task, buf: &[u8], sp: u64) {
 /// Build a signal frame on the user stack and redirect `frame` into
 /// `action.handler`. Returns false if the user stack could not be written or
 /// no restorer was registered, in which case the caller should kill the task.
+/// `fault` is what the signal was raised for, when a fault raised it.
 pub fn enter_signal_handler(
     task: &Task,
     signal: Signal,
     action: &SigAction,
     frame: &mut TrapFrame,
+    fault: Option<Fault>,
 ) -> bool {
     // The return address on the frame is the only way back from a handler on
     // this machine, and a program that registered no restorer has given
@@ -185,10 +189,17 @@ pub fn enter_signal_handler(
     });
     put64(&mut buf, m + SC_FPSTATE, sp + FPSTATE_OFFSET as u64);
 
-    // siginfo: si_signo, si_errno, si_code.
+    // siginfo: si_signo, si_errno, si_code, and for a fault `si_addr`, the
+    // first word of the union after the three ints and their padding. A
+    // handler for a fault reads what went wrong and where from here: Go's
+    // prints "unexpected fault address" with it, and tells a nil dereference
+    // it can turn into a panic from a signal sent with kill by the code.
+    let (code, address) = fault.map_or((0, 0), |fault| (fault.code, fault.address));
     buf[INFO_OFFSET..INFO_OFFSET + 4].copy_from_slice(&signal.number().to_le_bytes());
     buf[INFO_OFFSET + 4..INFO_OFFSET + 8].copy_from_slice(&0i32.to_le_bytes());
-    buf[INFO_OFFSET + 8..INFO_OFFSET + 12].copy_from_slice(&0i32.to_le_bytes());
+    buf[INFO_OFFSET + 8..INFO_OFFSET + 12].copy_from_slice(&code.to_le_bytes());
+    put64(&mut buf, INFO_OFFSET + 16, address);
+    put64(&mut buf, m + SC_CR2, address);
 
     if uaccess::write_bytes_in(task, sp, &buf).is_err() {
         return false;

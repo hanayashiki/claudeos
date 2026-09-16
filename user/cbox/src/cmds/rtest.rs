@@ -696,6 +696,78 @@ fn a_thread_that_takes_sigsegv_ends_its_process(report: &mut Report) {
     );
 }
 
+/// A fault is offered to the handler the program installed for it, as Linux's
+/// `force_sig_fault` offers it, with `si_code` and `si_addr` saying what went
+/// wrong and where. The kernel killed the process instead, whatever handler it
+/// had: Go's handler, which turns a nil dereference into a panic and prints
+/// "unexpected fault address" and every goroutine's stack otherwise, never ran,
+/// and a Go program's crash left nothing in its log.
+///
+/// The handler cannot return, which would take the same fault again, so it
+/// ends the child with 42 when it was told SIGSEGV, SEGV_MAPERR and the address
+/// written, and 43 otherwise. A child that blocks SIGSEGV cannot be left with
+/// it pending, since the fault would repeat for good: the signal is unblocked
+/// and its default action put back, so that child dies of signal 11.
+fn a_fault_reaches_its_handler(report: &mut Report) {
+    use crate::sys;
+    const SIGSEGV: i32 = 11;
+    const SA_SIGINFO: i32 = 4;
+    const SEGV_MAPERR: i32 = 1;
+    const ADDRESS: usize = 0x1234;
+
+    extern "C" fn on_fault(signum: i32, info: *const u8, _context: *mut u8) {
+        let (code, address) = unsafe {
+            let code = std::ptr::read_unaligned(info.add(8) as *const i32);
+            let address = std::ptr::read_unaligned(info.add(16) as *const usize);
+            (code, address)
+        };
+        let told = signum == SIGSEGV && code == SEGV_MAPERR && address == ADDRESS;
+        crate::sys::exit_group(if told { 42 } else { 43 });
+    }
+    let install = || {
+        let action = SigactionC {
+            handler: on_fault as extern "C" fn(i32, *const u8, *mut u8) as usize,
+            mask: [0; 16],
+            flags: SA_SIGINFO,
+            restorer: 0,
+        };
+        unsafe { sigaction(SIGSEGV, &action, std::ptr::null_mut()) }
+    };
+    let fault = || {
+        let address = std::hint::black_box(ADDRESS) as *mut u8;
+        unsafe { std::ptr::write_volatile(address, 1) };
+    };
+
+    let child = sys::fork();
+    if child == 0 {
+        if install() != 0 {
+            sys::exit_group(44);
+        }
+        fault();
+        sys::exit_group(45);
+    }
+    let (reaped, status) = wait_or_kill(child, Duration::from_secs(2));
+    report.check(
+        "a fault runs the handler, told SEGV_MAPERR and the address",
+        reaped == child && status & 0x7F == 0 && sys::exit_code_of(status) == 42,
+        format!("forked {} reaped {} status {:#x}", child, reaped, status),
+    );
+
+    let child = sys::fork();
+    if child == 0 {
+        install();
+        sys::sigprocmask(sys::SIG_BLOCK, 1u64 << (SIGSEGV - 1));
+        fault();
+        sys::exit_group(45);
+    }
+    let (reaped, status) = wait_or_kill(child, Duration::from_secs(2));
+    report.check(
+        "a fault with its signal blocked still ends the process with it",
+        reaped == child && sys::signal_of(status) == Some(SIGSEGV),
+        format!("forked {} reaped {} status {:#x}", child, reaped, status),
+    );
+}
+
 /// SIGKILL sent to a process with several threads ends all of them. It used to
 /// end the task whose id is the process's, the one a wait reports, so the
 /// parent was told of a kill while the other threads ran on. One of them spins
@@ -2854,6 +2926,7 @@ pub fn main(_args: &[String]) -> i32 {
     a_first_thread_that_exits_alone_is_not_the_process(&mut report);
     a_thread_that_aborts_ends_its_process(&mut report);
     a_thread_that_takes_sigsegv_ends_its_process(&mut report);
+    a_fault_reaches_its_handler(&mut report);
     a_kill_ends_every_thread(&mut report);
     a_signal_from_outside_ends_every_thread(&mut report);
     a_stopped_process_with_threads_is_killed(&mut report);

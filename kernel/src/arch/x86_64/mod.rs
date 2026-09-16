@@ -90,7 +90,7 @@ pub use task::{
 };
 #[allow(unused_imports)]
 pub use trap::{
-    dump_registers, end_of_interrupt, exception_name, exception_signal, fault_probe_registers,
+    dump_registers, end_of_interrupt, exception_name, exception_fault, fault_probe_registers,
     init_interrupt_controller, init_timer, instruction_pointer, irq_vector, mask_irq, page_fault,
     register_irq_handler, register_trap_handler, stack_pointer, trap_error_code, trap_vector,
     unmask_irq, vector_irq, Handler, PageFault, TrapFrame, EXCEPTION_COUNT, IRQ_COUNT,

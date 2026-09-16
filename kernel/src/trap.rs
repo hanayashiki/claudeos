@@ -81,7 +81,19 @@ fn page_fault(frame: &mut TrapFrame) {
             dump_user(name, at);
         }
         dump_regions(addr);
-        crate::sched::kill_current(crate::abi::SIGSEGV);
+        // Nothing mapped there is SEGV_MAPERR, a mapping that refused the
+        // access SEGV_ACCERR, as Linux's page fault handlers tell them apart.
+        let code = if fault.present {
+            crate::signal::SEGV_ACCERR
+        } else {
+            crate::signal::SEGV_MAPERR
+        };
+        crate::sched::force_fault(crate::signal::Fault {
+            signal: crate::abi::SIGSEGV,
+            code,
+            address: addr,
+        });
+        return;
     }
 
     // A kernel fault is not recoverable; dump everything useful and stop.
@@ -131,7 +143,8 @@ fn exception(frame: &mut TrapFrame) {
             arch::instruction_pointer(frame),
             arch::trap_error_code(frame)
         );
-        crate::sched::kill_current(arch::exception_signal(vector));
+        crate::sched::force_fault(arch::exception_fault(frame));
+        return;
     }
 
     println!();
@@ -149,7 +162,11 @@ pub fn unhandled(frame: &mut TrapFrame) {
     }
     println!("[trap] unhandled vector {} rip={:#x}", vector, arch::instruction_pointer(frame));
     if frame.from_user() {
-        crate::sched::kill_current(crate::abi::SIGSEGV);
+        crate::sched::force_fault(crate::signal::Fault {
+            signal: crate::abi::SIGSEGV,
+            code: crate::signal::SI_KERNEL,
+            address: 0,
+        });
     }
 }
 

@@ -557,14 +557,38 @@ pub fn exit_current(status: i32) -> ! {
     }
 }
 
-/// Terminate the current task's process as if `signal` had killed it: a fault
-/// the kernel cannot repair ends the thread group the way the signal's default
-/// action would, not only the thread that faulted.
-pub fn kill_current(signal: Signal) -> ! {
-    let name = current().name();
-    let pid = current().pid;
-    crate::println!("[kernel] pid {} ({}) killed by signal {}", pid, name, signal.number());
-    exit_group(signal.number())
+/// Send the running thread the signal for a fault the kernel could not repair,
+/// and act on it before the thread returns to user mode, as Linux's
+/// `force_sig_fault` does.
+///
+/// A handler the program installed runs, told the fault's code and address,
+/// on a frame holding the registers at the faulting instruction: Go's handler
+/// turns a nil dereference into a panic, and prints "unexpected fault address"
+/// and every goroutine's stack for one it cannot. A signal the thread blocks or
+/// ignores cannot be left to wait, because returning would take the same fault
+/// again, so its action is put back to the default and it is unblocked, which
+/// ends the thread group. Only the thread that faulted can take it.
+pub fn force_fault(fault: crate::signal::Fault) {
+    let task = current();
+    let signal = fault.signal;
+    crate::println!(
+        "[kernel] pid {} ({}) sent signal {} (code {}) for a fault at {:#x}",
+        task.pid,
+        task.name(),
+        signal.number(),
+        fault.code,
+        fault.address
+    );
+    let action = task.action(signal);
+    let blocked = task.blocked() & signal.bit() != 0;
+    if blocked || action.handler == crate::signal::SIG_IGN {
+        let default = crate::signal::SigAction { handler: crate::signal::SIG_DFL, ..action };
+        task.set_action(signal, default);
+        task.unblock(signal.bit());
+    }
+    task.fault.set(Some(fault));
+    task.add_pending(signal.bit());
+    check_signals();
 }
 
 /// Raise a signal on the running task.
@@ -863,7 +887,12 @@ pub fn check_signals() {
         if task.pending() == 0 {
             return;
         }
-        for signal in Signal::all() {
+        // A signal raised for a fault is taken before any other, as Linux's
+        // `dequeue_synchronous_signal` takes it: a handler for another signal
+        // run first would return to the faulting instruction, which faults
+        // again.
+        let first = task.fault.get().map(|fault| fault.signal);
+        for signal in first.into_iter().chain(Signal::all()) {
             let bit = signal.bit();
             if task.pending() & bit == 0 {
                 continue;
@@ -924,7 +953,11 @@ pub fn check_signals() {
             // A frame that cannot be written is SIGSEGV with its default
             // action, which Linux's `force_sigsegv` makes it, so it too ends
             // the thread group.
-            if !crate::signal::deliver(&task, signal, &action, frame) {
+            let fault = task.fault.get().filter(|fault| fault.signal == signal);
+            if fault.is_some() {
+                task.fault.set(None);
+            }
+            if !crate::signal::deliver(&task, signal, &action, frame, fault) {
                 exit_group(SIGSEGV.number());
             }
             return;
