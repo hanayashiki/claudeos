@@ -5,14 +5,18 @@
 #   scripts/mkcard.sh                    assemble build/boot and stop
 #   scripts/mkcard.sh --new /dev/disk4   assemble, erase the whole card, make its
 #                                        two partitions, write the boot one,
-#                                        and put user/data on /data
+#                                        and put build/data-aarch64 on /data
 #   scripts/mkcard.sh /dev/disk4         assemble, and rewrite only the boot
 #                                        partition of a card made with --new;
 #                                        the /data partition is not touched
+#   scripts/mkcard.sh --usr /dev/disk4   copy build/data-aarch64/usr onto
+#                                        /data/usr of a card made with --new,
+#                                        replacing the files of those names;
+#                                        nothing else on the card is touched
 #   scripts/mkcard.sh --dir DIR [--new] /dev/disk4
 #                                        the same with DIR in place of
 #                                        build/boot, assembling nothing
-#   scripts/mkcard.sh [--dir DIR] [--new] --image FILE
+#   scripts/mkcard.sh [--dir DIR] [--new | --usr] --image FILE
 #                                        the same against a disk image file
 #                                        instead of a card, on macOS, which is
 #                                        how the writes here are tested
@@ -24,13 +28,19 @@
 #      first FAT partition and nothing else, finding files by name, so there is
 #      no boot sector to install and nothing to mark bootable.
 #   2  FAT32, labelled CLAUDEDATA, the rest of the card: /data, which the
-#      kernel mounts read-write (README.md, "/data on the SD card"). --new
-#      puts the files under user/data on it: services.txt, the user services
-#      list, and site/index.html, the page its web server serves.
+#      kernel mounts read-write and makes /usr and /root out of (README.md,
+#      "/data on the SD card"). --new puts build/data-aarch64 on it, which
+#      scripts/build-user-aarch64.sh assembles from CARD_ITEMS in
+#      scripts/images.sh: services.txt, the user services list;
+#      site/index.html, the page its web server serves; root, the home
+#      directory; and usr/bin and usr/lib, the programs the board runs that
+#      are not in the image.
 #
 # Updating a card rewrites partition 1 and nothing else, so what is on /data
-# stays. The whole card is erased, and /data given its first files, only with
-# --new.
+# stays. --usr writes the files under build/data-aarch64/usr into /data/usr and
+# nothing else, so a program added there, services.txt and the site stay as
+# they are. The whole card is erased, and /data given its first files, only
+# with --new.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -243,10 +253,20 @@ mount_point() {
 # .Spotlight-V100 and its deletion. Whatever cannot be deleted is named here
 # and left: the bootloader and the kernel find their files by name, and
 # nothing reads a directory of the boot partition.
+#
+# $3, when given, names the one directory at the top of the volume that was
+# written, and only `._` files under it, and its own `._NAME` beside it, are
+# deleted: --usr writes /data/usr on a card whose other files are the user's,
+# and those are not looked at.
 tidy_and_unmount() {
-  local partition="$1" mount="$2" left
-  find "$mount" \( -name '.Spotlight-V100' -o -name '.fseventsd' -o -name '.Trashes' \) -prune \
-    -o -name '._*' -type f -exec rm -f {} + 2>/dev/null || true
+  local partition="$1" mount="$2" within="${3:-}" left
+  if [ -n "$within" ]; then
+    find "$mount/$within" -name '._*' -type f -exec rm -f {} + 2>/dev/null || true
+    rm -f "$mount/._$within"
+  else
+    find "$mount" \( -name '.Spotlight-V100' -o -name '.fseventsd' -o -name '.Trashes' \) -prune \
+      -o -name '._*' -type f -exec rm -f {} + 2>/dev/null || true
+  fi
   rm -rf "$mount/.fseventsd" "$mount/.Spotlight-V100" "$mount/.Trashes" 2>/dev/null || true
   left="$(ls -A "$mount" | grep -E '^(\._|\.fseventsd$|\.Spotlight-V100$|\.Trashes$)' || true)"
   [ -z "$left" ] || say "  macOS keeps on $(basename "$mount"): $(echo "$left" | tr '\n' ' ')"
@@ -274,10 +294,17 @@ copy_boot() {
   esac
 }
 
-# What a new card's /data starts with (README.md, "Services started at boot").
-DATA_SEED="$ROOT/user/data"
+# What a new card's /data starts with (README.md, "Programs on the card"),
+# assembled by scripts/build-user-aarch64.sh from CARD_ITEMS in
+# scripts/images.sh.
+DATA_SEED="$ROOT/build/data-aarch64"
 
-# Copy the files under user/data onto the partition $1, and unmount it.
+require_seed() {
+  [ -f "$DATA_SEED/services.txt" ] && [ -d "$DATA_SEED/usr/bin" ] \
+    || die "build/data-aarch64 is missing; run ./scripts/build-user-aarch64.sh"
+}
+
+# Copy the files under build/data-aarch64 onto the partition $1, and unmount it.
 seed_data() {
   local partition="$1" mount
   case "$(uname -s)" in
@@ -297,8 +324,35 @@ seed_data() {
   esac
 }
 
+# Copy the files under build/data-aarch64/usr into /data/usr on the partition
+# $1, over any file of the same name, and unmount it. No file outside /data/usr
+# is opened or written; the cleanup deletes only `._` files under it and the
+# directories macOS keeps at the top of every volume it mounts. A file in
+# /data/usr that the build does not have, such as a program the user added,
+# stays.
+copy_usr() {
+  local partition="$1" mount
+  case "$(uname -s)" in
+    Darwin)
+      mount="$(mount_point "$partition")"
+      mkdir -p "$mount/usr"
+      cp -RX "$DATA_SEED/usr"/ "$mount/usr"/
+      tidy_and_unmount "$partition" "$mount" usr
+      ;;
+    Linux)
+      mount="$(mktemp -d)"
+      command mount "$partition" "$mount"
+      mkdir -p "$mount/usr"
+      cp -R "$DATA_SEED/usr"/. "$mount/usr"/
+      sync
+      umount "$mount"
+      rmdir "$mount"
+      ;;
+  esac
+}
+
 # Erase the whole disk $1, make both partitions, write the boot files, and put
-# the files under user/data on /data.
+# the files under build/data-aarch64 on /data.
 write_new() {
   local device="$1" p1 p2
   case "$(uname -s)" in
@@ -363,15 +417,46 @@ write_update() {
   esac
 }
 
+# Copy build/data-aarch64/usr into /data/usr on the disk $1. The disk has to
+# look like what write_new makes: partition 1 labelled CLAUDEOS and partition 2
+# labelled CLAUDEDATA, so the partition written is the card's /data and no
+# other.
+write_usr() {
+  local device="$1" p1 p2 boot_label data_label
+  case "$(uname -s)" in
+    Darwin)
+      p1="${device}s1"
+      p2="${device}s2"
+      boot_label="$(volume_field "$p1" VolumeName)"
+      data_label="$(volume_field "$p2" VolumeName)"
+      ;;
+    Linux)
+      p1="$(linux_partition "$device" 1)"
+      p2="$(linux_partition "$device" 2)"
+      boot_label="$(lsblk -no LABEL "$p1" 2>/dev/null || true)"
+      data_label="$(lsblk -no LABEL "$p2" 2>/dev/null || true)"
+      ;;
+  esac
+  if [ "$boot_label" != "$BOOT_LABEL" ] || [ "$data_label" != "$DATA_LABEL" ]; then
+    die "$device does not have partition 1 labelled $BOOT_LABEL and partition 2 labelled $DATA_LABEL, which is what --new makes; nothing was written"
+  fi
+  copy_usr "$p2"
+  case "$(uname -s)" in
+    Darwin) diskutil eject "$device" ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 
 NEW=""
+USR=""
 DIR=""
 CARD_IMAGE=""
 DEVICE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --new)   NEW=1; shift ;;
+    --usr)   USR=1; shift ;;
     --dir)   [ $# -ge 2 ] || die "--dir needs a directory"; DIR="$2"; shift 2 ;;
     --image) [ $# -ge 2 ] || die "--image needs a file"; CARD_IMAGE="$2"; shift 2 ;;
     -*)      die "unknown option $1; see the top of $0" ;;
@@ -381,16 +466,21 @@ done
 
 if [ -z "$DEVICE" ] && [ -z "$CARD_IMAGE" ]; then
   [ -z "$NEW" ] || die "--new needs a device, or --image FILE, to erase"
+  [ -z "$USR" ] || die "--usr needs a device, or --image FILE, to write to"
   [ -z "$DIR" ] || die "--dir needs a device, or --image FILE, to write to"
   assemble
   say ""
   say "no device named, so nothing was written."
   say "to prepare a new card:       $0 --new /dev/diskN"
   say "to update its boot files:    $0 /dev/diskN"
+  say "to update its /data/usr:     $0 --usr /dev/diskN"
   say "(/dev/sdX on Linux, as root)"
   exit 0
 fi
 [ -z "$DEVICE" ] || [ -z "$CARD_IMAGE" ] || die "name a device or --image FILE, not both"
+if [ -n "$USR" ] && { [ -n "$NEW" ] || [ -n "$DIR" ]; }; then
+  die "--usr writes /data/usr and nothing else, so it takes neither --new nor --dir"
+fi
 
 # Check the target before building anything, so a wrong one is refused at once
 # rather than after a page of output.
@@ -401,7 +491,13 @@ else
   [ -f "$CARD_IMAGE" ] || die "$CARD_IMAGE: no such file; make an empty one with: mkfile -n 1g $CARD_IMAGE"
 fi
 
-if [ -n "$DIR" ]; then
+if [ -n "$NEW" ] || [ -n "$USR" ]; then
+  require_seed
+fi
+if [ -n "$USR" ]; then
+  # The boot partition is not written, so nothing is assembled for it.
+  :
+elif [ -n "$DIR" ]; then
   # A directory something else prepared, such as the EEPROM update files from
   # scripts/mkeeprom.sh, goes through the same checks and the same write.
   [ -d "$DIR" ] || die "$DIR is not a directory"
@@ -413,7 +509,13 @@ fi
 if [ -n "$CARD_IMAGE" ]; then
   DEVICE="$(attach_image "$CARD_IMAGE")"
   trap 'hdiutil detach "$DEVICE" > /dev/null 2>&1 || true' EXIT
-  if [ -n "$NEW" ]; then write_new "$DEVICE"; else write_update "$DEVICE"; fi
+  if [ -n "$NEW" ]; then
+    write_new "$DEVICE"
+  elif [ -n "$USR" ]; then
+    write_usr "$DEVICE"
+  else
+    write_update "$DEVICE"
+  fi
   say ""
   say "written to $CARD_IMAGE."
   exit 0
@@ -422,6 +524,9 @@ fi
 if [ -n "$NEW" ]; then
   confirm "About to ERASE all of $DEVICE, make partition 1 ($BOOT_LABEL, $BOOT_SIZE) and partition 2 ($DATA_LABEL, the rest), and write the boot files to partition 1. Everything on the card will be lost." "$DEVICE"
   write_new "$DEVICE"
+elif [ -n "$USR" ]; then
+  confirm "About to copy the files under build/data-aarch64/usr into /data/usr on partition 2 ($DATA_LABEL) of $DEVICE, over files of the same names. Nothing else on the card is written." "$DEVICE"
+  write_usr "$DEVICE"
 else
   confirm "About to erase partition 1 ($BOOT_LABEL) of $DEVICE and write the boot files to it. Partition 2, which holds /data, is not touched." "$DEVICE"
   write_update "$DEVICE"
