@@ -243,6 +243,12 @@ pub struct Task {
     pending_exec: Spinlock<Option<(String, Vec<String>, Vec<String>)>>,
     /// Parent blocked in vfork, to be woken when this task execs or exits.
     pub vfork_parent: Cell<Option<u32>>,
+    /// Set on a process's leader when its last thread exits and its parent
+    /// has said it will not wait for it: SIGCHLD ignored, or `SA_NOCLDWAIT`.
+    /// Nothing reports such a process to `wait4`, and its tasks are released
+    /// without one, as Linux's `exit_notify` releases a task
+    /// `do_notify_parent` says to reap itself.
+    pub released_at_exit: Cell<bool>,
 }
 
 unsafe impl Send for Task {}
@@ -319,6 +325,7 @@ impl Task {
             started: Cell::new(false),
             pending_exec: Spinlock::new(None),
             vfork_parent: Cell::new(None),
+            released_at_exit: Cell::new(false),
         }))
     }
 
@@ -970,8 +977,15 @@ impl Task {
         }
         if table.group_exited(self.tgid) {
             if let Some(leader) = table.find(self.tgid) {
-                table.notify_parent(leader.ppid.get());
+                table.notify_parent_of_exit(leader);
             }
+        }
+        // Nothing will wait for a thread: the next task out of a system call
+        // releases this one, which is still on the stack that would be handed
+        // back. `notify_parent_of_exit` asks the same for a process whose
+        // parent will not wait for it.
+        if self.pid != self.tgid {
+            crate::sched::tasks_to_release();
         }
     }
 

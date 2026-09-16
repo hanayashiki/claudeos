@@ -372,13 +372,19 @@ pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
         // starting now, not something that already happened, so the question
         // has to be asked again inside the same window, and the sleep skipped
         // if the answer has changed.
+        //
+        // A child can also be released as it exits, when this process ignores
+        // SIGCHLD or asked for SA_NOCLDWAIT, and then there is nothing to
+        // collect: the last one going is a reason to look again and fail with
+        // ECHILD, not to sleep.
         let sleep = crate::sync::without_interrupts(|irq| {
-            if sched::child_event_pending(
+            let pending = sched::child_event_pending(
                 me,
                 pid as i32,
                 options & WUNTRACED != 0,
                 options & WCONTINUED != 0,
-            ) {
+            );
+            if pending || !sched::has_children(me, pid as i32) {
                 return false;
             }
             let task = sched::current();

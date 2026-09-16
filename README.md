@@ -930,7 +930,9 @@ the signal takes it; `tkill` and `tgkill` send to one thread. A signal whose
 action is to terminate, a fault, or `exit_group` from any thread ends every
 thread, a stopped one included, and SIGSTOP stops every thread. `wait4`
 reports a process once its last thread has exited, with the status
-`exit_group` or the killing signal gave it.
+`exit_group` or the killing signal gave it. A child of a parent that ignores
+SIGCHLD, or set `SA_NOCLDWAIT`, is released as it exits rather than left a
+zombie, as on Linux.
 Scheduling is round-robin, preemptive, driven by the 100 Hz timer tick.
 Anonymous memory is demand-paged: `mmap` and `brk` record a region and the
 page fault handler supplies pages on first touch.
@@ -1347,7 +1349,7 @@ failures.
   reads differ and that 4 KiB of it holds nearly all 256 byte values, which is
   a check that the generator is running and not a check that it is any good.
 - The `rtest` applet, which only the test image's cbox is built with, runs
-  **104 checks** against the Rust standard library, 103 on aarch64, which has
+  **107 checks** against the Rust standard library, 106 on aarch64, which has
   no `alarm` system call of its own:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
@@ -1360,7 +1362,8 @@ failures.
   by an abort, a SIGSEGV or a fault in one thread, by SIGKILL or SIGTERM from
   outside, stopped and then killed, or whose first thread exits alone, each
   reported with its status and leaving no thread behind, a signal for a
-  process taken by the thread that does not block it,
+  process taken by the thread that does not block it, children of a parent
+  ignoring SIGCHLD or with `SA_NOCLDWAIT` released as they exit,
   a `UnixStream` pair carrying bytes both ways,
   an epoll set woken by a counter and a socket, timing out when it should and
   waking promptly when a write arrives, and a walk of the system call numbers

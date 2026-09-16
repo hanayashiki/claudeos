@@ -90,6 +90,8 @@ pub const SIGVTALRM: Signal = Signal(26);
 pub const SIGPROF: Signal = Signal(27);
 pub const SIGWINCH: Signal = Signal(28);
 
+/// The same value on both machines, as asm-generic and x86-64 define it.
+pub const SA_NOCLDWAIT: u64 = 0x0000_0002;
 pub const SA_SIGINFO: u64 = 0x0000_0004;
 pub const SA_RESTORER: u64 = 0x0400_0000;
 pub const SA_ONSTACK: u64 = 0x0800_0000;

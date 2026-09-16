@@ -40,9 +40,12 @@ in git).
   forks a child per connection, sets SIGCHLD to `SIG_IGN` (outside inetd
   mode, as its source is remembered; confirm) and never waits. On Linux a
   process ignoring SIGCHLD, or with `SA_NOCLDWAIT`, has its children reaped at
-  exit (`do_notify_parent`). Here `SIG_IGN` on SIGCHLD only keeps a pending
+  exit (`do_notify_parent`). Here `SIG_IGN` on SIGCHLD only kept a pending
   SIGCHLD from interrupting calls (`sched.rs` `has_pending_signal_except`);
-  exit never checks it, so each connection leaves a zombie.
+  exit never checked it, so each connection left a zombie. Fixed on branch
+  worktree-agent-a65bd54ce6a84aa3e: such a child is released as its last
+  thread exits, and `wait4` in its parent fails with ECHILD once no child is
+  left.
 - Kernel heap 45 MiB in use of 69.8 MiB (16 MiB at boot).
 - The board did not answer ping while TCP to port 23 worked.
 - `madvise` returns 0 and does nothing (syscall/mod.rs).
@@ -50,8 +53,9 @@ in git).
 **Work in progress.** Branch worktree-agent-a65bd54ce6a84aa3e ("threadgroup",
 not merged) has: signal sets read at bit n - 1 (a real bug: blocking SIGUSR1
 blocked SIGKILL), reaping a process when its last thread exits, a fatal signal
-or fault ending the whole thread group, and kill(pid) to the group. It does not
-yet deliver SIGSEGV for faults to a handler.
+or fault ending the whole thread group, kill(pid) to the group, and children of
+a parent ignoring SIGCHLD released at exit. It does not yet deliver SIGSEGV for
+faults to a handler.
 
 **Next.** Deliver fault signals to handlers so the next crash leaves Go's
 trace; then find what overwrites user memory. The user plans to review the

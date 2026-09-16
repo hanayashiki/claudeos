@@ -83,6 +83,11 @@ pub extern "C" fn syscall_dispatch(frame: &mut TrapFrame) {
 
     sched::check_signals();
 
+    // Tasks that exited with nobody to wait for them are handed back here,
+    // where the kernel holds nothing: a task cannot release itself while it
+    // is still running on the stack that would go.
+    sched::release_if_pending();
+
     // Here the kernel holds nothing and interrupts are on, which is what the
     // heap needs and cannot ask for: an allocation that runs the free list out
     // maps its own pages, and it does that inside whatever critical section

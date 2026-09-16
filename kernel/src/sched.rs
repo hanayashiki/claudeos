@@ -96,6 +96,34 @@ impl<'a> Held<'a> {
             parent.child_changed_state(self.irq);
         }
     }
+
+    /// Tell the parent of the process `leader` leads that every thread of it
+    /// has exited, the way Linux's `do_notify_parent` does.
+    ///
+    /// A parent that ignores SIGCHLD, or asked for `SA_NOCLDWAIT`, will not
+    /// wait for the child, so the child is released at once rather than left a
+    /// zombie: busybox httpd ignores SIGCHLD, forks a child per connection and
+    /// never waits, and every connection left a zombie behind for good. An
+    /// ignored SIGCHLD is not sent; one with `SA_NOCLDWAIT` and a handler is,
+    /// and the handler runs. Either way the parent is woken, so a `wait4` it
+    /// is blocked in looks again and fails with ECHILD once it has no children
+    /// left.
+    pub fn notify_parent_of_exit(&self, leader: &Task) {
+        let Some(parent) = self.find(leader.ppid.get()) else {
+            return;
+        };
+        let action = parent.action(SIGCHLD);
+        let ignored = action.handler == crate::signal::SIG_IGN;
+        if ignored || action.flags & crate::signal::SA_NOCLDWAIT != 0 {
+            leader.released_at_exit.set(true);
+            tasks_to_release();
+        }
+        if ignored {
+            parent.wake(self.irq);
+        } else {
+            parent.child_changed_state(self.irq);
+        }
+    }
 }
 
 /// Take the process table and run `f` with it held.
@@ -505,18 +533,15 @@ pub fn exit_current(status: i32) -> ! {
             // needs reaping, and init is normally asleep in wait4, so it has
             // to be woken here; nothing else will report the adopted zombie
             // to it.
-            let mut adopted_zombie = false;
             table.for_each(|other| {
                 if other.ppid.get() == pid {
                     other.ppid.set(1);
-                    if other.pid == other.tgid && table.group_exited(other.tgid) {
-                        adopted_zombie = true;
+                    let exited = other.pid == other.tgid && table.group_exited(other.tgid);
+                    if exited && !other.released_at_exit.get() && ppid != 1 {
+                        table.notify_parent_of_exit(other);
                     }
                 }
             });
-            if adopted_zombie && ppid != 1 {
-                table.notify_parent(1);
-            }
 
             // A signal sent to the process that this thread was woken to take
             // goes to a thread that is still there to take it.
@@ -918,8 +943,12 @@ pub fn check_signals() {
 /// thread's status, while the process it is actually waiting for is still
 /// running. A thread is reported to a joiner inside the process and to nothing
 /// else.
+///
+/// A process released at its exit, because its parent will not wait for it, is
+/// not a child either: Linux takes it off the parent's list of children as it
+/// exits.
 fn is_child_process(task: &Task, parent_pid: u32) -> bool {
-    task.ppid.get() == parent_pid && task.pid == task.tgid
+    task.ppid.get() == parent_pid && task.pid == task.tgid && !task.released_at_exit.get()
 }
 
 /// Does `task` match the pid argument `wait4` was given?
@@ -1014,30 +1043,57 @@ fn release(dead: Vec<*mut Task>) {
     }
 }
 
-/// Release the tasks of threads that have finished.
+/// Set when a task has exited that no `wait4` will take out of the table.
+static RELEASE_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Record that a task has exited that `reap_dead_threads` is to release.
+pub fn tasks_to_release() {
+    RELEASE_PENDING.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Release finished tasks that nothing will wait for, if any exited since the
+/// last time. For the way out of a system call, where the kernel holds nothing.
+pub fn release_if_pending() {
+    if RELEASE_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        reap_dead_threads();
+    }
+}
+
+/// Release the tasks that have finished and that no `wait4` will take out of
+/// the table: threads, and processes whose parent will not wait for them.
 ///
-/// Nothing waits for a thread, so no `wait4` ever takes its entry out of the
-/// table: the kernel stack, the task itself and the share it holds of the
-/// process's region list would stay taken for as long as the machine ran.
-/// Called where threads are made and where one exits, so a program that starts
-/// and joins them in a loop leaves at most the one that has not finished
-/// switching away yet.
+/// Without this the kernel stack, the task itself, its entry in /proc and the
+/// share it holds of the process's region list would stay taken for as long as
+/// the machine ran. Called where tasks are made and where one exits, and on the
+/// way out of the next system call after a task that needs it has exited, so a
+/// program that starts and joins threads in a loop, or a server that forks a
+/// child per connection and ignores SIGCHLD, leaves at most the one that has
+/// not finished switching away yet.
 pub fn reap_dead_threads() {
     let mut dead = Vec::new();
+    let mut unfinished = false;
     {
         let cur = unsafe { CURRENT };
         let mut tasks = TASKS.lock();
         tasks.retain(|entry| {
             let task = entry.get();
-            // The running task is in the middle of its own exit and is still on
-            // the stack this would hand back.
-            let finished =
-                task.state() == State::Zombie && task.pid != task.tgid && entry.0 != cur;
-            if finished {
-                dead.push(entry.0);
+            let unwaited = task.pid != task.tgid || task.released_at_exit.get();
+            if task.state() != State::Zombie || !unwaited {
+                return true;
             }
-            !finished
+            // The running task is in the middle of its own exit and is still on
+            // the stack this would hand back. Whoever runs next releases it.
+            if entry.0 == cur {
+                unfinished = true;
+                return true;
+            }
+            dead.push(entry.0);
+            false
         });
+    }
+    if unfinished {
+        tasks_to_release();
     }
     release(dead);
 }

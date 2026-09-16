@@ -896,6 +896,202 @@ fn a_signal_for_the_process_reaches_a_thread_that_takes_it(report: &mut Report) 
     );
 }
 
+/// musl's `struct sigaction`, which is what its `sigaction` takes: the
+/// handler, a `sigset_t` of 128 bytes, the flags, and a restorer musl fills in
+/// itself.
+#[repr(C)]
+struct SigactionC {
+    handler: usize,
+    mask: [u64; 16],
+    flags: i32,
+    restorer: usize,
+}
+
+extern "C" {
+    fn sigaction(signum: i32, act: *const SigactionC, old: *mut SigactionC) -> i32;
+}
+
+/// Run `body` in a forked child and hand back what it says: the child writes
+/// the text of an `Err` down a pipe. A child that does not finish within ten
+/// seconds is killed and reported.
+fn in_a_child(body: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    use crate::sys;
+    let Ok((reader, writer)) = sys::pipe() else {
+        return Err("no pipe to hear the child".to_string());
+    };
+    let child = sys::fork();
+    if child == 0 {
+        sys::close(reader);
+        let result = body();
+        if let Err(text) = &result {
+            sys::write(writer, text.as_bytes());
+        }
+        sys::exit_group(if result.is_ok() { 0 } else { 1 });
+    }
+    sys::close(writer);
+    if child < 0 {
+        sys::close(reader);
+        return Err(format!("fork returned {}", child));
+    }
+    let mut said = Vec::new();
+    let mut buf = [0u8; 512];
+    loop {
+        let n = sys::read(reader, &mut buf);
+        if n <= 0 {
+            break;
+        }
+        said.extend_from_slice(&buf[..n as usize]);
+    }
+    sys::close(reader);
+    let (reaped, status) = wait_or_kill(child, Duration::from_secs(10));
+    let said = String::from_utf8_lossy(&said).to_string();
+    if reaped == child && status == 0 {
+        Ok(())
+    } else {
+        Err(format!("child {} reaped {} status {:#x}: {}", child, reaped, status, said))
+    }
+}
+
+/// Fork `count` children that exit at once, the first with code 1, the next
+/// with 2 and so on. Returns their pids.
+fn children_that_exit(count: i32) -> Result<Vec<i32>, String> {
+    use crate::sys;
+    let mut pids = Vec::new();
+    for code in 1..=count {
+        let child = sys::fork();
+        if child == 0 {
+            sys::exit_group(code);
+        }
+        if child < 0 {
+            return Err(format!("fork returned {} after {} children", child, pids.len()));
+        }
+        pids.push(child as i32);
+    }
+    Ok(pids)
+}
+
+/// Wait up to two seconds for `done` to hold of the /proc/tasks lines for
+/// `pids`, and return the last lines read.
+fn tasks_until(pids: &[i32], done: impl Fn(&[String]) -> bool) -> (bool, Vec<String>) {
+    let started = Instant::now();
+    loop {
+        let listed = tasks_listed(pids);
+        if done(&listed) {
+            return (true, listed);
+        }
+        if started.elapsed() > Duration::from_secs(2) {
+            return (false, listed);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Children of a parent that will not wait for them are released as they exit.
+///
+/// A process that ignores SIGCHLD, or installs its action with `SA_NOCLDWAIT`,
+/// has its children reaped at their exit on Linux (`do_notify_parent`), and
+/// `wait4` then has nothing to report and fails with ECHILD once no child is
+/// left. busybox httpd ignores SIGCHLD, forks a child per connection and never
+/// waits: each connection left a zombie, about 120 in eleven hours on the
+/// board. With `SA_NOCLDWAIT` and a handler, SIGCHLD is still sent and the
+/// handler runs. A parent with the default action keeps its children until it
+/// waits for them, which is what the shell and the service keepers rely on.
+///
+/// Each case runs in a forked child of its own, so that the disposition changed
+/// is not this suite's.
+fn children_of_a_parent_that_will_not_wait(report: &mut Report) {
+    use crate::sys;
+    use std::sync::atomic::AtomicUsize;
+    const SIGCHLD: i32 = 17;
+    const SA_NOCLDWAIT: i32 = 2;
+    const ECHILD: i64 = -10;
+    const CHILDREN: i32 = 20;
+
+    static HANDLED: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn count_child_signal(_: i32) {
+        HANDLED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    // None of them left in /proc/tasks, and wait4 has nothing to report.
+    let released = || -> Result<(), String> {
+        let pids = children_that_exit(CHILDREN)?;
+        let (gone, listed) = tasks_until(&pids, |listed| listed.is_empty());
+        let (waited, status) = sys::wait4(-1, 0);
+        if !gone || waited != ECHILD {
+            return Err(format!(
+                "still listed after 2 s {:?}; wait4 then returned {} status {:#x}",
+                listed, waited, status
+            ));
+        }
+        Ok(())
+    };
+
+    let ignored = in_a_child(|| {
+        unsafe { signal(SIGCHLD, SIG_IGN) };
+        released()
+    });
+    report.check(
+        "children of a parent ignoring SIGCHLD are released as they exit",
+        ignored.is_ok(),
+        ignored.err().unwrap_or_default(),
+    );
+
+    let nocldwait = in_a_child(|| {
+        let action = SigactionC {
+            handler: count_child_signal as extern "C" fn(i32) as usize,
+            mask: [0; 16],
+            flags: SA_NOCLDWAIT,
+            restorer: 0,
+        };
+        let installed = unsafe { sigaction(SIGCHLD, &action, std::ptr::null_mut()) };
+        released()?;
+        let handled = HANDLED.load(Ordering::SeqCst);
+        if installed != 0 || handled == 0 {
+            return Err(format!("sigaction returned {}, handler ran {} times", installed, handled));
+        }
+        Ok(())
+    });
+    report.check(
+        "children of a parent with SA_NOCLDWAIT are released, and its handler runs",
+        nocldwait.is_ok(),
+        nocldwait.err().unwrap_or_default(),
+    );
+
+    let kept = in_a_child(|| {
+        let pids = children_that_exit(CHILDREN)?;
+        let all_zombies = |listed: &[String]| {
+            let zombie = |line: &String| line.split(' ').nth(3) == Some("Z");
+            listed.len() == pids.len() && listed.iter().all(zombie)
+        };
+        let (stayed, listed) = tasks_until(&pids, all_zombies);
+        if !stayed {
+            return Err(format!("not all {} listed as zombies: {:?}", CHILDREN, listed));
+        }
+        let mut reported = Vec::new();
+        for _ in 0..CHILDREN {
+            let (pid, status) = sys::wait4(-1, 0);
+            let index = pids.iter().position(|&p| p as i64 == pid);
+            let right = index.map_or(false, |i| status == (i as i32 + 1) << 8);
+            if !right || reported.contains(&pid) {
+                let after = format!("after {:?}", reported);
+                return Err(format!("wait4 returned {} status {:#x} {}", pid, status, after));
+            }
+            reported.push(pid);
+        }
+        let (last, _) = sys::wait4(-1, 0);
+        let left = tasks_listed(&pids);
+        if last != ECHILD || !left.is_empty() {
+            return Err(format!("then wait4 returned {}, still listed {:?}", last, left));
+        }
+        Ok(())
+    });
+    report.check(
+        "children of a parent with SIGCHLD's default action stay until it waits",
+        kept.is_ok(),
+        kept.err().unwrap_or_default(),
+    );
+}
+
 /// A process blocked on something other than a child still has to learn that a
 /// child finished: the child signal is a signal, and every other one returns a
 /// sleeping task to the run queue. A shell waiting for a key is the case that
@@ -2662,6 +2858,7 @@ pub fn main(_args: &[String]) -> i32 {
     a_signal_from_outside_ends_every_thread(&mut report);
     a_stopped_process_with_threads_is_killed(&mut report);
     a_signal_for_the_process_reaches_a_thread_that_takes_it(&mut report);
+    children_of_a_parent_that_will_not_wait(&mut report);
     a_child_exit_reaches_a_blocked_parent(&mut report);
     what_a_wait_does_with_signals(&mut report);
     a_continued_job_has_no_stop_to_report(&mut report);
