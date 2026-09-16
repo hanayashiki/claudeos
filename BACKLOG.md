@@ -36,9 +36,13 @@ in git).
   still read `state: running`, `starts: 1`.
 
 **Also seen in the capture, not the cause.**
-- About 120 zombie `httpd` children of pid 9, never reaped (busybox httpd
-  forks per connection). Check whether it ignores SIGCHLD, which on Linux
-  reaps children automatically, and whether this kernel implements that.
+- About 120 zombie `httpd` children of pid 9, never reaped. busybox httpd
+  forks a child per connection, sets SIGCHLD to `SIG_IGN` (outside inetd
+  mode, as its source is remembered; confirm) and never waits. On Linux a
+  process ignoring SIGCHLD, or with `SA_NOCLDWAIT`, has its children reaped at
+  exit (`do_notify_parent`). Here `SIG_IGN` on SIGCHLD only keeps a pending
+  SIGCHLD from interrupting calls (`sched.rs` `has_pending_signal_except`);
+  exit never checks it, so each connection leaves a zombie.
 - Kernel heap 45 MiB in use of 69.8 MiB (16 MiB at boot).
 - The board did not answer ping while TCP to port 23 worked.
 - `madvise` returns 0 and does nothing (syscall/mod.rs).
