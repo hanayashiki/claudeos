@@ -440,8 +440,14 @@ fn signal_to_send(signal: i32) -> Result<Option<Signal>, Errno> {
 /// where any thread that does not block it takes it; a thread id that is not
 /// the leader's names the process that thread is in, as on Linux. Zero is the
 /// caller's process group, minus one every process but init and the caller's
-/// own, and below that the process group its negation names. A process whose
-/// every thread has exited is not there to be signalled.
+/// own, and below that the process group its negation names.
+///
+/// A process whose every thread has exited and that has not been reaped is
+/// still there, as a zombie: the call succeeds and nothing is delivered, as on
+/// Linux. `kill(pid, 0)` is how a program asks whether a process is there, and
+/// answering ESRCH for a zombie told it the pid was free while its parent had
+/// not yet collected the child. A thread that has exited, and a process
+/// released at its exit, are gone.
 pub fn kill(pid: i32, signal: i32) -> SysResult {
     let send = signal_to_send(signal)?;
     let me = sched::current().tgid;
@@ -449,17 +455,25 @@ pub fn kill(pid: i32, signal: i32) -> SysResult {
     let mut delivered = false;
     sched::with_tasks(|table| {
         let mut deliver = |leader: &Task| {
+            if leader.released_at_exit.get() {
+                return;
+            }
+            delivered = true;
             if table.group_exited(leader.tgid) {
                 return;
             }
             if let Some(signal) = send {
                 sched::post_process_signal(leader, signal, table);
             }
-            delivered = true;
         };
         if pid > 0 {
-            let leader = table.find(pid as u32).and_then(|task| table.find(task.tgid));
-            if let Some(leader) = leader {
+            let Some(task) = table.find(pid as u32) else {
+                return;
+            };
+            if task.pid != task.tgid && task.state() == State::Zombie {
+                return;
+            }
+            if let Some(leader) = table.find(task.tgid) {
                 deliver(leader);
             }
             return;
@@ -498,6 +512,10 @@ pub fn kill(pid: i32, signal: i32) -> SysResult {
 /// also requires to be a thread of the process `tgid`. The signal is that
 /// thread's alone, as Linux sends it: no other thread takes it, and it waits
 /// for this one to unblock it.
+///
+/// A process's first thread that has exited stays findable until the process
+/// is reaped, and the call succeeds with nothing delivered, as for `kill`; any
+/// other thread that has exited is gone, as Linux releases it at its exit.
 pub fn tgkill(tgid: Option<i32>, tid: i32, signal: i32) -> SysResult {
     if tid <= 0 || tgid.map_or(false, |tgid| tgid <= 0) {
         return Err(Errno::EINVAL);
@@ -505,8 +523,12 @@ pub fn tgkill(tgid: Option<i32>, tid: i32, signal: i32) -> SysResult {
     let send = signal_to_send(signal)?;
     let found = sched::with_tasks(|table| {
         let task = table.find(tid as u32)?;
-        if task.state() == State::Zombie || tgid.map_or(false, |tgid| task.tgid != tgid as u32) {
+        if tgid.map_or(false, |tgid| task.tgid != tgid as u32) {
             return None;
+        }
+        if task.state() == State::Zombie {
+            let leader = task.pid == task.tgid && !task.released_at_exit.get();
+            return leader.then_some(());
         }
         if let Some(signal) = send {
             sched::post_signal(task, signal, table);

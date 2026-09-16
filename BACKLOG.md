@@ -161,9 +161,6 @@ bytes such as 0xff, on both machines.
   its signals, but only the leader's stop is reported to `wait4`, so a process
   whose first thread has already exited is never reported stopped. Linux
   reports the stop once every thread has stopped (`do_signal_stop`).
-- **A process whose threads have all exited cannot be signalled.** Until it is
-  reaped, `kill` answers ESRCH, and so do `tkill` and `tgkill` for its leader;
-  Linux answers 0.
 - **Carried over from the 2026-09-14 notes, not re-checked since:**
   - `openat(AT_FDCWD, "")` returns the current directory, where Linux returns
     ENOENT;

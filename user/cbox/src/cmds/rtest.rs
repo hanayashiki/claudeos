@@ -1198,6 +1198,35 @@ fn a_child_of_a_thread_belongs_to_the_process(report: &mut Report) {
     );
 }
 
+/// A child that has exited and not been reaped is still there to `kill`: a
+/// signal of zero, which asks whether a process is there, is answered 0, as on
+/// Linux, and ESRCH only once the child has been collected. It was answered
+/// ESRCH at once, which told a program watching a pid that it was free while
+/// the parent had yet to collect the child.
+fn a_zombie_is_still_there_to_kill(report: &mut Report) {
+    use crate::sys;
+    const ESRCH: i64 = -3;
+
+    let child = sys::fork();
+    if child == 0 {
+        sys::exit_group(0);
+    }
+    let pids = [child as i32];
+    let zombie = |listed: &[String]| listed.iter().any(|line| line.split(' ').nth(3) == Some("Z"));
+    let (exited, listed) = tasks_until(&pids, zombie);
+    let while_zombie = sys::kill(child as i32, 0);
+    let (reaped, _) = sys::wait4(child as i32, 0);
+    let after_reap = sys::kill(child as i32, 0);
+    report.check(
+        "kill with signal 0 finds a zombie, and not a reaped child",
+        exited && while_zombie == 0 && reaped == child && after_reap == ESRCH,
+        format!(
+            "listed {:?}; kill {} while a zombie, reaped {}, kill {} after",
+            listed, while_zombie, reaped, after_reap
+        ),
+    );
+}
+
 /// A process blocked on something other than a child still has to learn that a
 /// child finished: the child signal is a signal, and every other one returns a
 /// sleeping task to the run queue. A shell waiting for a key is the case that
@@ -2967,6 +2996,7 @@ pub fn main(_args: &[String]) -> i32 {
     a_signal_for_the_process_reaches_a_thread_that_takes_it(&mut report);
     children_of_a_parent_that_will_not_wait(&mut report);
     a_child_of_a_thread_belongs_to_the_process(&mut report);
+    a_zombie_is_still_there_to_kill(&mut report);
     a_child_exit_reaches_a_blocked_parent(&mut report);
     what_a_wait_does_with_signals(&mut report);
     a_continued_job_has_no_stop_to_report(&mut report);
