@@ -15,6 +15,7 @@ mod console;
 mod elf;
 mod fs;
 mod futex;
+mod hwcap;
 mod integrity;
 mod itimer;
 mod mm;
@@ -267,6 +268,7 @@ pub fn start(boot: &boot::BootInfo) -> ! {
     arch::init_traps();
     trap::init();
     arch::init_cpu();
+    hwcap::init();
 
     mm::frame::init(boot);
     mm::heap::init();

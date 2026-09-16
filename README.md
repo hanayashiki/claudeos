@@ -1615,6 +1615,7 @@ kernel/src
   syscall/            the Linux system call implementations
   fs/                 in-memory filesystem, devices, pipes, cpio, /proc
   elf.rs              ELF64 loader for static and static-PIE executables
+  hwcap.rs            the AT_HWCAP and AT_HWCAP2 words, read once at boot
   rng.rs              ChaCha20, the entropy pool, and what seeds it
   task.rs             task control block, user stack and auxiliary vector
   sched.rs            round-robin scheduler, exit and reaping

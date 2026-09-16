@@ -1130,10 +1130,14 @@ pub fn build_user_stack(
         (AT_RANDOM, random_addr),
         (AT_EXECFN, execfn_addr),
     ];
-    let extra: [(u64, u64); 3] = [
+    // Linux passes AT_HWCAP2 on both machines: `create_elf_tables` emits it
+    // wherever the architecture defines `ELF_HWCAP2`, and x86 and arm64 both
+    // do.
+    let extra: [(u64, u64); 4] = [
         (AT_PLATFORM, platform_addr),
         (AT_CLKTCK, 100),
-        (AT_HWCAP, 0),
+        (AT_HWCAP, crate::hwcap::hwcap()),
+        (AT_HWCAP2, crate::hwcap::hwcap2()),
     ];
 
     // Size of the pointer block, so the final rsp lands 16-byte aligned.
