@@ -4,6 +4,7 @@ use super::{link_node, mkdir_p, unlink, Node, NodeKind};
 use crate::abi::{Errno, S_IFREG};
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Generated {
@@ -21,6 +22,9 @@ pub enum Generated {
     PidStatus(u32),
     PidCmdline(u32),
     PidMaps(u32),
+    /// The auxiliary vector the process was started with. Not text: see
+    /// `contents`.
+    PidAuxv(u32),
 }
 
 /// The inode of /proc itself, so a lookup can tell when it is there.
@@ -115,6 +119,7 @@ pub fn build_process(pid: u32) -> ProcessEntry {
         ("status", Generated::PidStatus(pid)),
         ("cmdline", Generated::PidCmdline(pid)),
         ("maps", Generated::PidMaps(pid)),
+        ("auxv", Generated::PidAuxv(pid)),
     ];
     {
         let mut inner = dir.inner.lock();
@@ -143,7 +148,7 @@ pub fn publish_process(entry: ProcessEntry, _irq: crate::sync::NoInterrupts) {
 
 pub fn remove_process(pid: u32) {
     let dir = format!("/proc/{}", pid);
-    for name in ["stat", "status", "cmdline", "maps"] {
+    for name in ["stat", "status", "cmdline", "maps", "auxv"] {
         let _ = unlink(&format!("{}/{}", dir, name), false);
     }
     if let Ok(fd_dir) = crate::fs::lookup_nofollow(&format!("{}/fd", dir)) {
@@ -339,12 +344,31 @@ pub fn render(kind: Generated) -> String {
             crate::sched::with_task(pid, |task| format!("{}\0", task.exe_path()))
                 .unwrap_or_default()
         }
+        // Binary, so `contents` answers for it and this is never asked.
+        Generated::PidAuxv(_) => String::new(),
+    }
+}
+
+/// The bytes a read of `kind` finds.
+fn contents(kind: Generated) -> Vec<u8> {
+    match kind {
+        // The words exec put on the program's stack, each as the eight bytes
+        // an unsigned long is in memory, through the AT_NULL pair: what
+        // Linux's `auxv_read` in fs/proc/base.c hands back from the mm's
+        // `saved_auxv`. A task that has not exec'd has no vector and the file
+        // is empty, as it is on Linux for a task with no mm.
+        Generated::PidAuxv(pid) => crate::sched::with_task(pid, |task| task.saved_auxv())
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|word| word.to_ne_bytes())
+            .collect(),
+        text => render(text).into_bytes(),
     }
 }
 
 pub fn read(kind: Generated, offset: super::Offset, buf: &mut [u8]) -> Result<usize, Errno> {
-    let text = render(kind);
-    let bytes = text.as_bytes();
+    let contents = contents(kind);
+    let bytes = contents.as_slice();
     let want = offset.range(buf.len())?;
     if want.start >= bytes.len() {
         return Ok(0);
@@ -356,5 +380,5 @@ pub fn read(kind: Generated, offset: super::Offset, buf: &mut [u8]) -> Result<us
 }
 
 pub fn size(kind: Generated) -> u64 {
-    render(kind).len() as u64
+    contents(kind).len() as u64
 }

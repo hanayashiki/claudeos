@@ -116,11 +116,24 @@ pub struct MemState {
     pub brk_start: u64,
     pub brk: u64,
     pub mmap_top: u64,
+    /// The auxiliary vector exec wrote onto the stack of the program running
+    /// here, word for word, ending with the AT_NULL pair: what
+    /// /proc/<pid>/auxv hands back. Linux keeps it in the mm as `saved_auxv`,
+    /// and this record is what plays the mm's part, so it goes the same way:
+    /// threads share it, a fork copies it, and exec starts a new one. Empty
+    /// until the first exec, as a task with no mm has none to show.
+    pub saved_auxv: Vec<u64>,
 }
 
 impl MemState {
     pub fn new() -> MemState {
-        MemState { vmas: Vec::new(), brk_start: 0, brk: 0, mmap_top: USER_MMAP_BASE }
+        MemState {
+            vmas: Vec::new(),
+            brk_start: 0,
+            brk: 0,
+            mmap_top: USER_MMAP_BASE,
+            saved_auxv: Vec::new(),
+        }
     }
 }
 
@@ -601,6 +614,11 @@ impl Task {
         self.with_mem(|mm| mm.vmas.clone())
     }
 
+    /// The auxiliary vector the running program was started with, as words.
+    pub fn saved_auxv(&self) -> Vec<u64> {
+        self.with_mem(|mm| mm.saved_auxv.clone())
+    }
+
     /// Give every region overlapping `[start, end)` the new protection.
     pub fn set_vma_prot(&self, start: u64, end: u64, prot: u64) {
         self.with_mem(|mm| {
@@ -871,6 +889,7 @@ impl Task {
             target.brk_start = source.brk_start;
             target.brk = source.brk;
             target.mmap_top = source.mmap_top;
+            target.saved_auxv = source.saved_auxv.clone();
         });
     }
 
@@ -1139,12 +1158,22 @@ pub fn build_user_stack(
         (AT_HWCAP, crate::hwcap::hwcap()),
         (AT_HWCAP2, crate::hwcap::hwcap2()),
     ];
+    // The vector as the words that go on the stack, AT_NULL pair included.
+    // The same words are kept for /proc/<pid>/auxv, so the file cannot say
+    // anything the program was not told.
+    let mut vector: Vec<u64> = Vec::with_capacity(2 * (auxv.len() + extra.len() + 1));
+    for (key, value) in auxv.iter().chain(extra.iter()) {
+        vector.push(*key);
+        vector.push(*value);
+    }
+    vector.push(AT_NULL);
+    vector.push(0);
 
     // Size of the pointer block, so the final rsp lands 16-byte aligned.
     let words = 1                       // argc
         + argv.len() + 1                // argv + NULL
         + envp.len() + 1                // envp + NULL
-        + 2 * (auxv.len() + extra.len() + 1); // auxv pairs + AT_NULL
+        + vector.len();                 // auxv pairs + AT_NULL
     let block = (words * 8) as u64;
     sp = (sp - block) & !0xF;
 
@@ -1163,12 +1192,13 @@ pub fn build_user_stack(
         push_word(*addr, &mut at)?;
     }
     push_word(0, &mut at)?;
-    for (key, value) in auxv.iter().chain(extra.iter()) {
-        push_word(*key, &mut at)?;
-        push_word(*value, &mut at)?;
+    for word in &vector {
+        push_word(*word, &mut at)?;
     }
-    push_word(AT_NULL, &mut at)?;
-    push_word(0, &mut at)?;
+    // Into the record of the address space the stack was just built in, which
+    // exec made this task's before loading anything. An exec that fails puts
+    // the old record back, and that still holds the old program's vector.
+    task.with_mem(|mm| mm.saved_auxv = vector);
 
     Ok(sp)
 }
