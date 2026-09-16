@@ -930,9 +930,10 @@ the signal takes it; `tkill` and `tgkill` send to one thread. A signal whose
 action is to terminate, a fault, or `exit_group` from any thread ends every
 thread, a stopped one included, and SIGSTOP stops every thread. `wait4`
 reports a process once its last thread has exited, with the status
-`exit_group` or the killing signal gave it. A child of a parent that ignores
-SIGCHLD, or set `SA_NOCLDWAIT`, is released as it exits rather than left a
-zombie, as on Linux.
+`exit_group` or the killing signal gave it. A child's parent is the process
+that forked it, so any of its threads can wait for the child. A child of a
+parent that ignores SIGCHLD, or set `SA_NOCLDWAIT`, is released as it exits
+rather than left a zombie, as on Linux.
 Scheduling is round-robin, preemptive, driven by the 100 Hz timer tick.
 Anonymous memory is demand-paged: `mmap` and `brk` record a region and the
 page fault handler supplies pages on first touch.
@@ -1101,6 +1102,13 @@ handler would run is told, and one that has named no stack is told that. A
 runtime that reads the answer back before deciding what to do needs both, and
 Go is one -- its scheduler interrupts a running thread with a signal, and the
 first thing its handler does is work out which stack it is standing on.
+
+A fault the kernel cannot repair is sent to the thread that took it, as
+SIGSEGV, SIGBUS, SIGILL or SIGFPE with `si_code` and `si_addr` filled in, so a
+handler the program installed runs on the registers of the faulting
+instruction; Go's turns a nil dereference into a panic, and prints the fault
+address and every goroutine's stack for one it cannot handle. A fault whose
+signal is blocked or ignored ends the process, as on Linux.
 
 Terminal signals are raised from the interrupt that receives the
 character, so `Ctrl-C` reaches a running job while the shell is blocked waiting
@@ -1340,7 +1348,7 @@ search of standard input is not something that can be asked for.
 `make test` boots the OS once per suite and requires each to report zero
 failures.
 
-- `tests/suite.sh` runs **313 checks** inside the OS, driving the shell through
+- `tests/suite.sh` runs **320 checks** inside the OS, driving the shell through
   pipelines, redirection, here-documents, globbing, control flow, `case`,
   subshells, functions, file and script execution, `chmod`, devices,
   subprocesses and `/proc`. One of the pipeline checks sends megabytes from
@@ -1349,7 +1357,7 @@ failures.
   reads differ and that 4 KiB of it holds nearly all 256 byte values, which is
   a check that the generator is running and not a check that it is any good.
 - The `rtest` applet, which only the test image's cbox is built with, runs
-  **107 checks** against the Rust standard library, 106 on aarch64, which has
+  **112 checks** against the Rust standard library, 111 on aarch64, which has
   no `alarm` system call of its own:
   multi-megabyte allocations, sorting two million elements, eight threads
   incrementing an atomic, a mutex shared across threads, an `mpsc` channel,
@@ -1363,7 +1371,10 @@ failures.
   outside, stopped and then killed, or whose first thread exits alone, each
   reported with its status and leaving no thread behind, a signal for a
   process taken by the thread that does not block it, children of a parent
-  ignoring SIGCHLD or with `SA_NOCLDWAIT` released as they exit,
+  ignoring SIGCHLD or with `SA_NOCLDWAIT` released as they exit, a fault
+  handler told the faulting address, a child forked by one thread collected by
+  another, `kill` with signal 0 finding a zombie, an alarm taken by the thread
+  that unblocks it,
   a `UnixStream` pair carrying bytes both ways,
   an epoll set woken by a counter and a socket, timing out when it should and
   waking promptly when a write arrives, and a walk of the system call numbers
