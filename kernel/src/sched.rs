@@ -89,12 +89,29 @@ impl<'a> Held<'a> {
         group_exited(self.tasks, tgid)
     }
 
-    /// Tell `ppid` that one of its children changed state, and wake it if it
-    /// is blocked.
+    /// Tell the process `ppid` that one of its children changed state.
+    ///
+    /// SIGCHLD goes to the process, as Linux's `do_notify_parent` sends it,
+    /// and wakes a thread that can take it: a shell blocked reading its
+    /// terminal has a handler for it and would otherwise not learn that a
+    /// background job had finished until the next key was pressed. Every
+    /// thread of the process waiting in `wait4` is woken to look again, since
+    /// the child is the whole process's to collect and not only the thread's
+    /// that forked it (`__wake_up_parent`).
     pub fn notify_parent(&self, ppid: u32) {
         if let Some(parent) = self.find(ppid) {
-            parent.child_changed_state(self.irq);
+            post_process_signal(parent, SIGCHLD, self);
+            self.wake_waiters(parent.tgid);
         }
+    }
+
+    /// Wake every thread of the process `tgid` that is waiting in `wait4`.
+    fn wake_waiters(&self, tgid: u32) {
+        self.for_each(|task| {
+            if task.tgid == tgid && task.waiting_for.get().is_some() {
+                task.wake(self.irq);
+            }
+        });
     }
 
     /// Tell the parent of the process `leader` leads that every thread of it
@@ -119,9 +136,9 @@ impl<'a> Held<'a> {
             tasks_to_release();
         }
         if ignored {
-            parent.wake(self.irq);
+            self.wake_waiters(parent.tgid);
         } else {
-            parent.child_changed_state(self.irq);
+            self.notify_parent(parent.pid);
         }
     }
 }
@@ -511,7 +528,6 @@ pub fn exit_current(status: i32) -> ! {
             task.space().free_user_memory();
             task.clear_vmas();
         }
-        let ppid = task.ppid.get();
         let pid = task.pid;
 
         if pid == 1 {
@@ -529,26 +545,31 @@ pub fn exit_current(status: i32) -> ! {
         // it: a tick in between hands the CPU to something else and never
         // hands it back.
         with_tasks(|table| {
-            // Orphans are adopted by init. One that has already exited still
-            // needs reaping, and init is normally asleep in wait4, so it has
-            // to be woken here; nothing else will report the adopted zombie
-            // to it.
-            table.for_each(|other| {
-                if other.ppid.get() == pid {
-                    other.ppid.set(1);
-                    let exited = other.pid == other.tgid && table.group_exited(other.tgid);
-                    if exited && !other.released_at_exit.get() && ppid != 1 {
-                        table.notify_parent_of_exit(other);
-                    }
-                }
-            });
-
             // A signal sent to the process that this thread was woken to take
             // goes to a thread that is still there to take it.
             let task = current();
             retarget_shared_pending(&task, !task.blocked(), table);
 
             task.become_zombie(table);
+
+            // A child's parent is the process, so its children are handed on
+            // only once every thread of it has exited; until then any thread
+            // left can wait for them, as Linux's `forget_original_parent`
+            // hands them to a live thread of the group first. Orphans are
+            // adopted by init. One that has already exited still needs
+            // reaping, and init is normally asleep in wait4, so it has to be
+            // told here; nothing else will report the adopted zombie to it.
+            if table.group_exited(task.tgid) {
+                table.for_each(|other| {
+                    if other.ppid.get() == task.tgid {
+                        other.ppid.set(1);
+                        let exited = other.pid == other.tgid && table.group_exited(other.tgid);
+                        if exited && !other.released_at_exit.get() {
+                            table.notify_parent_of_exit(other);
+                        }
+                    }
+                });
+            }
         });
     }
     loop {

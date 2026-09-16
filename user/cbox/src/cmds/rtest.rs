@@ -1164,6 +1164,40 @@ fn children_of_a_parent_that_will_not_wait(report: &mut Report) {
     );
 }
 
+/// A child forked by one thread is the process's child: its `getppid` is the
+/// process's pid, and another thread collects it after the forking thread has
+/// exited. The forking thread's id was recorded as the parent, so the child
+/// read that id back, a wait in any other thread failed with ECHILD, and the
+/// child was handed to init as soon as the forking thread exited.
+///
+/// In a forked child of its own, because this suite is init, which is where an
+/// orphan would have gone anyway.
+fn a_child_of_a_thread_belongs_to_the_process(report: &mut Report) {
+    use crate::sys;
+
+    let result = in_a_child(|| {
+        let me = sys::getpid();
+        let forker = std::thread::spawn(move || {
+            let child = sys::fork();
+            if child == 0 {
+                sys::exit_group(if sys::getppid() == me { 0 } else { 1 });
+            }
+            child
+        });
+        let child = forker.join().unwrap_or(-1);
+        let (reaped, status) = wait_or_kill(child, Duration::from_secs(2));
+        if child <= 0 || reaped != child || status != 0 {
+            return Err(format!("forked {} reaped {} status {:#x}", child, reaped, status));
+        }
+        Ok(())
+    });
+    report.check(
+        "a child forked by a thread is collected by another, and its parent is the process",
+        result.is_ok(),
+        result.err().unwrap_or_default(),
+    );
+}
+
 /// A process blocked on something other than a child still has to learn that a
 /// child finished: the child signal is a signal, and every other one returns a
 /// sleeping task to the run queue. A shell waiting for a key is the case that
@@ -2932,6 +2966,7 @@ pub fn main(_args: &[String]) -> i32 {
     a_stopped_process_with_threads_is_killed(&mut report);
     a_signal_for_the_process_reaches_a_thread_that_takes_it(&mut report);
     children_of_a_parent_that_will_not_wait(&mut report);
+    a_child_of_a_thread_belongs_to_the_process(&mut report);
     a_child_exit_reaches_a_blocked_parent(&mut report);
     what_a_wait_does_with_signals(&mut report);
     a_continued_job_has_no_stop_to_report(&mut report);

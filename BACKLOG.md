@@ -156,14 +156,6 @@ bytes such as 0xff, on both machines.
   them on. aarch64 already does the equivalent, and the copy-on-write repair
   masks explicitly either way.
 - **`fork` does not copy the parent's signal mask**; Linux does.
-- **A child's parent is the thread that forked it.** `fork` sets the child's
-  `ppid` to the forking task's id, which for a thread other than the first is
-  not the process's. The child's `getppid` returns that thread id, `wait4` in
-  another thread of the parent finds no such child (it matches `ppid` against
-  the caller's own id), and when that thread exits `exit_current` hands its
-  children to init while the parent process runs on. Linux's parent is the
-  process: any thread can wait for the child, and a thread's exit hands its
-  children to another thread of the group.
 - **Stopping a process with threads is only partly Linux's group stop.** A
   stop is made pending on every thread and each stops when it next looks at
   its signals, but only the leader's stop is reported to `wait4`, so a process

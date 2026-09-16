@@ -52,7 +52,11 @@ pub fn fork(
     let child_pid = child.pid;
     let is_thread = flags & CLONE_THREAD != 0;
 
-    child.ppid.set(if is_thread { parent.ppid.get() } else { parent.pid });
+    // A process's parent is the process that forked it, whichever of its
+    // threads made the call: `getppid` answers with its pid, any thread of it
+    // can wait for the child, and the child is handed to init only once all of
+    // them have exited. A thread has its process's parent.
+    child.ppid.set(if is_thread { parent.ppid.get() } else { parent.tgid });
     child.tgid = if is_thread { parent.tgid } else { child_pid };
     child.pgid.set(parent.pgid.get());
     // Two more things a thread shares with the task that started it. Without
@@ -339,7 +343,8 @@ pub fn execve(path_addr: u64, argv_addr: u64, envp_addr: u64, frame: &mut TrapFr
 }
 
 pub fn wait4(pid: i64, status_addr: u64, options: u64) -> SysResult {
-    let me = sched::current().pid;
+    // The children are the process's, so any of its threads collects them.
+    let me = sched::current().tgid;
     loop {
         if let Some((child_pid, status)) = sched::reap_child(me, pid as i32) {
             if status_addr != 0 {

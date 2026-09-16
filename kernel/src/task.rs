@@ -994,19 +994,6 @@ impl Task {
         }
     }
 
-    /// Record that a child of this task changed state, and put it back on the
-    /// run queue if it was asleep.
-    ///
-    /// Any sleep, not only a wait for a child. This is a signal, and every
-    /// other signal returns a sleeping task to the run queue; a shell blocked
-    /// reading its terminal has a handler for this one and would otherwise not
-    /// learn that a background job had finished until the next key was
-    /// pressed.
-    pub fn child_changed_state(&self, irq: NoInterrupts) {
-        self.add_pending(SIGCHLD.bit());
-        self.wake(irq);
-    }
-
     /// The timer found this task's deadline passed.
     pub fn deadline_reached(&self, _irq: NoInterrupts) {
         self.wake_at.set(0);
