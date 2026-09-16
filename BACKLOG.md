@@ -4,6 +4,55 @@ Known problems and open decisions that are not being worked on. Each entry says
 what is wrong, where, and what a fix involves. Remove an entry when it is fixed
 or decided.
 
+## Incident 2026-09-16: the tunnel died and stayed dead
+
+The board's live state was captured over telnet at 23:28 JST, before any
+reboot; the redacted capture is build/incident-2026-09-16-cloudflared.txt (not
+in git).
+
+**What happened.**
+- 21:27:28 JST: Cloudflare's edge dropped 2 of cloudflared's 4 connections and
+  cloudflared began reconnecting (the last lines of /var/log/tunnel.log).
+- One cloudflared thread (tid 15, of process 10) took a user page fault:
+  write to 0xddfe4a12f6d4950d, pc 0x61a104, ESR 0x92000044. The address is not
+  canonical (top 16 bits 0xddfe) and not 8-aligned. In cloudflared 2026.9.1
+  (go1.26.8) pc 0x61a104 is `http2.(*serverConn).newWriterAndRequest`, inlined
+  from net/textproto/header.go:15 (`MIMEHeader.Add`), called from
+  `processHeaders` at http2/server.go:1962: a map insert for an incoming
+  request's headers.
+- The fault address is x13 + 8. The object x0 points at reads 0x0a, then
+  high-entropy 64-bit words where a map header would hold a directory pointer
+  and a small length. Likely cause: that object's memory was overwritten with
+  foreign bytes, which points at kernel memory corruption (a page used by two
+  mappings, a copy to the wrong page) more than at Go. Not proven.
+
+**Why it never recovered: two kernel faults, both confirmed in the code.**
+- `trap.rs` `page_fault` calls `kill_current(SIGSEGV)` for every unresolved
+  user fault. It never delivers SIGSEGV to an installed handler. Linux does,
+  and Go's handler would have written "unexpected fault address" and every
+  goroutine's stack to the log and exited the process.
+- `kill_current` ends only the faulting thread. Threads 10, 12, 13, 14 and 21
+  stayed alive, so the keeper's `wait4` never returned; the tunnel's status
+  still read `state: running`, `starts: 1`.
+
+**Also seen in the capture, not the cause.**
+- About 120 zombie `httpd` children of pid 9, never reaped (busybox httpd
+  forks per connection). Check whether it ignores SIGCHLD, which on Linux
+  reaps children automatically, and whether this kernel implements that.
+- Kernel heap 45 MiB in use of 69.8 MiB (16 MiB at boot).
+- The board did not answer ping while TCP to port 23 worked.
+- `madvise` returns 0 and does nothing (syscall/mod.rs).
+
+**Work in progress.** Branch worktree-agent-a65bd54ce6a84aa3e ("threadgroup",
+not merged) has: signal sets read at bit n - 1 (a real bug: blocking SIGUSR1
+blocked SIGKILL), reaping a process when its last thread exits, a fatal signal
+or fault ending the whole thread group, and kill(pid) to the group. It does not
+yet deliver SIGSEGV for faults to a handler.
+
+**Next.** Deliver fault signals to handlers so the next crash leaves Go's
+trace; then find what overwrites user memory. The user plans to review the
+kernel's unsafe code, which mostly mirrors C, in an overhaul.
+
 ## Paths, arguments and environment are text, where Linux has bytes
 
 Linux hands a program's paths, `argv` and `envp` to the kernel as
