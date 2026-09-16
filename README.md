@@ -522,12 +522,14 @@ so; `fsck_msdos -y` or Disk Utility's First Aid on the Mac clears it.
 
 - Owners and permission bits. Every file and every directory reports root and
   mode 0777, as Linux's vfat does mounted with `umask=0`, so a program kept
-  there can be run. `chmod` and `fchmod` to 0777 succeed, and to any other
-  mode answer EPERM, so a `chmod` that succeeds has left the file with the
-  mode it asked for. Linux's vfat without `quiet` answers EPERM only for the
-  setuid, setgid and sticky bits, and lets other modes it cannot keep through
-  as success without effect. A program that sets the mode of a file it copies
-  onto `/data`, such as busybox `cp -p`, gets EPERM for any mode but 0777.
+  there can be run. `chmod`, `fchmod` and `fchmodat` follow Linux's vfat
+  mounted without `quiet`: a mode with the setuid, setgid or sticky bit
+  answers EPERM, and any other mode succeeds and changes nothing, so the file
+  still reports 0777. `chown`, `fchown`, `lchown` and `fchownat` to an owner
+  or group other than root answer EPERM, and to root succeed. So `cp -p`, `tar`
+  and `mv` from memory copy onto `/data` without an error. One difference from
+  Linux: a mode with no write bits makes vfat set FAT's read-only attribute
+  and report the mode without them, and here it changes nothing.
 - Hard links, symbolic links and named pipes. Making one answers EPERM. A link
   or a rename between `/data` and the ram filesystem answers EXDEV, which makes
   `mv` copy instead.
@@ -1635,7 +1637,9 @@ failures.
   directory, renames within and across directories, over a file, into the
   directory's own subdirectory and changing only case, a moved directory's
   `..`, unlink and rmdir, the mode 0777 FAT files and directories report,
-  `chmod` succeeding to that mode and answering EPERM for another, no hard or
+  `chmod` to another mode succeeding and changing nothing, `chmod` with setuid,
+  setgid or sticky and `chown` to another owner or group answering EPERM,
+  busybox `cp -p` and `mv` of a 0644 file from memory succeeding, no hard or
   symbolic links, a device number of its own, `df` and `mount` naming the
   card's partition and `/data`, busybox copied onto `/data` and run from there,
   a `#!` script run from there, `/usr` and `/root` as links to `/data/usr` and

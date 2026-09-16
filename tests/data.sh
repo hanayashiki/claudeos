@@ -114,12 +114,24 @@ write)
 
   check "a file's mode"              "-rwxrwxrwx"      "$(ls -l $T/sub/B.TXT | cut -c 1-10)"
   check "a directory's mode"         "drwxrwxrwx"      "$(ls -ld $T/sub | cut -c 1-10)"
+  # vfat without `quiet`: EPERM for setuid, setgid and sticky and for another
+  # owner or group, and success that changes nothing for every other mode.
   check "chmod to the mode it has"   "0"               "$(chmod 777 $T/sub/B.TXT; echo $?)"
-  check "chmod +x, which it has"     "0"               "$(chmod +x $T/sub/B.TXT; echo $?)"
-  check "chmod to another mode"      "EPERM"           "$(chmod 644 $T/sub/B.TXT 2>&1 | grep -q 'Operation not permitted' && echo EPERM)"
-  check "a directory to another"     "EPERM"           "$(chmod 755 $T/sub 2>&1 | grep -q 'Operation not permitted' && echo EPERM)"
+  check "chmod to another mode"      "0"               "$(chmod 644 $T/sub/B.TXT; echo $?)"
+  check "a directory to another"     "0"               "$(chmod 755 $T/sub; echo $?)"
+  check "no write bits"              "0"               "$(chmod 555 $T/sub/B.TXT; echo $?)"
   check "setuid"                     "EPERM"           "$(chmod 4777 $T/sub/B.TXT 2>&1 | grep -q 'Operation not permitted' && echo EPERM)"
+  check "setgid"                     "EPERM"           "$(chmod 2777 $T/sub/B.TXT 2>&1 | grep -q 'Operation not permitted' && echo EPERM)"
+  check "sticky, on a directory"     "EPERM"           "$(chmod 1777 $T/sub 2>&1 | grep -q 'Operation not permitted' && echo EPERM)"
   check "and the modes are as they were" "-rwxrwxrwx drwxrwxrwx" "$(ls -l $T/sub/B.TXT | cut -c 1-10) $(ls -ld $T/sub | cut -c 1-10)"
+  check "chown to root"              "0"               "$(busybox chown 0:0 $T/sub/B.TXT; echo $?)"
+  check "chown to another owner"     "EPERM"           "$(busybox chown 1 $T/sub/B.TXT 2>&1 | grep -q 'Operation not permitted' && echo EPERM)"
+  check "chgrp to another group"     "EPERM"           "$(busybox chgrp 1 $T/sub/B.TXT 2>&1 | grep -q 'Operation not permitted' && echo EPERM)"
+  printf 'copied\n' > /tmp/mode644.txt
+  chmod 644 /tmp/mode644.txt
+  check "cp -p from memory"          "0 copied"        "$(busybox cp -p /tmp/mode644.txt $T/cp-p.txt 2>&1; echo $? $(cat $T/cp-p.txt))"
+  check "mv from memory"             "0 1 copied"      "$(busybox mv /tmp/mode644.txt $T/mv.txt 2>&1; s=$?; test -e /tmp/mode644.txt; gone=$?; echo $s $gone $(cat $T/mv.txt))"
+  check "and they read 0777"         "-rwxrwxrwx -rwxrwxrwx" "$(ls -l $T/cp-p.txt | cut -c 1-10) $(ls -l $T/mv.txt | cut -c 1-10)"
   check "no hard links"              "1"               "$(ln $T/sub/B.TXT $T/link 2>/dev/null; echo $?)"
   check "no symbolic links"          "1"               "$(ln -s B.TXT $T/sub/sym 2>/dev/null; echo $?)"
   check "a directory on the card is not /" "0"         "$(test "$(stat -c %d /data)" != "$(stat -c %d /)"; echo $?)"

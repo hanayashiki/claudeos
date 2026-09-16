@@ -584,21 +584,57 @@ pub fn fchmod(fd: i32, mode: u32) -> SysResult {
 /// Give `node` the permission bits `mode`.
 ///
 /// FAT keeps no permission bits, and every file and directory on /data
-/// reports 0777. Asking for that mode succeeds and asking for any other is
-/// EPERM, so a chmod that returns 0 has left the file with the mode it asked
-/// for. Linux's vfat, mounted without `quiet`, answers EPERM in `fat_setattr`
-/// for bits it has no place for, setuid, setgid and sticky, and a mode that
-/// clears every write bit sets the FAT read-only attribute; a change to the
-/// other bits it cannot store it lets through as success without effect
-/// ("We don't return -EPERM here. Yes, strange, but this is too old
-/// behavior."). Here those are EPERM as well, and the read-only attribute is
-/// not used.
+/// reports 0777. This follows Linux's vfat mounted without `quiet`:
+/// `fat_setattr` answers EPERM for a mode with bits outside
+/// S_IFREG | S_IFDIR | 0777, which for chmod are setuid, setgid and sticky,
+/// and lets any other mode it cannot store through as success that changes
+/// nothing ("We don't return -EPERM here. Yes, strange, but this is too old
+/// behavior."). One difference: a mode that clears every write bit makes
+/// vfat set the FAT read-only attribute and report the mode without them,
+/// and here it changes nothing, like any other mode.
 fn set_mode(node: &fs::NodeRef, mode: u32) -> SysResult {
     if node.is_stored() {
-        return if mode & 0o7777 == node.mode() & 0o7777 { Ok(0) } else { Err(Errno::EPERM) };
+        return if mode & (S_ISUID | S_ISGID | S_ISVTX) != 0 { Err(Errno::EPERM) } else { Ok(0) };
     }
     let mut inner = node.inner.lock();
     inner.mode = (inner.mode & S_IFMT) | (mode & 0o7777);
+    Ok(0)
+}
+
+/// `chown`, `lchown` and `fchownat`.
+pub fn chown(dirfd: i64, path_addr: u64, uid: u32, gid: u32, flags: u32) -> SysResult {
+    let path = uaccess::read_cstr(path_addr, 4096)?;
+    if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        return fchown(dirfd as i32, uid, gid);
+    }
+    let resolved = resolve_str(dirfd, &path)?;
+    let node = if flags & AT_SYMLINK_NOFOLLOW != 0 { fs::lookup_nofollow(&resolved)? } else { fs::lookup(&resolved)? };
+    set_owner(&node, uid, gid)
+}
+
+pub fn fchown(fd: i32, uid: u32, gid: u32) -> SysResult {
+    let file = sched::current().fds.get(fd)?;
+    set_owner(file.node().ok_or(Errno::EBADF)?, uid, gid)
+}
+
+/// Give `node` the owner `uid` and group `gid`, either of which is -1 to keep
+/// the one it has.
+///
+/// Everything runs as root on a single-user system, and a file in memory
+/// keeps root as its owner whatever is asked. FAT keeps no owner, and every
+/// entry on /data is root's: Linux's vfat mounted without `quiet` answers
+/// EPERM in `fat_setattr` for an owner or group other than the mount's, and
+/// so does this.
+fn set_owner(node: &fs::NodeRef, uid: u32, gid: u32) -> SysResult {
+    if node.is_stored() {
+        let (owner, group) = {
+            let inner = node.inner.lock();
+            (inner.uid, inner.gid)
+        };
+        if (uid != u32::MAX && uid != owner) || (gid != u32::MAX && gid != group) {
+            return Err(Errno::EPERM);
+        }
+    }
     Ok(0)
 }
 
