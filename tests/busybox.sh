@@ -1,3 +1,4 @@
+#!/bin/sh
 # Run an upstream busybox against the kernel. busybox is not built by this
 # project, so it exercises the system call interface as a third party.
 

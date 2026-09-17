@@ -1,3 +1,4 @@
+#!/bin/sh
 # /data on an SD card, run by the /data section of scripts/test.sh with a card
 # image in the emulated Pi 4's slot. Which part runs comes from `datatest=PART`,
 # given on the kernel command line or in front of the command:
