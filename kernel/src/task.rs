@@ -444,14 +444,16 @@ impl Task {
     }
 
     /// The record of what is in the address space, held for as long as the
-    /// call that asked for it runs. Two locks: the outer one holds the task's
-    /// reference still, because exec replaces it with a different one, and the
-    /// inner one is the address space's own. `None` for a task with no address
-    /// space, which no system call from a program reaches here for.
+    /// call that asked for it runs. `None` for a task with no address space,
+    /// which no system call from a program reaches here for.
+    ///
+    /// The task's own lock is held only to take a reference, so it is never
+    /// held around anything else: a fault report reads it too, and a fault
+    /// inside a call that held it would hang the report rather than print it.
     fn with_mem<R>(&self, f: impl FnOnce(&mut MemState) -> R) -> Option<R> {
-        let slot = self.mm.lock();
-        let mut mm = slot.as_ref()?.lock();
-        Some(f(&mut mm))
+        let mm = self.mm()?;
+        let mut mem = mm.lock();
+        Some(f(&mut mem))
     }
 
     pub fn cwd(&self) -> String {
