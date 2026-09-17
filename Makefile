@@ -4,7 +4,7 @@
 #   make run        boot into an interactive shell
 #   make test       run both self-test suites and report
 #   make demo       run the scripted tour
-#   make alpine     build Alpine's root filesystem with its suite, to boot
+#   make alpine     build Alpine's root filesystem with its suite, to boot it
 #   make fetch      fill the download cache, build/cache, and build nothing
 #   make clean      remove build products
 #

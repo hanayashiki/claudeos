@@ -8,16 +8,18 @@
   // once. With aarch64-unknown-linux-musl every crate resolves: cbox and inet
   // are analysed for the target they are built for; the kernel and cbox with
   // their aarch64 code active, the board's code and the larger half of the
-  // kernel; and fatdisk against a std that compiles it. A bare-metal target
-  // leaves cbox and inet without std (48 and 13 unresolved names).
-  // x86_64-unknown-linux-musl analyses the x86-64 half instead, also without
-  // errors. Leaving the target unset gives the host's, which on an Apple
-  // silicon Mac analyses the same as this and on an x86-64 machine does not.
+  // kernel; and fatdisk and distro against a std that compiles them. A
+  // bare-metal target leaves cbox, inet and distro without std (48, 13 and 16
+  // unresolved names). x86_64-unknown-linux-musl analyses the x86-64 half
+  // instead, also without errors. Leaving the target unset gives the host's,
+  // which on an Apple silicon Mac analyses the same as this and on an x86-64
+  // machine does not.
   //
   // Measured with rust-analyzer 0.3.3049's `analysis-stats .` and
-  // `diagnostics .` at the root: with this target 146 modules, 34 expressions
-  // of unknown type and no errors. Before the workspace, the root found only
-  // kernel/, 71 modules.
+  // `diagnostics .` at the root: with this target 12 crates, 158 modules, 34
+  // expressions of unknown type and no errors. Before the workspace, the root
+  // found only kernel/, 71 modules, and fatdisk on its own had 202 errors, from
+  // the kernel's FAT code it could not reach.
   "rust-analyzer.cargo.target": "aarch64-unknown-linux-musl",
 
   // The check on save runs `cargo check --workspace --all-targets`. The kernel

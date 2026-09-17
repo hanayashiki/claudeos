@@ -61,8 +61,8 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("readlink", "print what a symbolic link points at"),
     ("reboot", "restart the machine"),
     ("rm", "remove files"),
-    // scripts/list-applets.sh reads this attribute too, so an image whose cbox
-    // is built without the feature gets no /bin/rtest link.
+    // tools/distro/src/applets.rs reads this attribute too, so an image whose
+    // cbox is built without the feature gets no /bin/rtest link.
     #[cfg(feature = "rtest")]
     ("rtest", "exercise the Rust standard library"),
     ("rmdir", "remove empty directories"),

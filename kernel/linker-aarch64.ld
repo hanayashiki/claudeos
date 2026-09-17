@@ -31,8 +31,8 @@ SECTIONS
          * __integrity_end at the end of .rodata: the code and the read-only
          * data, which do not change once the kernel is loaded. The kernel
          * hashes them in memory through these two symbols, and
-         * tools/checksums.py reads the same two symbols out of the ELF to
-         * hash the same bytes at build time. */
+         * tools/distro/src/checksums.rs reads the same two symbols out of the
+         * ELF to hash the same bytes at build time. */
         __integrity_start = .;
         *(.text .text.*)
         . = ALIGN(4K);

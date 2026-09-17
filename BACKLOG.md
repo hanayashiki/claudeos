@@ -284,18 +284,6 @@ it erases the card.
 - how a bare-metal kernel's firmware property call for the reboot flag
   interacts with the watchdog restart.
 
-## Raspberry Pi firmware is fetched unpinned
-
-scripts/mkcard.sh fetches `start4.elf`, `fixup4.dat`, `bcm2711-rpi-4-b.dtb` and
-`overlays/disable-bt.dtbo` from `raw/master/boot` of
-github.com/raspberrypi/firmware, with no commit and no checksum. It caches the
-first download in build/thirdparty/firmware (the copy in use is dated
-2026-09-13, firmware build a089929a of Sep 11 2026). So a fresh checkout gets
-whatever master holds that day, and a changed or damaged download goes unnoticed.
-scripts/mkeeprom.sh already pins a commit and checks a sha256 for each file;
-mkcard.sh should do the same. The kernel's boot checksums cannot cover these
-files: the GPU firmware loads them before the kernel runs.
-
 ## Boot time
 
 - **About 2.5 minutes from reset to shell over WiFi TFTP,** most of it

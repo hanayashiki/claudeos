@@ -6,7 +6,7 @@
 #   kernel         --target x86_64-unknown-none or aarch64-unknown-none-softfloat,
 #                  --profile kernel (scripts/build.sh)
 #   user/cbox,     --target x86_64-unknown-linux-musl or aarch64-unknown-linux-musl,
-#   user/inet      --profile user (scripts/build-user.sh, build-user-aarch64.sh)
+#   user/inet      --profile user (tools/distro builds them for the images)
 #   tools/fatdisk, the Mac, --release
 #   tools/distro
 #

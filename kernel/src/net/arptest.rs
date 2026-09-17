@@ -15,7 +15,7 @@
 //!
 //! Run it with
 //!
-//!     ./scripts/run.sh --net --initrd build/initramfs.cpio --append nettest
+//!     ./scripts/run.sh --net --initrd build/distro/test-x86_64/initramfs.cpio --append nettest
 //!
 //! The first request usually goes unanswered, and that is QEMU rather than
 //! the card. Writing the receive control register arms a one-second timer in

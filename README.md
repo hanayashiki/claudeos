@@ -36,9 +36,12 @@ claudeos:/root# seq 1 20 | grep 1 | wc -l
 
 ## Building and running
 
-Requirements: a Rust toolchain, QEMU, Python 3, and optionally clang for the C
-demo. No network access is needed at build time; the musl C library comes from
-the Rust toolchain's own `self-contained` directory.
+Requirements: a Rust toolchain, QEMU, Python 3, and optionally clang and Go for
+two of the test programs, which are left out of the image with a warning when
+their compiler is missing. The first build needs the network, to fetch what the
+images hold that this repository does not into `build/cache`; after that no
+network access is needed. The musl C library comes from the Rust toolchain's
+own `self-contained` directory.
 
 ```sh
 rustup target add x86_64-unknown-none x86_64-unknown-linux-musl
@@ -48,15 +51,14 @@ make                         # build the kernel and the userland
 make run                     # boot into an interactive shell
 make test                    # run every self-test suite
 make demo                    # run the scripted tour
-make busybox                 # fetch an upstream busybox to test against
-make alpine                  # fetch an Alpine root filesystem to boot
-make cloudflared             # fetch Cloudflare's own cloudflared to run
+make alpine                  # build an Alpine root filesystem to boot
+make fetch                   # fetch every download into build/cache, and build nothing
 ```
 
 After `make alpine`, boot into Alpine itself:
 
 ```sh
-./scripts/run.sh --initrd build/alpine.cpio --append 'init=/bin/sh'
+./scripts/run.sh --initrd build/distro/alpine-x86_64/initramfs.cpio --append 'init=/bin/sh'
 ```
 
 `make run` gives a shell on the serial console. `exit` powers the machine off,
@@ -77,26 +79,65 @@ real. `ARCH` picks which one; everything defaults to x86-64.
 ```sh
 rustup target add aarch64-unknown-none-softfloat aarch64-unknown-linux-musl
 
-ARCH=aarch64 ./scripts/build.sh          # build/kernel8.img
-./scripts/build-user-aarch64.sh          # build/initramfs-aarch64.cpio, and -board.cpio
-ARCH=aarch64 ./scripts/run.sh --initrd build/initramfs-aarch64.cpio \
+ARCH=aarch64 make                        # build/kernel8.img, and the test and board images
+ARCH=aarch64 ./scripts/run.sh --initrd build/distro/test-aarch64/initramfs.cpio \
     --append 'init=/bin/init'
-ARCH=aarch64 make busybox                # an aarch64 busybox to test against
 ARCH=aarch64 make alpine                 # an aarch64 Alpine root filesystem
 ARCH=aarch64 ./scripts/test.sh           # every section but telnet and network time
 ```
 
-Both third-party images are fetched for the machine `ARCH` names, so the same
-ten sections run on either one. x86-64 runs two more, the telnet console
-and network time, which need the network card that QEMU's `raspi4b` does
-not emulate; network time also needs the internet, and reports that it did
-not run when neither time server answers. aarch64 runs a different one, a
-boot of the board image described below, which only that machine has.
-busybox.net has no aarch64 build among its
-prebuilt binaries, so that one comes from Alpine's `busybox-static` package
-instead; `scripts/fetch-busybox.sh` refuses anything that is not a static ELF
-for the machine asked for, since a dynamically linked one has no interpreter to
-load it here.
+Both third-party suites, upstream busybox and Alpine, get their programs for
+the machine `ARCH` names, so the same ten sections run on either one. x86-64
+runs two more, the telnet console and network time, which need the network
+card that QEMU's `raspi4b` does not emulate; network time also needs the
+internet, and reports that it did not run when neither time server answers.
+aarch64 runs a different one, a boot of the board image described below, which
+only that machine has. busybox.net has no aarch64 build among its prebuilt
+binaries, so that one comes from Alpine's `busybox-static` package instead.
+
+### The images
+
+`tools/distro` builds every image from one tree declared in Rust, in
+`tools/distro/src/images.rs`. A node is a directory, a file or a symbolic link.
+It names the variants that have it and where it comes from: a file in the
+repository, text, a download pinned by sha256 or a file inside one, a program
+the build runs (cargo, clang or go), or content made in code, such as
+`/etc/motd` and the boot check's manifest. Moving a node from one image to
+another is a change to its variants, and nothing gets into an image that the
+tree does not declare. The Alpine fixtures are a small tree of their own, in
+`tools/distro/src/alpine.rs`.
+
+```
+variant          its folder, build/distro/VARIANT          booted by
+test-x86_64      root/                                     scripts/test.sh and make run
+test-aarch64     root/                                     scripts/test.sh and make run, ARCH=aarch64
+board-aarch64    root/, data/ and boot/                    a Raspberry Pi 4
+alpine-x86_64    root/: Alpine's minirootfs, tests/alpine.sh   the Alpine suite
+alpine-aarch64   the same for aarch64                      the Alpine suite, ARCH=aarch64
+```
+
+```sh
+cargo run --release -p distro -- build test-aarch64    # the folder, then the image; `all` for every variant
+cargo run --release -p distro -- folder board-aarch64  # the folder only, to look at or change
+cargo run --release -p distro -- cpio board-aarch64    # pack the image from the folder as it is
+cargo run --release -p distro -- list board-aarch64    # the tree, and where each node comes from
+cargo run --release -p distro -- fetch                 # fill build/cache and build nothing
+```
+
+A variant is built first into its folder, which is made again from nothing on
+every build; the image, `build/distro/VARIANT/initramfs.cpio`, is then packed
+from `root/`. The board's `data/` is what a new card's `/data` starts with, and
+its `boot/` is the card's boot partition but for the kernel and the image (see
+"Putting it on a Raspberry Pi 4"). The kernel is built before the images, by
+`scripts/build.sh`, since each image's manifest holds the kernel's digest.
+
+Every download is fetched once into `build/cache/sha256/`, under the sha256
+recorded for it in `tools/distro/src/downloads.rs`, and checked against it
+each time it is used; a file taken out of a package is kept and checked under
+its own sha256. A download that does not match stops the build, and a copy in
+the cache that no longer matches is fetched again. The programs are built into
+`target/`, the one target directory of the cargo workspace, and cargo, clang
+and go are run on every build and do nothing when nothing changed.
 
 ## Putting it on a Raspberry Pi 4
 
@@ -106,26 +147,25 @@ everything it needs is a plain file on that partition, found by name. There is
 no boot sector to install and nothing to mark bootable.
 
 ```sh
-ARCH=aarch64 ./scripts/build.sh
-./scripts/build-user-aarch64.sh
+ARCH=aarch64 make                        # the kernel, then the test and board images
 ./scripts/mkcard.sh                      # assemble build/boot and stop
 ./scripts/mkcard.sh --new /dev/disk4     # erase that card, partition it, write it
 ./scripts/mkcard.sh /dev/disk4           # later: rewrite its boot partition only
 ./scripts/mkcard.sh --usr /dev/disk4     # later: copy the programs into /data/usr
 ```
 
-The userland build makes two images out of one list, `IMAGE_ITEMS` in
-`scripts/images.sh`, and prints the list as it builds. Each line names the
-images an item goes in (`both`, `test` or `board`), so moving an item from one
-image to the other is a change to one word. A second list there, `CARD_ITEMS`,
-is what a new card's `/data` starts with (see "Programs on the card").
+The aarch64 build makes two images out of the one tree (see "The images"): the
+test image and the board image. The board variant's folder also holds what a
+new card's `/data` starts with (see "Programs on the card") and the rest of its
+boot partition.
 
 ```
-build/initramfs-aarch64.cpio         the test image, which scripts/test.sh and
-                                     make run boot under QEMU
-build/initramfs-aarch64-board.cpio   the board image, which mkcard.sh puts on
-                                     the card and netboot.sh serves
-build/data-aarch64                   the files mkcard.sh --new puts on /data
+build/distro/test-aarch64/initramfs.cpio    the test image, which scripts/test.sh
+                                            and make run boot under QEMU
+build/distro/board-aarch64/initramfs.cpio   the board image, which mkcard.sh puts
+                                            on the card and netboot.sh serves
+build/distro/board-aarch64/data             the files mkcard.sh --new puts on /data
+build/distro/board-aarch64/boot             the firmware, config.txt and cmdline.txt
 ```
 
 The board image holds what the kernel and init need to boot and to reach the
@@ -137,21 +177,21 @@ certificate store), the WiFi firmware in `/lib/firmware`, and a link from
 loader and cloudflared are on the card. It has none of what only the tests use:
 no `/tests` (the suites, `demo.sh`, `hello.txt`), no `hello_c` or `inet` in
 `/bin`, and a cbox built without its `rtest` applet, which is a cargo feature
-only the test image's build turns on. A file the build makes that no line of
-either list names stops the build, so nothing can drop out unnoticed. x86-64
-has only the test image. The test images keep busybox and cloudflared in
-`/bin`, and on aarch64 busybox-extras in `/bin` and the loader itself at
-`/lib/ld-musl-aarch64.so.1`, where the suites run them without a card.
+only the test image's build turns on. x86-64 has only the test image. The test
+images keep busybox and cloudflared in `/bin`, and on aarch64 busybox-extras in
+`/bin` and the loader itself at `/lib/ld-musl-aarch64.so.1`, where the suites
+run them without a card.
 
 Run it once with no argument first and look at what it assembled. `--new`
 erases the whole card and makes two MBR partitions: partition 1, FAT32 labelled
 `CLAUDEOS`, 512 MiB, which gets the files below, and partition 2, FAT32
 labelled `CLAUDEDATA`, the rest of the card, which is `/data` (see "/data on
-the SD card") and gets `build/data-aarch64`. A device named without `--new`
-erases partition 1 alone and writes the files again, leaving `/data` as it
-was; it refuses a card whose partition 1 is not labelled `CLAUDEOS` with a
-partition 2 after it. `--usr` copies `build/data-aarch64/usr` into `/data/usr`
-over files of the same names and writes nothing else; it refuses a card whose
+the SD card") and gets `build/distro/board-aarch64/data`. A device named
+without `--new` erases partition 1 alone and writes the files again, leaving
+`/data` as it was; it refuses a card whose partition 1 is not labelled
+`CLAUDEOS` with a partition 2 after it. `--usr` copies
+`build/distro/board-aarch64/data/usr` into `/data/usr` over files of the same
+names and writes nothing else; it refuses a card whose
 partitions are not labelled `CLAUDEOS` and `CLAUDEDATA`. Every way
 it refuses anything that is not a removable whole disk and asks you to type the
 path again before it writes. Find the path with `diskutil list` on macOS or
@@ -173,9 +213,11 @@ kernel8.img                    this kernel, as a flat image
 initramfs-aarch64-board.cpio   the userland, the board image
 ```
 
-The first four are Raspberry Pi firmware. They are not in this repository; the
-script fetches them from the Raspberry Pi firmware repository and caches them
-under `build/`.
+The first four are Raspberry Pi firmware. They are not in this repository;
+`tools/distro` fetches them from the Raspberry Pi firmware repository at a pinned
+commit, checks each against its sha256, and puts them in the board's `boot/`
+with `config.txt` and `cmdline.txt`, which `mkcard.sh` copies into `build/boot`
+with the kernel and the board image.
 
 The lines in `config.txt` that matter:
 
@@ -243,16 +285,10 @@ chip's own processor, loads the regulatory data, sets the country, scans,
 joins, and runs the WPA2 handshake. Only WPA2 with a passphrase and CCMP is
 joined.
 
-Two things it needs are not in this repository:
-
-```sh
-./scripts/fetch-wifi-firmware.sh     # firmware, NVRAM and regulatory data, into build/thirdparty
-./scripts/build-user-aarch64.sh      # puts them in /lib/firmware/brcm in the image
-```
-
-The firmware is the build Raspberry Pi OS installs, from
-`RPi-Distro/firmware-nonfree` at a pinned commit, and each file is checked
-against its sha256 before it is kept.
+Two things it needs are not in this repository. The firmware, NVRAM and
+regulatory data are in `/lib/firmware/brcm` of both aarch64 images: the build
+Raspberry Pi OS installs, from `RPi-Distro/firmware-nonfree` at a pinned
+commit, each file checked against its sha256 (see "The images").
 
 The network to join goes in `build/wifi.conf`, which git ignores:
 
@@ -262,10 +298,10 @@ psk=its passphrase, 8 to 63 characters
 country=JP
 ```
 
-`country` is JP when the line is absent. When the file exists, the image build
-copies it in as `/etc/wifi.conf`; the kernel reads it at bring-up and removes
-it from the ram filesystem once it has parsed. Neither the name nor the
-passphrase is printed anywhere, in the log, a panic or an error.
+`country` is JP when the line is absent. When the file exists, the build copies
+it into both aarch64 images as `/etc/wifi.conf`; the kernel reads it at bring-up
+and removes it from the ram filesystem once it has parsed. Neither the name nor
+the passphrase is printed anywhere, in the log, a panic or an error.
 
 `net=wifi` on the kernel command line leaves the wired cards alone, so that
 everything that reaches the network goes over the air:
@@ -274,7 +310,7 @@ everything that reaches the network goes over the air:
 net=wifi init=/bin/init
 ```
 
-`scripts/mkcard.sh` writes this line into `cmdline.txt` when the board image
+The build writes this line into the board's `cmdline.txt` when the board image
 holds `/etc/wifi.conf`, and `init=/bin/init` alone when it does not. Without
 `net=wifi` the wired Ethernet is taken, whether or not a cable is plugged in,
 because the stack holds one interface and the wired driver is asked first; the
@@ -413,7 +449,7 @@ on a machine with a network card, so under QEMU's `raspi4b` it never starts.
 Under QEMU on x86-64 a port on the Mac can be forwarded to it:
 
 ```sh
-./scripts/run.sh --timeout 3600 --hostfwd tcp:127.0.0.1:2323-:23 --initrd build/initramfs.cpio
+./scripts/run.sh --timeout 3600 --hostfwd tcp:127.0.0.1:2323-:23 --initrd build/distro/test-x86_64/initramfs.cpio
 scripts/console.py 127.0.0.1 --port 2323
 ```
 
@@ -663,9 +699,9 @@ the card             /usr -> /data/usr, /root -> /data/root,          not checke
                      /data/services.txt, /data/site
 ```
 
-A card from `scripts/mkcard.sh --new` starts with what `CARD_ITEMS` in
-`scripts/images.sh` lists, which the aarch64 build assembles in
-`build/data-aarch64`:
+A card from `scripts/mkcard.sh --new` starts with the board variant's `data/`,
+which the tree in `tools/distro/src/images.rs` declares and the aarch64 build
+assembles in `build/distro/board-aarch64/data`:
 
 ```
 /data/usr/bin/busybox                 Alpine's busybox-static 1.36.1: ntpd, wget, tar and the other applets
@@ -685,9 +721,9 @@ keep in step with the first, and a link in the image would put the card's
 layout in the image. busybox-extras is dynamically linked and its program
 header names `/lib/ld-musl-aarch64.so.1`, which the board image makes a link
 to `/usr/lib/ld-musl-aarch64.so.1`; the kernel follows links when it looks
-the interpreter up, as for any other path. `scripts/fetch-busybox.sh` checks
-every file it downloads, and every file it takes out of a package, against a
-sha256 recorded in the script, and stops on a mismatch.
+the interpreter up, as for any other path. The build checks every file it
+downloads, and every file it takes out of a package, against a sha256 recorded
+in `tools/distro/src/downloads.rs`, and stops on a mismatch.
 
 **How /usr and /root get there.** Once the kernel has mounted `/data`, and
 before it prints the `data:` line, it makes `/data/usr` and `/data/root` if
@@ -699,8 +735,8 @@ every boot then gets the same layout whatever program is init. Links rather
 than a second mount of each directory, because path lookup, the program loader
 included, already follows links, and a `mv` or `rmdir` of `/data/usr` needs no
 refusal of its own: the link is left pointing at nothing, as on Linux. No item
-of either image may be under `/usr` or `/root`; `scripts/images.sh` refuses
-one, since a mounted card would hide it.
+of either image may be under `/usr` or `/root`; tools/distro refuses one,
+since a mounted card would hide it.
 
 **Without the card.** With no card, a volume that does not mount, or
 `data=off`, `/usr` and `/root` stay empty directories in memory, init makes
@@ -715,16 +751,18 @@ be made, leaves that one in memory, and the `data:` line says why.
 "Integrity check"). Nothing on the card is: the check runs before the card is
 mounted, and a program in `/data/usr` that is damaged or replaced runs as it
 is. To compare the card's programs with the build, run `busybox sha1sum
-/usr/bin/* /usr/lib/*` on the board and `shasum build/data-aarch64/usr/bin/*
-build/data-aarch64/usr/lib/*` on the Mac.
+/usr/bin/* /usr/lib/*` on the board and `shasum
+build/distro/board-aarch64/data/usr/bin/* build/distro/board-aarch64/data/usr/lib/*`
+on the Mac.
 
 **Adding or updating a program.** With the card in the Mac,
-`scripts/mkcard.sh --usr /dev/diskN` copies `build/data-aarch64/usr` over the
-files of the same names in `/data/usr` and writes nothing else, so a program
-added there, `services.txt` and the site stay as they are. A program the build
-should carry to every new card gets a line in `CARD_ITEMS` and a copy into the
-staging tree in `scripts/build-user-aarch64.sh`. Over the telnet console, fetch
-the new file under another name and rename it into place:
+`scripts/mkcard.sh --usr /dev/diskN` copies
+`build/distro/board-aarch64/data/usr` over the files of the same names in
+`/data/usr` and writes nothing else, so a program added there,
+`services.txt` and the site stay as they are. A program the build should carry
+to every new card gets a node under `data/usr` in `tools/distro/src/images.rs`.
+Over the telnet console, fetch the new file under another name and rename it
+into place:
 
 ```
 busybox wget -O /usr/bin/tailscaled.new http://ADDRESS:PORT/tailscaled
@@ -958,8 +996,8 @@ the physical load addresses are what it actually uses.
 
 **Integrity check.** Right after the ram disk is unpacked, and before init
 starts, the kernel checks itself and the core software against
-`/etc/claudeos/checksums`, which the userland build writes into every image it
-makes. Each line is a SHA-1 digest, two spaces and a name, as `shasum` prints
+`/etc/claudeos/checksums`, which the build writes into every image of its own
+userland. Each line is a SHA-1 digest, two spaces and a name, as `shasum` prints
 them; on x86-64, for example:
 
 ```
@@ -968,15 +1006,15 @@ cacccb244e157cea90abf89e84ae7854a7223a68  /bin/cbox
 2b2ba069d11a8bdcc05d3a8a4f97d1aab544c9e4  /etc/claudeos/services
 ```
 
-The items are `CHECKSUM_ITEMS` in `scripts/images.sh`, which are what the
-image holds of the software: the kernel, `/bin/cbox`,
-`/etc/claudeos/services`, which decides what runs at every boot, and the three
-WiFi firmware files. Adding one is a line there. An item an image does not
-have, such as the firmware on x86-64, is left out of its manifest. So is
-`kernel` when the kernel ELF has not been built, with a warning, which is why
-the kernel is built before the userland. Nothing on the card is checked: the
-check runs before `/data` is mounted, and the programs in `/usr` are the
-user's to replace (see "Programs on the card").
+The items are the kernel and the files declared `checked()` in
+`tools/distro/src/images.rs`, which are what the image holds of the software:
+`/bin/cbox`, `/etc/claudeos/services`, which decides what runs at every boot,
+and the three WiFi firmware files. Adding one is a `checked()` on its node. An
+item an image does not have, such as the firmware on x86-64, is left out of its
+manifest. So is `kernel` when the kernel ELF has not been built, with a warning,
+which is why the kernel is built before the userland. Nothing on the card is
+checked: the check runs before `/data` is mounted, and the programs in `/usr`
+are the user's to replace (see "Programs on the card").
 
 For each item the console and the kernel log get `integrity: /bin/cbox ok`,
 `integrity: /bin/cbox DAMAGED: expected ..., got ...` or
@@ -994,10 +1032,10 @@ whoever can change a file in the image can change the manifest beside it.
 bytes from `__integrity_start`, at the start of `.text`, to `__integrity_end`,
 at the end of `.rodata`. `.data` and `.bss` are left out because they change
 while the kernel runs. Both linker scripts define the two symbols. The kernel
-hashes the memory between them, and `tools/checksums.py` reads the same two
-symbols out of the ELF and hashes the file contents of the loadable segments
-that cover that range, so the build and the kernel hash the same bytes. On the
-current builds that range is 576 KiB on x86-64 and 796 KiB on aarch64.
+hashes the memory between them, and `tools/distro/src/checksums.rs` reads the
+same two symbols out of the ELF and hashes the file contents of the loadable
+segments that cover that range, so the build and the kernel hash the same bytes.
+On the current builds that range is 576 KiB on x86-64 and 796 KiB on aarch64.
 `scripts/mkcard.sh` refuses a board image whose manifest names a different
 kernel digest from `build/kernel-aarch64.elf`, since that card would report its
 kernel damaged at every boot.
@@ -1334,7 +1372,7 @@ none. `nameserver=` without `ip=` replaces the name servers a lease names.
 `ip=off` leaves the machine with no address and nothing asking for one.
 
 ```
-$ ./scripts/run.sh --hostfwd tcp::8080-:8080 --initrd build/initramfs.cpio \
+$ ./scripts/run.sh --hostfwd tcp::8080-:8080 --initrd build/distro/test-x86_64/initramfs.cpio \
       --append 'init=/bin/inet serve 8080'
 inet: listening on 0.0.0.0:8080
 inet: connection from 10.0.2.2:55451
@@ -1347,12 +1385,12 @@ Content-Length: 20
 hello from claudeos
 ```
 
-**Something large that is not ours.** `make cloudflared` fetches Cloudflare's
-own `cloudflared`, a forty-megabyte static Go program, and puts it in the
-image. It is the largest thing here that this project did not build, and it
-asks for a different half of the interface from everything else: Go brings its
-own threads, its own scheduler, its own resolver and its own TLS rather than
-calling a libc for any of them.
+**Something large that is not ours.** The test images hold Cloudflare's own
+`cloudflared`, a forty-megabyte static Go program, at `/bin/cloudflared`. It is
+the largest thing here that this project did not build, and it asks for a
+different half of the interface from everything else: Go brings its own threads,
+its own scheduler, its own resolver and its own TLS rather than calling a libc
+for any of them.
 
 ```
 / # cloudflared tunnel --protocol http2 --url http://localhost:8080
@@ -1555,8 +1593,7 @@ failures.
   `md5sum` and `sha256sum` (whose digests are compared against the ones the
   host computes for the same input), `ps`, `df`, `xargs`, `timeout`,
   busybox's own `ash` shell running loops, pipelines and arithmetic, and
-  `/bin/httpd` serving a file to busybox `wget`. Run `make busybox` first to
-  fetch it; the suite is skipped when it is absent. The x86-64 binary is
+  `/bin/httpd` serving a file to busybox `wget`. The x86-64 binary is
   busybox.net's own 1.35.0 build against musl; the aarch64 one is Alpine's
   `busybox-static` 1.36.1, because busybox.net publishes no aarch64 build. On
   aarch64 `/bin/httpd` is Alpine's dynamically linked `busybox-extras`, and
@@ -1567,9 +1604,8 @@ failures.
   filesystem, where every program is dynamically linked and loaded by Alpine's
   own musl loader: `awk`, `sed`, `tar` with gzip, `md5sum` and `sha256sum`
   against digests the host computes, `find`, `stat`, `ps`, and ash running
-  loops, `case` and here-documents. Run `make alpine` first; the suite is
-  skipped when it is absent. Alpine publishes the same minimal root filesystem
-  for both machines, so the same 34 checks run on either.
+  loops, `case` and here-documents. Alpine publishes the same minimal root
+  filesystem for both machines, so the same 34 checks run on either.
 - The **kernel's own checks** run in a boot of their own and are counted into
   one summary with the memory and protocol checks: 15 of them are the random
   number generator, of which the three that matter compare the ChaCha20 block
@@ -1590,8 +1626,8 @@ failures.
   malformed line is reported and skipped and the good one still checked; and
   no manifest at all. Every one of those boots has to reach the shell without
   a panic, and `/proc/claudeos/integrity` has to hold what the console showed.
-- The **board image** boots `build/initramfs-aarch64-board.cpio` on aarch64.
-  With no card it has to reach the shell, report every item ok, have no
+- The **board image** boots `build/distro/board-aarch64/initramfs.cpio` on
+  aarch64. With no card it has to reach the shell, report every item ok, have no
   `/tests`, nothing under `/root` and nothing under `/usr` but the `/usr/bin`
   init makes, none of `hello_c`, `inet`, `rtest`, `busybox`, `busybox-extras`,
   `httpd` or `cloudflared` in `/bin`, and `/lib/ld-musl-aarch64.so.1` a link to
@@ -1599,22 +1635,22 @@ failures.
   `scripts/mkcard.sh --new --image` then writes a 1 GiB card image.
   `tools/fatdisk` has to find exactly the files `mkcard.sh` assembled in
   `build/boot` on its partition 1, and exactly the files in
-  `build/data-aarch64`, programs included, byte for byte, and a `root`
-  directory on its `/data`, with no `._` file or `.fseventsd` on either. An
-  update with `mkcard.sh --image` has to leave the SHA-1 of `/data`'s blocks as
-  it was and partition 1 holding exactly the boot files again. Then, with a
+  `build/distro/board-aarch64/data`, programs included, byte for byte, and a
+  `root` directory on its `/data`, with no `._` file or `.fseventsd` on either.
+  An update with `mkcard.sh --image` has to leave the SHA-1 of `/data`'s blocks
+  as it was and partition 1 holding exactly the boot files again. Then, with a
   line added to `services.txt`, a file in `/root`, a program of the user's in
   `/usr/bin` and `/usr/bin/httpd` overwritten, `mkcard.sh --usr --image` has to
   put `httpd` back, keep the user's program, leave every file outside
-  `/data/usr` with the SHA-1 it had, and leave no `._` file or `.fseventsd`.
-  The card is then booted with the board image: the `data:` line has to say
-  `/usr` and `/root` are links to the card, `/root` has to hold the file put
-  there and the user's program has to run from `/usr/bin`, ntpd has to have
-  been started from `/usr/bin/busybox` rather than fail to start, and the web
-  server the seeded list starts through `/usr/bin/httpd` and the loader on the
-  card has to serve the seeded page to busybox `wget`. The quick tunnel, run
-  from `/usr/bin/cloudflared`, which has no network under QEMU, has to exit and
-  be started again.
+  `/data/usr` with the SHA-1 it had, and leave no `._` file or `.fseventsd`. The
+  card is then booted with the board image: the `data:` line has to say `/usr`
+  and `/root` are links to the card, `/root` has to hold the file put there and
+  the user's program has to run from `/usr/bin`, ntpd has to have been started
+  from `/usr/bin/busybox` rather than fail to start, and the web server the
+  seeded list starts through `/usr/bin/httpd` and the loader on the card has to
+  serve the seeded page to busybox `wget`. The quick tunnel, run from
+  `/usr/bin/cloudflared`, which has no network under QEMU, has to exit and be
+  started again.
 - **/data on an SD card** runs on aarch64, and on a Mac, since its card images
   are made with macOS's `newfs_msdos` through `hdiutil`, without root; elsewhere
   it reports itself skipped. It first runs `tools/fatdisk`'s tests, which build
@@ -1795,18 +1831,17 @@ user/services         the system services list, /etc/claudeos/services in both i
 user/data             the files of a new card's /data that are not built: the
                       user services list, the site, /usr/bin/httpd
 user/c/hello.c        a C program linked against musl
-tools/mkcpio.py       initramfs builder
-tools/checksums.py    the manifest the boot check reads, and the kernel's digest
+tools/distro          builds the images, the card's /data and boot files and the
+                      Alpine fixtures, as declared in its src/images.rs and
+                      src/alpine.rs; the cache of downloads, the cpio writer and
+                      the manifest the boot check reads
 tools/drive.py        drives the console over a socket, rendering as a terminal
 tools/fatdisk         makes, reads and damages SD card images with macOS's FAT
                       tools, and tests and fuzzes the kernel's FAT code on the Mac
-scripts/images.sh     what goes in the test image, the board image and a new
-                      card's /data, and what the boot check covers
+scripts/build.sh      builds the kernel for ARCH
 scripts/reap-stale.sh clears QEMU instances an earlier run left behind
 scripts/mkcard.sh     assembles the boot partition for a Pi, and prepares or
                       updates a card
-scripts/fetch-wifi-firmware.sh
-                      the Pi 4's WiFi firmware, NVRAM and regulatory data
 scripts/console.py    a telnet client for the telnet console, interactive or scripted
 scripts/lossy-transfer.sh
                       megabytes each way through the card over a lossy link
