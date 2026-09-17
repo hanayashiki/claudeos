@@ -89,8 +89,8 @@ const CHIP_COMPATIBLE: &[u8] = b"brcm,bcm4329-fmac";
 const EXPANDER_COMPATIBLE: &[u8] = b"raspberrypi,firmware-gpio";
 const GPIO_COMPATIBLE: &[u8] = b"brcm,bcm2711-gpio";
 
-/// Where the three files are, named as brcmfmac asks for them and put there
-/// by `scripts/build-user-aarch64.sh` from `scripts/fetch-wifi-firmware.sh`.
+/// Where the three files are, named as brcmfmac asks for them, in both aarch64
+/// images as tools/distro/src/images.rs declares them.
 const FIRMWARE_PATH: &str = "/lib/firmware/brcm/brcmfmac43455-sdio.bin";
 const NVRAM_PATH: &str = "/lib/firmware/brcm/brcmfmac43455-sdio.txt";
 const CLM_PATH: &str = "/lib/firmware/brcm/brcmfmac43455-sdio.clm_blob";
@@ -616,7 +616,7 @@ fn bring_up(mut found: Found) -> Result<Dongle, String> {
     let chip = chip::attach(&mut bp)?;
 
     let firmware = read_file(FIRMWARE_PATH)
-        .map_err(|_| format!("{} is not in the image; run scripts/fetch-wifi-firmware.sh", FIRMWARE_PATH))?;
+        .map_err(|_| format!("{} is not in the image", FIRMWARE_PATH))?;
     let text = read_file(NVRAM_PATH).map_err(|_| format!("{} is not in the image", NVRAM_PATH))?;
     let nvram = nvram::strip(&text).map_err(|e| format!("the NVRAM file cannot be used: {:?}", e))?;
     let clm = read_file(CLM_PATH).ok();

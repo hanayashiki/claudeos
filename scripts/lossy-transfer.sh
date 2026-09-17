@@ -37,7 +37,7 @@ echo "== serving $MEGABYTES MiB on port $PORT, losing one frame in $ONE_IN =="
 # alone leaves the emulator running and holding the forwarded port.
 set -m
 "$ROOT/scripts/run.sh" --timeout 240 --hostfwd "tcp::$PORT-:$PORT" \
-    --initrd "$ROOT/build/initramfs.cpio" \
+    --initrd "$ROOT/build/distro/test-x86_64/initramfs.cpio" \
     --append "netloss=$ONE_IN init=/bin/inet serve $PORT 4" \
     < /dev/null > "$LOG" 2>&1 &
 QEMU=$!

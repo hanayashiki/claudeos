@@ -1,3 +1,4 @@
+#!/bin/sh
 # claudeos self-test, run by the shell on the OS itself.
 # Each check prints PASS or FAIL; a total is reported at the end.
 

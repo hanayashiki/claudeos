@@ -1,0 +1,74 @@
+# Every Rust crate in the repository, built into one target/ directory.
+#
+# The crates are built for three kinds of machine, and a cargo invocation names
+# the one it wants:
+#
+#   kernel         --target x86_64-unknown-none or aarch64-unknown-none-softfloat,
+#                  --profile kernel (scripts/build.sh)
+#   user/cbox,     --target x86_64-unknown-linux-musl or aarch64-unknown-linux-musl,
+#   user/inet      --profile user (tools/distro builds them for the images)
+#   tools/fatdisk, the Mac, --release
+#   tools/distro
+#
+# .cargo/config.toml holds the flags each of those targets needs, and sets no
+# default target, so a plain `cargo build` or `cargo test` here builds the
+# default members below for the Mac.
+[workspace]
+resolver = "2"
+members = ["kernel", "user/cbox", "user/inet", "tools/fatdisk", "tools/distro"]
+# The crates whose tests and programs run on the Mac. The kernel needs its own
+# target and linker script, and building it for the Mac fails at the link.
+default-members = ["user/cbox", "user/inet", "tools/fatdisk", "tools/distro"]
+
+# `lto` and `panic` cannot differ between the packages of one profile, and the
+# kernel, the programs in the images and the host tools each need their own, so
+# each has a profile.
+
+# The host tools, fatdisk and distro.
+#
+# fatdisk is built the way the kernel builds the same FAT code: overflow checks
+# on, so that an arithmetic wrap is a panic `fuzz` reports rather than a wrong
+# number; and unwinding, the default here, so that `fuzz` can catch the panic
+# and name the seed.
+[profile.release]
+overflow-checks = true
+debug = true
+
+[profile.test]
+overflow-checks = true
+
+# The kernel, as `cargo build --profile kernel`.
+[profile.kernel]
+inherits = "release"
+panic = "abort"
+# An arithmetic wrap on a value that came from a file, a device or a program is
+# how four bounds checks in the program loader were defeated. Every wrap this
+# kernel means is already spelled `wrapping_*`, so turning these on costs
+# nothing it wanted and turns the rest into a panic naming a file and a line,
+# which on a board with only a serial cable is the difference between a
+# diagnosis and a week.
+overflow-checks = true
+opt-level = 2
+debug = true
+lto = false
+codegen-units = 1
+
+# The kernel unoptimised, as scripts/build.sh builds it with PROFILE=dev.
+[profile.kernel-dev]
+inherits = "dev"
+panic = "abort"
+opt-level = 1
+
+# cbox and inet, the programs in the images: small, since every byte of them is
+# in the ram disk and, for /bin/cbox, hashed by the boot check.
+[profile.user]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+# Neither is set for these programs; the release profile above sets both for
+# the host tools.
+overflow-checks = false
+debug = false

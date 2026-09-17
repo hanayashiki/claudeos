@@ -4,7 +4,11 @@
 extern crate alloc;
 
 /// The kernel's FAT32 code, as it is. Its files use only `core` and `alloc`.
-#[path = "../../../kernel/src/storage/fat/mod.rs"]
+///
+/// src/fat is a symbolic link to kernel/src/storage/fat rather than a
+/// `#[path]` out of this directory: rustc follows either, but rust-analyzer
+/// resolves a module file only inside the directory of the package declaring
+/// it, and with the `#[path]` it left every name from this module unresolved.
 pub mod fat;
 
 pub mod cut;

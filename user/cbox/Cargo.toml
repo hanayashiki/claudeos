@@ -2,6 +2,8 @@
 name = "cbox"
 version = "0.1.0"
 edition = "2021"
+# Profile `user` in the workspace's Cargo.toml; the target flags in its
+# .cargo/config.toml.
 
 [[bin]]
 name = "cbox"
@@ -10,12 +12,5 @@ path = "src/main.rs"
 [features]
 # The `rtest` applet, the Rust standard library checks the test harness boots
 # into. The test image's cbox is built with it and the board's without; which
-# image gets it is a line in scripts/images.sh.
+# image gets it is CBOX_FEATURES in tools/distro/src/images.rs.
 rtest = []
-
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true

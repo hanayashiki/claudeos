@@ -1,0 +1,21 @@
+[package]
+name = "distro"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A host program: the images, the card's /data and its boot files declared as
+# one tree in src/images.rs, and what builds them into folders under
+# build/distro and packs the images. Built with the release profile in the
+# workspace's Cargo.toml.
+[dependencies]
+# SHA-1 for the manifest the kernel checks at boot, and SHA-256 for every
+# download. The same sha1 as the kernel's, without its `force-soft`, which only
+# matters inside the kernel.
+sha1 = { version = "=0.10.7", default-features = false }
+sha2 = { version = "=0.10.9", default-features = false }
+# The Alpine packages and root filesystems are tar archives in gzip, an .apk
+# being several gzip streams one after another; MultiGzDecoder reads them as
+# one. Versions are pinned exactly; Cargo.lock pins what they depend on.
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
+tar = { version = "=0.4.46", default-features = false }

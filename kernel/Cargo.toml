@@ -2,6 +2,17 @@
 name = "kernel"
 version = "0.1.0"
 edition = "2021"
+# Profiles `kernel` and `kernel-dev` in the workspace's Cargo.toml; the target
+# flags in its .cargo/config.toml; the linker script from build.rs.
+
+# No test harness: the harness needs std and a panic handler of its own, which
+# this crate cannot have beside its own, so `cargo test` and an editor's
+# `cargo check --all-targets` from the workspace root would fail on it.
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+test = false
+bench = false
 
 [dependencies]
 # SHA-1 on both machines, for the boot-time integrity check in
@@ -23,21 +34,3 @@ hmac = { version = "=0.12.1", default-features = false }
 pbkdf2 = { version = "=0.12.2", default-features = false, features = ["hmac"] }
 aes = { version = "=0.8.4", default-features = false, features = ["zeroize"] }
 aes-kw = { version = "=0.2.1", default-features = false }
-
-[profile.dev]
-panic = "abort"
-opt-level = 1
-
-[profile.release]
-panic = "abort"
-# An arithmetic wrap on a value that came from a file, a device or a program is
-# how four bounds checks in the program loader were defeated. Every wrap this
-# kernel means is already spelled `wrapping_*`, so turning these on costs
-# nothing it wanted and turns the rest into a panic naming a file and a line,
-# which on a board with only a serial cable is the difference between a
-# diagnosis and a week.
-overflow-checks = true
-opt-level = 2
-debug = true
-lto = false
-codegen-units = 1

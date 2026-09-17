@@ -1,3 +1,4 @@
+#!/bin/sh
 # A tour of what the shell and kernel can do.
 echo "--- processes ---"
 ps

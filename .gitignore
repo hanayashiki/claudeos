@@ -3,4 +3,6 @@ build/
 *.o
 *.cpio
 .claude/
-.vscode/
+# The editor settings for the workspace are shared; anything else there is not.
+.vscode/*
+!.vscode/settings.json

@@ -2,14 +2,9 @@
 name = "inet"
 version = "0.1.0"
 edition = "2021"
+# Profile `user` in the workspace's Cargo.toml; the target flags in its
+# .cargo/config.toml.
 
 [[bin]]
 name = "inet"
 path = "src/main.rs"
-
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true

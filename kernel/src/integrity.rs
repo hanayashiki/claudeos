@@ -5,7 +5,7 @@
 //! shasum prints: forty hex digits, two spaces, a name. The name `kernel` stands
 //! for this kernel's own code and read-only data as they are in memory; any
 //! other name is a file in the unpacked image. What the build puts in it is
-//! listed in scripts/images.sh.
+//! the files declared `checked()` in tools/distro/src/images.rs.
 //!
 //! SHA-1 is enough for what this is for, which is noticing accidental damage: a
 //! card going bad, a transfer cut short, an image copied from the wrong build.
@@ -54,9 +54,9 @@ extern "C" {
     /// The kernel's checked bytes: from the start of .text to the end of
     /// .rodata, which do not change once the kernel is loaded. .data and .bss
     /// are left out because they do. The linker scripts define both symbols,
-    /// and tools/checksums.py reads the same two symbols out of the ELF to hash
-    /// the same bytes at build time, so the two ends cannot name different
-    /// ranges.
+    /// and tools/distro/src/checksums.rs reads the same two symbols out of the
+    /// ELF to hash the same bytes at build time, so the two ends cannot name
+    /// different ranges.
     static __integrity_start: u8;
     static __integrity_end: u8;
 }

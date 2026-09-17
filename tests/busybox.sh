@@ -1,8 +1,9 @@
+#!/bin/sh
 # Run an upstream busybox against the kernel. busybox is not built by this
 # project, so it exercises the system call interface as a third party.
 
 if ! test -x /bin/busybox; then
-  echo "busybox is not installed; run scripts/fetch-busybox.sh"
+  echo "busybox is not in this image; tools/distro/src/images.rs puts it in the test images"
   echo "=== 0 passed, 0 failed ==="
   exit 0
 fi
