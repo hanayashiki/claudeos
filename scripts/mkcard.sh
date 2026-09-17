@@ -5,11 +5,11 @@
 #   scripts/mkcard.sh                    assemble build/boot and stop
 #   scripts/mkcard.sh --new /dev/disk4   assemble, erase the whole card, make its
 #                                        two partitions, write the boot one,
-#                                        and put build/data-aarch64 on /data
+#                                        and put the board's data/ on /data
 #   scripts/mkcard.sh /dev/disk4         assemble, and rewrite only the boot
 #                                        partition of a card made with --new;
 #                                        the /data partition is not touched
-#   scripts/mkcard.sh --usr /dev/disk4   copy build/data-aarch64/usr onto
+#   scripts/mkcard.sh --usr /dev/disk4   copy the board's data/usr onto
 #                                        /data/usr of a card made with --new,
 #                                        replacing the files of those names;
 #                                        nothing else on the card is touched
@@ -29,30 +29,33 @@
 #      no boot sector to install and nothing to mark bootable.
 #   2  FAT32, labelled CLAUDEDATA, the rest of the card: /data, which the
 #      kernel mounts read-write and makes /usr and /root out of (README.md,
-#      "/data on the SD card"). --new puts build/data-aarch64 on it, which
-#      scripts/build-user-aarch64.sh assembles from CARD_ITEMS in
-#      scripts/images.sh: services.txt, the user services list;
-#      site/index.html, the page its web server serves; root, the home
-#      directory; and usr/bin and usr/lib, the programs the board runs that
-#      are not in the image.
+#      "/data on the SD card"). --new puts build/distro/board-aarch64/data on
+#      it, which tools/distro builds as tools/distro/src/images.rs declares
+#      it: services.txt, the user services list; site/index.html, the page its
+#      web server serves; root, the home directory; and usr/bin and usr/lib,
+#      the programs the board runs that are not in the image.
+#
+# Everything assembled here comes from what tools/distro builds for the board,
+# build/distro/board-aarch64, and from the kernel scripts/build.sh builds:
+#
+#   ARCH=aarch64 ./scripts/build.sh
+#   cargo run --release -p distro -- build board-aarch64
 #
 # Updating a card rewrites partition 1 and nothing else, so what is on /data
-# stays. --usr writes the files under build/data-aarch64/usr into /data/usr and
-# nothing else, so a program added there, services.txt and the site stay as
+# stays. --usr writes the files under build/distro/board-aarch64/data/usr into
+# /data/usr and nothing else, so a program added there, services.txt and the site stay as
 # they are. The whole card is erased, and /data given its first files, only
 # with --new.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BOOT="$ROOT/build/boot"
-CACHE="$ROOT/build/thirdparty/firmware"
-
-# The Raspberry Pi firmware, which is not ours and is not in this repository.
-FIRMWARE_URL="https://github.com/raspberrypi/firmware/raw/master/boot"
-# start4.elf is the firmware the EEPROM bootloader loads, fixup4.dat tells it
-# how to split memory with the video core, and the two device tree files
-# describe the board and move the serial port to the header pins.
-FIRMWARE_FILES="start4.elf fixup4.dat bcm2711-rpi-4-b.dtb overlays/disable-bt.dtbo"
+# The board variant's folder: root/, the image's tree, packed into
+# initramfs.cpio; data/, what a new card's /data starts with; and boot/, the
+# boot partition's files but the kernel and the image: the Raspberry Pi
+# firmware, pinned in tools/distro/src/downloads.rs, config.txt and
+# cmdline.txt.
+BOARD="$ROOT/build/distro/board-aarch64"
 
 # The two partitions a new card gets.
 BOOT_LABEL=CLAUDEOS
@@ -66,77 +69,35 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 # Assemble what goes on the card
 # ---------------------------------------------------------------------------
 
-fetch_firmware() {
-  mkdir -p "$CACHE/overlays"
-  for file in $FIRMWARE_FILES; do
-    if [ -s "$CACHE/$file" ]; then continue; fi
-    say "fetching $file"
-    curl -fsSL -o "$CACHE/$file" "$FIRMWARE_URL/$file" \
-      || die "could not fetch $file; check the network and try again"
-  done
-}
-
-# The board image, which scripts/build-user-aarch64.sh builds beside the test
-# image and which has none of the test suites or the programs they drive.
-IMAGE=initramfs-aarch64-board.cpio
-
 assemble() {
   [ -f "$ROOT/build/kernel8.img" ] \
     || die "build/kernel8.img is missing; run ARCH=aarch64 ./scripts/build.sh"
-  [ -f "$ROOT/build/$IMAGE" ] \
-    || die "build/$IMAGE is missing; run ./scripts/build-user-aarch64.sh"
+  [ -f "$BOARD/initramfs.cpio" ] && [ -f "$BOARD/boot/config.txt" ] \
+    || die "build/distro/board-aarch64 is missing; run: cargo run --release -p distro -- build board-aarch64"
 
   # The image carries the digest of the kernel it was built after, and the
   # kernel checks itself against it at every boot. A kernel rebuilt since would
   # report itself DAMAGED on every boot of the card, so refuse the pair here.
-  local manifest="$ROOT/build/rootfs-aarch64-board/etc/claudeos/checksums" built recorded
-  built="$(python3 "$ROOT/tools/checksums.py" kernel "$ROOT/build/kernel-aarch64.elf")" \
+  # distro is run as built rather than through cargo, which a root shell
+  # writing a card on Linux may not have; building the board variant built it.
+  local manifest="$BOARD/root/etc/claudeos/checksums" built recorded image
+  [ -x "$ROOT/target/release/distro" ] \
+    || die "target/release/distro is missing; run: cargo run --release -p distro -- build board-aarch64"
+  built="$("$ROOT/target/release/distro" kernel-digest "$ROOT/build/kernel-aarch64.elf")" \
     || die "cannot take the digest of build/kernel-aarch64.elf; run ARCH=aarch64 ./scripts/build.sh"
   recorded="$(sed -n 's/^\([0-9a-f]*\)  kernel$/\1/p' "$manifest" 2>/dev/null)"
   [ "$built" = "$recorded" ] \
-    || die "build/$IMAGE was built against a different kernel than build/kernel8.img; run ./scripts/build-user-aarch64.sh"
+    || die "build/distro/board-aarch64 was built against a different kernel than build/kernel8.img; run: cargo run --release -p distro -- build board-aarch64"
 
-  fetch_firmware
+  # The image goes on the card under the name config.txt gives the firmware.
+  image="$(sed -n 's/^initramfs \([^ ]*\) followkernel$/\1/p' "$BOARD/boot/config.txt")"
+  [ -n "$image" ] || die "$BOARD/boot/config.txt names no initramfs"
 
   rm -rf "$BOOT"
-  mkdir -p "$BOOT/overlays"
-  for file in $FIRMWARE_FILES; do
-    cp "$CACHE/$file" "$BOOT/$file"
-  done
+  cp -R "$BOARD/boot" "$BOOT"
   cp "$ROOT/build/kernel8.img" "$BOOT/kernel8.img"
-  cp "$ROOT/build/$IMAGE" "$BOOT/$IMAGE"
-
-  # The firmware reads this before it loads anything else.
-  #
-  # arm_64bit    start the processor in 64-bit mode and look for kernel8.img.
-  # enable_uart  turn the serial console on and hold the clock steady.
-  # dtoverlay    move the full serial port to the pins on the header. Without
-  #              it that port is wired to the Bluetooth radio and a cable on
-  #              the header sees nothing, whatever the kernel writes.
-  # initramfs    load our ram disk and tell the kernel where it landed. The
-  #              word takes a space rather than an equals sign, which is a
-  #              quirk of this file rather than a mistake here. `followkernel`
-  #              places it directly after the kernel image.
-  cat > "$BOOT/config.txt" <<EOF
-arm_64bit=1
-enable_uart=1
-dtoverlay=disable-bt
-kernel=kernel8.img
-initramfs $IMAGE followkernel
-EOF
-
-  # Passed to the kernel as its command line, through the device tree.
-  #
-  # net=wifi  bring up the WiFi rather than the wired port, when the image
-  #           carries a network to join in /etc/wifi.conf. The kernel's
-  #           network stack holds one interface, and without this word it
-  #           takes the wired port whether or not a cable is plugged in.
-  local cmdline='init=/bin/init'
-  if [ -f "$ROOT/build/rootfs-aarch64-board/etc/wifi.conf" ]; then
-    cmdline="net=wifi $cmdline"
-  fi
-  echo "$cmdline" > "$BOOT/cmdline.txt"
-  say "command line: $cmdline"
+  cp "$BOARD/initramfs.cpio" "$BOOT/$image"
+  say "command line: $(cat "$BOOT/cmdline.txt")"
 
   say ""
   say "assembled $BOOT:"
@@ -294,17 +255,15 @@ copy_boot() {
   esac
 }
 
-# What a new card's /data starts with (README.md, "Programs on the card"),
-# assembled by scripts/build-user-aarch64.sh from CARD_ITEMS in
-# scripts/images.sh.
-DATA_SEED="$ROOT/build/data-aarch64"
+# What a new card's /data starts with (README.md, "Programs on the card").
+DATA_SEED="$BOARD/data"
 
 require_seed() {
   [ -f "$DATA_SEED/services.txt" ] && [ -d "$DATA_SEED/usr/bin" ] \
-    || die "build/data-aarch64 is missing; run ./scripts/build-user-aarch64.sh"
+    || die "build/distro/board-aarch64/data is missing; run: cargo run --release -p distro -- build board-aarch64"
 }
 
-# Copy the files under build/data-aarch64 onto the partition $1, and unmount it.
+# Copy the files under the board's data/ onto the partition $1, and unmount it.
 seed_data() {
   local partition="$1" mount
   case "$(uname -s)" in
@@ -324,7 +283,7 @@ seed_data() {
   esac
 }
 
-# Copy the files under build/data-aarch64/usr into /data/usr on the partition
+# Copy the files under the board's data/usr into /data/usr on the partition
 # $1, over any file of the same name, and unmount it. No file outside /data/usr
 # is opened or written; the cleanup deletes only `._` files under it and the
 # directories macOS keeps at the top of every volume it mounts. A file in
@@ -352,7 +311,7 @@ copy_usr() {
 }
 
 # Erase the whole disk $1, make both partitions, write the boot files, and put
-# the files under build/data-aarch64 on /data.
+# the files under the board's data/ on /data.
 write_new() {
   local device="$1" p1 p2
   case "$(uname -s)" in
@@ -417,7 +376,7 @@ write_update() {
   esac
 }
 
-# Copy build/data-aarch64/usr into /data/usr on the disk $1. The disk has to
+# Copy the board's data/usr into /data/usr on the disk $1. The disk has to
 # look like what write_new makes: partition 1 labelled CLAUDEOS and partition 2
 # labelled CLAUDEDATA, so the partition written is the card's /data and no
 # other.
@@ -525,7 +484,7 @@ if [ -n "$NEW" ]; then
   confirm "About to ERASE all of $DEVICE, make partition 1 ($BOOT_LABEL, $BOOT_SIZE) and partition 2 ($DATA_LABEL, the rest), and write the boot files to partition 1. Everything on the card will be lost." "$DEVICE"
   write_new "$DEVICE"
 elif [ -n "$USR" ]; then
-  confirm "About to copy the files under build/data-aarch64/usr into /data/usr on partition 2 ($DATA_LABEL) of $DEVICE, over files of the same names. Nothing else on the card is written." "$DEVICE"
+  confirm "About to copy the files under build/distro/board-aarch64/data/usr into /data/usr on partition 2 ($DATA_LABEL) of $DEVICE, over files of the same names. Nothing else on the card is written." "$DEVICE"
   write_usr "$DEVICE"
 else
   confirm "About to erase partition 1 ($BOOT_LABEL) of $DEVICE and write the boot files to it. Partition 2, which holds /data, is not touched." "$DEVICE"

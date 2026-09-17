@@ -9,35 +9,42 @@ cd "$ROOT"
 
 ARCH="${ARCH:-x86_64}"
 export ARCH
+
+# The images, their folders and the cpio writer: tools/distro.
+distro() {
+  cargo run -q --release -p distro -- "$@"
+}
+
+# What tools/distro builds for this machine, in build/distro/VARIANT: the
+# folder's root/ and the image packed from it.
+TEST_VARIANT="test-$ARCH"
+IMAGE="$ROOT/build/distro/$TEST_VARIANT/initramfs.cpio"
+TREE="$ROOT/build/distro/$TEST_VARIANT/root"
+BUSYBOX="$TREE/bin/busybox"
+ALPINE="$ROOT/build/distro/alpine-$ARCH/initramfs.cpio"
+VARIANTS="$TEST_VARIANT alpine-$ARCH"
 if [ "$ARCH" = aarch64 ]; then
-  IMAGE="$ROOT/build/initramfs-aarch64.cpio"
-  TREE="$ROOT/build/rootfs-aarch64"
-  BUSYBOX="$TREE/bin/busybox"
-  ALPINE="$ROOT/build/alpine-aarch64.cpio"
-  BOARD_IMAGE="$ROOT/build/initramfs-aarch64-board.cpio"
+  VARIANTS="$VARIANTS board-aarch64"
+  BOARD_IMAGE="$ROOT/build/distro/board-aarch64/initramfs.cpio"
   KERNEL_ELF="$ROOT/build/kernel-aarch64.elf"
   KERNEL_IMAGE="$ROOT/build/kernel8.img"
 else
-  IMAGE="$ROOT/build/initramfs.cpio"
-  TREE="$ROOT/build/rootfs"
-  BUSYBOX="$TREE/bin/busybox"
-  ALPINE="$ROOT/build/alpine.cpio"
   KERNEL_ELF="$ROOT/build/kernel.elf"
   KERNEL_IMAGE="$ROOT/build/kernel.elf"
 fi
 
 # Build before testing, rather than running whatever was last left in build/.
 # Without this the suites silently test a stale kernel or userland, which reads
-# as a passing run of code that is not the code in the tree. Both builds are
-# incremental, so this costs nothing when there is nothing to do. NOBUILD=1
-# skips it for the rare case of testing a binary on purpose.
+# as a passing run of code that is not the code in the tree. The builds are
+# incremental and the downloads cached, so this costs little when there is
+# nothing to do. The kernel is built first, since each image's manifest holds
+# its digest. NOBUILD=1 skips it for the rare case of testing a binary on
+# purpose.
 if [ -z "${NOBUILD:-}" ]; then
   "$ROOT/scripts/build.sh" > /dev/null || exit 1
-  if [ "$ARCH" = aarch64 ]; then
-    "$ROOT/scripts/build-user-aarch64.sh" > /dev/null || exit 1
-  else
-    "$ROOT/scripts/build-user.sh" > /dev/null || exit 1
-  fi
+  for variant in $VARIANTS; do
+    distro build "$variant" > /dev/null || exit 1
+  done
 fi
 
 status=0
@@ -426,7 +433,7 @@ run_integrity() {
 
   # One byte of the kernel's code changed, past the end of its last function,
   # in a copy of the image QEMU boots.
-  python3 "$ROOT/tools/checksums.py" flip-code-byte "$KERNEL_ELF" "$KERNEL_IMAGE" "$dir/kernel.img" || ok=0
+  distro flip-code-byte "$KERNEL_ELF" "$KERNEL_IMAGE" "$dir/kernel.img" || ok=0
   integrity_boot kernel "$IMAGE" "$dir/kernel.img"
   integrity_expect kernel \
       "^integrity: kernel DAMAGED: expected $(integrity_digest kernel), got [0-9a-f]\{40\}$" \
@@ -534,13 +541,6 @@ run_ntp() {
     echo
     return
   fi
-  # init starts the time keeper only when there is a busybox to run.
-  if [ ! -x "$BUSYBOX" ]; then
-    echo ">> network time: skipped (run ARCH=$ARCH scripts/fetch-busybox.sh)"
-    skipped=$((skipped + 1))
-    echo
-    return
-  fi
   if ! ntp_reachable; then
     echo "   neither ntp.nict.jp nor time.cloudflare.com answered this machine"
     echo ">> network time: not run: no internet"
@@ -550,9 +550,9 @@ run_ntp() {
   fi
   local dir floor ok=1
   dir="$(mktemp -d)"
-  cp -R "$ROOT/build/rootfs" "$dir/rootfs"
+  cp -R "$TREE" "$dir/rootfs"
   # The same two lines as /etc/ntp.conf in the board image, which
-  # scripts/build-user-aarch64.sh writes.
+  # tools/distro/src/images.rs declares.
   printf 'server ntp.nict.jp\nserver time.cloudflare.com\n' > "$dir/rootfs/etc/ntp.conf"
   # The system list runs /usr/bin/busybox, which a board has on its card. This
   # machine has no card slot, so nothing replaces the image's /usr, and the
@@ -585,7 +585,7 @@ os.utime(sys.argv[1], (stamp, stamp))
 print(stamp)
 PY
 )"
-  python3 "$ROOT/tools/mkcpio.py" "$dir/rootfs" "$dir/ntp.cpio" > /dev/null
+  distro pack "$dir/rootfs" "$dir/ntp.cpio" > /dev/null
 
   # Every console line, prefixed with the time this machine received it.
   "$ROOT/scripts/run.sh" --timeout 120 --net --initrd "$dir/ntp.cpio" \
@@ -669,7 +669,7 @@ open(path, "wb").write(data)' "$copy/$what" ;;
     remove) rm -r "${copy:?}/$what" ;;
     replace-manifest) cp "$what" "$copy/etc/claudeos/checksums" ;;
   esac
-  python3 "$ROOT/tools/mkcpio.py" "$copy" "$dir/$name.cpio" > /dev/null
+  distro pack "$copy" "$dir/$name.cpio" > /dev/null
   rm -rf "$copy"
 }
 
@@ -782,7 +782,7 @@ run_board_image() {
 }
 
 # A card scripts/mkcard.sh --new writes, to a disk image on the Mac. /data has
-# to hold what build/data-aarch64 holds, the programs under usr among it, and
+# to hold what build/distro/board-aarch64/data holds, the programs under usr among it, and
 # nothing else, so no file macOS makes on a volume it mounts; updating the boot
 # files has to leave /data's blocks as they were. `mkcard.sh --usr` has to put
 # back a program in /data/usr that was changed, keep one the build does not
@@ -794,7 +794,7 @@ run_board_image() {
 # exit and be started again from /usr/bin/cloudflared.
 board_card() {
   local dir card fatdisk="$ROOT/target/release/fatdisk" names before output expected failed=0
-  local seed="$ROOT/build/data-aarch64" file outside
+  local seed="$ROOT/build/distro/board-aarch64/data" file outside
   if ! cargo build -p fatdisk --release -q; then
     echo "   tools/fatdisk did not build"
     return 1
@@ -813,7 +813,7 @@ board_card() {
   board_card_files CLAUDEDATA "$seed" "after --new" || failed=1
   while IFS= read -r file; do
     if ! "$fatdisk" cat "$card" CLAUDEDATA "/$file" | cmp -s - "$seed/$file"; then
-      echo "   /data/$file on the card is not build/data-aarch64/$file"
+      echo "   /data/$file on the card is not build/distro/board-aarch64/data/$file"
       failed=1
     fi
   done < <(cd "$seed" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
@@ -1380,7 +1380,7 @@ ntpd)
 esac
 echo "svc-done"
 SCRIPT
-  python3 "$ROOT/tools/mkcpio.py" "$dir/services-tree" "$dir/services.cpio" > /dev/null
+  distro pack "$dir/services-tree" "$dir/services.cpio" > /dev/null
   rm -rf "$dir/services-tree"
   system_ntpd='^svc-status: ntpd list=system state=(running|waiting) starts=[1-9][0-9]* last='
 
@@ -1620,22 +1620,11 @@ run_suite "network protocols" "net=test" 60
 # The socket system calls, through the standard library, over the loopback
 # address, so no card has to be there.
 run_suite "internet sockets" "init=/bin/inet" 120
-# The two suites below run software this project did not build. Both images
-# are fetched for the machine ARCH names, so both run on either one.
-if [ -x "$BUSYBOX" ]; then
-  run_suite "upstream busybox" "/tests/busybox.sh" 300
-else
-  echo ">> upstream busybox: skipped (run ARCH=$ARCH scripts/fetch-busybox.sh)"
-  skipped=$((skipped + 1))
-  echo
-fi
-if [ -f "$ALPINE" ]; then
-  run_suite "alpine linux userland" "init=/bin/sh /root/alpine.sh" 300 "$ALPINE"
-else
-  echo ">> alpine linux userland: skipped (run ARCH=$ARCH scripts/fetch-alpine.sh)"
-  skipped=$((skipped + 1))
-  echo
-fi
+# The two suites below run software this project did not build: the test
+# image's busybox, and Alpine's own root filesystem. tools/distro builds both
+# for the machine ARCH names, so both run on either one.
+run_suite "upstream busybox" "/tests/busybox.sh" 300
+run_suite "alpine linux userland" "init=/bin/sh /root/alpine.sh" 300 "$ALPINE"
 run_integrity
 run_board_image
 run_data

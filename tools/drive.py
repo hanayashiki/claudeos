@@ -281,7 +281,8 @@ class TerminalConsole:
 def main():
     args = sys.argv[1:]
     timeout = 60
-    initramfs = os.path.join(ROOT, "build", "initramfs.cpio")
+    # The test image tools/distro builds for the machine ARCH names.
+    initramfs = os.path.join(ROOT, "build", "distro", "test-" + os.environ.get("ARCH", "x86_64"), "initramfs.cpio")
     kernel = None
     append = None
     sd = None
