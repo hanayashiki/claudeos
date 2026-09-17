@@ -1,0 +1,12 @@
+[package]
+name = "mmtest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A library and its tests, built for the Mac and never for the kernel. The
+# library compiles the kernel's own memory-management code that uses nothing of
+# the kernel, kernel/src/mm/active.rs, by path, and the tests check the order
+# address spaces are loaded and freed in against spaces that record it. No
+# crate outside the standard library is used.
+[dependencies]

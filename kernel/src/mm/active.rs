@@ -83,8 +83,4 @@ impl<T> Deferred<T> {
     pub fn take(&mut self) -> Vec<T> {
         core::mem::take(&mut self.waiting)
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.waiting.is_empty()
-    }
 }
