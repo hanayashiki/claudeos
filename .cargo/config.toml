@@ -1,0 +1,42 @@
+# What each target the workspace builds for needs, whoever runs cargo. There is
+# no [build] target: the host tools are built from here for the Mac, and every
+# build of the kernel or of a program for the images names its --target.
+
+# The kernel on x86-64. The linker script is added by kernel/build.rs, by
+# absolute path.
+[target.x86_64-unknown-none]
+rustflags = [
+  "-C", "link-arg=-zmax-page-size=4096",
+  "-C", "link-arg=-no-pie",
+  "-C", "relocation-model=static",
+  "-C", "code-model=kernel",
+  "-C", "force-frame-pointers=yes",
+]
+
+# The kernel on aarch64.
+#
+# The soft-float variant, because the plain one lets the compiler use the
+# vector and floating point registers inside the kernel. Those registers belong
+# to whichever program was interrupted, and nothing saves them yet.
+#
+# rust-lld refuses -nostartfiles here, so the script alone says what to link.
+[target.aarch64-unknown-none-softfloat]
+rustflags = [
+  "-C", "link-arg=-zmax-page-size=4096",
+  "-C", "link-arg=-no-pie",
+  "-C", "relocation-model=static",
+  "-C", "force-frame-pointers=yes",
+]
+
+# The programs in the images, cbox and inet: static executables at a fixed
+# address, linked against the musl libc and C runtime objects that come with
+# rustup's target, by the lld in rustc's own sysroot. rustc picks the linker
+# flavour from the linker's file name, and finds rust-lld in the sysroot, so no
+# other toolchain is needed.
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static", "-C", "relocation-model=static"]
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static", "-C", "relocation-model=static"]

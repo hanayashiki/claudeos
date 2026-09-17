@@ -18,14 +18,18 @@ case "$ARCH" in
   *) echo "unknown ARCH: $ARCH" >&2; exit 1 ;;
 esac
 
-cd "$ROOT/kernel"
-if [ "$PROFILE" = "release" ]; then
-  cargo build --release --target "$TARGET"
-else
-  cargo build --target "$TARGET"
-fi
+# The profiles are in the workspace's Cargo.toml: `kernel`, and `kernel-dev`
+# for PROFILE=dev.
+case "$PROFILE" in
+  release) CARGO_PROFILE=kernel ;;
+  dev)     CARGO_PROFILE=kernel-dev ;;
+  *) echo "unknown PROFILE: $PROFILE" >&2; exit 1 ;;
+esac
 
-RAW="$ROOT/kernel/target/$TARGET/$PROFILE/kernel"
+cd "$ROOT"
+cargo build -p kernel --profile "$CARGO_PROFILE" --target "$TARGET"
+
+RAW="$ROOT/target/$TARGET/$CARGO_PROFILE/kernel"
 mkdir -p "$ROOT/build"
 
 if [ "$ARCH" = aarch64 ]; then

@@ -793,9 +793,9 @@ run_board_image() {
 # on the card, and the quick tunnel, which has no network under QEMU, has to
 # exit and be started again from /usr/bin/cloudflared.
 board_card() {
-  local dir card fatdisk="$ROOT/tools/fatdisk/target/release/fatdisk" names before output expected failed=0
+  local dir card fatdisk="$ROOT/target/release/fatdisk" names before output expected failed=0
   local seed="$ROOT/build/data-aarch64" file outside
-  if ! (cd "$ROOT/tools/fatdisk" && cargo build --release -q); then
+  if ! cargo build -p fatdisk --release -q; then
     echo "   tools/fatdisk did not build"
     return 1
   fi
@@ -995,8 +995,8 @@ run_data() {
     echo
     return
   fi
-  local fatdisk="$ROOT/tools/fatdisk/target/release/fatdisk"
-  if ! (cd "$ROOT/tools/fatdisk" && cargo build --release -q); then
+  local fatdisk="$ROOT/target/release/fatdisk"
+  if ! cargo build -p fatdisk --release -q; then
     echo "   tools/fatdisk did not build"
     echo ">> /data on an SD card: FAILED"
     status=1
@@ -1009,7 +1009,7 @@ run_data() {
   card="$dir/card.img"
 
   # The kernel's FAT code on the Mac, before any boot.
-  if (cd "$ROOT/tools/fatdisk" && cargo test --release -q > "$dir/host-tests" 2>&1); then
+  if cargo test -p fatdisk --release -q > "$dir/host-tests" 2>&1; then
     echo "   tools/fatdisk tests: $(grep -E '^test result' "$dir/host-tests" | awk '{ p += $4; f += $6 } END { print p " passed, " f " failed" }')"
   else
     echo "   tools/fatdisk tests failed:"
@@ -1315,11 +1315,11 @@ data_expect() {
 # arriving and ntpd started.
 run_services() {
   banner "services at boot"
-  local dir ok=1 fatdisk="$ROOT/tools/fatdisk/target/release/fatdisk" card="" system_ntpd filler
+  local dir ok=1 fatdisk="$ROOT/target/release/fatdisk" card="" system_ntpd filler
   dir="$(mktemp -d)"
 
   # The list format's own tests, which build cbox for the Mac.
-  if (cd "$ROOT/user/cbox" && cargo test --release -q > "$dir/host-tests" 2>&1); then
+  if cargo test -p cbox --release -q > "$dir/host-tests" 2>&1; then
     echo "   user/cbox tests: $(grep -E '^test result' "$dir/host-tests" | awk '{ p += $4; f += $6 } END { print p " passed, " f " failed" }')"
   else
     echo "   user/cbox tests failed:"
@@ -1398,7 +1398,7 @@ SCRIPT
   elif [ "$(uname -s)" != Darwin ]; then
     echo "   the card images are made by macOS's newfs_msdos through hdiutil"
     skipped=$((skipped + 1))
-  elif ! (cd "$ROOT/tools/fatdisk" && cargo build --release -q); then
+  elif ! cargo build -p fatdisk --release -q; then
     echo "   tools/fatdisk did not build"
     ok=0
   else

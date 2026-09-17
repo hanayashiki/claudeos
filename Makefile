@@ -58,5 +58,5 @@ clean:
 	       build/initramfs-aarch64.cpio build/alpine-rootfs-aarch64 \
 	       build/stage build/stage-aarch64 build/rootfs-aarch64-board \
 	       build/initramfs-aarch64-board.cpio build/data-aarch64 \
-	       build/alpine-aarch64.cpio build/hello_c-aarch64.o \
-	       kernel/target user/cbox/target
+	       build/alpine-aarch64.cpio build/hello_c-aarch64.o
+	cargo clean

@@ -22,13 +22,11 @@ if [ ! -d "$SYSROOT/lib/rustlib/$TARGET" ]; then
   exit 1
 fi
 
-# rustc picks the linker flavour from the linker's file name, so expose
-# rust-lld under the name it recognises for ELF targets.
+# The C program below is linked by hand, and lld picks its flavour from the
+# name it is run under, so expose rust-lld under the name of the ELF one. The
+# Rust programs get their linker from .cargo/config.toml.
 mkdir -p "$ROOT/build/toolchain"
 ln -sf "$LLVMBIN/rust-lld" "$ROOT/build/toolchain/ld.lld"
-
-export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$ROOT/build/toolchain/ld.lld"
-export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static -C relocation-model=static"
 
 # ---- which image gets what -----------------------------------------------
 # The list, and the steps that make each image out of the staging tree below,
@@ -41,9 +39,9 @@ TEST_TREE="$ROOT/build/rootfs-aarch64"
 BOARD_TREE="$ROOT/build/rootfs-aarch64-board"
 echo
 
-cd "$ROOT/user/inet"
-cargo build --release --target "$TARGET"
-INET="$ROOT/user/inet/target/$TARGET/release/inet"
+cd "$ROOT"
+cargo build -p inet --profile user --target "$TARGET"
+INET="$ROOT/target/$TARGET/user/inet"
 
 # ---- stage everything either image can have ------------------------------
 RFS="$ROOT/build/stage-aarch64"

@@ -33,6 +33,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cbox"
+version = "0.1.0"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -79,6 +83,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fatdisk"
+version = "0.1.0"
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -96,6 +104,10 @@ checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest",
 ]
+
+[[package]]
+name = "inet"
+version = "0.1.0"
 
 [[package]]
 name = "inout"

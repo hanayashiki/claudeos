@@ -183,8 +183,8 @@ assemble_image() {
         ln -sfn "${item#*=}" "$tree${item%%=*}"
         ;;
       /bin/cbox)
-        (cd "$ROOT/user/cbox" && cargo build --release --target "$TARGET" --features "$features")
-        cp "$ROOT/user/cbox/target/$TARGET/release/cbox" "$tree/bin/cbox"
+        (cd "$ROOT" && cargo build -p cbox --profile user --target "$TARGET" --features "$features")
+        cp "$ROOT/target/$TARGET/user/cbox" "$tree/bin/cbox"
         chmod +x "$tree/bin/cbox"
         for applet in $applets; do
           [ "$applet" = cbox ] || ln -sf cbox "$tree/bin/$applet"
