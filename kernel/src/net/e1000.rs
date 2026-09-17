@@ -28,7 +28,6 @@
 use crate::abi::Errno;
 use crate::arch::{self, TrapFrame};
 use crate::mm::frame::alloc_contiguous;
-use crate::arch::paging::AddressSpace;
 use crate::mm::{phys_to_virt, PAGE_SIZE};
 use crate::net::Interface;
 use crate::pci;
@@ -830,12 +829,11 @@ fn interrupt(frame: &mut TrapFrame) {
 /// Start the kernel task that runs the protocol half.
 ///
 /// It never enters user mode, so it has no user address space of its own and
-/// runs on the kernel's. It must be created after the init process, because
-/// the scheduler hands out process ids in order and a great deal of the
-/// system assumes pid 1 is init.
+/// runs on whatever tables the processor is on. It must be created after the
+/// init process, because the scheduler hands out process ids in order and a
+/// great deal of the system assumes pid 1 is init.
 pub fn start_task() {
-    let space = AddressSpace::current();
-    let Some(mut task) = Task::new("netd", space) else {
+    let Some(mut task) = Task::new("netd", None) else {
         crate::println!("e1000: cannot create the network task");
         return;
     };

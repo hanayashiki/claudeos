@@ -11,7 +11,7 @@
 //! where the signal would be delivered, which is what Linux does here too.
 
 use super::cpu::idt::TrapFrame;
-use super::paging::AddressSpace;
+use super::paging::PageTables;
 use super::task::FPU_STATE_SIZE;
 use crate::abi::{Errno, SysResult};
 use crate::signal::{Fault, SigAction, Signal, SA_NODEFER, SA_ONSTACK};
@@ -23,7 +23,7 @@ use crate::uaccess;
 /// refuses to deliver a signal whose disposition names no restorer, rather
 /// than supplying one. The name exists because the exec path calls it on
 /// whichever machine it is built for; aarch64 is the one with a page to map.
-pub fn map_signal_trampoline(_task: &Task, _space: &AddressSpace) -> Result<(), Errno> {
+pub fn map_signal_trampoline(_task: &Task, _space: &PageTables) -> Result<(), Errno> {
     Ok(())
 }
 

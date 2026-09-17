@@ -271,6 +271,8 @@ pub fn start(boot: &boot::BootInfo) -> ! {
     hwcap::init();
 
     mm::frame::init(boot);
+    // Before the heap, which is the first thing mapped into the kernel half.
+    arch::paging::adopt_boot_tables();
     mm::heap::init();
     let (used, total) = mm::frame::stats();
     println!(

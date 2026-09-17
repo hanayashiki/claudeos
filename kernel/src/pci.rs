@@ -12,7 +12,7 @@
 //! taking 0xFFFF, which is what the bus returns when nothing answers, as
 //! "empty".
 
-use crate::arch::paging::{AddressSpace, NO_CACHE, NO_EXECUTE, PRESENT, WRITABLE};
+use crate::arch::paging::{kernel_tables, NO_CACHE, NO_EXECUTE, PRESENT, WRITABLE};
 use crate::arch::{pci_config_read32, pci_config_write32};
 use crate::mm::{page_align_up, PAGE_SIZE_U64};
 use crate::sync::Spinlock;
@@ -289,10 +289,10 @@ static MMIO_NEXT: Spinlock<u64> = Spinlock::new(DEVICE_MMIO_BASE);
 /// put it rather than being merged with its neighbours. The pages are also
 /// marked no-execute, since nothing here is code.
 ///
-/// The mapping goes into the current address space, which at boot is the one
-/// every later address space copies its kernel half from. Calling this after
-/// a user address space exists would leave that space without the mapping, so
-/// devices are brought up before the first process is created.
+/// The mapping goes into the kernel's own tables, which every later address
+/// space copies its kernel half from. Calling this after a user address space
+/// exists would leave that space without the mapping, so devices are brought up
+/// before the first process is created.
 pub fn map_device(phys: u64, len: u64) -> Option<u64> {
     let offset = phys & (PAGE_SIZE_U64 - 1);
     let base = phys - offset;
@@ -306,15 +306,19 @@ pub fn map_device(phys: u64, len: u64) -> Option<u64> {
     if virt + pages * PAGE_SIZE_U64 > DEVICE_MMIO_LIMIT {
         return None;
     }
-    let space = AddressSpace::current();
+    let space = kernel_tables();
     for page in 0..pages {
-        space
-            .map_fixed(
+        // SAFETY: `phys` is a device's register block, which is not memory the
+        // frame allocator manages: it takes only what the memory map calls
+        // usable RAM, and never above `DEVICE_PHYS_BASE`.
+        unsafe {
+            space.map_fixed(
                 virt + page * PAGE_SIZE_U64,
                 base + page * PAGE_SIZE_U64,
                 PRESENT | WRITABLE | NO_CACHE | NO_EXECUTE,
             )
-            .ok()?;
+        }
+        .ok()?;
     }
     *next = virt + pages * PAGE_SIZE_U64;
     Some(virt + offset)

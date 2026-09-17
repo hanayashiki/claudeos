@@ -8,12 +8,14 @@
 //! summary line out of the boot, so these are counted into the same one as the
 //! protocol checks rather than printing a second.
 
-use crate::arch::paging::{AddressSpace, MapError, NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::arch::paging::{live_root, MapError, PageTables, NO_EXECUTE, PRESENT, USER, WRITABLE};
 use crate::mm::frame;
+use crate::mm::space::{release_deferred, switch_mm, switch_to_kernel, Mm};
+use crate::sync::{disable_interrupts, enable_interrupts, interrupts_enabled, without_interrupts};
 
 /// Somewhere in the lower half, clear of where a program is loaded. Nothing is
-/// running while these checks are, and the spaces they build are never
-/// switched to, so the address only has to be one a walk accepts.
+/// running while these checks are, and nothing is ever fetched from a space
+/// they build, so the address only has to be one a walk accepts.
 const VIRT: u64 = 0x1000_0000;
 
 pub struct Report {
@@ -41,6 +43,9 @@ pub fn run(report: &mut Report) {
     replacing_nothing_maps_nothing(report);
     replacing_leaks_nothing(report);
     a_clone_reaches_a_shared_page_through_tables_of_its_own(report);
+    the_last_reference_frees_the_space(report);
+    a_last_reference_dropped_masked_waits(report);
+    the_space_the_processor_is_on_outlives_its_owner(report);
     #[cfg(target_arch = "aarch64")]
     device_window::run(report);
     #[cfg(target_arch = "aarch64")]
@@ -143,7 +148,7 @@ fn flags() -> u64 {
 /// An address that already has a mapping is refused, and the frame that was
 /// turned away is released rather than left with no owner.
 fn refuses_a_second_mapping(report: &mut Report) {
-    let Some(space) = AddressSpace::new_user() else {
+    let Some(space) = PageTables::new_user() else {
         report.check("an address space to map into", false);
         return;
     };
@@ -167,7 +172,7 @@ fn refuses_a_second_mapping(report: &mut Report) {
     report.check("the frame that was turned away is released", after == before);
 
     let kept = mapped.unwrap_or(0);
-    space.destroy();
+    drop(space);
     report.check(
         "tearing the space down releases what it held",
         frame::frame_references(kept) == 0,
@@ -182,13 +187,13 @@ fn refusing_leaks_nothing(report: &mut Report) {
     let (before, _) = frame::stats();
     let mut reached = 0usize;
     for _ in 0..ROUNDS {
-        let Some(space) = AddressSpace::new_user() else { break };
+        let Some(space) = PageTables::new_user() else { break };
         if space.map_new(VIRT, flags()).is_err() {
-            space.destroy();
+            drop(space);
             break;
         }
         let _ = space.map_new(VIRT, flags());
-        space.destroy();
+        drop(space);
         reached += 1;
     }
     let (after, _) = frame::stats();
@@ -205,13 +210,13 @@ fn refusing_leaks_nothing(report: &mut Report) {
 /// where the caller cannot see it, which is what a copy-on-write fault needs:
 /// the frame it was sharing is still held by the address spaces that share it.
 fn replacing_hands_the_old_frame_back(report: &mut Report) {
-    let Some(space) = AddressSpace::new_user() else {
+    let Some(space) = PageTables::new_user() else {
         report.check("an address space to map into", false);
         return;
     };
     let (Ok(old), Some(fresh)) = (space.map_new(VIRT, flags()), frame::alloc_zeroed()) else {
         report.check("a mapping to replace and a frame to replace it with", false);
-        space.destroy();
+        drop(space);
         return;
     };
     let new = fresh.addr();
@@ -230,7 +235,7 @@ fn replacing_hands_the_old_frame_back(report: &mut Report) {
     report.check("it is still held while the handle is", held_while_in_hand == 1);
     report.check("and dropping the handle releases it", held_after == 0);
 
-    space.destroy();
+    drop(space);
     report.check(
         "the replacement goes when the space does",
         frame::frame_references(new) == 0,
@@ -241,13 +246,13 @@ fn replacing_hands_the_old_frame_back(report: &mut Report) {
 /// would be creating a mapping, which is what `map_new` is for, and it would
 /// hand back a frame reference that no entry was holding.
 fn replacing_nothing_maps_nothing(report: &mut Report) {
-    let Some(space) = AddressSpace::new_user() else {
+    let Some(space) = PageTables::new_user() else {
         report.check("an address space to map into", false);
         return;
     };
     let Some(fresh) = frame::alloc_zeroed() else {
         report.check("a frame to offer", false);
-        space.destroy();
+        drop(space);
         return;
     };
     let offered = fresh.addr();
@@ -262,7 +267,7 @@ fn replacing_nothing_maps_nothing(report: &mut Report) {
     report.check("replacing what is not there is refused", refused);
     report.check("and leaves the address with nothing at it", reaches.is_none());
     report.check("and releases the frame it was offered", released == 0);
-    space.destroy();
+    drop(space);
 }
 
 /// A replacement that dropped the old entry's reference on the floor would
@@ -273,19 +278,19 @@ fn replacing_leaks_nothing(report: &mut Report) {
     let (before, _) = frame::stats();
     let mut reached = 0usize;
     for _ in 0..ROUNDS {
-        let Some(space) = AddressSpace::new_user() else { break };
+        let Some(space) = PageTables::new_user() else { break };
         if space.map_new(VIRT, flags()).is_err() {
-            space.destroy();
+            drop(space);
             break;
         }
         let Some(fresh) = frame::alloc_zeroed() else {
-            space.destroy();
+            drop(space);
             break;
         };
         drop(crate::sync::without_interrupts(|irq| {
             space.replace(VIRT, fresh, flags(), irq)
         }));
-        space.destroy();
+        drop(space);
         reached += 1;
     }
     let (after, _) = frame::stats();
@@ -305,22 +310,22 @@ fn replacing_leaks_nothing(report: &mut Report) {
 /// so taking that one page away hands back exactly the three and leaves the
 /// page where the space it was cloned from has it.
 fn a_clone_reaches_a_shared_page_through_tables_of_its_own(report: &mut Report) {
-    let Some(parent) = AddressSpace::new_user() else {
+    let Some(parent) = PageTables::new_user() else {
         report.check("an address space to map into", false);
         return;
     };
     let Ok(page) = parent.map_new(VIRT, flags()) else {
         report.check("a page to share", false);
-        parent.destroy();
+        drop(parent);
         return;
     };
 
     // Nothing may print between the counts below: printing goes through the
     // kernel heap, which takes frames.
     let (mapped, _) = frame::stats();
-    let Some(child) = AddressSpace::new_user() else {
+    let Some(child) = PageTables::new_user() else {
         report.check("a second address space", false);
-        parent.destroy();
+        drop(parent);
         return;
     };
     let cloned = child.clone_user_from(&parent).is_ok();
@@ -346,9 +351,102 @@ fn a_clone_reaches_a_shared_page_through_tables_of_its_own(report: &mut Report) 
         parent_reaches == Some(page) && held == 1,
     );
 
-    child.destroy();
-    parent.destroy();
+    drop(child);
+    drop(parent);
     report.check("both spaces release what is left", frame::frame_references(page) == 0);
+}
+
+/// Run `f` with interrupts on, which is where an address space is freed. These
+/// checks otherwise run with them masked, before any task has been admitted,
+/// so a tick in here finds nothing to switch to.
+fn with_interrupts_on<R>(f: impl FnOnce() -> R) -> R {
+    let was_enabled = interrupts_enabled();
+    enable_interrupts();
+    let result = f();
+    if !was_enabled {
+        disable_interrupts();
+    }
+    result
+}
+
+/// How many references the frame at `mapped` has, or `u16::MAX` when the
+/// mapping it came from failed, which no check below expects.
+fn references(mapped: Result<u64, MapError>) -> u16 {
+    mapped.map_or(u16::MAX, frame::frame_references)
+}
+
+/// An address space goes back when its last reference does, and not before.
+///
+/// Threads share one `Mm`, and a thread letting go of its share is not the
+/// process ending: when a release decided that by looking for another task on
+/// the same tables, two releases of one process could both find none and free
+/// the tables twice. The count cannot answer that question twice, and every
+/// frame the space took, its tables among them, comes back with the last one.
+fn the_last_reference_frees_the_space(report: &mut Report) {
+    // Nothing may print between the counts: printing goes through the kernel
+    // heap, which takes frames.
+    let (before, _) = frame::stats();
+    let Some(mm) = Mm::new_user() else {
+        report.check("an address space to map into", false);
+        return;
+    };
+    let page = mm.tables_unlocked().map_new(VIRT, flags());
+    let thread = mm.clone();
+    with_interrupts_on(|| drop(mm));
+    let held = references(page);
+    with_interrupts_on(|| drop(thread));
+    let (after, _) = frame::stats();
+
+    report.check("an address space outlives all but its last reference", held == 1);
+    report.check(
+        "and the last one frees it, tables and all",
+        references(page) == 0 && after == before,
+    );
+}
+
+/// A last reference that goes with interrupts masked leaves the free to
+/// `release_deferred`, since freeing walks every table the space has.
+fn a_last_reference_dropped_masked_waits(report: &mut Report) {
+    let Some(mm) = Mm::new_user() else {
+        report.check("an address space to map into", false);
+        return;
+    };
+    let page = mm.tables_unlocked().map_new(VIRT, flags());
+    without_interrupts(|_| drop(mm));
+    let held = references(page);
+    with_interrupts_on(release_deferred);
+
+    report.check("a last reference dropped with interrupts masked frees nothing there", held == 1);
+    report.check("and the space is freed once they are on", references(page) == 0);
+}
+
+/// The processor's reference to the space it is on keeps the space after the
+/// task that ran in it lets go, as an exit and an exec both do while still on
+/// those tables. Moving the processor off hands that reference back, and
+/// dropping it then frees the space.
+fn the_space_the_processor_is_on_outlives_its_owner(report: &mut Report) {
+    let Some(mm) = Mm::new_user() else {
+        report.check("an address space to switch to", false);
+        return;
+    };
+    let page = mm.tables_unlocked().map_new(VIRT, flags());
+    let root = mm.id();
+    let (loaded, held, left) = without_interrupts(move |irq| {
+        let previous = switch_mm(&mm, irq);
+        let loaded = previous.is_none() && live_root() == root;
+        drop(mm);
+        let held = references(page);
+        (loaded, held, switch_to_kernel(irq))
+    });
+    let back = live_root() != root;
+    with_interrupts_on(|| drop(left));
+
+    report.check("switching to an address space loads its tables", loaded);
+    report.check("the processor's reference keeps the space after its owner goes", held == 1);
+    report.check(
+        "and leaving it hands that reference back, which frees the space",
+        back && references(page) == 0,
+    );
 }
 
 /// What the frame allocator makes of the memory map a 4 GiB Raspberry Pi 4

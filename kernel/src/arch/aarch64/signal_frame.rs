@@ -20,7 +20,7 @@
 //! `map_signal_trampoline` builds the same page here, and it is where a
 //! handler goes back through when the field is empty.
 
-use super::paging::{AddressSpace, FreshPage, PRESENT, USER};
+use super::paging::{FreshPage, PageTables, PRESENT, USER};
 use super::task::VECTOR_BYTES;
 use super::trap::TrapFrame;
 use crate::abi::{Errno, SysResult, MAP_PRIVATE, PROT_EXEC, PROT_READ};
@@ -62,7 +62,7 @@ const _: () = assert!(super::nr::RT_SIGRETURN < 1 << 16, "movz carries 16 bits")
 /// not known when its address space is being built. It goes in at exec, where
 /// the rest of the address space is laid out, and a fork inherits it with
 /// everything else.
-pub fn map_signal_trampoline(task: &Task, space: &AddressSpace) -> Result<(), Errno> {
+pub fn map_signal_trampoline(task: &Task, space: &PageTables) -> Result<(), Errno> {
     let mut page = FreshPage::new().ok_or(Errno::ENOMEM)?;
     let mut at = 0;
     for instruction in RETURN_SEQUENCE {

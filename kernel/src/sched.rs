@@ -161,8 +161,7 @@ pub fn with_tasks<R>(f: impl FnOnce(&Held) -> R) -> R {
 
 /// Adopt the boot context as the idle task.
 pub fn init() {
-    let space = arch::paging::AddressSpace::current();
-    let mut idle = Task::new("idle", space).expect("idle task");
+    let mut idle = Task::new("idle", None).expect("idle task");
     idle.pid = 0;
     idle.tgid = 0;
     let entry = TaskPtr::new(idle);
@@ -248,18 +247,6 @@ pub fn current_pgid() -> u32 {
     current().pgid.get()
 }
 
-/// True when any task on the machine still names `space`.
-///
-/// A zombie counts. It has not been reaped, so the address space it ran in has
-/// not been handed back yet, and under `CLONE_VM` it is one of several tasks
-/// naming the same one. The caller counts too: a task that shares its address
-/// space with a child is the reason not to tear it down, not an exception to
-/// it. A caller that is about to stop naming the space asks after it has
-/// stopped.
-pub fn space_in_use(space: arch::paging::AddressSpace) -> bool {
-    entries(&TASKS.lock()).any(|task| task.space() == space)
-}
-
 fn pick_next() -> Option<*mut Task> {
     let tasks = TASKS.lock();
     let irq = tasks.irq();
@@ -326,8 +313,19 @@ unsafe fn switch_to(next: *mut Task) {
     arch::set_kernel_entry_stack(next_task.kstack_top);
     arch::set_current_task(next as u64);
 
-    if next_task.space() != prev_task.space() {
-        next_task.space().switch_to();
+    // The incoming task's address space goes on the processor unless it is
+    // there already. A kernel task has none and runs on whatever is loaded,
+    // which the processor's reference to it keeps alive, as Linux's lazy
+    // `active_mm` does; coming back to the task it was borrowed from then
+    // loads nothing and flushes nothing.
+    //
+    // The reference to the space being left is dropped here with interrupts
+    // off. When it is the last one, the owner's drop leaves the free to
+    // `mm::space::release_deferred`.
+    if let Some(mm) = next_task.mm() {
+        // SAFETY: `schedule` masked interrupts before calling this.
+        let irq = NoInterrupts::assume();
+        drop(crate::mm::space::switch_mm(&mm, irq));
     }
 
     CURRENT = next;
@@ -498,9 +496,8 @@ fn end_thread_group(member: &Task, status: i32, table: &Held) -> i32 {
 /// reports it: exit codes in bits 8..15, a killing signal in bits 0..6.
 pub fn exit_current(status: i32) -> ! {
     {
-        // Threads that finished earlier are still holding a kernel stack and a
-        // reference to this process's region list, and the second of those is
-        // what decides below whether the user memory may go.
+        // Threads that finished earlier are still holding a kernel stack and an
+        // entry in the table.
         reap_dead_threads();
 
         let task = current();
@@ -533,13 +530,16 @@ pub fn exit_current(status: i32) -> ! {
             task.fds.clear();
         }
 
-        // Threads share an address space and its region list; only the last
-        // thread out may tear either of them down.
-        let last_thread = task.mm_shares() == 1;
-        if last_thread {
-            task.space().free_user_memory();
-            task.clear_vmas();
-        }
+        // This task's reference to its address space goes now, rather than
+        // when the task is reaped: nothing runs in it again, and a zombie that
+        // nobody waits for would hold all of it until then. Other threads of
+        // the process hold references of their own, so this frees the space
+        // only when it was the last. The processor moves to the kernel's own
+        // tables first and lets go of its reference too, so that a last
+        // reference is dropped here, where interrupts are normally on, rather
+        // than at the switch away, where they are off and the free would wait.
+        // Linux's `exit_mm` lets go of the mm at the same point.
+        drop(crate::sync::without_interrupts(|irq| task.run_on_mm(None, irq)));
         let pid = task.pid;
 
         if pid == 1 {
@@ -1084,27 +1084,21 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
 }
 
 /// Hand back what tasks taken out of the table hold: the entry in /proc, the
-/// kernel stack, the task itself, and the address space once nothing names
-/// it.
+/// kernel stack, and the task itself.
 ///
-/// Tasks released together can run on one address space, and each of them is
-/// already out of the table when it is looked at, so the table alone would say
-/// the space is free for every one of them; only the last of them to name it
-/// may destroy it.
+/// Nothing here decides about address spaces. A task lets go of its reference
+/// to one in `exit_current`, and a task that never got that far lets go of it
+/// when its box is dropped here; the last reference is what frees the space.
 fn release(dead: Vec<*mut Task>) {
-    for (i, &ptr) in dead.iter().enumerate() {
-        unsafe {
-            let mut task = Box::from_raw(ptr);
-            crate::fs::procfs::remove_process(task.pid);
-            let space = task.space();
-            let named_later = dead[i + 1..].iter().any(|&other| (*other).space() == space);
-            if !named_later && !space_in_use(space) {
-                space.destroy();
-            }
-            task.free_kernel_stack();
-            task.mark_dead();
-            drop(task);
-        }
+    for ptr in dead {
+        // SAFETY: the pointer came out of an entry taken out of the table
+        // under its lock, so nothing else can reach the task, and each entry
+        // is released once.
+        let mut task = unsafe { Box::from_raw(ptr) };
+        crate::fs::procfs::remove_process(task.pid);
+        task.free_kernel_stack();
+        task.mark_dead();
+        drop(task);
     }
 }
 
@@ -1126,7 +1120,8 @@ pub fn release_if_pending() {
 }
 
 /// Release the tasks that have finished and that no `wait4` will take out of
-/// the table: threads, and processes whose parent will not wait for them.
+/// the table: threads, and processes whose parent will not wait for them. Then
+/// free the address spaces whose last reference went with interrupts off.
 ///
 /// Without this the kernel stack, the task itself, its entry in /proc and the
 /// share it holds of the process's region list would stay taken for as long as
@@ -1163,6 +1158,8 @@ pub fn reap_dead_threads() {
         tasks_to_release();
     }
     release(dead);
+    // Address spaces whose last reference went with interrupts off.
+    crate::mm::space::release_deferred();
 }
 
 /// Report a child that stopped or was continued since the last report. The

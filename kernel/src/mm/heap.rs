@@ -1,6 +1,6 @@
 //! Kernel heap: an address-ordered free list with coalescing on free.
 
-use crate::arch::paging::{AddressSpace, NO_EXECUTE, PRESENT, WRITABLE};
+use crate::arch::paging::{kernel_tables, NO_EXECUTE, PRESENT, WRITABLE};
 use super::{align_up, KERNEL_HEAP_BASE, KERNEL_HEAP_SIZE, PAGE_SIZE_U64};
 use crate::sync::Spinlock;
 use core::alloc::{GlobalAlloc, Layout};
@@ -191,7 +191,7 @@ struct Claim {
 /// Thousands of page table writes and an invalidation each, so this is what
 /// the heap lock must not be held across.
 unsafe fn map_claim(claim: &Claim) -> usize {
-    let space = AddressSpace::current();
+    let space = kernel_tables();
     let pages = claim.bytes as u64 / PAGE_SIZE_U64;
     for page in 0..pages {
         let virt = claim.start + page * PAGE_SIZE_U64;
@@ -306,7 +306,7 @@ pub static HEAP: LockedHeap = LockedHeap(Spinlock::new(HoleList::new()));
 
 /// Map the kernel heap and hand it to the allocator.
 pub fn init() {
-    let space = AddressSpace::current();
+    let space = kernel_tables();
     let pages = KERNEL_HEAP_SIZE as u64 / PAGE_SIZE_U64;
     for i in 0..pages {
         let virt = KERNEL_HEAP_BASE + i * PAGE_SIZE_U64;

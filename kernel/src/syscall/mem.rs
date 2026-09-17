@@ -1,11 +1,13 @@
 //! Memory-related system calls.
 
 use crate::abi::*;
-use crate::arch::paging::{is_user_addr, FreshPage, NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::arch::paging::{is_user_addr, FreshPage, PageTables, NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::mm::space::Mm;
 use crate::mm::{page_align_down, page_align_up, PAGE_SIZE_U64, USER_MMAP_BASE};
 use crate::sched;
 use crate::sync::without_interrupts;
 use crate::uaccess;
+use alloc::sync::Arc;
 
 /// Upper bound on a single mapping, so a bogus length fails fast.
 const MAX_MAPPING: u64 = 1 << 40;
@@ -26,6 +28,15 @@ fn in_user_space(addr: u64, len: u64) -> bool {
     }
 }
 
+/// The address space of the task making the call, held for the length of it.
+///
+/// A task that entered a system call from a program is running in one. A
+/// reference of the call's own is what keeps the tables it walks alive while
+/// it is preempted, whatever the task's threads do meanwhile.
+fn current_mm() -> Result<Arc<Mm>, Errno> {
+    sched::current().mm().ok_or(Errno::EFAULT)
+}
+
 fn prot_to_flags(prot: u64) -> u64 {
     let mut bits = PRESENT | USER;
     if prot & PROT_WRITE != 0 {
@@ -39,6 +50,7 @@ fn prot_to_flags(prot: u64) -> u64 {
 
 pub fn brk(request: u64) -> SysResult {
     let task = sched::current();
+    let mm = current_mm()?;
     let (brk_start, current_brk) = (task.brk_start(), task.brk());
     if request == 0 || request < brk_start {
         return Ok(current_brk);
@@ -51,9 +63,10 @@ pub fn brk(request: u64) -> SysResult {
     if new_brk < current_brk {
         // Shrinking: give the frames back. Taking the mapping away hands
         // back the reference the entry held, and dropping it is the release.
+        let tables = mm.tables_unlocked();
         let mut page = new_brk;
         while page < current_brk {
-            without_interrupts(|irq| drop(task.space().unmap(page, irq)));
+            without_interrupts(|irq| drop(tables.unmap(page, irq)));
             page += PAGE_SIZE_U64;
         }
     }
@@ -74,6 +87,7 @@ pub fn mmap(
         return Err(Errno::EINVAL);
     }
     let len = page_align_up(length);
+    let mm = current_mm()?;
 
     let base = if flags & MAP_FIXED != 0 {
         if addr == 0 || addr & (PAGE_SIZE_U64 - 1) != 0 || !in_user_space(addr, len) {
@@ -112,7 +126,9 @@ pub fn mmap(
         let task = sched::current();
 
         let offset = crate::fs::Offset::new(offset);
-        if let Err(err) = populate_from_file(&node, base, len, offset, prot_to_flags(prot)) {
+        let tables = mm.tables_unlocked();
+        if let Err(err) = populate_from_file(&tables, &node, base, len, offset, prot_to_flags(prot))
+        {
             // Pages already published are reachable and pages not yet
             // published are not, so a failure part of the way through leaves a
             // range that is partly the file. Take back what this call put in,
@@ -122,7 +138,7 @@ pub fn mmap(
             // place.
             let mut page = base;
             while page < base + len {
-                without_interrupts(|irq| drop(task.space().unmap(page, irq)));
+                without_interrupts(|irq| drop(tables.unmap(page, irq)));
                 page += PAGE_SIZE_U64;
             }
             return Err(err);
@@ -139,7 +155,7 @@ pub fn mmap(
 }
 
 /// Fill `[base, base + len)` from the file at `offset` and publish each page
-/// with `bits`.
+/// into `tables` with `bits`.
 ///
 /// A page is read into a frame the allocator has just handed over, through the
 /// kernel's own view of memory, and goes into the address space once with the
@@ -156,13 +172,13 @@ pub fn mmap(
 /// reaches is read short and the rest of the frame stays zero, which is what a
 /// page of a mapping that arrives later from a fault already does.
 fn populate_from_file(
+    tables: &PageTables,
     node: &crate::fs::NodeRef,
     base: u64,
     len: u64,
     offset: crate::fs::Offset,
     bits: u64,
 ) -> Result<(), Errno> {
-    let task = sched::current();
     let mut page = base;
     while page < base + len {
         let mut fresh = FreshPage::new().ok_or(Errno::ENOMEM)?;
@@ -174,7 +190,7 @@ fn populate_from_file(
         if n > 0 && bits & NO_EXECUTE == 0 {
             crate::arch::sync_instruction_cache(fresh.bytes().as_ptr() as u64, n);
         }
-        task.space().publish(page, fresh, bits).map_err(|_| Errno::ENOMEM)?;
+        tables.publish(page, fresh, bits).map_err(|_| Errno::ENOMEM)?;
         page += PAGE_SIZE_U64;
     }
     Ok(())
@@ -188,6 +204,10 @@ fn unmap_range(addr: u64, len: u64) {
         return;
     }
     let task = sched::current();
+    let Some(mm) = task.mm() else {
+        return;
+    };
+    let tables = mm.tables_unlocked();
     let start = page_align_down(addr);
     let end = page_align_up(addr + len);
     // The region goes first. A thread sharing the address space that touches
@@ -204,7 +224,7 @@ fn unmap_range(addr: u64, len: u64) {
         // for as long as it takes to walk one. What has to be inside one
         // section is the emptying of a table and the decision to free it,
         // which is the whole of what `unmap` does.
-        without_interrupts(|irq| drop(task.space().unmap(page, irq)));
+        without_interrupts(|irq| drop(tables.unmap(page, irq)));
         page += PAGE_SIZE_U64;
     }
 }
@@ -222,6 +242,8 @@ pub fn mprotect(addr: u64, length: u64, prot: u64) -> SysResult {
         return Err(Errno::EINVAL);
     }
     let task = sched::current();
+    let mm = current_mm()?;
+    let tables = mm.tables_unlocked();
     let start = page_align_down(addr);
     let end = page_align_up(addr + length);
     let bits = prot_to_flags(prot);
@@ -232,13 +254,13 @@ pub fn mprotect(addr: u64, length: u64, prot: u64) -> SysResult {
         // protection when they fault in. A page still shared after a fork
         // keeps its copy-on-write mark and stays read-only whatever is asked
         // for: the copy happens when it is written to, as before.
-        if let Some(existing) = task.space().flags_of(page) {
+        if let Some(existing) = tables.flags_of(page) {
             let bits = if existing & crate::arch::paging::COW != 0 {
                 (bits & !WRITABLE) | crate::arch::paging::COW
             } else {
                 bits
             };
-            task.space().set_flags(page, bits);
+            tables.set_flags(page, bits);
         }
         page += PAGE_SIZE_U64;
     }

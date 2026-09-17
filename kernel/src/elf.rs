@@ -1,7 +1,7 @@
 //! ELF64 program loader for static executables.
 
 use crate::abi::Errno;
-use crate::arch::paging::{AddressSpace, FreshPage, NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::arch::paging::{FreshPage, PageTables, NO_EXECUTE, PRESENT, USER, WRITABLE};
 use crate::fs::NodeKind;
 use crate::mm::{page_align_down, PAGE_SIZE_U64};
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -349,7 +349,7 @@ impl Extent {
 /// on: the contents go in through the frames rather than through the
 /// addresses they will be read at.
 pub fn load_at(
-    space: &AddressSpace,
+    space: &PageTables,
     node: &crate::fs::NodeRef,
     base_override: Option<u64>,
 ) -> Result<LoadedImage, Errno> {
