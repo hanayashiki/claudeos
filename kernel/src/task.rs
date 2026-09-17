@@ -1332,14 +1332,39 @@ pub fn prepare(
     Ok(task)
 }
 
-pub struct TaskPtr(pub *mut Task);
+/// An entry in the process table: a task `sched::register` took the box of.
+///
+/// The pointer is private. With a public one, any code could build an entry
+/// naming anything, or keep reading one after `release` had freed the task
+/// behind it, and `get` would hand out a reference to whatever was there.
+pub struct TaskPtr(*mut Task);
 unsafe impl Send for TaskPtr {}
 
 impl TaskPtr {
-    /// The task, borrowed for as long as the entry that names it. The entry is
-    /// in the process table, so what the borrow comes from is a hold on the
-    /// table, and the reference cannot outlive it.
-    pub fn get(&self) -> &Task {
+    /// Take ownership of `task` as an entry. Nothing frees it until `release`
+    /// turns the pointer back into the box.
+    pub fn new(task: alloc::boxed::Box<Task>) -> TaskPtr {
+        TaskPtr(alloc::boxed::Box::into_raw(task))
+    }
+
+    /// The task's address, for comparing entries and for handing the box back.
+    pub fn as_ptr(&self) -> *mut Task {
+        self.0
+    }
+
+    /// The task, borrowed for as long as the entry that names it.
+    ///
+    /// # Safety
+    ///
+    /// The entry must be in the process table, and the reference must not be
+    /// used after the hold on the table it was read under is let go.
+    /// `sched::release` frees a task once it has been taken out of the table
+    /// under that lock, and nothing else keeps the task alive, so a reference
+    /// kept past the hold can name freed memory. The hold also masks
+    /// interrupts, which is what keeps the task's cells whole while they are
+    /// read through a reference another task can hold too.
+    pub unsafe fn get(&self) -> &Task {
+        // SAFETY: the caller keeps the entry in the table for the borrow.
         unsafe { &*self.0 }
     }
 }

@@ -3,7 +3,7 @@
 use crate::abi::*;
 use crate::arch;
 use crate::sync::{
-    disable_interrupts, enable_interrupts, interrupts_enabled, NoInterrupts, Spinlock,
+    disable_interrupts, enable_interrupts, interrupts_enabled, NoInterrupts, SpinGuard, Spinlock,
 };
 use crate::signal::Signal;
 use crate::task::{State, Task, TaskPtr};
@@ -13,6 +13,16 @@ use alloc::vec::Vec;
 static mut CURRENT: *mut Task = core::ptr::null_mut();
 static mut IDLE: *mut Task = core::ptr::null_mut();
 static TASKS: Spinlock<Vec<TaskPtr>> = Spinlock::new(Vec::new());
+
+/// A hold on the process table.
+type Table = SpinGuard<'static, Vec<TaskPtr>>;
+
+/// The tasks in the table, borrowed from the hold on it.
+fn entries(table: &Table) -> impl Iterator<Item = &Task> {
+    // SAFETY: every entry is in the table while the hold is, and the borrow
+    // is of the hold, so no reference outlives it.
+    table.iter().map(|entry| unsafe { entry.get() })
+}
 static FOREGROUND_PGID: Spinlock<u32> = Spinlock::new(0);
 
 /// The task the CPU is running, as a guard rather than a reference.
@@ -59,7 +69,7 @@ pub fn has_current() -> bool {
 /// taken, and that hold is also what proves a tick cannot land between the two
 /// halves. Both facts are the same object rather than two arguments.
 pub struct Held<'a> {
-    tasks: &'a [TaskPtr],
+    tasks: &'a Table,
     irq: NoInterrupts<'a>,
 }
 
@@ -75,12 +85,12 @@ impl<'a> Held<'a> {
     /// asking for the caller's own pid is an ordinary thing to do rather than
     /// a second route to something it already has.
     pub fn find(&self, pid: u32) -> Option<&'a Task> {
-        self.tasks.iter().find(|t| t.get().pid == pid).map(|t| t.get())
+        entries(self.tasks).find(|task| task.pid == pid)
     }
 
     pub fn for_each(&self, mut f: impl FnMut(&'a Task)) {
-        for entry in self.tasks {
-            f(entry.get());
+        for task in entries(self.tasks) {
+            f(task);
         }
     }
 
@@ -155,12 +165,13 @@ pub fn init() {
     let mut idle = Task::new("idle", space).expect("idle task");
     idle.pid = 0;
     idle.tgid = 0;
-    let ptr = Box::into_raw(idle);
+    let entry = TaskPtr::new(idle);
+    let ptr = entry.as_ptr();
     unsafe {
         CURRENT = ptr;
         IDLE = ptr;
     }
-    TASKS.lock().push(TaskPtr(ptr));
+    TASKS.lock().push(entry);
     crate::task::reset_pid_counter(1);
 }
 
@@ -189,7 +200,7 @@ pub fn register(task: Box<Task>) -> u32 {
 
 /// Put a task in the table, where the scheduler can pick it.
 fn admit(task: Box<Task>, _irq: NoInterrupts) {
-    TASKS.lock().push(TaskPtr(Box::into_raw(task)));
+    TASKS.lock().push(TaskPtr::new(task));
 }
 
 /// Run `f` on the task with `pid`, with the table held for as long as it runs.
@@ -201,8 +212,8 @@ fn admit(task: Box<Task>, _irq: NoInterrupts) {
 /// two the same length.
 pub fn with_task<R>(pid: u32, f: impl FnOnce(&Task) -> R) -> Option<R> {
     let tasks = TASKS.lock();
-    let entry = tasks.iter().find(|t| t.get().pid == pid)?;
-    Some(f(entry.get()))
+    let task = entries(&tasks).find(|task| task.pid == pid)?;
+    Some(f(task))
 }
 
 /// The running task's pid, or zero before there is one.
@@ -246,7 +257,7 @@ pub fn current_pgid() -> u32 {
 /// it. A caller that is about to stop naming the space asks after it has
 /// stopped.
 pub fn space_in_use(space: arch::paging::AddressSpace) -> bool {
-    TASKS.lock().iter().any(|t| t.get().space() == space)
+    entries(&TASKS.lock()).any(|task| task.space() == space)
 }
 
 fn pick_next() -> Option<*mut Task> {
@@ -255,8 +266,7 @@ fn pick_next() -> Option<*mut Task> {
     let now = crate::trap::ticks();
     let idle = unsafe { IDLE };
 
-    for entry in tasks.iter() {
-        let task = entry.get();
+    for task in entries(&tasks) {
         if task.state() == State::Sleeping && task.wake_at() != 0 && now >= task.wake_at() {
             task.deadline_reached(irq);
         }
@@ -267,19 +277,20 @@ fn pick_next() -> Option<*mut Task> {
     if len == 0 {
         return None;
     }
-    let start = tasks.iter().position(|t| t.0 == cur).unwrap_or(0);
+    let start = tasks.iter().position(|t| t.as_ptr() == cur).unwrap_or(0);
 
     for k in 1..=len {
         let entry = &tasks[(start + k) % len];
-        if entry.0 == idle {
+        if entry.as_ptr() == idle {
             continue;
         }
-        let task = entry.get();
+        // SAFETY: the entry is read under the hold on the table and not kept.
+        let task = unsafe { entry.get() };
         if task.state() == State::Runnable {
-            if entry.0 == cur {
+            if entry.as_ptr() == cur {
                 return None; // already running the only candidate
             }
-            return Some(entry.0);
+            return Some(entry.as_ptr());
         }
     }
 
@@ -345,7 +356,8 @@ pub fn other_runnable() -> bool {
     let idle = unsafe { IDLE };
     let tasks = TASKS.lock();
     tasks.iter().any(|t| {
-        t.0 != cur && t.0 != idle && t.get().state() == State::Runnable
+        // SAFETY: the entry is read under the hold on the table and not kept.
+        t.as_ptr() != cur && t.as_ptr() != idle && unsafe { t.get() }.state() == State::Runnable
     })
 }
 
@@ -1024,16 +1036,13 @@ fn matches_want(task: &Task, want: i32) -> bool {
 /// A process has finished only then. Its first thread can exit alone, with
 /// the `exit` system call, while the others run on, and Linux's `wait` passes
 /// over such a leader until its thread group is empty (`delay_group_leader`).
-fn group_exited(tasks: &[TaskPtr], tgid: u32) -> bool {
-    tasks.iter().all(|t| {
-        let task = t.get();
-        task.tgid != tgid || task.state() == State::Zombie
-    })
+fn group_exited(tasks: &Table, tgid: u32) -> bool {
+    entries(tasks).all(|task| task.tgid != tgid || task.state() == State::Zombie)
 }
 
 /// True when `task` is a process that `wait4` can collect: its leader, with
 /// every thread of it exited.
-fn finished_process(tasks: &[TaskPtr], task: &Task) -> bool {
+fn finished_process(tasks: &Table, task: &Task) -> bool {
     task.state() == State::Zombie && group_exited(tasks, task.tgid)
 }
 
@@ -1042,7 +1051,7 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
     let mut group = Vec::new();
     let (pid, code) = {
         let mut tasks = TASKS.lock();
-        let leader = tasks.iter().map(|entry| entry.get()).find(|task| {
+        let leader = entries(&tasks).find(|task| {
             is_child_process(task, parent_pid)
                 && matches_want(task, want)
                 && finished_process(&tasks, task)
@@ -1060,9 +1069,11 @@ pub fn reap_child(parent_pid: u32, want: i32) -> Option<(u32, i32)> {
         // would keep its kernel stack and its entry in /proc until the next
         // task was made or exited.
         tasks.retain(|entry| {
-            let member = entry.get().tgid == tgid;
+            // SAFETY: the entry is read under the hold on the table; the task
+            // is freed only by `release`, after this hold is let go.
+            let member = unsafe { entry.get() }.tgid == tgid;
             if member {
-                group.push(entry.0);
+                group.push(entry.as_ptr());
             }
             !member
         });
@@ -1131,18 +1142,20 @@ pub fn reap_dead_threads() {
         let cur = unsafe { CURRENT };
         let mut tasks = TASKS.lock();
         tasks.retain(|entry| {
-            let task = entry.get();
+            // SAFETY: the entry is read under the hold on the table; the task
+            // is freed only by `release`, after this hold is let go.
+            let task = unsafe { entry.get() };
             let unwaited = task.pid != task.tgid || task.released_at_exit.get();
             if task.state() != State::Zombie || !unwaited {
                 return true;
             }
             // The running task is in the middle of its own exit and is still on
             // the stack this would hand back. Whoever runs next releases it.
-            if entry.0 == cur {
+            if entry.as_ptr() == cur {
                 unfinished = true;
                 return true;
             }
-            dead.push(entry.0);
+            dead.push(entry.as_ptr());
             false
         });
     }
@@ -1161,8 +1174,7 @@ pub fn child_status_change(
     continued: bool,
 ) -> Option<(u32, i32)> {
     let tasks = TASKS.lock();
-    for entry in tasks.iter() {
-        let task = entry.get();
+    for task in entries(&tasks) {
         if !is_child_process(task, parent_pid) {
             continue;
         }
@@ -1193,8 +1205,7 @@ pub fn child_event_pending(
     continued: bool,
 ) -> bool {
     let tasks = TASKS.lock();
-    tasks.iter().any(|t| {
-        let task = t.get();
+    let pending = entries(&tasks).any(|task| {
         if !is_child_process(task, parent_pid) {
             return false;
         }
@@ -1204,16 +1215,16 @@ pub fn child_event_pending(
         finished_process(&tasks, task)
             || (untraced && task.report_stop.get())
             || (continued && task.report_continue.get())
-    })
+    });
+    pending
 }
 
 /// True when the parent has at least one live child matching `want`.
 pub fn has_children(parent_pid: u32, want: i32) -> bool {
     let tasks = TASKS.lock();
-    tasks.iter().any(|t| {
-        let task = t.get();
-        is_child_process(task, parent_pid) && matches_want(task, want)
-    })
+    let found =
+        entries(&tasks).any(|task| is_child_process(task, parent_pid) && matches_want(task, want));
+    found
 }
 
 /// A set of tasks waiting for one condition.
