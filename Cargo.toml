@@ -8,28 +8,33 @@
 #   user/cbox,     --target x86_64-unknown-linux-musl or aarch64-unknown-linux-musl,
 #   user/inet      --profile user (tools/distro builds them for the images)
 #   tools/fatdisk, the Mac, --release
-#   tools/distro
+#   tools/distro,
+#   tools/devicetree
 #
 # .cargo/config.toml holds the flags each of those targets needs, and sets no
 # default target, so a plain `cargo build` or `cargo test` here builds the
 # default members below for the Mac.
 [workspace]
 resolver = "2"
-members = ["kernel", "user/cbox", "user/inet", "tools/fatdisk", "tools/distro"]
+members = ["kernel", "user/cbox", "user/inet", "tools/fatdisk", "tools/distro", "tools/devicetree"]
 # The crates whose tests and programs run on the Mac. The kernel needs its own
 # target and linker script, and building it for the Mac fails at the link.
+# tools/devicetree runs on the Mac too, but two of its tests read trees that
+# `distro build board-aarch64` and QEMU write under build/, which a plain
+# `cargo test` does not make; scripts/test.sh makes both and then runs it.
 default-members = ["user/cbox", "user/inet", "tools/fatdisk", "tools/distro"]
 
 # `lto` and `panic` cannot differ between the packages of one profile, and the
 # kernel, the programs in the images and the host tools each need their own, so
 # each has a profile.
 
-# The host tools, fatdisk and distro.
+# The host tools, fatdisk, distro and devicetree.
 #
 # fatdisk is built the way the kernel builds the same FAT code: overflow checks
 # on, so that an arithmetic wrap is a panic `fuzz` reports rather than a wrong
 # number; and unwinding, the default here, so that `fuzz` can catch the panic
-# and name the seed.
+# and name the seed. devicetree's damaged trees rely on the same overflow
+# checks.
 [profile.release]
 overflow-checks = true
 debug = true
