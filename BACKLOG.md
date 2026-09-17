@@ -75,6 +75,17 @@ fills freed physical frames with a recognisable pattern and checks that
 frames handed to user memory are zero, and a fault dump that names the
 physical frame behind the corrupted object.
 
+**Audit, 2026-09-18.** A read-only check of the kernel's unsafe code against
+Rust's rules is in build/audit-2026-09-18-unsafe.md (not in git): 11 ranked
+findings, rule violations with no effect today, what was found sound, and what
+could not be checked. The main pattern: page-table and region updates are
+check-then-store sequences run with interrupts on, in a kernel preemptible on
+one CPU, with no lock per address space, so sibling threads can interleave
+(findings 1, 2, 4, 5, 6, 8, 9). Also: an address space can be destroyed twice
+(AddressSpace is Copy with a safe destroy), user-copy sections can sleep when
+a page comes from /data (where cloudflared now runs), threads start with no
+signals blocked, and kernel stacks have no guard page.
+
 **Next.** Find what overwrites user memory; the next crash should leave Go's
 trace in the tunnel's log. The user plans to review the kernel's unsafe code,
 which mostly mirrors C, in an overhaul.
