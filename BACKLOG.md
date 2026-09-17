@@ -57,6 +57,24 @@ or fault ending the whole thread group, kill(pid) to the group, and children of
 a parent ignoring SIGCHLD released at exit, and a fault's signal delivered to
 the handler the program installed, with `si_code` and `si_addr`.
 
+**2026-09-18, the same fault again, now recovered.** In 21 h of uptime on
+main dd2ff99 cloudflared died three times, each time exited with status 2 and
+was restarted by its keeper within 30 s (excerpts, tokens redacted, in
+build/incident-2026-09-18-cloudflared-traces.txt):
+- after 18669 s: `fatal error: receive on synctest channel from outside
+  bubble` in net/http `(*persistConn).readLoop.func4` (transport.go:2422).
+  cloudflared uses no synctest; the runtime reads that from a field of the
+  channel object, which must be nil.
+- after 58849 s and 75335 s: SIGSEGV at 0x7c3bf476e658e144 and
+  0x9a6a208d7e6e4699, both at pc 0x61a104, the same `MIMEHeader.Add` in
+  `newWriterAndRequest` (http2 server.go:2163) as the first incident.
+Every time a Go object held random 64-bit data where the runtime keeps a
+pointer or nil. Kernel heap was 3 MiB in use and no zombies were left, so the
+thread-group and SIGCHLD fixes hold. Suggested next step: a debug build that
+fills freed physical frames with a recognisable pattern and checks that
+frames handed to user memory are zero, and a fault dump that names the
+physical frame behind the corrupted object.
+
 **Next.** Find what overwrites user memory; the next crash should leave Go's
 trace in the tunnel's log. The user plans to review the kernel's unsafe code,
 which mostly mirrors C, in an overhaul.
