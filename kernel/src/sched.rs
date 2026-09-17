@@ -1353,6 +1353,12 @@ pub fn idle_until(deadline: u64, mut ready: impl FnMut() -> bool) -> bool {
 pub fn idle_loop() -> ! {
     loop {
         enable_interrupts();
+        // An address space whose last reference went with interrupts masked is
+        // waiting for a caller that has them on. The way out of a system call
+        // is normally that caller; with nothing left to make one -- a process
+        // killed by a signal taken on the way out of a timer interrupt, and
+        // nothing else running -- this is.
+        crate::mm::space::release_deferred();
         arch::halt();
         schedule();
     }
