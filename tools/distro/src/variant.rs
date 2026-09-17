@@ -122,7 +122,7 @@ impl Variants {
     }
 
     pub fn list(self) -> impl Iterator<Item = Variant> {
-        Variant::ALL.into_iter().filter(move |variant| self.has(variant.to_owned()))
+        Variant::ALL.into_iter().filter(move |variant| self.has(*variant))
     }
 }
 

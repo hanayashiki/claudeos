@@ -136,8 +136,9 @@ recorded for it in `tools/distro/src/downloads.rs`, and checked against it
 each time it is used; a file taken out of a package is kept and checked under
 its own sha256. A download that does not match stops the build, and a copy in
 the cache that no longer matches is fetched again. The programs are built into
-`target/`, the one target directory of the cargo workspace, and cargo, clang
-and go are run on every build and do nothing when nothing changed.
+`target/`, the one target directory of the cargo workspace, on every build:
+cargo and go keep caches of their own and rebuild nothing that did not change,
+and the C program, compiled and linked again each time, is one file.
 
 ## Putting it on a Raspberry Pi 4
 
