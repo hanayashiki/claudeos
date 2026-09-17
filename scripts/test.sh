@@ -715,6 +715,72 @@ integrity_expect() {
   return $missing
 }
 
+# The kernel's reader of a device tree's memory nodes, reservations, command
+# line and ram disk, compiled for the Mac by tools/devicetree and run over the
+# Pi's tree file, over the tree QEMU makes of that file for its emulated Pi 4,
+# and over trees its tests write. Then the Rust suite boots with QEMU handing
+# over that tree instead of the tag list it hands over by default: the boot has
+# to print the reservations the tests found in the tree, and pass.
+run_device_tree() {
+  banner "device tree reader"
+  if [ "$ARCH" != aarch64 ]; then
+    echo "   only the Raspberry Pi 4 is booted with a device tree, so $ARCH has none to read"
+    echo ">> device tree reader: not run on $ARCH"
+    echo
+    return
+  fi
+  local ok=1 dir output
+  local board_dtb="$ROOT/build/distro/board-aarch64/boot/bcm2711-rpi-4-b.dtb"
+  local qemu_dtb="$ROOT/build/qemu-raspi4b.dtb"
+  local line="reserved memory: /memreserve/ 0x0-0x1000; linux,cma dynamic, size 0x4000000, not allocated; nvram@0 disabled, not reserved; nvram@1 disabled, not reserved"
+  dir="$(mktemp -d)"
+
+  # -dtb needs -kernel; dumpdtb writes the tree as QEMU would hand it over and
+  # exits before the machine runs.
+  if ! qemu-system-aarch64 -M "raspi4b,dumpdtb=$qemu_dtb" -dtb "$board_dtb" \
+      -kernel "$KERNEL_IMAGE" -display none > "$dir/dump" 2>&1; then
+    echo "   QEMU did not write its tree:"
+    sed 's/^/     /' "$dir/dump"
+    ok=0
+  fi
+  if PI_DTB="$board_dtb" QEMU_DTB="$qemu_dtb" cargo test -p devicetree --release -q > "$dir/host-tests" 2>&1; then
+    echo "   tools/devicetree tests: $(grep -E '^test result' "$dir/host-tests" | awk '{ p += $4; f += $6 } END { print p " passed, " f " failed" }')"
+  else
+    echo "   tools/devicetree tests failed:"
+    tail -n 40 "$dir/host-tests" | sed 's/^/     /'
+    ok=0
+  fi
+
+  # watchdog=off, because the tree describes the watchdog and QEMU 11.1.1
+  # resets the machine on the write that starts it (see watchdog_start).
+  output="$("$ROOT/scripts/run.sh" --timeout 300 --initrd "$IMAGE" \
+      --append "watchdog=off init=/bin/rtest" -dtb "$board_dtb" 2>&1 | tr -d '\r')"
+  record_boot_id "$output"
+  for expected in "handoff: device tree at" "$line"; do
+    if ! echo "$output" | grep -qF "$expected"; then
+      echo "   missing expected output: $expected"
+      ok=0
+    fi
+  done
+  if ! echo "$output" | grep -qE "^=== [0-9]+ passed, 0 failed ===$"; then
+    echo "   the Rust suite did not pass with the tree handed over:"
+    echo "$output" | tail -n 40 | sed 's/^/     /'
+    ok=0
+  else
+    echo "   $(echo "$output" | grep -E "^=== [0-9]+ passed, 0 failed ===$") with the tree handed over"
+  fi
+  echo "   $(echo "$output" | grep -F "reserved memory:")"
+  rm -rf "$dir"
+
+  if [ $ok -eq 1 ]; then
+    echo ">> device tree reader: OK"
+  else
+    echo ">> device tree reader: FAILED"
+    status=1
+  fi
+  echo
+}
+
 # The image scripts/mkcard.sh puts on the card, booted under QEMU with no card.
 # It has to reach the shell and pass its own check; its /bin has to hold none of
 # the test image's programs and none of the card's; there has to be no /tests,
@@ -1627,6 +1693,7 @@ run_suite "upstream busybox" "/tests/busybox.sh" 300
 run_suite "alpine linux userland" "init=/bin/sh /root/alpine.sh" 300 "$ALPINE"
 run_integrity
 run_board_image
+run_device_tree
 run_data
 run_services
 run_interactive

@@ -1055,6 +1055,30 @@ by remembering to call free. Physical memory is also mapped in one piece at
 temporary mappings. On top of that sit a 4-level page table implementation and
 a coalescing kernel heap.
 
+Before the allocator hands anything out it holds back the kernel image, the ram
+disk, what the loader handed over, and the low memory the machine claims: the
+first megabyte on x86-64, everything under the kernel's load address on the Pi.
+A memory map entry that is not usable wins over a usable one it overlaps, as
+Linux resolves an E820 map. On the Pi the device tree names what the firmware
+keeps for itself, and both lists are held back as Linux holds them back: every
+range in the header's reservation block, and every `reg` range of a
+`/reserved-memory` child that is switched on, read with that node's own cell
+counts. A child with only a `size` asks the kernel to allocate a pool, which
+nothing here uses, so nothing is allocated for it; a child that is switched off
+or cannot be read is skipped. A `no-map` range stays in the direct map, which
+covers the low four gigabytes whatever the tree says, and is only kept out of
+the allocator. The allocator's bitmap goes in the first run of memory clear of
+all of it. Boot prints the list, with each range that lies partly or wholly
+outside the memory the tree describes marked so:
+
+```
+reserved memory: /memreserve/ 0x0-0x1000; linux,cma dynamic, size 0x4000000, not allocated; nvram@0 disabled, not reserved; nvram@1 disabled, not reserved
+```
+
+That is the Pi's tree file as QEMU hands it over. On the board the firmware
+fills in the tree before the kernel reads it, so the board's line is the one
+that shows what it reserved.
+
 The tables themselves are given back the same way. A last-level table covers
 two megabytes, and the one an unmap leaves with nothing in it is freed, and the
 ones above it while they keep emptying, so a program that maps and unmaps its
@@ -1576,7 +1600,9 @@ failures.
   and every value of every length byte in it; and a lease kept while the link
   goes down and comes back, with a renewal under way sent again on the tick the
   link returns. On aarch64 the same run adds the Pi's own Ethernet and WiFi
-  drivers, for 464. The WiFi checks include the
+  drivers and the frame allocator given a tree whose `/reserved-memory` names
+  ranges, every frame of which it has to hand out without one of them, for
+  468. The WiFi checks include the
   WPA2 handshake: the SHA-1 PRF and the 802.11 passphrase-to-key vectors, RFC
   3394 key wrap, and Wireshark's published `wpa-Induction` capture fed through
   the supplicant. Messages 2 and 4 have to match the captured frames byte for
@@ -1652,6 +1678,22 @@ failures.
   serve the seeded page to busybox `wget`. The quick tunnel, run from
   `/usr/bin/cloudflared`, which has no network under QEMU, has to exit and be
   started again.
+- The **device tree reader** runs on aarch64. It first runs `tools/devicetree`'s
+  tests, which build the kernel's reader of memory nodes, reservations, command
+  line and ram disk for the Mac. Over the Pi's tree file and the tree QEMU makes
+  of it with `-machine dumpdtb`: the header's reservation of the spin tables'
+  page is reserved, `linux,cma` is listed as a pool that is not allocated, and
+  `nvram@0` and `nvram@1` as switched off. Over trees the tests write: one and
+  two cells of address and size, a `/reserved-memory` whose cell counts differ
+  from the root's or that gives none, `no-map`, pools, `status` before and after
+  `reg`, a `reg` that is not whole entries, empty or of size zero, cell counts
+  out of range, ranges partly or wholly outside memory or across banks that
+  touch or overlap, a range past the top of the address space, more entries
+  than the boot line lists, and headers that point outside the blob; and every
+  byte of a written tree and every seventh byte of the Pi's replaced, and every
+  length a written tree can be cut to, none of which may make it panic. Then the
+  Rust suite boots with QEMU handing over the Pi's tree instead of a tag list,
+  and has to print that tree's reservations and pass.
 - **/data on an SD card** runs on aarch64, and on a Mac, since its card images
   are made with macOS's `newfs_msdos` through `hdiutil`, without root; elsewhere
   it reports itself skipped. It first runs `tools/fatdisk`'s tests, which build
@@ -1839,6 +1881,9 @@ tools/distro          builds the images, the card's /data and boot files and the
 tools/drive.py        drives the console over a socket, rendering as a terminal
 tools/fatdisk         makes, reads and damages SD card images with macOS's FAT
                       tools, and tests and fuzzes the kernel's FAT code on the Mac
+tools/devicetree      the kernel's reader of a device tree's memory and
+                      reservations, tested on the Mac over the Pi's tree, QEMU's
+                      and trees its tests write
 scripts/build.sh      builds the kernel for ARCH
 scripts/reap-stale.sh clears QEMU instances an earlier run left behind
 scripts/mkcard.sh     assembles the boot partition for a Pi, and prepares or
