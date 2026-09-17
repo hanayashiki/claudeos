@@ -1600,8 +1600,8 @@ failures.
   and every value of every length byte in it; and a lease kept while the link
   goes down and comes back, with a renewal under way sent again on the tick the
   link returns. On aarch64 the same run adds the Pi's own Ethernet and WiFi
-  drivers and the frame allocator given a tree whose `/reserved-memory` names
-  ranges, every frame of which it has to hand out without one of them, for
+  drivers, and the frame allocator built from a tree whose `/reserved-memory`
+  names ranges, where every frame it hands out has to lie outside them, for
   468. The WiFi checks include the
   WPA2 handshake: the SHA-1 PRF and the 802.11 passphrase-to-key vectors, RFC
   3394 key wrap, and Wireshark's published `wpa-Induction` capture fed through
