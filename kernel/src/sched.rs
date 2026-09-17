@@ -322,6 +322,12 @@ unsafe fn switch_to(next: *mut Task) {
     // The reference to the space being left is dropped here with interrupts
     // off. When it is the last one, the owner's drop leaves the free to
     // `mm::space::release_deferred`.
+    //
+    // Both references are let go of before the switch below, and nothing that
+    // has a drop may be left alive across it: a task suspended in there and
+    // then reaped never comes back to run one, because its kernel stack is
+    // handed back as memory. A reference left on it would hold an address
+    // space for as long as the machine ran.
     if let Some(mm) = next_task.mm() {
         // SAFETY: `schedule` masked interrupts before calling this.
         let irq = NoInterrupts::assume();
