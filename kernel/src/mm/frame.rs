@@ -2,7 +2,7 @@
 //!
 //! One bit per 4 KiB frame over the whole usable physical range; a set bit
 //! means the frame is in use. The bitmap itself lives in the first usable
-//! hole large enough to hold it, past everything the boot loader placed.
+//! hole large enough to hold it that overlaps nothing the allocator holds back.
 
 use super::{page_align_up, phys_to_virt, HHDM_LIMIT, KERNEL_PHYS_START, PAGE_SIZE_U64};
 use crate::arch::{DEVICE_PHYS_BASE, RESERVED_PHYS};
