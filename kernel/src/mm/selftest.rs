@@ -512,7 +512,7 @@ mod device_window {
             core::ptr::copy_nonoverlapping(tree.as_ptr(), at, tree.len());
         }
         let mut boot = BootInfo::new();
-        if !fdt::read_into(page.first, &mut boot) {
+        if fdt::read_into(page.first, &mut boot).is_none() {
             return None;
         }
         Some((boot, page))

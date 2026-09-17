@@ -149,7 +149,8 @@ pub extern "C" fn kmain(handoff: u64) -> ! {
     crate::serial::init();
 
     let mut boot = crate::boot::BootInfo::new();
-    let described = if fdt::parse(handoff, &mut boot) {
+    let reserved = fdt::parse(handoff, &mut boot);
+    let described = if reserved.is_some() {
         "device tree"
     } else if atags::parse(handoff, &mut boot) {
         "tag list"
@@ -161,6 +162,13 @@ pub extern "C" fn kmain(handoff: u64) -> ! {
         "nothing"
     };
     crate::println!("handoff: {} at {:#x}", described, handoff);
+    // What the firmware keeps for itself, each range with the node that named
+    // it. The Pi firmware writes some of these at boot, so the tree file on
+    // the card does not show them and this line is where they can be seen.
+    match &reserved {
+        Some(found) => crate::println!("reserved memory: {}", found),
+        None => crate::println!("reserved memory: none named, the handoff is not a device tree"),
+    }
     crate::start(&boot)
 }
 
