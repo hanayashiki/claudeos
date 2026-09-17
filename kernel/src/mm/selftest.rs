@@ -392,89 +392,174 @@ mod device_window {
     /// are counted, reported in a third bank above them.
     const THIRD_BANK: (u64, u64) = (0x1_0000_0000, 0x8C0_0000);
 
+    /// A tree written node by node: the structure block and the strings block
+    /// it names properties out of.
+    struct Writer {
+        structure: Vec<u8>,
+        strings: Vec<u8>,
+    }
+
+    impl Writer {
+        fn new() -> Writer {
+            Writer { structure: Vec::new(), strings: Vec::new() }
+        }
+
+        fn word(&mut self, value: u32) {
+            self.structure.extend_from_slice(&value.to_be_bytes());
+        }
+
+        fn pad(&mut self) {
+            while self.structure.len() % 4 != 0 {
+                self.structure.push(0);
+            }
+        }
+
+        fn begin(&mut self, name: &str) {
+            self.word(BEGIN_NODE);
+            self.structure.extend_from_slice(name.as_bytes());
+            self.structure.push(0);
+            self.pad();
+        }
+
+        fn end(&mut self) {
+            self.word(END_NODE);
+        }
+
+        fn prop(&mut self, name: &str, value: &[u8]) {
+            let offset = self.strings.len() as u32;
+            self.strings.extend_from_slice(name.as_bytes());
+            self.strings.push(0);
+            self.word(PROP);
+            self.word(value.len() as u32);
+            self.word(offset);
+            self.structure.extend_from_slice(value);
+            self.pad();
+        }
+
+        /// A `reg` of two-cell addresses and two-cell sizes.
+        fn reg(&mut self, entries: &[(u64, u64)]) {
+            let mut reg: Vec<u8> = Vec::new();
+            for &(base, size) in entries {
+                reg.extend_from_slice(&base.to_be_bytes());
+                reg.extend_from_slice(&size.to_be_bytes());
+            }
+            self.prop("reg", &reg);
+        }
+
+        /// The header, then an empty list of reserved ranges ending in a pair
+        /// of zeroes, then the two blocks.
+        fn finish(mut self) -> Vec<u8> {
+            self.word(END);
+            let reserve_at = 40usize;
+            let struct_at = reserve_at + 16;
+            let strings_at = struct_at + self.structure.len();
+            let total = strings_at + self.strings.len();
+
+            let mut blob: Vec<u8> = Vec::with_capacity(total);
+            for word in [
+                MAGIC,
+                total as u32,
+                struct_at as u32,
+                strings_at as u32,
+                reserve_at as u32,
+                VERSION,
+                LAST_COMPATIBLE_VERSION,
+                0,
+                self.strings.len() as u32,
+                self.structure.len() as u32,
+            ] {
+                blob.extend_from_slice(&word.to_be_bytes());
+            }
+            blob.resize(struct_at, 0);
+            blob.extend_from_slice(&self.structure);
+            blob.extend_from_slice(&self.strings);
+            blob
+        }
+    }
+
+    /// The root, whose cell counts say how wide the numbers in its children's
+    /// `reg` are: two cells each, which is what a board with memory above four
+    /// gigabytes has to use.
+    fn root() -> Writer {
+        let mut tree = Writer::new();
+        tree.begin("");
+        tree.prop("#address-cells", &2u32.to_be_bytes());
+        tree.prop("#size-cells", &2u32.to_be_bytes());
+        tree
+    }
+
     /// A tree carrying nothing but a memory node, whose second bank ends where
     /// the caller says. Only the memory map is read out of it, so the rest of
     /// what a board's tree holds would not be looked at.
     fn memory_tree(second_bank_end: u64) -> Vec<u8> {
-        let mut structure: Vec<u8> = Vec::new();
-        let mut strings: Vec<u8> = Vec::new();
-
-        let be32 = |out: &mut Vec<u8>, value: u32| out.extend_from_slice(&value.to_be_bytes());
-        let intern = |strings: &mut Vec<u8>, name: &str| {
-            let offset = strings.len() as u32;
-            strings.extend_from_slice(name.as_bytes());
-            strings.push(0);
-            offset
-        };
-        let prop = |structure: &mut Vec<u8>, strings: &mut Vec<u8>, name: &str, value: &[u8]| {
-            let offset = intern(strings, name);
-            structure.extend_from_slice(&PROP.to_be_bytes());
-            structure.extend_from_slice(&(value.len() as u32).to_be_bytes());
-            structure.extend_from_slice(&offset.to_be_bytes());
-            structure.extend_from_slice(value);
-            while structure.len() % 4 != 0 {
-                structure.push(0);
-            }
-        };
-
-        // The root, whose cell counts say how wide the numbers in its
-        // children's `reg` are: two cells each, which is what a board with
-        // memory above four gigabytes has to use.
-        be32(&mut structure, BEGIN_NODE);
-        structure.push(0);
-        while structure.len() % 4 != 0 {
-            structure.push(0);
-        }
-        prop(&mut structure, &mut strings, "#address-cells", &2u32.to_be_bytes());
-        prop(&mut structure, &mut strings, "#size-cells", &2u32.to_be_bytes());
-
-        be32(&mut structure, BEGIN_NODE);
-        structure.extend_from_slice(b"memory@0\0");
-        while structure.len() % 4 != 0 {
-            structure.push(0);
-        }
-        prop(&mut structure, &mut strings, "device_type", b"memory\0");
-        let mut reg: Vec<u8> = Vec::new();
-        for &(base, size) in &[
+        let mut tree = root();
+        tree.begin("memory@0");
+        tree.prop("device_type", b"memory\0");
+        tree.reg(&[
             (0u64, FIRST_BANK_END),
             (SECOND_BANK_START, second_bank_end - SECOND_BANK_START),
             THIRD_BANK,
-        ] {
-            reg.extend_from_slice(&base.to_be_bytes());
-            reg.extend_from_slice(&size.to_be_bytes());
-        }
-        prop(&mut structure, &mut strings, "reg", &reg);
-        be32(&mut structure, END_NODE);
+        ]);
+        tree.end();
+        tree.end();
+        tree.finish()
+    }
 
-        be32(&mut structure, END_NODE);
-        be32(&mut structure, END);
+    /// Memory of the tree `reserving_tree` writes.
+    const RESERVING_MEMORY: u64 = 0x0800_0000;
+    /// The ranges its `/reserved-memory` children name and leave switched on:
+    /// one of a megabyte with `no-map`, and a node of two entries, the first of
+    /// which starts and ends inside a page.
+    const RESERVING_NAMED: [(u64, u64); 3] =
+        [(0x0500_0000, 0x10_0000), (0x0600_0c00, 0x1800), (0x0680_0000, 0x2000)];
+    /// The range of its child that is switched off.
+    const RESERVING_DISABLED: (u64, u64) = (0x0700_0000, 0x10_0000);
+    /// Where its child whose size runs past the top of the address space
+    /// starts.
+    const RESERVING_TO_THE_TOP: u64 = 0x07f0_0000;
 
-        // The header, then an empty list of reserved ranges ending in a pair
-        // of zeroes, then the two blocks.
-        let reserve_at = 40usize;
-        let struct_at = reserve_at + 16;
-        let strings_at = struct_at + structure.len();
-        let total = strings_at + strings.len();
+    /// A tree for 128 MiB whose `/reserved-memory` holds what the Pi's can
+    /// once the firmware has filled it in -- a range with `no-map`, a pool to
+    /// be allocated, a node switched off -- and a node with two ranges, and one
+    /// whose size runs past the top of the address space.
+    fn reserving_tree() -> Vec<u8> {
+        let mut tree = root();
+        tree.begin("reserved-memory");
+        tree.prop("#address-cells", &2u32.to_be_bytes());
+        tree.prop("#size-cells", &2u32.to_be_bytes());
+        tree.prop("ranges", &[]);
 
-        let mut blob: Vec<u8> = Vec::with_capacity(total);
-        for word in [
-            MAGIC,
-            total as u32,
-            struct_at as u32,
-            strings_at as u32,
-            reserve_at as u32,
-            VERSION,
-            LAST_COMPATIBLE_VERSION,
-            0,
-            strings.len() as u32,
-            structure.len() as u32,
-        ] {
-            blob.extend_from_slice(&word.to_be_bytes());
-        }
-        blob.resize(struct_at, 0);
-        blob.extend_from_slice(&structure);
-        blob.extend_from_slice(&strings);
-        blob
+        tree.begin("linux,cma");
+        tree.prop("size", &0x0100_0000u64.to_be_bytes());
+        tree.prop("reusable", &[]);
+        tree.end();
+
+        tree.begin("firmware@5000000");
+        tree.reg(&RESERVING_NAMED[..1]);
+        tree.prop("no-map", &[]);
+        tree.end();
+
+        tree.begin("split@6000c00");
+        tree.reg(&RESERVING_NAMED[1..]);
+        tree.end();
+
+        tree.begin("off@7000000");
+        tree.reg(&[RESERVING_DISABLED]);
+        tree.prop("status", b"disabled\0");
+        tree.end();
+
+        tree.begin("top@7f00000");
+        tree.reg(&[(RESERVING_TO_THE_TOP, u64::MAX)]);
+        tree.end();
+        tree.end();
+
+        // After `/reserved-memory`, where the Pi's tree has it.
+        tree.begin("memory@0");
+        tree.prop("device_type", b"memory\0");
+        tree.reg(&[(0, RESERVING_MEMORY)]);
+        tree.end();
+        tree.end();
+        tree.finish()
     }
 
     /// Frames taken from the real allocator, given back when the check is
@@ -526,6 +611,51 @@ mod device_window {
     pub fn run(report: &mut Report) {
         reports_only_what_it_can_touch(report);
         hands_out_nothing_in_the_window(report);
+        hands_out_nothing_the_firmware_reserved(report);
+    }
+
+    /// The ranges a tree's `/reserved-memory` names, read by the kernel's own
+    /// reader out of memory and applied by the allocator. Every frame the
+    /// allocator will give is taken, so the check covers all of them rather
+    /// than the first few.
+    fn hands_out_nothing_the_firmware_reserved(report: &mut Report) {
+        let tree = reserving_tree();
+        let Some((boot, _blob)) = map_from(&tree) else {
+            report.check("a tree whose /reserved-memory names ranges", false);
+            return;
+        };
+        let limit = frame::usable_limit(&boot);
+        let Some(metadata) = Borrowed::take(frame::metadata_bytes(limit)) else {
+            report.check("a tree whose /reserved-memory names ranges", false);
+            return;
+        };
+        let mut alloc = frame::build(&boot, limit, metadata.first);
+        report.check("a tree whose /reserved-memory names ranges", true);
+
+        let touches = |addr: u64, (start, size): (u64, u64)| addr < start + size && start < addr + PAGE_SIZE_U64;
+        let mut named = 0usize;
+        let mut disabled = 0usize;
+        let mut highest = 0u64;
+        while let Some(addr) = alloc.alloc() {
+            if RESERVING_NAMED.iter().any(|&range| touches(addr, range)) {
+                named += 1;
+            }
+            if touches(addr, RESERVING_DISABLED) {
+                disabled += 1;
+            }
+            highest = highest.max(addr);
+        }
+        report.check("it hands out no page holding any part of a range they name", named == 0);
+        report.check(
+            "nor anything of the range that runs to the top of the address space",
+            highest < RESERVING_TO_THE_TOP,
+        );
+        // Most of its megabyte: the blob and the metadata borrowed from the
+        // real allocator for this check, eighteen pages, could sit in it.
+        report.check(
+            "and hands out the range of the node that is switched off",
+            disabled >= (RESERVING_DISABLED.1 / PAGE_SIZE_U64) as usize - 32,
+        );
     }
 
     /// A 4 GiB board's own map: everything below the peripherals is memory and
