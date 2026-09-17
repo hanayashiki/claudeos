@@ -1,0 +1,14 @@
+[package]
+name = "devicetree"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A library and its tests, built for the Mac and never for the kernel. The
+# library compiles the kernel's own device tree reader,
+# kernel/src/arch/aarch64/fdt/machine.rs, and the BootInfo it fills in,
+# kernel/src/boot.rs, by links under src/. The tests run it over the Pi's tree
+# file from build/distro/board-aarch64/boot, the tree QEMU makes of that file
+# for its emulated Pi 4, and trees the tests write. No crate outside the
+# standard library is used.
+[dependencies]

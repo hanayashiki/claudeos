@@ -2,10 +2,12 @@
 //!
 //! This is how a board following the Linux AArch64 boot protocol says what it
 //! has: the firmware leaves a blob in memory and puts its address in x0.
-//! `parse` takes four things out of it at start-up — where memory is, what the
-//! command line says, and where an initial ram disk was placed — because
-//! everything else this kernel needs about the machine itself it already
-//! knows.
+//! `parse` takes four things out of it at start-up — where memory is, which
+//! parts of it the firmware has reserved, what the command line says, and
+//! where an initial ram disk was placed — because everything else this kernel
+//! needs about the machine itself it already knows. That reading is in
+//! `machine`, over a byte slice, so that tools/devicetree can run it on the
+//! Mac.
 //!
 //! `find_compatible` is the other half, and it is for devices rather than for
 //! the machine. A driver that is not on a bus it can enumerate has no way to
@@ -16,8 +18,12 @@
 //! block indexed by offset, so nothing can be overlaid with a struct.
 
 use crate::boot::BootInfo;
-use crate::mm::phys_to_virt;
+use crate::mm::{phys_to_virt, HHDM_LIMIT};
 use core::sync::atomic::{AtomicU64, Ordering};
+
+mod machine;
+
+pub use machine::Found;
 
 const MAGIC: u32 = 0xD00D_FEED;
 
@@ -87,135 +93,46 @@ pub fn blob() -> Option<u64> {
 }
 
 /// Read the blob at `phys` into `info` and remember it as the machine's own,
-/// which is the tree every later device lookup goes through. Returns false if
-/// there is no device tree there, in which case `info` is untouched.
-pub fn parse(phys: u64, info: &mut BootInfo) -> bool {
-    if !read_into(phys, info) {
-        return false;
+/// which is the tree every later device lookup goes through. Returns what the
+/// read found reserved, for the boot line, or nothing if there is no device
+/// tree there, in which case `info` is untouched.
+pub fn parse(phys: u64, info: &mut BootInfo) -> Option<Found> {
+    let found = read_into(phys, info);
+    match found {
+        Some(_) => BLOB.store(phys, Ordering::Relaxed),
+        // The magic number is there and the rest of the header is not usable.
+        // Said here, because the handoff line that follows calls it nothing.
+        None if present(phys) => crate::println!(
+            "device tree at {:#x} refused: its header is malformed or says it is over {} bytes",
+            phys,
+            machine::MAX_SIZE
+        ),
+        None => {}
     }
-    BLOB.store(phys, Ordering::Relaxed);
-    true
+    found
 }
 
 /// The same without remembering it. A check reading a tree it built itself
 /// wants this: the machine's own tree is the one the drivers have to keep.
-pub fn read_into(phys: u64, info: &mut BootInfo) -> bool {
+pub fn read_into(phys: u64, info: &mut BootInfo) -> Option<Found> {
     if !present(phys) {
-        return false;
+        return None;
     }
     let base = phys_to_virt(phys);
-    unsafe {
-        let total_size = be32(base + 4) as u64;
-        let struct_offset = be32(base + 8) as u64;
-        let strings_offset = be32(base + 12) as u64;
-        let reserve_offset = be32(base + 16) as u64;
-        let struct_size = be32(base + 36) as u64;
-
-        // The blob itself is read all through start-up, so it has to survive
-        // the frame allocator's first pass.
-        info.reserve(phys, phys + total_size);
-
-        // Ranges the firmware says are already spoken for.
-        let mut entry = base + reserve_offset;
-        loop {
-            let address = be64(entry);
-            let size = be64(entry + 8);
-            if size == 0 {
-                break;
-            }
-            info.reserve(address, address + size);
-            entry += 16;
-        }
-
-        let strings = base + strings_offset;
-        let mut cursor = base + struct_offset;
-        let end = cursor + struct_size;
-
-        let mut depth = 0usize;
-        let mut in_memory = false;
-        let mut in_chosen = false;
-        // What the specification says to assume when the root does not say.
-        let mut address_cells = 2u32;
-        let mut size_cells = 1u32;
-        // The two ends of the ram disk arrive as separate properties in
-        // either order, so they are held until the walk is over.
-        let mut initrd_start = 0u64;
-        let mut initrd_end = 0u64;
-
-        while cursor + 4 <= end {
-            let token = be32(cursor);
-            cursor += 4;
-            match token {
-                BEGIN_NODE => {
-                    let name = cstr(cursor);
-                    cursor += align4(name.len() as u64 + 1);
-                    depth += 1;
-                    if depth == 2 {
-                        in_memory = name.starts_with(b"memory");
-                        in_chosen = name == b"chosen";
-                    }
-                }
-                END_NODE => {
-                    if depth == 2 {
-                        in_memory = false;
-                        in_chosen = false;
-                    }
-                    depth = depth.saturating_sub(1);
-                }
-                PROP => {
-                    let length = be32(cursor) as u64;
-                    let name = cstr(strings + be32(cursor + 4) as u64);
-                    let value = cursor + 8;
-                    cursor = value + align4(length);
-
-                    if depth == 1 {
-                        // The root's cell counts say how wide the addresses
-                        // and sizes in its children are.
-                        if name == b"#address-cells" {
-                            address_cells = be32(value);
-                        } else if name == b"#size-cells" {
-                            size_cells = be32(value);
-                        }
-                    } else if in_memory && name == b"reg" {
-                        let stride = (address_cells + size_cells) as u64 * 4;
-                        let mut at = value;
-                        while at + stride <= value + length {
-                            let address = cells(at, address_cells);
-                            let size = cells(at + address_cells as u64 * 4, size_cells);
-                            info.add_region(address, size, true);
-                            at += stride;
-                        }
-                    } else if in_chosen {
-                        if name == b"bootargs" {
-                            // The property carries its terminator; the command
-                            // line does not want it.
-                            let text = &core::slice::from_raw_parts(
-                                value as *const u8,
-                                length as usize,
-                            )[..];
-                            let text = match text.iter().position(|&b| b == 0) {
-                                Some(at) => &text[..at],
-                                None => text,
-                            };
-                            info.set_cmdline(text);
-                        } else if name == b"linux,initrd-start" {
-                            initrd_start = cells(value, (length / 4) as u32);
-                        } else if name == b"linux,initrd-end" {
-                            initrd_end = cells(value, (length / 4) as u32);
-                        }
-                    }
-                }
-                NOP => {}
-                END => break,
-                _ => break,
-            }
-        }
-
-        if initrd_end > initrd_start {
-            info.add_module(initrd_start, initrd_end);
-        }
+    let total_size = unsafe { be32(base + 4) } as u64;
+    // The blob is read through the direct map, which ends at HHDM_LIMIT, and
+    // a size past MAX_SIZE is a damaged header rather than a tree.
+    if total_size as usize > machine::MAX_SIZE || phys.checked_add(total_size)? > HHDM_LIMIT {
+        return None;
     }
-    true
+    // SAFETY: the range is inside the direct map boot.s built over the low
+    // four gigabytes, and nothing writes to the blob while it is read.
+    let blob = unsafe { core::slice::from_raw_parts(base as *const u8, total_size as usize) };
+    let found = machine::read(blob, info)?;
+    // The blob is read all through start-up, and every device lookup goes
+    // back to it, so the frame allocator must never hand it out.
+    info.reserve(phys, phys + total_size);
+    Some(found)
 }
 
 // ---------------------------------------------------------------------------

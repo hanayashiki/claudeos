@@ -2,7 +2,7 @@
 //!
 //! One bit per 4 KiB frame over the whole usable physical range; a set bit
 //! means the frame is in use. The bitmap itself lives in the first usable
-//! hole large enough to hold it, past everything the boot loader placed.
+//! hole large enough to hold it that overlaps nothing the allocator holds back.
 
 use super::{page_align_up, phys_to_virt, HHDM_LIMIT, KERNEL_PHYS_START, PAGE_SIZE_U64};
 use crate::arch::{DEVICE_PHYS_BASE, RESERVED_PHYS};
@@ -64,9 +64,16 @@ impl BitmapAllocator {
         unsafe { *self.refcounts.add(frame) }
     }
 
+    /// The end of what the bitmap covers. Ranges are cut to it before they
+    /// are rounded to pages: a range a device tree reserves can run to the top
+    /// of the address space, and rounding that up would overflow.
+    fn covered(&self) -> u64 {
+        self.frames as u64 * PAGE_SIZE_U64
+    }
+
     fn mark_range_used(&mut self, start: u64, end: u64) {
-        let first = (start / PAGE_SIZE_U64) as usize;
-        let last = (page_align_up(end) / PAGE_SIZE_U64) as usize;
+        let first = (start.min(self.covered()) / PAGE_SIZE_U64) as usize;
+        let last = (page_align_up(end.min(self.covered())) / PAGE_SIZE_U64) as usize;
         for f in first..last.min(self.frames) {
             if !self.test(f) {
                 self.used += 1;
@@ -78,8 +85,8 @@ impl BitmapAllocator {
     }
 
     fn mark_range_free(&mut self, start: u64, end: u64) {
-        let first = (page_align_up(start) / PAGE_SIZE_U64) as usize;
-        let last = (end / PAGE_SIZE_U64) as usize;
+        let first = (page_align_up(start.min(self.covered())) / PAGE_SIZE_U64) as usize;
+        let last = (end.min(self.covered()) / PAGE_SIZE_U64) as usize;
         for f in first..last.min(self.frames) {
             if self.test(f) {
                 self.used -= 1;
@@ -272,6 +279,17 @@ pub fn build(boot: &BootInfo, limit: u64, metadata_phys: u64) -> BitmapAllocator
             alloc.mark_range_free(r.addr, r.end().min(limit));
         }
     }
+    // Where a map lists a range as usable and also as something else, the
+    // other entry wins. That is how Linux resolves an E820 map whose entries
+    // overlap, which its e820__update_table (arch/x86/kernel/e820.c) says some
+    // BIOSes report: of the overlapping types the highest numbered is kept,
+    // and usable RAM is type 1. Each range is rounded out to whole pages, so a
+    // page that is partly reserved is not handed out.
+    for r in boot.regions() {
+        if !r.usable {
+            alloc.mark_range_used(r.addr, r.end());
+        }
+    }
     // What has just been released is all the memory there is. Whatever the
     // bitmap still covers is a hole between the banks the map reports, or the
     // part of the map that was clamped away above; neither is memory, so
@@ -292,39 +310,61 @@ pub fn build(boot: &BootInfo, limit: u64, metadata_phys: u64) -> BitmapAllocator
     alloc
 }
 
+/// The end of the first thing `start..end` overlaps that `build` will hold
+/// back: the kernel image, the modules, a range the loader or the firmware
+/// reserved, memory the machine claims, or a range the map does not call
+/// usable. Nothing when it overlaps none of them.
+fn first_overlap(boot: &BootInfo, start: u64, end: u64) -> Option<u64> {
+    let overlaps = |from: u64, to: u64| from < end && start < to;
+    let kernel = (KERNEL_PHYS_START, super::kernel_phys_end());
+    let reserved = boot.reserved().iter().map(|r| (r.start, r.end));
+    let modules = boot.modules().iter().map(|m| (m.start, m.end));
+    let claimed = RESERVED_PHYS.iter().copied();
+    let unusable = boot.regions().iter().filter(|r| !r.usable).map(|r| (r.addr, r.end()));
+    core::iter::once(kernel)
+        .chain(reserved)
+        .chain(modules)
+        .chain(claimed)
+        .chain(unusable)
+        .find(|&(from, to)| overlaps(from, to))
+        .map(|(_, to)| to)
+}
+
 /// Build the frame allocator from the boot loader's memory map.
 pub fn init(boot: &BootInfo) {
     let limit = usable_limit(boot);
-    let metadata = metadata_bytes(limit);
+    let metadata = metadata_bytes(limit) as u64;
 
-    // The bitmap must not land on the kernel image, the modules, anything the
-    // loader left behind, or memory the machine claims, so start looking past
-    // all of them.
-    let mut barrier = super::kernel_phys_end();
-    for r in boot.reserved() {
-        barrier = barrier.max(r.end);
-    }
-    for m in boot.modules() {
-        barrier = barrier.max(m.end);
-    }
-    for &(_, end) in RESERVED_PHYS {
-        barrier = barrier.max(end);
-    }
-    let mut bitmap_phys = 0u64;
-    for r in boot.regions() {
+    // The bitmap goes in the first run of usable memory long enough for it
+    // that overlaps nothing `build` holds back. Searching past the highest
+    // reserved end instead would find no room at all on a machine whose
+    // firmware reserves a range near the top of memory, or outside it, as a
+    // device tree's `/reserved-memory` can. Each overlap moves the search past
+    // the range overlapped, so the search ends.
+    let mut bitmap_phys = None;
+    'regions: for r in boot.regions() {
         if !r.usable {
             continue;
         }
-        let start = page_align_up(r.addr.max(barrier));
         // Clamped like the rest of the map: metadata reached through a device
         // alias would be read back with whatever attributes the walk of the
         // bitmap happened to use.
-        if start + metadata as u64 <= r.end().min(limit) {
-            bitmap_phys = start;
-            break;
+        let end = r.end().min(limit);
+        let mut start = page_align_up(r.addr);
+        while start.saturating_add(metadata) <= end {
+            match first_overlap(boot, start, start + metadata) {
+                None => {
+                    bitmap_phys = Some(start);
+                    break 'regions;
+                }
+                Some(past) if past < end => start = page_align_up(past),
+                // Held back to the end of this region or beyond, which can be
+                // the top of the address space, where aligning would overflow.
+                Some(_) => break,
+            }
         }
     }
-    assert!(bitmap_phys != 0, "no room for the frame bitmap");
+    let bitmap_phys = bitmap_phys.expect("no room for the frame bitmap");
 
     *ALLOCATOR.lock() = Some(build(boot, limit, bitmap_phys));
 }

@@ -47,7 +47,11 @@ impl Module {
 
 pub const MAX_REGIONS: usize = 32;
 pub const MAX_MODULES: usize = 8;
-pub const MAX_RESERVED: usize = 16;
+/// Room for what the loader placed and everything a device tree's
+/// `/reserved-memory` names, so that a full table, which folds a new range
+/// into its nearest neighbour and reserves everything between the two, is not
+/// reached by a tree with a few more children than the Pi's.
+pub const MAX_RESERVED: usize = 64;
 /// The same length Linux accepts on arm64. The Raspberry Pi firmware puts a
 /// few hundred bytes of its own settings in front of cmdline.txt, so a shorter
 /// limit cuts off the end of the line, which is the part that came from us.
@@ -79,7 +83,10 @@ impl BootInfo {
         }
     }
 
+    /// A region running past the top of the address space is cut there, so
+    /// that `end` of a damaged entry is not an overflow.
     pub fn add_region(&mut self, addr: u64, len: u64, usable: bool) {
+        let len = len.min(u64::MAX - addr);
         if self.region_count < MAX_REGIONS {
             self.regions[self.region_count] = MemRegion { addr, len, usable };
             self.region_count += 1;
