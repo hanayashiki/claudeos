@@ -36,6 +36,9 @@ pub const PAGE_BITS: u32 = 12;
 pub const LEVEL_BITS: u32 = 9;
 /// Bytes in a page.
 pub const PAGE_BYTES: usize = 1 << PAGE_BITS;
+/// How much four levels translate. An address above this has no descriptor:
+/// the top index would be taken from bits the walk does not read.
+pub const SPAN: u64 = 1 << (PAGE_BITS + LEVEL_BITS * 4);
 
 /// The descriptor of `virt` at `level`: 3 in the top table, 0 at the last.
 #[inline]
@@ -591,6 +594,12 @@ impl<'a, M: Machine> Tables<'a, M> {
     /// without holding a descriptor pointer: the caller gets an address, lets
     /// go of whatever it was holding, and comes back with the address.
     pub fn next_populated(&self, from: u64, limit: u64) -> Option<u64> {
+        // Past `SPAN` the top index is taken from bits the walk does not read,
+        // so a scan that ran on would find the same tables again under a
+        // different address. The kernel's callers stop at the top of the half
+        // a program owns and never reach this; it is here so that a limit
+        // meaning "everything" cannot be one.
+        let limit = limit.min(SPAN);
         let mut virt = from & !(level_size(1) - 1);
         'blocks: while virt < limit {
             let mut table = self.root;
