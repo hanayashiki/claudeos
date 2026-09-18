@@ -32,6 +32,7 @@ pub fn spin_us(micros: u64) {
 
 /// Sleep for at least `millis` milliseconds, rounded up to the timer tick.
 pub fn sleep_ms(millis: u64) {
+    crate::mm::space::might_sleep("sleeping for a card");
     let hz = arch::TICK_HZ as u64;
     crate::sched::sleep_ticks((millis * hz).div_ceil(1000).max(1));
 }

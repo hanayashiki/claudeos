@@ -1,7 +1,9 @@
 //! ELF64 program loader for static executables.
 
 use crate::abi::Errno;
-use crate::arch::paging::{FreshPage, PageTables, NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::arch::paging::{NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::mm::space::Mm;
+use crate::mm::tables::Prepared;
 use crate::fs::NodeKind;
 use crate::mm::{page_align_down, PAGE_SIZE_U64};
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -349,7 +351,7 @@ impl Extent {
 /// on: the contents go in through the frames rather than through the
 /// addresses they will be read at.
 pub fn load_at(
-    space: &PageTables,
+    space: &Mm,
     node: &crate::fs::NodeRef,
     base_override: Option<u64>,
 ) -> Result<LoadedImage, Errno> {
@@ -439,9 +441,9 @@ pub fn load_at(
     // same memory either way -- mapping each page as the copy reached it
     // would commit exactly as much -- but until the end it is held here
     // instead of in the page tables.
-    let mut fresh: BTreeMap<u64, FreshPage> = BTreeMap::new();
+    let mut fresh: BTreeMap<u64, Prepared> = BTreeMap::new();
     for page in eager {
-        fresh.insert(page, FreshPage::new().ok_or(Errno::ENOMEM)?);
+        fresh.insert(page, Prepared::new(0).ok_or(Errno::ENOMEM)?);
     }
 
     for (_, extent) in &loads {
@@ -467,7 +469,7 @@ pub fn load_at(
     }
 
     for (page, flags) in &page_flags {
-        let Some(fresh) = fresh.remove(page) else {
+        let Some(mut fresh) = fresh.remove(page) else {
             continue;
         };
         let mut bits = PRESENT | USER;
@@ -477,7 +479,14 @@ pub fn load_at(
         if flags & PF_X == 0 {
             bits |= NO_EXECUTE;
         }
-        space.publish(*page, fresh, bits).map_err(|_| Errno::ENOMEM)?;
+        // One page per turn of the lock. The image is being built into an
+        // address space the task doing the building is the only holder of, so
+        // there is nothing for a longer hold to keep out; a page at a time is
+        // what keeps the timer off for one store rather than for the length of
+        // the image.
+        let done = space.publish_page(*page, &mut fresh, bits);
+        drop(fresh);
+        done.map_err(|_| Errno::ENOMEM)?;
     }
 
     // AT_PHDR must point at the program headers as they sit in memory.

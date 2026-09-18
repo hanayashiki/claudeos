@@ -12,7 +12,8 @@
 //! taking 0xFFFF, which is what the bus returns when nothing answers, as
 //! "empty".
 
-use crate::arch::paging::{kernel_tables, NO_CACHE, NO_EXECUTE, PRESENT, WRITABLE};
+use crate::arch::paging::{NO_CACHE, NO_EXECUTE, PRESENT, WRITABLE};
+use crate::mm::tables::kernel_tables;
 use crate::arch::{pci_config_read32, pci_config_write32};
 use crate::mm::{page_align_up, PAGE_SIZE_U64};
 use crate::sync::Spinlock;

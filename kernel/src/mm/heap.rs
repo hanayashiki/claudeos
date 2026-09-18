@@ -1,6 +1,7 @@
 //! Kernel heap: an address-ordered free list with coalescing on free.
 
-use crate::arch::paging::{kernel_tables, NO_EXECUTE, PRESENT, WRITABLE};
+use crate::arch::paging::{NO_EXECUTE, PRESENT, WRITABLE};
+use crate::mm::tables::kernel_tables;
 use super::{align_up, KERNEL_HEAP_BASE, KERNEL_HEAP_SIZE, PAGE_SIZE_U64};
 use crate::sync::Spinlock;
 use core::alloc::{GlobalAlloc, Layout};

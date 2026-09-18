@@ -61,6 +61,7 @@ impl<T> SleepLock<T> {
 
     /// Take the lock, sleeping until it is free. Only from a task.
     pub fn lock(&self) -> SleepGuard<'_, T> {
+        crate::mm::space::might_sleep("taking a sleeping lock");
         // The test runs inside the queue's check, with interrupts off, so a
         // release between a failed try and the sleep still wakes this task.
         self.queue.wait_until(|| self.held.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok());

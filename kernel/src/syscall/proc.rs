@@ -202,14 +202,13 @@ pub fn exec_into_current(
     let task = sched::current();
     let old_mm = task.mm();
     drop(crate::sync::without_interrupts(|irq| task.run_on_mm(Some(new_mm.clone()), irq)));
-    let new_space = new_mm.tables_unlocked();
 
     // The code a machine supplies to every program, on the one that supplies
     // any: the page an aarch64 signal handler returns through when the
     // program registered no restorer of its own, which is what a program
     // built for Linux there does. It goes in first, so that everything placed
     // afterwards is placed knowing it is there.
-    if let Err(err) = arch::map_signal_trampoline(&task, &new_space) {
+    if let Err(err) = arch::map_signal_trampoline(&task, &new_mm) {
         abandon_exec(&task, old_mm);
         return Err(err);
     }
@@ -217,7 +216,7 @@ pub fn exec_into_current(
     // The loader reads the file in pieces under its lock rather than holding
     // it open: only the first pages are assembled here, and the rest arrives
     // through the fault handler later.
-    let image = match elf::load_at(&new_space, &node, None) {
+    let image = match elf::load_at(&new_mm, &node, None) {
         Ok(image) => image,
         Err(err) => {
             abandon_exec(&task, old_mm);
@@ -247,7 +246,7 @@ pub fn exec_into_current(
     if let Some(interp_path) = image.interp.clone() {
         let loaded = crate::fs::lookup(&interp_path)
             .map_err(|_| Errno::ENOENT)
-            .and_then(|node| elf::load_at(&new_space, &node, Some(elf::INTERP_BASE)));
+            .and_then(|node| elf::load_at(&new_mm, &node, Some(elf::INTERP_BASE)));
         match loaded {
             Ok(interp_image) => {
                 for segment in &interp_image.segments {
