@@ -63,7 +63,6 @@ pub mod wpa;
 use crate::abi::Errno;
 use crate::arch;
 use crate::arch::mailbox::{self, Mailbox};
-use crate::arch::paging::AddressSpace;
 use crate::mm::phys_to_virt;
 use crate::net::Interface;
 use crate::sched::{self, WaitQueue};
@@ -356,8 +355,7 @@ pub fn probe() -> bool {
 
 /// Start the driver's task, which does the rest.
 pub fn start_task() {
-    let space = AddressSpace::current();
-    let Some(mut task) = Task::new("wifid", space) else {
+    let Some(mut task) = Task::new("wifid", None) else {
         crate::println!("wifi: cannot create the driver task");
         return;
     };

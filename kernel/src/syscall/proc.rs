@@ -1,14 +1,15 @@
 //! Process, time and signal system calls.
 
 use crate::abi::*;
-use crate::arch::paging::AddressSpace;
 use crate::arch::{self, TrapFrame};
 use crate::elf;
+use crate::mm::space::Mm;
 use crate::sched;
 use crate::signal::Signal;
 use crate::task::{self, State, Task};
 use crate::uaccess;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 pub fn fork(
@@ -22,33 +23,16 @@ pub fn fork(
     let parent = sched::current();
     let share_vm = flags & CLONE_VM != 0;
 
-    // A fresh address space belongs to nothing until the child is registered
-    // on it, so anything that goes wrong before then has to hand it back here
-    // or it is held by nobody: the tables under it, and the references its
-    // entries took on the parent's frames, would stay taken for good.
-    let space = if share_vm {
-        parent.space()
-    } else {
-        let space = AddressSpace::new_user().ok_or(Errno::ENOMEM)?;
-        if space.clone_user_from(&parent.space()).is_err() {
-            space.destroy();
-            return Err(Errno::ENOMEM);
-        }
-        space
-    };
-
-    let Some(mut child) = Task::new(&parent.name(), space) else {
-        if !share_vm {
-            space.destroy();
-        }
+    // Threads must see each other's mappings, so they share the one address
+    // space; a fork gets its own copy. Either way the child holds a reference,
+    // and a child that goes no further than this function drops it again: a
+    // copy nobody else holds is freed with it, the tables under it and the
+    // references its entries took on the parent's frames included.
+    let parent_mm = parent.mm().ok_or(Errno::ENOMEM)?;
+    let mm = if share_vm { parent_mm } else { parent_mm.fork().ok_or(Errno::ENOMEM)? };
+    let Some(mut child) = Task::new(&parent.name(), Some(mm)) else {
         return Err(Errno::ENOMEM);
     };
-    if share_vm {
-        // Threads must see each other's mappings, so they share one record.
-        child.share_space_of(&parent);
-    } else {
-        child.copy_mem_from(&parent);
-    }
     let child_pid = child.pid;
     let is_thread = flags & CLONE_THREAD != 0;
 
@@ -158,24 +142,21 @@ pub fn fork(
 /// Put the task back on the image it was running when an exec could not be
 /// finished.
 ///
-/// Both halves of what was swapped out have to come back. The page tables are
-/// the obvious one; the record of regions and the program break is the other,
-/// and the fault handler consults it for every page that has not been touched
-/// yet, so a task left running with an empty one takes a fault it cannot serve
-/// on the first stack page or heap byte it reaches.
-fn abandon_exec(
-    task: &Task,
-    old_space: AddressSpace,
-    old_mm: alloc::sync::Arc<crate::sync::Spinlock<crate::task::MemState>>,
-    new_space: AddressSpace,
-) {
-    // A context switch reloads the page table root only when the two tasks'
-    // recorded spaces differ, so between the record going back to the old space
-    // and the CPU following it the two disagree. A sibling thread recorded on
-    // the old space is then resumed with no reload and runs on the half-built
+/// The page tables and the record of regions and the program break come back
+/// together, because they are one address space. The fault handler consults
+/// the record for every page that has not been touched yet, so a task left
+/// running with an empty one takes a fault it cannot serve on the first stack
+/// page or heap byte it reaches.
+///
+/// The half-built image is freed when exec's own reference to it goes, after
+/// this returns.
+fn abandon_exec(task: &Task, old_mm: Option<Arc<Mm>>) {
+    // A context switch loads the incoming task's tables only when they are not
+    // the ones loaded, so between the record going back to the old space and
+    // the processor following it the two disagree. A sibling thread recorded
+    // on the old space is then resumed with no load and runs on the half-built
     // exec image. The pair has to move together.
-    crate::sync::without_interrupts(|irq| task.run_on_space(old_space, old_mm, irq));
-    new_space.destroy();
+    drop(crate::sync::without_interrupts(|irq| task.run_on_mm(old_mm, irq)));
 }
 
 /// Replace the current task's program image.
@@ -203,26 +184,25 @@ pub fn exec_into_current(
 
     elf::check(&node)?;
 
-    let old_space = sched::current().space();
-    let new_space = AddressSpace::new_user().ok_or(Errno::ENOMEM)?;
+    let new_mm = Mm::new_user().ok_or(Errno::ENOMEM)?;
 
     // Everything below runs against the new address space; the kernel half is
     // shared so the stack and heap stay valid across the switch.
     //
     // The task's recorded address space is what a context switch compares to
-    // decide whether to reload the page table root, so the record and the CPU
+    // decide whether to load other tables, so the record and the processor
     // have to change together: while they disagree, a sibling thread recorded
-    // on the space the record names is resumed with no reload and runs on the
+    // on the space the record names is resumed with no load and runs on the
     // other one.
     //
-    // exec starts a fresh address space; a shared record must not follow it.
-    // The old record is kept until the image is known to load, because the page
-    // tables it describes are still there and the task goes back to running on
-    // them if it does not.
+    // exec starts a fresh address space; a sibling sharing the old one keeps
+    // it. This call keeps its own reference to the old one until the image is
+    // known to load, because the task goes back to running on it if it does
+    // not.
     let task = sched::current();
     let old_mm = task.mm();
-    let new_mm = alloc::sync::Arc::new(crate::sync::Spinlock::new(crate::task::MemState::new()));
-    crate::sync::without_interrupts(|irq| task.run_on_space(new_space, new_mm, irq));
+    drop(crate::sync::without_interrupts(|irq| task.run_on_mm(Some(new_mm.clone()), irq)));
+    let new_space = new_mm.tables_unlocked();
 
     // The code a machine supplies to every program, on the one that supplies
     // any: the page an aarch64 signal handler returns through when the
@@ -230,7 +210,7 @@ pub fn exec_into_current(
     // built for Linux there does. It goes in first, so that everything placed
     // afterwards is placed knowing it is there.
     if let Err(err) = arch::map_signal_trampoline(&task, &new_space) {
-        abandon_exec(&task, old_space, old_mm, new_space);
+        abandon_exec(&task, old_mm);
         return Err(err);
     }
 
@@ -240,7 +220,7 @@ pub fn exec_into_current(
     let image = match elf::load_at(&new_space, &node, None) {
         Ok(image) => image,
         Err(err) => {
-            abandon_exec(&task, old_space, old_mm, new_space);
+            abandon_exec(&task, old_mm);
             return Err(err);
         }
     };
@@ -290,7 +270,7 @@ pub fn exec_into_current(
                     interp_path,
                     err
                 );
-                abandon_exec(&task, old_space, old_mm, new_space);
+                abandon_exec(&task, old_mm);
                 return Err(Errno::ENOENT);
             }
         }
@@ -299,16 +279,15 @@ pub fn exec_into_current(
     let sp = match task::build_user_stack(&task, &image, &argv, &envp, &exec_path, interp_base) {
         Ok(sp) => sp,
         Err(err) => {
-            abandon_exec(&task, old_space, old_mm, new_space);
+            abandon_exec(&task, old_mm);
             return Err(err);
         }
     };
 
-    // The old image is unreachable from this task. Under CLONE_VM another
-    // task is still running on it, so only the last user tears it down.
-    if old_space != new_space && !sched::space_in_use(old_space) {
-        old_space.destroy();
-    }
+    // The old image is unreachable from this task. A task still running on it
+    // under CLONE_VM holds a reference of its own; when none does, this was
+    // the last, and dropping it frees the image here, with interrupts on.
+    drop(old_mm);
 
     // A vfork parent may resume as soon as the address space is handed back.
     if let Some(parent_pid) = task.vfork_parent.take() {

@@ -1,4 +1,4 @@
-//! Tasks: kernel stacks, address spaces, and the process table.
+//! Tasks: kernel stacks, the address space each runs in, and the process table.
 //!
 //! The kernel runs on a single CPU with interrupt-disabling locks, so the
 //! current task is reached through a raw pointer rather than a lock that a
@@ -11,12 +11,11 @@
 //! the reason set out on `Task` below.
 
 use crate::abi::*;
-use crate::arch::paging::{
-    AddressSpace, FreshPage, MapError, COW, NO_EXECUTE, PRESENT, USER, WRITABLE,
-};
+use crate::arch::paging::{FreshPage, MapError, COW, NO_EXECUTE, PRESENT, USER, WRITABLE};
 use crate::arch::{self, TaskContext, TrapFrame};
 use crate::fs::{FdTable, OpenFile};
-use crate::mm::{page_align_down, page_align_up, PAGE_SIZE_U64, USER_MMAP_BASE, USER_STACK_TOP};
+use crate::mm::space::{Displaced, MemState, Mm};
+use crate::mm::{page_align_down, PAGE_SIZE_U64, USER_STACK_TOP};
 use alloc::alloc::{alloc, dealloc, Layout};
 use alloc::string::{String, ToString};
 use crate::sync::{NoInterrupts, Spinlock};
@@ -59,83 +58,7 @@ pub enum PageAccess {
     Refused,
 }
 
-/// Where a region's contents come from, for a region backed by a file.
-///
-/// An executable is not copied into memory at exec: the pages are filled one
-/// at a time from the file as the program reaches them, which is most of what
-/// makes starting a program cheap.
-#[derive(Clone)]
-pub struct FileMap {
-    pub node: crate::fs::NodeRef,
-    /// Offset in the file of the region's first byte.
-    pub offset: u64,
-    /// Bytes from the start of the region that come from the file. Anything
-    /// past this reads as zero, which is what .bss is.
-    pub length: u64,
-}
-
-impl core::fmt::Debug for FileMap {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "FileMap {{ offset: {:#x}, length: {:#x} }}", self.offset, self.length)
-    }
-}
-
-/// A region of the user address space, used to fault pages in on demand.
-#[derive(Debug, Clone)]
-pub struct Vma {
-    pub start: u64,
-    pub end: u64,
-    pub prot: u64,
-    pub flags: u64,
-    pub file: Option<FileMap>,
-}
-
-impl Vma {
-    pub fn contains(&self, addr: u64) -> bool {
-        addr >= self.start && addr < self.end
-    }
-
-    /// Page table bits this region's pages should get.
-    pub fn page_flags(&self) -> u64 {
-        let mut bits = PRESENT | USER;
-        if self.prot & PROT_WRITE != 0 {
-            bits |= WRITABLE;
-        }
-        if self.prot & PROT_EXEC == 0 {
-            bits |= NO_EXECUTE;
-        }
-        bits
-    }
-}
-
-/// The parts of the address space bookkeeping that threads share. The page
-/// tables themselves are shared through the identical `AddressSpace` value;
-/// this holds the region list and heap bounds that go with them.
-pub struct MemState {
-    pub vmas: Vec<Vma>,
-    pub brk_start: u64,
-    pub brk: u64,
-    pub mmap_top: u64,
-    /// The auxiliary vector exec wrote onto the stack of the program running
-    /// here, word for word, ending with the AT_NULL pair: what
-    /// /proc/<pid>/auxv hands back. Linux keeps it in the mm as `saved_auxv`,
-    /// and this record is what plays the mm's part, so it goes the same way:
-    /// threads share it, a fork copies it, and exec starts a new one. Empty
-    /// until the first exec, as a task with no mm has none to show.
-    pub saved_auxv: Vec<u64>,
-}
-
-impl MemState {
-    pub fn new() -> MemState {
-        MemState {
-            vmas: Vec::new(),
-            brk_start: 0,
-            brk: 0,
-            mmap_top: USER_MMAP_BASE,
-            saved_auxv: Vec::new(),
-        }
-    }
-}
+pub use crate::mm::space::{FileMap, Vma};
 
 /// A task control block.
 ///
@@ -173,14 +96,18 @@ pub struct Task {
     kstack: *mut u8,
     pub kstack_top: u64,
 
-    /// The page tables the task runs on, and the record of what is in them.
-    /// Private for the same reason the scheduling state is: the two have to
-    /// change together, and `run_on_space` is where that happens.
-    space: Cell<AddressSpace>,
-    /// Shared with every thread running in the same address space. Exec gives
-    /// the task a different one and leaves the old to whatever still runs on
-    /// it, so the share itself is what changes, not only its contents.
-    mm: Spinlock<Arc<Spinlock<MemState>>>,
+    /// The address space the task runs in: its page tables and the record of
+    /// what is in them. Shared with every thread cloned with `CLONE_VM`. Exec
+    /// puts a new one here and leaves the old to whatever still holds it, and
+    /// exit takes it away; the last holder to let go frees it. `None` for a
+    /// kernel task, which runs on whatever tables the processor is on, and for
+    /// a task that has exited.
+    ///
+    /// Private for the same reason the scheduling state is: the record and
+    /// the tables the processor is on have to change together, and
+    /// `run_on_mm` is where that happens. A lock rather than a cell, because
+    /// other tasks read it through the process table.
+    mm: Spinlock<Option<Arc<Mm>>>,
     /// Shared with every task that cloned with `CLONE_FILES`.
     pub fds: FdTable,
     /// Shared with every task that cloned with `CLONE_FS`, so that a directory
@@ -297,8 +224,9 @@ fn kstack_layout() -> Layout {
 }
 
 impl Task {
-    /// Allocate a task with a fresh kernel stack and address space.
-    pub fn new(name: &str, space: AddressSpace) -> Option<alloc::boxed::Box<Task>> {
+    /// Allocate a task with a fresh kernel stack, running in `mm`: `None` for
+    /// a task that runs only in the kernel.
+    pub fn new(name: &str, mm: Option<Arc<Mm>>) -> Option<alloc::boxed::Box<Task>> {
         let kstack = unsafe { alloc(kstack_layout()) };
         if kstack.is_null() {
             return None;
@@ -314,8 +242,7 @@ impl Task {
             kernel_sp: Cell::new(0),
             kstack,
             kstack_top,
-            space: Cell::new(space),
-            mm: Spinlock::new(Arc::new(Spinlock::new(MemState::new()))),
+            mm: Spinlock::new(mm),
             fds: FdTable::new(),
             cwd: Arc::new(Spinlock::new(String::from("/"))),
             name: Spinlock::new(name.to_string()),
@@ -517,13 +444,16 @@ impl Task {
     }
 
     /// The record of what is in the address space, held for as long as the
-    /// call that asked for it runs. Two locks: the outer one holds the share
-    /// still, because exec replaces it with a different one, and the inner one
-    /// is the record's own.
-    fn with_mem<R>(&self, f: impl FnOnce(&mut MemState) -> R) -> R {
-        let mm = self.mm.lock();
-        let mut state = mm.lock();
-        f(&mut state)
+    /// call that asked for it runs. `None` for a task with no address space,
+    /// which no system call from a program reaches here for.
+    ///
+    /// The task's own lock is held only to take a reference, so it is never
+    /// held around anything else: a fault report reads it too, and a fault
+    /// inside a call that held it would hang the report rather than print it.
+    fn with_mem<R>(&self, f: impl FnOnce(&mut MemState) -> R) -> Option<R> {
+        let mm = self.mm()?;
+        let mut mem = mm.lock();
+        Some(f(&mut mem))
     }
 
     pub fn cwd(&self) -> String {
@@ -535,11 +465,11 @@ impl Task {
     }
 
     pub fn brk_start(&self) -> u64 {
-        self.with_mem(|mm| mm.brk_start)
+        self.with_mem(|mm| mm.brk_start).unwrap_or(0)
     }
 
     pub fn brk(&self) -> u64 {
-        self.with_mem(|mm| mm.brk)
+        self.with_mem(|mm| mm.brk).unwrap_or(0)
     }
 
     pub fn set_brk(&self, value: u64) {
@@ -562,133 +492,77 @@ impl Task {
     }
 
     pub fn find_vma(&self, addr: u64) -> Option<Vma> {
-        self.with_mem(|mm| mm.vmas.iter().find(|v| v.contains(addr)).cloned())
+        self.with_mem(|mm| mm.find_vma(addr).cloned()).flatten()
     }
 
     /// True when no recorded region overlaps `[start, end)`.
     pub fn range_is_free(&self, start: u64, end: u64) -> bool {
-        self.with_mem(|mm| mm.vmas.iter().all(|v| v.end <= start || v.start >= end))
-    }
-
-    pub fn clear_vmas(&self) {
-        self.with_mem(|mm| {
-            mm.vmas.clear();
-            mm.mmap_top = USER_MMAP_BASE;
-        });
+        self.with_mem(|mm| mm.range_is_free(start, end)).unwrap_or(false)
     }
 
     /// Total size of every recorded region plus the heap, for /proc reporting.
     pub fn virtual_size(&self) -> u64 {
-        self.with_mem(|mm| {
-            let regions: u64 = mm.vmas.iter().map(|v| v.end - v.start).sum();
-            regions + mm.brk.saturating_sub(mm.brk_start)
-        })
+        self.with_mem(|mm| mm.virtual_size()).unwrap_or(0)
     }
 
     /// Pages actually backed by memory right now.
     pub fn resident_pages(&self) -> u64 {
-        let space = self.space.get();
-        self.with_mem(|mm| {
-            let mut pages = 0u64;
-            for vma in mm.vmas.iter() {
-                let mut page = vma.start;
-                while page < vma.end {
-                    if space.translate(page).is_some() {
-                        pages += 1;
-                    }
-                    page += PAGE_SIZE_U64;
-                }
-            }
-            let mut page = mm.brk_start;
-            while page < mm.brk {
-                if space.translate(page).is_some() {
+        let Some(mm) = self.mm() else {
+            return 0;
+        };
+        let mm = mm.lock();
+        let tables = mm.tables();
+        let mut pages = 0u64;
+        for vma in mm.vmas.iter() {
+            let mut page = vma.start;
+            while page < vma.end {
+                if tables.translate(page).is_some() {
                     pages += 1;
                 }
                 page += PAGE_SIZE_U64;
             }
-            pages
-        })
+        }
+        let mut page = mm.brk_start;
+        while page < mm.brk {
+            if tables.translate(page).is_some() {
+                pages += 1;
+            }
+            page += PAGE_SIZE_U64;
+        }
+        pages
     }
 
     pub fn snapshot_vmas(&self) -> Vec<Vma> {
-        self.with_mem(|mm| mm.vmas.clone())
+        self.with_mem(|mm| mm.vmas.clone()).unwrap_or_default()
     }
 
     /// The auxiliary vector the running program was started with, as words.
     pub fn saved_auxv(&self) -> Vec<u64> {
-        self.with_mem(|mm| mm.saved_auxv.clone())
+        self.with_mem(|mm| mm.saved_auxv.clone()).unwrap_or_default()
     }
 
     /// Give every region overlapping `[start, end)` the new protection.
     pub fn set_vma_prot(&self, start: u64, end: u64, prot: u64) {
-        self.with_mem(|mm| {
-            for vma in mm.vmas.iter_mut() {
-                if vma.start < end && start < vma.end {
-                    vma.prot = prot;
-                }
-            }
-        });
+        self.with_mem(|mm| mm.set_vma_prot(start, end, prot));
     }
 
     /// Remove `[start, end)` from the recorded regions, splitting as needed.
     pub fn remove_vma_range(&self, start: u64, end: u64) {
-        self.with_mem(|mm| {
-        let mut out: Vec<Vma> = Vec::new();
-        for vma in mm.vmas.iter().cloned() {
-            if vma.end <= start || vma.start >= end {
-                out.push(vma);
-                continue;
-            }
-            if vma.start < start {
-                let mut head = vma.clone();
-                head.end = start;
-                if let Some(file) = &mut head.file {
-                    file.length = file.length.min(start - vma.start);
-                }
-                out.push(head);
-            }
-            if vma.end > end {
-                let mut tail = vma.clone();
-                tail.start = end;
-                // The tail begins further into the file than the whole did.
-                if let Some(file) = &mut tail.file {
-                    let skipped = end - vma.start;
-                    file.offset += skipped;
-                    file.length = file.length.saturating_sub(skipped);
-                }
-                out.push(tail);
-            }
-        }
-        mm.vmas = out;
-        });
+        self.with_mem(|mm| mm.remove_vma_range(start, end));
     }
 
-    /// Find a free span of `len` bytes in the mmap area.
+    /// Find a free span of `len` bytes in the mmap area. Zero for a task with
+    /// no address space, which has nowhere to put one.
     pub fn find_free_region(&self, len: u64) -> u64 {
-        let len = page_align_up(len);
-        self.with_mem(|mm| {
-            let mut candidate = mm.mmap_top;
-            loop {
-                let end = candidate + len;
-                let clash =
-                    mm.vmas.iter().find(|v| v.start < end && candidate < v.end).map(|v| v.end);
-                match clash {
-                    Some(v) => candidate = v,
-                    None => {
-                        mm.mmap_top = end;
-                        return candidate;
-                    }
-                }
-            }
-        })
+        self.with_mem(|mm| mm.find_free_region(len)).unwrap_or(0)
     }
 
     /// Give this task a private copy of a shared page it is trying to write.
     /// Returns whether a write to the page may be made now, which is false for
     /// a page no write of this task's can complete on.
     ///
-    /// Nothing in the task itself changes: the page tables are reached through
-    /// a value the task holds by copy, and the region list through a lock. A
+    /// Nothing in the task itself changes: the page tables and the region list
+    /// are reached through the address space the task holds a reference to. A
     /// shared reference is what the validating path can hand over, and asking
     /// for an exclusive one there would mean a second one to a task the caller
     /// already holds.
@@ -705,7 +579,10 @@ impl Task {
     /// machine it is.
     pub fn handle_cow(&self, addr: u64, irq: NoInterrupts) -> bool {
         let page = page_align_down(addr);
-        let space = self.space.get();
+        let Some(mm) = self.mm() else {
+            return false;
+        };
+        let space = mm.tables_unlocked();
         let Some(flags) = space.flags_of(page) else {
             return false;
         };
@@ -765,7 +642,11 @@ impl Task {
     /// shared looks exactly the same to it.
     pub fn access_page(&self, addr: u64, write: bool, irq: NoInterrupts) -> PageAccess {
         let page = page_align_down(addr);
-        let Some(flags) = self.space.get().flags_of(page) else {
+        let Some(mm) = self.mm() else {
+            // No address space, so nothing can be mapped for the access either.
+            return PageAccess::Refused;
+        };
+        let Some(flags) = mm.tables_unlocked().flags_of(page) else {
             return PageAccess::Absent;
         };
         // A page shared after a fork is read-only until someone writes to it.
@@ -793,7 +674,12 @@ impl Task {
     /// already in it.
     pub fn fault_in(&self, addr: u64) -> bool {
         let page = page_align_down(addr);
-        let space = self.space.get();
+        // Held for the whole of the fault, which can sleep on the card: an
+        // exec on this task, or its exit, cannot free the tables under it.
+        let Some(mm) = self.mm() else {
+            return false;
+        };
+        let space = mm.tables_unlocked();
         if space.translate(page).is_some() {
             // The hardware found nothing at this address and the tables have
             // something at it: two readings of one entry either side of a
@@ -803,12 +689,10 @@ impl Task {
             // decided before this is called.
             return true;
         }
-        let (in_heap, vma) = self.with_mem(|mm| {
-            (
-                page >= mm.brk_start && page < mm.brk,
-                mm.vmas.iter().find(|v| v.contains(page)).cloned(),
-            )
-        });
+        let (in_heap, vma) = {
+            let mem = mm.lock();
+            (page >= mem.brk_start && page < mem.brk, mem.find_vma(page).cloned())
+        };
         if in_heap {
             return served(space.map_new(page, PRESENT | WRITABLE | USER | NO_EXECUTE));
         }
@@ -871,46 +755,18 @@ impl Task {
         self.wake_at.get()
     }
 
-    /// The page tables the task runs on.
-    pub fn space(&self) -> AddressSpace {
-        self.space.get()
-    }
-
-    /// The record of what is in them, shared with this task's threads.
-    pub fn mm(&self) -> Arc<Spinlock<MemState>> {
+    /// The address space the task runs in, shared with this task's threads.
+    /// `None` for a kernel task and for one that has exited.
+    ///
+    /// A reference of the caller's own: what it reaches stays alive for as
+    /// long as the caller holds it, whatever this task does meanwhile.
+    pub fn mm(&self) -> Option<Arc<Mm>> {
         self.mm.lock().clone()
     }
 
-    /// How many tasks hold that record: the threads running in this address
-    /// space, this one among them. The last one out is the only task that may
-    /// tear the address space down, and this is how it knows it is the last.
-    pub fn mm_shares(&self) -> usize {
-        Arc::strong_count(&self.mm.lock())
-    }
-
-    /// Take a copy of `other`'s region list, which is what a fork that does
-    /// not share the address space gives the child.
-    pub fn copy_mem_from(&self, other: &Task) {
-        let source = other.mm();
-        let source = source.lock();
-        self.with_mem(|target| {
-            target.vmas = source.vmas.clone();
-            target.brk_start = source.brk_start;
-            target.brk = source.brk;
-            target.mmap_top = source.mmap_top;
-            target.saved_auxv = source.saved_auxv.clone();
-        });
-    }
-
-    /// Run in the address space `other` runs in, sharing its region list.
-    ///
-    /// Only for a task that has not been admitted to the scheduler yet, which
-    /// is why it asks for no proof of anything: nothing can see this task to
-    /// be confused by a half-done change. A task that is already running
-    /// changes address space through `run_on_space`.
-    pub fn share_space_of(&self, other: &Task) {
-        self.space.set(other.space.get());
-        *self.mm.lock() = other.mm();
+    /// The `id` of the address space the task runs in, or zero for none.
+    pub fn mm_id(&self) -> u64 {
+        self.mm.lock().as_ref().map_or(0, |mm| mm.id())
     }
 
     // -----------------------------------------------------------------------
@@ -1034,22 +890,26 @@ impl Task {
         self.state.set(State::Dead);
     }
 
-    /// Run on `space` from here on, with `mm` as the record of what is in it.
+    /// Run in `mm` from here on, or in no address space of the task's own for
+    /// `None`, putting the processor on the matching tables: `mm`'s, or the
+    /// kernel's.
     ///
-    /// A context switch reloads the page table root only when the two tasks'
-    /// recorded spaces differ, so between the record changing and the CPU
-    /// following it the two disagree, and a sibling thread recorded on the
-    /// other one is resumed with no reload. The record and the register move
-    /// together or not at all.
-    pub fn run_on_space(
-        &self,
-        space: AddressSpace,
-        mm: Arc<Spinlock<MemState>>,
-        _irq: NoInterrupts,
-    ) {
-        self.space.set(space);
-        *self.mm.lock() = mm;
-        unsafe { space.switch_to() };
+    /// A context switch loads the incoming task's tables only when they are not
+    /// the ones already loaded, so between the record changing and the
+    /// processor following it the two disagree, and a sibling thread recorded
+    /// on the other space is resumed with no load. The record and the register
+    /// move together or not at all.
+    ///
+    /// What this lets go of comes back to the caller rather than being dropped
+    /// inside the section, because the last reference to an address space
+    /// frees it, and that is not something to do with interrupts off.
+    pub fn run_on_mm(&self, mm: Option<Arc<Mm>>, irq: NoInterrupts) -> Displaced {
+        let processor = match &mm {
+            Some(mm) => crate::mm::space::switch_mm(mm, irq),
+            None => crate::mm::space::switch_to_kernel(irq),
+        };
+        let task = core::mem::replace(&mut *self.mm.lock(), mm);
+        Displaced { task, processor }
     }
 }
 
@@ -1095,9 +955,10 @@ pub fn build_user_stack(
     // through the checked path on purpose, because a block longer than what is
     // mapped here has to grow the stack rather than fault in the kernel.
     let prefault_from = USER_STACK_TOP - STACK_PREFAULT;
+    let mm = task.mm().ok_or(Errno::ENOMEM)?;
     let mut page = prefault_from;
     while page < USER_STACK_TOP {
-        task.space()
+        mm.tables_unlocked()
             .map_new(page, PRESENT | WRITABLE | USER | NO_EXECUTE)
             .map_err(|_| Errno::ENOMEM)?;
         page += PAGE_SIZE_U64;
@@ -1300,7 +1161,7 @@ pub extern "C" fn user_bootstrap() -> ! {
 
 /// Build a task that will run `path`. Its pid is taken now; handing it to
 /// `sched::register` is what starts it, and a task built here has to be, or
-/// its address space and kernel stack are never given back.
+/// its kernel stack is never given back.
 ///
 /// The two are apart so the pid order and the start order can differ: init
 /// has to be pid 1, and at boot it is held back while the network task, which
@@ -1311,20 +1172,18 @@ pub fn prepare(
     envp: Vec<String>,
     parent_pid: u32,
 ) -> Result<alloc::boxed::Box<Task>, Errno> {
-    // Nothing owns the address space or the kernel stack until the task is
-    // registered, so anything that goes wrong before then hands them back here
-    // or they are held by nobody: dropping the task frees neither.
-    let space = crate::arch::paging::AddressSpace::new_user().ok_or(Errno::ENOMEM)?;
+    // Nothing owns the kernel stack until the task is registered, so anything
+    // that goes wrong before then hands it back here or it is held by nobody:
+    // dropping the task does not free it. The task has no address space until
+    // the exec its bootstrap runs gives it one.
     let name = path.rsplit('/').next().unwrap_or(path);
-    let Some(mut task) = Task::new(name, space) else {
-        space.destroy();
+    let Some(mut task) = Task::new(name, None) else {
         return Err(Errno::ENOMEM);
     };
     task.ppid.set(parent_pid);
     task.pgid.set(task.pid);
     if let Err(err) = attach_console(&task) {
         task.free_kernel_stack();
-        space.destroy();
         return Err(err);
     }
     task.set_pending_exec((path.to_string(), argv, envp));
@@ -1332,14 +1191,39 @@ pub fn prepare(
     Ok(task)
 }
 
-pub struct TaskPtr(pub *mut Task);
+/// An entry in the process table: a task `sched::register` took the box of.
+///
+/// The pointer is private. With a public one, any code could build an entry
+/// naming anything, or keep reading one after `release` had freed the task
+/// behind it, and `get` would hand out a reference to whatever was there.
+pub struct TaskPtr(*mut Task);
 unsafe impl Send for TaskPtr {}
 
 impl TaskPtr {
-    /// The task, borrowed for as long as the entry that names it. The entry is
-    /// in the process table, so what the borrow comes from is a hold on the
-    /// table, and the reference cannot outlive it.
-    pub fn get(&self) -> &Task {
+    /// Take ownership of `task` as an entry. Nothing frees it until `release`
+    /// turns the pointer back into the box.
+    pub fn new(task: alloc::boxed::Box<Task>) -> TaskPtr {
+        TaskPtr(alloc::boxed::Box::into_raw(task))
+    }
+
+    /// The task's address, for comparing entries and for handing the box back.
+    pub fn as_ptr(&self) -> *mut Task {
+        self.0
+    }
+
+    /// The task, borrowed for as long as the entry that names it.
+    ///
+    /// # Safety
+    ///
+    /// The entry must be in the process table, and the reference must not be
+    /// used after the hold on the table it was read under is let go.
+    /// `sched::release` frees a task once it has been taken out of the table
+    /// under that lock, and nothing else keeps the task alive, so a reference
+    /// kept past the hold can name freed memory. The hold also masks
+    /// interrupts, which is what keeps the task's cells whole while they are
+    /// read through a reference another task can hold too.
+    pub unsafe fn get(&self) -> &Task {
+        // SAFETY: the caller keeps the entry in the table for the borrow.
         unsafe { &*self.0 }
     }
 }

@@ -27,7 +27,6 @@
 //! second exchange to show what the round trip costs once the card is past
 //! that window.
 
-use crate::arch::paging::AddressSpace;
 use crate::sched;
 use crate::sync::Spinlock;
 use crate::task::Task;
@@ -138,8 +137,7 @@ pub fn start() {
     ARMED.store(true, Ordering::Relaxed);
     super::trace_received(true);
 
-    let space = AddressSpace::current();
-    let Some(mut task) = Task::new("arptest", space) else {
+    let Some(mut task) = Task::new("arptest", None) else {
         crate::println!("[nettest] cannot create the test task");
         return;
     };

@@ -15,6 +15,10 @@ use crate::mm::frame::{self, Frame};
 use crate::mm::{phys_to_virt, HHDM_BASE, PAGE_SIZE_U64};
 use crate::sync::NoInterrupts;
 use core::arch::asm;
+use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
+use core::ops::Deref;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// The descriptor is valid. At the last level a page descriptor also needs
 /// bit 1, which `encode` adds.
@@ -318,42 +322,185 @@ impl FreshPage {
     }
 }
 
-/// A translation table hierarchy, identified by the physical address of its
-/// top-level table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AddressSpace {
-    pub root: u64,
+/// The top table the kernel was running on when it took over the machine.
+///
+/// Every address space copies its kernel half from it, and the processor is
+/// put back on it when it is left on no address space of a program's. It is
+/// in the kernel image rather than taken from the frame allocator, and nothing
+/// frees it.
+static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
+
+/// Record the tables the processor is on as the kernel's own. Once, at boot,
+/// before anything is mapped into the kernel half and before any address space
+/// exists.
+pub fn adopt_boot_tables() {
+    KERNEL_ROOT.store(read_ttbr0(), Ordering::Release);
 }
 
-impl AddressSpace {
-    /// A number that tells this address space apart from every other one alive
-    /// at the same moment, for anything that has to key on which one it is.
+/// The top table the processor is walking right now.
+pub fn live_root() -> u64 {
+    read_ttbr0()
+}
+
+/// Print the walk of `virt` through the tables the processor is on, which in
+/// a fault report may not be the ones the running task is recorded on.
+pub fn dump_live_walk(virt: u64) {
+    // Never dropped, so it frees nothing. The tables it names are the
+    // kernel's own or an address space the processor holds a reference to
+    // while it is loaded (`mm::space`), so they are not freed under the walk.
+    ManuallyDrop::new(PageTables { root: live_root() }).dump_walk(virt);
+}
+
+/// A translation table hierarchy for one address space: its top-level table,
+/// and every table and frame the user half of it reaches.
+///
+/// It has one owner. It is not `Copy` or `Clone`, the root is private, and the
+/// only way the tables go back is dropping the owner, so a second value naming
+/// the same tables cannot be written outside this file and cannot free them
+/// twice. Threads that share an address space share this owner through
+/// `mm::Mm`, and the last reference to that is what drops it. When this was a
+/// `Copy` value with a public root and a safe `destroy`, `sched::release`
+/// decided whether to destroy one by looking for a task still naming the same
+/// root. Two tasks releasing threads of one process could both find none, and
+/// the second destroy freed a top table that had already been given to
+/// another process, along with every frame its old entries still named.
+pub struct PageTables {
+    root: u64,
+}
+
+impl Drop for PageTables {
+    /// Release every user mapping, every table that held one, and the top
+    /// table. The kernel half is shared, so it is not freed.
+    ///
+    /// The processor must not be on these tables, since it walks them for the
+    /// kernel's own addresses as well. `mm::space` holds a reference to the
+    /// address space that is loaded and gives it up only after another has
+    /// been, so the last owner is never dropped while its tables are loaded.
+    /// The check turns a mistake there into a panic rather than a page table
+    /// freed under the processor.
+    fn drop(&mut self) {
+        assert_ne!(self.root, read_ttbr0(), "freeing the tables the processor is on");
+        self.free_user_memory();
+        // SAFETY: `new_user` recorded the top table's reference in this owner,
+        // and this is the owner's one drop.
+        drop(unsafe { Frame::from_recorded(self.root) });
+    }
+}
+
+/// Tables that an owner elsewhere holds, reached without going through it.
+///
+/// For the page table changes that are not yet made under the lock of the
+/// address space they belong to (`mm::Mm::tables_unlocked`). It releases
+/// nothing when dropped, and borrows from what keeps the owner alive, so it
+/// cannot outlive the tables.
+pub struct Borrowed<'a> {
+    tables: ManuallyDrop<PageTables>,
+    owner: PhantomData<&'a ()>,
+}
+
+impl Deref for Borrowed<'_> {
+    type Target = PageTables;
+
+    fn deref(&self) -> &PageTables {
+        &self.tables
+    }
+}
+
+/// The kernel half of every address space, through the kernel's own top table.
+///
+/// Below the top level the kernel half is one set of tables that every address
+/// space names, because `new_user` copies the top table's upper half, so a page
+/// mapped there through one top table is reached through all of them. The
+/// kernel's own is the one this walks. The one the processor happens to be on
+/// can belong to a process that exits and is freed while a kernel task that
+/// was preempted partway through a walk of it still holds its address.
+pub struct KernelTables(ManuallyDrop<PageTables>);
+
+/// The kernel's own tables, which `adopt_boot_tables` recorded.
+pub fn kernel_tables() -> KernelTables {
+    let root = KERNEL_ROOT.load(Ordering::Acquire);
+    assert!(root != 0, "the kernel's tables are used before they are recorded");
+    KernelTables(ManuallyDrop::new(PageTables { root }))
+}
+
+impl KernelTables {
+    /// Map a zeroed page at `virt`, an address in the kernel half: the heap.
+    pub fn map_new(&self, virt: u64, flags: u64) -> Result<u64, MapError> {
+        assert!(!is_user_addr(virt), "a kernel mapping at a program's address");
+        self.0.map_new(virt, flags)
+    }
+
+    /// Map `phys` at `virt`, an address in the kernel half, without taking a
+    /// reference on it: in practice a device's registers.
+    ///
+    /// # Safety
+    ///
+    /// `phys` must not be memory the frame allocator can hand out for as long
+    /// as the mapping stays. Nothing takes this mapping away when a frame is
+    /// released, so a frame given to a program afterwards would be reachable
+    /// through it.
+    pub unsafe fn map_fixed(&self, virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
+        assert!(!is_user_addr(virt), "a kernel mapping at a program's address");
+        self.0.map_fixed(virt, phys, flags)
+    }
+
+    /// Put the processor on the kernel's own tables.
+    ///
+    /// # Safety
+    ///
+    /// Interrupts must be off, and the caller must give up whatever kept the
+    /// tables it is leaving alive only after this returns.
+    pub unsafe fn load(&self) {
+        // SAFETY: the kernel's tables map the kernel half, which is all that
+        // runs with no address space of a program's.
+        unsafe { write_ttbr(self.0.root) };
+    }
+}
+
+impl PageTables {
+    /// A number that tells these tables apart from every other set alive at the
+    /// same moment, for anything that has to key on which one it is.
     pub fn id(&self) -> u64 {
         self.root
     }
 
-    pub fn current() -> AddressSpace {
-        AddressSpace { root: read_ttbr0() }
-    }
-
     /// Create a fresh address space that shares the kernel half.
-    pub fn new_user() -> Option<AddressSpace> {
-        // The space owns its top table; `destroy` takes the reference back.
+    pub fn new_user() -> Option<PageTables> {
+        // The owner holds the top table's reference; its drop gives it back.
         let root = frame::alloc_zeroed()?.into_recorded();
-        let kernel = Self::current();
+        let kernel = kernel_tables();
         unsafe {
-            let src = table_at(kernel.root);
+            let src = table_at(kernel.0.root);
             let dst = table_at(root);
             // Entries 256..512 cover the kernel: direct map, heap, image.
             for i in 256..512 {
                 (*src.add(i)).store(dst.add(i));
             }
         }
-        Some(AddressSpace { root })
+        Some(PageTables { root })
     }
 
-    pub unsafe fn switch_to(&self) {
-        write_ttbr(self.root);
+    /// A handle on the tables whose `id` is `id`, that releases nothing.
+    ///
+    /// # Safety
+    ///
+    /// `id` must be the `id()` of a `PageTables` that is not dropped for as
+    /// long as `'a` lasts.
+    pub unsafe fn borrow<'a>(id: u64) -> Borrowed<'a> {
+        Borrowed { tables: ManuallyDrop::new(PageTables { root: id }), owner: PhantomData }
+    }
+
+    /// Put the processor on these tables.
+    ///
+    /// # Safety
+    ///
+    /// Interrupts must be off, and the tables must stay alive for as long as
+    /// they are loaded: the caller keeps a reference to their owner until the
+    /// processor has been put on other tables.
+    pub unsafe fn load(&self) {
+        // SAFETY: the kernel half is copied into every address space, so the
+        // kernel runs on as it did; the caller keeps the tables alive.
+        unsafe { write_ttbr(self.root) };
     }
 
     /// Walk to the last-level descriptor for `virt`, allocating tables if
@@ -474,8 +621,9 @@ impl AddressSpace {
     }
 
     /// Map a physical address the kernel does not own a reference to, in
-    /// practice a device's registers.
-    pub fn map_fixed(&self, virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
+    /// practice a device's registers. Private: `KernelTables::map_fixed` is
+    /// the way in, and says what the caller has to promise.
+    fn map_fixed(&self, virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
         unsafe {
             let entry = self.entry_for(virt, true)?;
             if (*entry).is_present() {
@@ -677,14 +825,6 @@ impl AddressSpace {
         Some(())
     }
 
-    /// Map `pages` fresh frames from `virt` up.
-    pub fn map_range(&self, virt: u64, pages: usize, flags: u64) -> Result<(), MapError> {
-        for page in 0..pages as u64 {
-            self.map_new(virt + page * PAGE_SIZE_U64, flags)?;
-        }
-        Ok(())
-    }
-
     /// Release every user mapping and every table that held one.
     ///
     /// The whole user half is detached first and the detachment made visible
@@ -693,7 +833,10 @@ impl AddressSpace {
     /// written through the old one, and here the walker is allowed to act on
     /// such an entry speculatively, without any instruction naming that
     /// address.
-    pub fn free_user_memory(&self) {
+    ///
+    /// Private, and reached only from the owner's drop: called on tables that
+    /// are still in use, it empties them under whoever is running on them.
+    fn free_user_memory(&self) {
         // Entries 0..256 are the low half: everything a program owns.
         let mut detached = [Entry::EMPTY; 256];
         unsafe {
@@ -718,7 +861,7 @@ impl AddressSpace {
     /// stops partway leaves nothing behind that a flush here would have to
     /// clean up. What this address space has collected by then is the
     /// caller's to release.
-    pub fn clone_user_from(&self, src: &AddressSpace) -> Result<(), MapError> {
+    pub fn clone_user_from(&self, src: &PageTables) -> Result<(), MapError> {
         unsafe { self.share_user_tables(src) }
     }
 
@@ -774,7 +917,7 @@ impl AddressSpace {
         self.map(virt, shared, flags)
     }
 
-    unsafe fn share_user_tables(&self, src: &AddressSpace) -> Result<(), MapError> {
+    unsafe fn share_user_tables(&self, src: &PageTables) -> Result<(), MapError> {
         let from = table_at(src.root);
         for i in 0..256usize {
             let entry = *from.add(i);
@@ -785,13 +928,6 @@ impl AddressSpace {
             clone_table(self, src, entry.addr(), virt, 3)?;
         }
         Ok(())
-    }
-
-    /// Release the top table itself. The kernel half is shared, so it is not
-    /// freed.
-    pub fn destroy(self) {
-        self.free_user_memory();
-        drop(unsafe { Frame::from_recorded(self.root) });
     }
 }
 
@@ -816,8 +952,8 @@ unsafe fn free_table(phys: u64, level: u32) {
 /// Copy one level of `src`'s user tables into `dst`, sharing the frames at the
 /// bottom and marking both sides copy-on-write.
 unsafe fn clone_table(
-    dst: &AddressSpace,
-    src: &AddressSpace,
+    dst: &PageTables,
+    src: &PageTables,
     phys: u64,
     base: u64,
     level: u32,

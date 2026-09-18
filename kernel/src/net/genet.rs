@@ -39,7 +39,6 @@
 //! difference is called out at the point it matters.
 
 use crate::abi::Errno;
-use crate::arch::paging::AddressSpace;
 use crate::arch::{self, TrapFrame};
 use crate::mm::frame::alloc_contiguous;
 use crate::mm::{phys_to_virt, PAGE_SIZE};
@@ -1534,8 +1533,7 @@ fn interrupt(frame: &mut TrapFrame) {
 /// because process ids are handed out in order and a great deal of the system
 /// takes pid 1 to be init.
 pub fn start_task() {
-    let space = AddressSpace::current();
-    let Some(mut task) = Task::new("netd", space) else {
+    let Some(mut task) = Task::new("netd", None) else {
         crate::println!("genet: cannot create the network task");
         return;
     };

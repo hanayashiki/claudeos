@@ -65,7 +65,6 @@ mod fat;
 pub mod vfs;
 
 use crate::arch;
-use crate::arch::paging::AddressSpace;
 use crate::mmc::delay::{now_us, sleep_ms, Deadline};
 use crate::sched;
 use crate::sched::WaitQueue;
@@ -141,7 +140,7 @@ pub fn start(cmdline: &str, init: &str) {
         }
     };
     *LABEL.lock() = Some(label);
-    let Some(mut task) = Task::new("sdcard", AddressSpace::current()) else {
+    let Some(mut task) = Task::new("sdcard", None) else {
         crate::println!("data: /data is not mounted: no memory for the storage task");
         return;
     };

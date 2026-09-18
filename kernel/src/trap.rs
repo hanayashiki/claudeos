@@ -113,18 +113,20 @@ fn page_fault(frame: &mut TrapFrame) {
     // happened is one this is the only way to take further: what is left is a
     // level above it, a translation cached from an older entry, or tables that
     // are not the ones the access went through.
-    let live = arch::paging::AddressSpace::current();
-    live.dump_walk(addr);
+    arch::paging::dump_live_walk(addr);
     if crate::sched::has_current() {
         let task = crate::sched::current();
         println!("  faulted in pid {} ({})", task.pid, task.name());
         // The same tables in every path that reaches user memory through a
         // task. Printed when they are not, because a check made against one
         // and an access made through the other explains a fault that neither
-        // on its own does.
-        if task.space() != live {
-            println!("  but the task is recorded on other tables:");
-            task.space().dump_walk(addr);
+        // on its own does. A kernel task has none of its own and runs on
+        // whatever was loaded.
+        if let Some(mm) = task.mm() {
+            if mm.id() != arch::paging::live_root() {
+                println!("  but the task is recorded on other tables:");
+                mm.tables_unlocked().dump_walk(addr);
+            }
         }
     }
     dump(frame);
@@ -174,7 +176,10 @@ pub fn unhandled(frame: &mut TrapFrame) {
 /// was inside a region at all.
 fn dump_regions(addr: u64) {
     let task = crate::sched::current();
-    let mm = task.mm();
+    let Some(mm) = task.mm() else {
+        println!("  regions: none, the task has no address space");
+        return;
+    };
     let mm = mm.lock();
     println!(
         "  regions: brk {:#x}..{:#x}  mmap_top {:#x}  {} vmas",
