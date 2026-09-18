@@ -68,6 +68,11 @@ unsafe impl Machine for Mach {
     }
 
     #[inline]
+    fn shared(&self, flags: u64) -> Option<u64> {
+        paging::shared(flags)
+    }
+
+    #[inline]
     fn widen(&self, table_bits: u64, leaf_flags: u64) -> Option<u64> {
         paging::widen(table_bits, leaf_flags)
     }

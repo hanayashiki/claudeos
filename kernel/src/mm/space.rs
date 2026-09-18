@@ -634,19 +634,7 @@ impl Mm {
                 // by address covers the parent's cached translation and the
                 // child's alike, and the parent is the space the processor is
                 // on.
-                to.share_block(
-                    &from,
-                    block,
-                    |flags| {
-                        if flags & WRITABLE != 0 {
-                            Some(flags | COW)
-                        } else {
-                            None
-                        }
-                    },
-                    &mut stock,
-                    &mut parent.tlb,
-                )
+                to.share_block(&from, block, &mut stock, &mut parent.tlb)
             };
             // What the block did not use goes back out here, with the locks
             // let go and interrupts back on.

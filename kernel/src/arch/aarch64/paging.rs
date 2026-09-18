@@ -107,6 +107,18 @@ pub fn flags(bits: u64) -> u64 {
     bits & FLAG_MASK
 }
 
+/// Write permission is a software bit here and `leaf` derives read-only from
+/// it and from the mark together, so a shared page keeps the permission it was
+/// asked for and the mark is what makes the hardware refuse the store.
+#[inline]
+pub fn shared(flags: u64) -> Option<u64> {
+    if flags & WRITABLE != 0 {
+        Some(flags | COW)
+    } else {
+        None
+    }
+}
+
 /// Nothing: the table levels say nothing about permission here, so a leaf is
 /// reachable whatever is above it.
 #[inline]

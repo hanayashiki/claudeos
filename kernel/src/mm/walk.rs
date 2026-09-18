@@ -87,6 +87,18 @@ pub unsafe trait Machine {
     /// The flags as they were asked for, software bits included.
     fn flags(&self, bits: u64) -> u64;
 
+    /// The flags a page gets when a second address space starts sharing it
+    /// and the first write to either side must make a private copy, or `None`
+    /// when the page is already read-only and needs no mark.
+    ///
+    /// The two machines do not agree on what this is. One spells write
+    /// permission as a bit the hardware reads, so sharing has to take that bit
+    /// away and the mark is what remembers it was there; the other keeps the
+    /// permission as a software bit and derives read-only from the mark, so
+    /// the permission stays as it was. A fork that wrote the first machine's
+    /// answer on the second leaves both sides writing one frame.
+    fn shared(&self, flags: u64) -> Option<u64>;
+
     /// What a table descriptor has to become before a leaf asking for
     /// `leaf_flags` under it is reachable, or `None` when it already is.
     ///
@@ -611,13 +623,12 @@ impl<'a, M: Machine> Tables<'a, M> {
         &self,
         parent: &Tables<'a, M>,
         block: u64,
-        mark: impl Fn(u64) -> Option<u64> + Copy,
         stock: &mut TableStock,
         tlb: &mut Tlb,
     ) -> Result<(), Refused> {
         for index in 0..ENTRIES {
             let virt = block + (index as u64) * level_size(0);
-            self.share_from(parent, virt, mark, stock, tlb)?;
+            self.share_from(parent, virt, stock, tlb)?;
         }
         Ok(())
     }
@@ -632,8 +643,8 @@ impl<'a, M: Machine> Tables<'a, M> {
     /// took the last-owner path and cleared the mark, so the parent kept write
     /// access to a frame the child was about to share.
     ///
-    /// `mark` turns the flags a writable page has into the flags both sides
-    /// get. `None` from it means the page is shared as it stands.
+    /// `Machine::shared` is what turns the flags a page has into the flags
+    /// both sides get.
     ///
     /// The reference for the child is taken first, so the count is never lower
     /// than the number of mappings that are going to hold it.
@@ -641,7 +652,6 @@ impl<'a, M: Machine> Tables<'a, M> {
         &self,
         parent: &Tables<'a, M>,
         virt: u64,
-        mark: impl Fn(u64) -> Option<u64>,
         stock: &mut TableStock,
         tlb: &mut Tlb,
     ) -> Result<(), Refused> {
@@ -656,7 +666,7 @@ impl<'a, M: Machine> Tables<'a, M> {
         }
         let phys = self.machine.addr(bits);
         self.machine.share(phys);
-        let flags = match mark(self.machine.flags(bits)) {
+        let flags = match self.machine.shared(self.machine.flags(bits)) {
             Some(shared) => {
                 // The page the parent is still running on has to lose write
                 // permission too, or its writes would be seen by the child.

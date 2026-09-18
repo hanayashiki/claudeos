@@ -62,6 +62,18 @@ pub fn flags(bits: u64) -> u64 {
     bits & !ADDR_MASK
 }
 
+/// Write permission is the bit the hardware reads here, so sharing has to take
+/// it away; the mark is what remembers it was there, and breaking the sharing
+/// puts it back.
+#[inline]
+pub fn shared(flags: u64) -> Option<u64> {
+    if flags & WRITABLE != 0 {
+        Some((flags & !WRITABLE) | COW)
+    } else {
+        None
+    }
+}
+
 /// A user leaf is unreachable if any table above it lacks the user bit, so the
 /// way down is opened as the walk descends.
 #[inline]
