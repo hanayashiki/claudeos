@@ -11,7 +11,8 @@
 //! the reason set out on `Task` below.
 
 use crate::abi::*;
-use crate::arch::paging::{FreshPage, MapError, COW, NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::arch::paging::{COW, NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::mm::tables::{MapError, Prepared};
 use crate::arch::{self, TaskContext, TrapFrame};
 use crate::fs::{FdTable, OpenFile};
 use crate::mm::space::{Displaced, MemState, Mm};
@@ -505,40 +506,73 @@ impl Task {
         self.with_mem(|mm| mm.virtual_size()).unwrap_or(0)
     }
 
-    /// Pages actually backed by memory right now.
+    /// Pages actually backed by memory right now, for /proc.
+    ///
+    /// The ranges are read under the lock and then walked in pieces, with the
+    /// lock taken again for each. It is a statistic, so a page that arrives or
+    /// goes while it is being counted may be counted either way; what it may
+    /// not do is hold the timer off for as long as walking every page of the
+    /// largest program takes. One reader of /proc/<pid>/statm over a 64 MiB
+    /// program was sixteen thousand walks under one hold, measured at eight
+    /// milliseconds with interrupts masked.
     pub fn resident_pages(&self) -> u64 {
         let Some(mm) = self.mm() else {
             return 0;
         };
-        let mm = mm.lock();
-        let tables = mm.tables();
+        let ranges: Vec<(u64, u64)> = {
+            let space = mm.lock();
+            space
+                .vmas
+                .iter()
+                .map(|vma| (vma.start, vma.end))
+                .chain(core::iter::once((space.brk_start, space.brk)))
+                .collect()
+        };
+        /// Pages counted per turn of the lock: one last-level table's worth.
+        const PER_TURN: u64 = crate::mm::walk::ENTRIES as u64;
         let mut pages = 0u64;
-        for vma in mm.vmas.iter() {
-            let mut page = vma.start;
-            while page < vma.end {
-                if tables.translate(page).is_some() {
-                    pages += 1;
+        for (start, end) in ranges {
+            let mut page = start;
+            while page < end {
+                let stop = end.min(page + PER_TURN * PAGE_SIZE_U64);
+                let space = mm.lock();
+                while page < stop {
+                    if space.translate(page).is_some() {
+                        pages += 1;
+                    }
+                    page += PAGE_SIZE_U64;
                 }
-                page += PAGE_SIZE_U64;
             }
-        }
-        let mut page = mm.brk_start;
-        while page < mm.brk {
-            if tables.translate(page).is_some() {
-                pages += 1;
-            }
-            page += PAGE_SIZE_U64;
         }
         pages
     }
 
+    /// A copy of the region list.
+    ///
+    /// The room for it is taken before the lock and the copy made under it, so
+    /// nothing under the lock allocates. An allocation there is the one that
+    /// can find the kernel heap full and map the pages it grows by, which is
+    /// thousands of page table writes with interrupts masked.
     pub fn snapshot_vmas(&self) -> Vec<Vma> {
-        self.with_mem(|mm| mm.vmas.clone()).unwrap_or_default()
+        let Some(mm) = self.mm() else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(mm.lock().vmas.len() + 4);
+        let space = mm.lock();
+        out.extend_from_slice(&space.vmas);
+        out
     }
 
     /// The auxiliary vector the running program was started with, as words.
     pub fn saved_auxv(&self) -> Vec<u64> {
-        self.with_mem(|mm| mm.saved_auxv.clone()).unwrap_or_default()
+        let Some(mm) = self.mm() else {
+            return Vec::new();
+        };
+        // The room first, for the reason `snapshot_vmas` gives.
+        let mut out = Vec::with_capacity(mm.lock().saved_auxv.len() + 4);
+        let space = mm.lock();
+        out.extend_from_slice(&space.saved_auxv);
+        out
     }
 
     /// Give every region overlapping `[start, end)` the new protection.
@@ -562,91 +596,33 @@ impl Task {
     /// a page no write of this task's can complete on.
     ///
     /// Nothing in the task itself changes: the page tables and the region list
-    /// are reached through the address space the task holds a reference to. A
-    /// shared reference is what the validating path can hand over, and asking
-    /// for an exclusive one there would mean a second one to a task the caller
-    /// already holds.
-    ///
-    /// The whole of it is one step. What the entry says, what it points at,
-    /// how many address spaces that frame is in and what finally goes in the
-    /// entry have to be one account of the page: a sibling thread that runs in
-    /// the middle of it is looking at the same entry, and what it does there
-    /// is decided by a state that only exists halfway through this. The token
-    /// is the proof that it cannot. On aarch64 a fault from user mode is
-    /// handled with interrupts in the state the faulting code was in, so a
-    /// program's own fault arrives here with them on, and `read`, `recvfrom`
-    /// and `mremap` reach here from a system call with them on whichever
-    /// machine it is.
-    pub fn handle_cow(&self, addr: u64, irq: NoInterrupts) -> bool {
-        let page = page_align_down(addr);
-        let Some(mm) = self.mm() else {
-            return false;
-        };
-        let space = mm.tables_unlocked();
-        let Some(flags) = space.flags_of(page) else {
-            return false;
-        };
-        if flags & COW == 0 {
-            // Not shared. A page that was never shared and a page a sibling
-            // thread has already taken the copy of look exactly alike from
-            // here, and the permissions are what tell them apart: one that
-            // user code may write is repaired, whoever repaired it, and the
-            // store can be made again. Reading it as unrepairable instead is a
-            // bad address out of a system call, or a segmentation fault on a
-            // page whose walk shows present and writable.
-            return flags & WRITABLE != 0 && flags & USER != 0;
+    /// are reached through the address space the task holds a reference to,
+    /// and the whole of the change is made under that space's lock
+    /// (`Mm::break_cow`). The token the caller holds is no longer what makes
+    /// the change whole -- the lock is -- but it is still what says the caller
+    /// is somewhere a lock that masks interrupts may be taken at all.
+    pub fn handle_cow(&self, addr: u64, _irq: NoInterrupts) -> bool {
+        match self.mm() {
+            Some(mm) => mm.break_cow(addr),
+            None => false,
         }
-        let Some(phys) = space.translate(page).map(page_align_down) else {
-            return false;
-        };
-
-        // The last owner can simply take the page back.
-        if crate::mm::frame::frame_references(phys) <= 1 {
-            return space.set_flags(page, (flags & !COW) | WRITABLE).is_some();
-        }
-
-        let Some(copy) = crate::mm::frame::alloc() else {
-            return false;
-        };
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                crate::mm::phys_to_virt(phys) as *const u8,
-                crate::mm::phys_to_virt(copy.addr()) as *mut u8,
-                crate::mm::PAGE_SIZE,
-            );
-        }
-        // A page the program may execute has just been written through a
-        // different address than the one it will be fetched from.
-        if flags & NO_EXECUTE == 0 {
-            crate::arch::sync_instruction_cache(
-                crate::mm::phys_to_virt(copy.addr()),
-                crate::mm::PAGE_SIZE,
-            );
-        }
-        // The copy goes in over the shared page in one store, which hands back
-        // the reference this table held on the frame it was sharing. Dropping
-        // it is the release.
-        let shared = space.replace(page, copy, (flags & !COW) | WRITABLE, irq);
-        let replaced = shared.is_some();
-        drop(shared);
-        replaced
     }
 
     /// Whether the kernel may touch `addr`'s page on this task's behalf,
     /// taking the private copy of a shared page when a write needs one.
     ///
-    /// Reading what the entry says and repairing it are one operation under
-    /// the token rather than two calls a caller makes in order. Apart, a
-    /// sibling thread that takes the copy in between leaves the repair
-    /// looking at a page that is no longer shared, and a page that was never
-    /// shared looks exactly the same to it.
+    /// Reading what the descriptor says and repairing it are one operation
+    /// under the address space's lock rather than two calls a caller makes in
+    /// order. Apart, a sibling thread that takes the copy in between leaves
+    /// the repair looking at a page that is no longer shared, and a page that
+    /// was never shared looks exactly the same to it.
     pub fn access_page(&self, addr: u64, write: bool, irq: NoInterrupts) -> PageAccess {
         let page = page_align_down(addr);
         let Some(mm) = self.mm() else {
             // No address space, so nothing can be mapped for the access either.
             return PageAccess::Refused;
         };
-        let Some(flags) = mm.tables_unlocked().flags_of(page) else {
+        let Some(flags) = mm.lock().flags_of(page) else {
             return PageAccess::Absent;
         };
         // A page shared after a fork is read-only until someone writes to it.
@@ -669,74 +645,16 @@ impl Task {
     /// True means the address has memory at it now, not that this call is what
     /// put it there. Threads share an address space, so two of them reaching
     /// one page of a program's text at the same moment is ordinary, and the
-    /// one that arrives second has nothing to do and nothing to report. What
-    /// it finds is finished, because a page is published with its contents
-    /// already in it.
+    /// one that arrives second has nothing to do and nothing to report.
+    ///
+    /// The reference is taken first and held for the whole of the fault, which
+    /// can sleep on the card: an exec on this task, or its exit, cannot free
+    /// the tables under it.
     pub fn fault_in(&self, addr: u64) -> bool {
-        let page = page_align_down(addr);
-        // Held for the whole of the fault, which can sleep on the card: an
-        // exec on this task, or its exit, cannot free the tables under it.
-        let Some(mm) = self.mm() else {
-            return false;
-        };
-        let space = mm.tables_unlocked();
-        if space.translate(page).is_some() {
-            // The hardware found nothing at this address and the tables have
-            // something at it: two readings of one entry either side of a
-            // sibling's store. The faulting instruction can run again. A fault
-            // the tables really do refuse does not arrive here, because a
-            // present page's fault is a protection violation and that is
-            // decided before this is called.
-            return true;
+        match self.mm() {
+            Some(mm) => mm.fault_in(addr),
+            None => false,
         }
-        let (in_heap, vma) = {
-            let mem = mm.lock();
-            (page >= mem.brk_start && page < mem.brk, mem.find_vma(page).cloned())
-        };
-        if in_heap {
-            return served(space.map_new(page, PRESENT | WRITABLE | USER | NO_EXECUTE));
-        }
-        let Some(vma) = vma else {
-            return false;
-        };
-        let Some(file) = &vma.file else {
-            return served(space.map_new(page, vma.page_flags()));
-        };
-
-        // A page of an executable is filled before it is published, and goes
-        // in once with the protection its segment asked for. A fresh frame is
-        // already zero, so the part past the file's contents needs nothing.
-        let Some(mut fresh) = FreshPage::new() else {
-            return false;
-        };
-        let flags = vma.page_flags();
-        let into = page - vma.start;
-        if into < file.length {
-            let want = (file.length - into).min(PAGE_SIZE_U64) as usize;
-            let from = (file.offset + into) as usize;
-            let filled = if file.node.kind == crate::fs::NodeKind::DataFile {
-                // A program kept on the data volume: the page comes from the
-                // card, through the volume's sleeping lock, as a read would.
-                // A page the card cannot give is a fault the program is not
-                // served, the same as an address with nothing mapped.
-                match crate::fs::data::read(&file.node, crate::fs::Offset::new(from as u64), &mut fresh.bytes()[..want]) {
-                    Ok(n) => n,
-                    Err(_) => return false,
-                }
-            } else {
-                let data = file.node.inner.lock();
-                let available = data.data.len().saturating_sub(from).min(want);
-                fresh.bytes()[..available].copy_from_slice(&data.data[from..from + available]);
-                available
-            };
-            // A text page arrives this way, and these bytes have just been
-            // written through a different address than the one they will be
-            // fetched from.
-            if filled > 0 && flags & NO_EXECUTE == 0 {
-                crate::arch::sync_instruction_cache(fresh.bytes().as_ptr() as u64, filled);
-            }
-        }
-        served(space.publish(page, fresh, flags))
     }
 
     pub fn free_kernel_stack(&mut self) {
@@ -958,9 +876,12 @@ pub fn build_user_stack(
     let mm = task.mm().ok_or(Errno::ENOMEM)?;
     let mut page = prefault_from;
     while page < USER_STACK_TOP {
-        mm.tables_unlocked()
-            .map_new(page, PRESENT | WRITABLE | USER | NO_EXECUTE)
-            .map_err(|_| Errno::ENOMEM)?;
+        // Prepared outside the lock and published under it, one page at a
+        // time, which is the shape of every publish in the kernel.
+        let mut fresh = Prepared::new(0).ok_or(Errno::ENOMEM)?;
+        let done = mm.publish_page(page, &mut fresh, PRESENT | WRITABLE | USER | NO_EXECUTE);
+        drop(fresh);
+        done.map_err(|_| Errno::ENOMEM)?;
         page += PAGE_SIZE_U64;
     }
 

@@ -20,7 +20,9 @@
 //! `map_signal_trampoline` builds the same page here, and it is where a
 //! handler goes back through when the field is empty.
 
-use super::paging::{FreshPage, PageTables, PRESENT, USER};
+use super::paging::{PRESENT, USER};
+use crate::mm::space::Mm;
+use crate::mm::tables::Prepared;
 use super::task::VECTOR_BYTES;
 use super::trap::TrapFrame;
 use crate::abi::{Errno, SysResult, MAP_PRIVATE, PROT_EXEC, PROT_READ};
@@ -62,8 +64,8 @@ const _: () = assert!(super::nr::RT_SIGRETURN < 1 << 16, "movz carries 16 bits")
 /// not known when its address space is being built. It goes in at exec, where
 /// the rest of the address space is laid out, and a fork inherits it with
 /// everything else.
-pub fn map_signal_trampoline(task: &Task, space: &PageTables) -> Result<(), Errno> {
-    let mut page = FreshPage::new().ok_or(Errno::ENOMEM)?;
+pub fn map_signal_trampoline(task: &Task, space: &Mm) -> Result<(), Errno> {
+    let mut page = Prepared::new(0).ok_or(Errno::ENOMEM)?;
     let mut at = 0;
     for instruction in RETURN_SEQUENCE {
         page.bytes()[at..at + 4].copy_from_slice(&instruction.to_le_bytes());
@@ -80,7 +82,9 @@ pub fn map_signal_trampoline(task: &Task, space: &PageTables) -> Result<(), Errn
     // Read-only and executable, which is what it stays. It is never reachable
     // any wider: the contents are finished before the page is published, and
     // publishing is what makes it reachable at all.
-    space.publish(USER_TRAMPOLINE, page, PRESENT | USER).map_err(|_| Errno::ENOMEM)?;
+    let done = space.publish_page(USER_TRAMPOLINE, &mut page, PRESENT | USER);
+    drop(page);
+    done.map_err(|_| Errno::ENOMEM)?;
     task.add_vma(
         USER_TRAMPOLINE,
         USER_TRAMPOLINE + PAGE_SIZE_U64,

@@ -113,7 +113,7 @@ fn page_fault(frame: &mut TrapFrame) {
     // happened is one this is the only way to take further: what is left is a
     // level above it, a translation cached from an older entry, or tables that
     // are not the ones the access went through.
-    arch::paging::dump_live_walk(addr);
+    crate::mm::tables::dump_live_walk(addr);
     if crate::sched::has_current() {
         let task = crate::sched::current();
         println!("  faulted in pid {} ({})", task.pid, task.name());
@@ -125,7 +125,7 @@ fn page_fault(frame: &mut TrapFrame) {
         if let Some(mm) = task.mm() {
             if mm.id() != arch::paging::live_root() {
                 println!("  but the task is recorded on other tables:");
-                mm.tables_unlocked().dump_walk(addr);
+                mm.dump_walk_unlocked(addr);
             }
         }
     }

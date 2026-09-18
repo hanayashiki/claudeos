@@ -8,7 +8,9 @@
 //! summary line out of the boot, so these are counted into the same one as the
 //! protocol checks rather than printing a second.
 
-use crate::arch::paging::{live_root, MapError, PageTables, NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::arch::paging::{live_root, NO_EXECUTE, PRESENT, USER, WRITABLE};
+use crate::mm::space::Refused;
+use crate::mm::tables::Prepared;
 use crate::mm::frame;
 use crate::mm::space::{release_deferred, switch_mm, switch_to_kernel, Mm};
 use crate::sync::{disable_interrupts, enable_interrupts, interrupts_enabled, without_interrupts};
@@ -145,55 +147,68 @@ fn flags() -> u64 {
     PRESENT | WRITABLE | USER | NO_EXECUTE
 }
 
-/// An address that already has a mapping is refused, and the frame that was
+/// Put a zeroed page in at `virt`, the way everything else does: a page and
+/// the frames for its tables taken outside the lock, published under it, and
+/// what the publish did not take given back outside.
+fn map_one(mm: &Mm, virt: u64) -> Result<u64, Refused> {
+    let Some(mut page) = Prepared::new(0) else {
+        return Err(Refused::ShortOfTables);
+    };
+    let done = mm.publish_page(virt, &mut page, flags());
+    drop(page);
+    done
+}
+
+/// An address that already has a mapping is refused, and the page that was
 /// turned away is released rather than left with no owner.
 fn refuses_a_second_mapping(report: &mut Report) {
-    let Some(space) = PageTables::new_user() else {
+    let Some(mm) = Mm::new_user() else {
         report.check("an address space to map into", false);
         return;
     };
-    let mapped = space.map_new(VIRT, flags());
+    let mapped = map_one(&mm, VIRT);
 
     // Nothing may print between the calls below and the counts read after
     // them: printing goes through the kernel heap, which takes frames. The
-    // tables down to this address are built by the first call, so the only
-    // frame the refused one can take is the page it fails to map.
+    // tables down to this address are built by the first call, so the frames
+    // the refused one takes are the page and the three it brought for tables
+    // it did not need, and all four go back when it is dropped.
     let (before, _) = frame::stats();
-    let refused = space.map_new(VIRT, flags());
+    let refused = map_one(&mm, VIRT);
     let (after, _) = frame::stats();
-    let still_there = space.translate(VIRT);
+    let still_there = mm.lock().translate(VIRT);
 
     report.check("the first mapping goes in", mapped.is_ok());
     report.check(
         "a second mapping at the same address is refused",
-        refused == Err(MapError::AlreadyMapped),
+        refused == Err(Refused::Occupied),
     );
     report.check("the mapping that was there is untouched", still_there == mapped.ok());
-    report.check("the frame that was turned away is released", after == before);
+    report.check("the page that was turned away is released", after == before);
 
     let kept = mapped.unwrap_or(0);
-    drop(space);
+    with_interrupts_on(|| drop(mm));
     report.check(
         "tearing the space down releases what it held",
         frame::frame_references(kept) == 0,
     );
 }
 
-/// A mapping written over an entry that was already present would leave the
-/// frame that entry named with nobody to release it: one frame each time. A
-/// thousand of them cost none.
+/// A mapping written over a descriptor that was already present would leave
+/// the frame that descriptor named with nobody to release it: one frame each
+/// time. A thousand of them cost none.
 fn refusing_leaks_nothing(report: &mut Report) {
     const ROUNDS: usize = 1000;
     let (before, _) = frame::stats();
     let mut reached = 0usize;
     for _ in 0..ROUNDS {
-        let Some(space) = PageTables::new_user() else { break };
-        if space.map_new(VIRT, flags()).is_err() {
-            drop(space);
+        let Some(mm) = Mm::new_user() else { break };
+        if map_one(&mm, VIRT).is_err() {
+            with_interrupts_on(|| drop(mm));
             break;
         }
-        let _ = space.map_new(VIRT, flags());
-        drop(space);
+        let _ = map_one(&mm, VIRT);
+        with_interrupts_on(|| drop(mm));
         reached += 1;
     }
     let (after, _) = frame::stats();
@@ -206,36 +221,49 @@ fn refusing_leaks_nothing(report: &mut Report) {
 /// What replaces a mapping is one store, so the address it covers is never
 /// without one. A machine with one processor cannot be caught in the middle
 /// of a store from here; what can be pinned is the accounting either side of
-/// it. The old entry's reference comes back in hand rather than being dropped
-/// where the caller cannot see it, which is what a copy-on-write fault needs:
-/// the frame it was sharing is still held by the address spaces that share it.
+/// it. The old descriptor's reference comes back as a `Stale`, which is not a
+/// frame the allocator can have until the guard has thrown the translation
+/// away, and that is what a copy-on-write fault needs: the frame it was
+/// sharing is still held by the address spaces that share it.
 fn replacing_hands_the_old_frame_back(report: &mut Report) {
-    let Some(space) = PageTables::new_user() else {
+    let Some(mm) = Mm::new_user() else {
         report.check("an address space to map into", false);
         return;
     };
-    let (Ok(old), Some(fresh)) = (space.map_new(VIRT, flags()), frame::alloc_zeroed()) else {
+    let (Ok(old), Some(fresh)) = (map_one(&mm, VIRT), frame::alloc_zeroed()) else {
         report.check("a mapping to replace and a frame to replace it with", false);
-        drop(space);
+        with_interrupts_on(|| drop(mm));
         return;
     };
     let new = fresh.addr();
 
     // Every reading is taken before anything is printed, for the reason above.
-    let handed_back =
-        crate::sync::without_interrupts(|irq| space.replace(VIRT, fresh, flags(), irq));
-    let reaches = space.translate(VIRT);
-    let named = handed_back.as_ref().map(|frame| frame.addr());
+    let mut guard = mm.lock();
+    let handed_back = guard.replace(VIRT, fresh, flags());
+    let reaches = guard.translate(VIRT);
+    let named = handed_back.as_ref().ok().map(|stale| stale.frames()[0]);
     let held_while_in_hand = frame::frame_references(old);
-    drop(handed_back);
+    let replaced = match handed_back {
+        Ok(stale) => {
+            guard.retire(stale);
+            true
+        }
+        Err(frame) => {
+            drop(frame);
+            false
+        }
+    };
+    // Retiring puts the frame in the guard's hands; the guard's drop is what
+    // invalidates and releases it.
+    drop(guard);
     let held_after = frame::frame_references(old);
 
-    report.check("the address reaches the replacement", reaches == Some(new));
+    report.check("the address reaches the replacement", replaced && reaches == Some(new));
     report.check("the frame that was there is handed back", named == Some(old));
     report.check("it is still held while the handle is", held_while_in_hand == 1);
-    report.check("and dropping the handle releases it", held_after == 0);
+    report.check("and retiring the handle releases it", held_after == 0);
 
-    drop(space);
+    with_interrupts_on(|| drop(mm));
     report.check(
         "the replacement goes when the space does",
         frame::frame_references(new) == 0,
@@ -243,54 +271,68 @@ fn replacing_hands_the_old_frame_back(report: &mut Report) {
 }
 
 /// An address with nothing at it has no mapping to replace. Writing one there
-/// would be creating a mapping, which is what `map_new` is for, and it would
-/// hand back a frame reference that no entry was holding.
+/// would be creating a mapping, which is what a publish is for, and it would
+/// hand back a frame reference that no descriptor was holding.
 fn replacing_nothing_maps_nothing(report: &mut Report) {
-    let Some(space) = PageTables::new_user() else {
+    let Some(mm) = Mm::new_user() else {
         report.check("an address space to map into", false);
         return;
     };
     let Some(fresh) = frame::alloc_zeroed() else {
         report.check("a frame to offer", false);
-        drop(space);
+        with_interrupts_on(|| drop(mm));
         return;
     };
     let offered = fresh.addr();
 
-    let handed_back =
-        crate::sync::without_interrupts(|irq| space.replace(VIRT, fresh, flags(), irq));
-    let refused = handed_back.is_none();
-    drop(handed_back);
-    let reaches = space.translate(VIRT);
+    let mut guard = mm.lock();
+    let refused = match guard.replace(VIRT, fresh, flags()) {
+        Ok(stale) => {
+            guard.retire(stale);
+            false
+        }
+        // The frame comes straight back, so nothing was written and nothing
+        // is left holding it.
+        Err(frame) => {
+            drop(frame);
+            true
+        }
+    };
+    let reaches = guard.translate(VIRT);
+    drop(guard);
     let released = frame::frame_references(offered);
 
     report.check("replacing what is not there is refused", refused);
     report.check("and leaves the address with nothing at it", reaches.is_none());
     report.check("and releases the frame it was offered", released == 0);
-    drop(space);
+    with_interrupts_on(|| drop(mm));
 }
 
-/// A replacement that dropped the old entry's reference on the floor would
-/// cost one frame each time, and one that took an extra would cost one for
-/// every frame it handed back. A thousand of them cost neither.
+/// A replacement that dropped the old descriptor's reference on the floor
+/// would cost one frame each time, and one that took an extra would cost one
+/// for every frame it handed back. A thousand of them cost neither.
 fn replacing_leaks_nothing(report: &mut Report) {
     const ROUNDS: usize = 1000;
     let (before, _) = frame::stats();
     let mut reached = 0usize;
     for _ in 0..ROUNDS {
-        let Some(space) = PageTables::new_user() else { break };
-        if space.map_new(VIRT, flags()).is_err() {
-            drop(space);
+        let Some(mm) = Mm::new_user() else { break };
+        if map_one(&mm, VIRT).is_err() {
+            with_interrupts_on(|| drop(mm));
             break;
         }
         let Some(fresh) = frame::alloc_zeroed() else {
-            drop(space);
+            with_interrupts_on(|| drop(mm));
             break;
         };
-        drop(crate::sync::without_interrupts(|irq| {
-            space.replace(VIRT, fresh, flags(), irq)
-        }));
-        drop(space);
+        {
+            let mut guard = mm.lock();
+            match guard.replace(VIRT, fresh, flags()) {
+                Ok(stale) => guard.retire(stale),
+                Err(frame) => drop(frame),
+            }
+        }
+        with_interrupts_on(|| drop(mm));
         reached += 1;
     }
     let (after, _) = frame::stats();
@@ -305,38 +347,42 @@ fn replacing_leaks_nothing(report: &mut Report) {
 ///
 /// The two are one decision: freeing a table another address space still
 /// named would take that space's mappings away with it. The counts say which
-/// it is. A clone of a space with one page in it takes four frames -- its top
+/// it is. A fork of a space with one page in it takes four frames -- its top
 /// table and the three under it -- and shares the page rather than the tables,
 /// so taking that one page away hands back exactly the three and leaves the
-/// page where the space it was cloned from has it.
+/// page where the space it was forked from has it.
 fn a_clone_reaches_a_shared_page_through_tables_of_its_own(report: &mut Report) {
-    let Some(parent) = PageTables::new_user() else {
+    let Some(parent) = Mm::new_user() else {
         report.check("an address space to map into", false);
         return;
     };
-    let Ok(page) = parent.map_new(VIRT, flags()) else {
+    let Ok(page) = map_one(&parent, VIRT) else {
         report.check("a page to share", false);
-        drop(parent);
+        with_interrupts_on(|| drop(parent));
         return;
     };
 
     // Nothing may print between the counts below: printing goes through the
     // kernel heap, which takes frames.
     let (mapped, _) = frame::stats();
-    let Some(child) = PageTables::new_user() else {
+    let Some(child) = parent.fork() else {
         report.check("a second address space", false);
-        drop(parent);
+        with_interrupts_on(|| drop(parent));
         return;
     };
-    let cloned = child.clone_user_from(&parent).is_ok();
     let (after_clone, _) = frame::stats();
     let shares = frame::frame_references(page);
-    drop(crate::sync::without_interrupts(|irq| child.unmap(VIRT, irq)));
+    {
+        let mut guard = child.lock();
+        if let Some(stale) = guard.unmap(VIRT) {
+            guard.retire(stale);
+        }
+    }
     let (after_unmap, _) = frame::stats();
-    let parent_reaches = parent.translate(VIRT);
+    let parent_reaches = parent.lock().translate(VIRT);
     let held = frame::frame_references(page);
 
-    report.check("a clone of an address space is built", cloned);
+    report.check("a fork of an address space is built", after_clone > mapped);
     report.check(
         "it reaches the page through tables of its own",
         after_clone == mapped + 4,
@@ -347,12 +393,12 @@ fn a_clone_reaches_a_shared_page_through_tables_of_its_own(report: &mut Report) 
         after_unmap == mapped + 1,
     );
     report.check(
-        "and leaves the page where the space it was cloned from has it",
+        "and leaves the page where the space it was forked from has it",
         parent_reaches == Some(page) && held == 1,
     );
 
-    drop(child);
-    drop(parent);
+    with_interrupts_on(|| drop(child));
+    with_interrupts_on(|| drop(parent));
     report.check("both spaces release what is left", frame::frame_references(page) == 0);
 }
 
@@ -371,7 +417,7 @@ fn with_interrupts_on<R>(f: impl FnOnce() -> R) -> R {
 
 /// How many references the frame at `mapped` has, or `u16::MAX` when the
 /// mapping it came from failed, which no check below expects.
-fn references(mapped: Result<u64, MapError>) -> u16 {
+fn references(mapped: Result<u64, Refused>) -> u16 {
     mapped.map_or(u16::MAX, frame::frame_references)
 }
 
@@ -390,7 +436,7 @@ fn the_last_reference_frees_the_space(report: &mut Report) {
         report.check("an address space to map into", false);
         return;
     };
-    let page = mm.tables_unlocked().map_new(VIRT, flags());
+    let page = map_one(&mm, VIRT);
     let thread = mm.clone();
     with_interrupts_on(|| drop(mm));
     let held = references(page);
@@ -411,7 +457,7 @@ fn a_last_reference_dropped_masked_waits(report: &mut Report) {
         report.check("an address space to map into", false);
         return;
     };
-    let page = mm.tables_unlocked().map_new(VIRT, flags());
+    let page = map_one(&mm, VIRT);
     without_interrupts(|_| drop(mm));
     let held = references(page);
     with_interrupts_on(release_deferred);
@@ -429,7 +475,7 @@ fn the_space_the_processor_is_on_outlives_its_owner(report: &mut Report) {
         report.check("an address space to switch to", false);
         return;
     };
-    let page = mm.tables_unlocked().map_new(VIRT, flags());
+    let page = map_one(&mm, VIRT);
     let root = mm.id();
     let (loaded, held, left) = without_interrupts(move |irq| {
         let previous = switch_mm(&mm, irq);

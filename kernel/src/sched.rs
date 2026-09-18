@@ -340,6 +340,11 @@ unsafe fn switch_to(next: *mut Task) {
 }
 
 pub fn schedule() {
+    // An address space held still by one task while another runs is a lock
+    // this processor cannot release, because releasing it is this task's next
+    // instruction. Phase C of docs/memory-safety-plan.md makes it a borrow the
+    // compiler refuses; until then this is where the kernel finds out.
+    crate::mm::space::might_sleep("a task switch");
     let was_enabled = interrupts_enabled();
     disable_interrupts();
     if let Some(next) = pick_next() {

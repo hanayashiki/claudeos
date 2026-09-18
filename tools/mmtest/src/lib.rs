@@ -9,3 +9,13 @@ extern crate alloc;
 /// src/active.rs is a symbolic link to kernel/src/mm/active.rs, for the reason
 /// tools/fatdisk/src/lib.rs gives for its link to the FAT code.
 pub mod active;
+
+/// The kernel's `mm::walk`, as it is: the walk of a four-level translation
+/// table and every change to one, over whatever memory and frames the machine
+/// underneath supplies. Here that is `host`, a `Vec`.
+///
+/// src/walk.rs is a symbolic link to kernel/src/mm/walk.rs, for the reason
+/// tools/fatdisk/src/lib.rs gives for its link to the FAT code.
+pub mod walk;
+
+pub mod host;
