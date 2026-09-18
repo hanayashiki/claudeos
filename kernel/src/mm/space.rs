@@ -234,6 +234,19 @@ pub fn might_sleep(what: &str) {
     );
 }
 
+/// How many pages one turn of the lock takes away, and how many a fork shares
+/// in one.
+///
+/// A range a program asks to be rid of is as long as the program says, and a
+/// fork copies as much as the program has; the lock masks interrupts, so one
+/// guard for the whole of either holds the timer off for that long. Measured
+/// on this kernel under emulation, a 64 MiB range taken away under one guard
+/// was eight milliseconds and one two-megabyte block of a fork was three, both
+/// long enough to stop the tick and the card polling with it. At this many the
+/// longest either holds is under two hundred microseconds there, and a tenth
+/// of that on the board.
+const UNMAP_CHUNK: u64 = 128;
+
 /// How many times a publish goes back for more table frames before it gives
 /// up. Each turn means another task took a level away in the window between
 /// the count and the lock, so one is nearly always enough.
@@ -622,20 +635,33 @@ impl Mm {
             for _ in 0..walk::DEPTH {
                 stock.push(frame::alloc_zeroed()?.into_recorded());
             }
-            let done = {
-                let mut parent = self.lock();
-                // The child was made here and no other task can reach it, so
-                // taking its lock inside the parent's cannot wait on anyone.
-                let into = child.lock();
-                let from = parent.tables();
-                let to = into.tables();
-                // One accounting of the translations for both sides: this
-                // kernel uses no address space identifiers, so an invalidation
-                // by address covers the parent's cached translation and the
-                // child's alike, and the parent is the space the processor is
-                // on.
-                to.share_block(&from, block, &mut stock, &mut parent.tlb)
-            };
+            // The block goes in pieces, with the locks let go between them.
+            // Only the first piece creates tables, and the frames it did not
+            // use stay in the stock for the next block, so no piece allocates.
+            let mut done = Ok(());
+            let mut piece = block;
+            while piece < block + walk::level_size(1) {
+                let count = UNMAP_CHUNK as usize;
+                done = {
+                    let mut parent = self.lock();
+                    // The child was made here and no other task can reach it,
+                    // so taking its lock inside the parent's cannot wait on
+                    // anyone.
+                    let into = child.lock();
+                    let from = parent.tables();
+                    let to = into.tables();
+                    // One accounting of the translations for both sides: this
+                    // kernel uses no address space identifiers, so an
+                    // invalidation by address covers the parent's cached
+                    // translation and the child's alike, and the parent is the
+                    // space the processor is on.
+                    to.share_range(&from, piece, count, &mut stock, &mut parent.tlb)
+                };
+                if done.is_err() {
+                    break;
+                }
+                piece += count as u64 * PAGE_SIZE_U64;
+            }
             // What the block did not use goes back out here, with the locks
             // let go and interrupts back on.
             while let Some(unused) = stock.take() {
@@ -698,6 +724,37 @@ impl Mm {
             }
         }
         false
+    }
+
+    /// Take the recorded regions covering `[start, end)` away, and then every
+    /// page in it.
+    ///
+    /// The regions go first, under one guard. A thread sharing the address
+    /// space that touches this range while the pages are being taken away
+    /// faults, and a fault inside a region that is still recorded is served a
+    /// fresh page of zeroes: one this call has already walked past and so
+    /// leaves behind, at an address the program was told nothing is at. With
+    /// the regions gone first there is nothing here to fault into, which is
+    /// what an unmapped range is, and nothing can publish into the range
+    /// behind the sweep however long the sweep takes.
+    pub fn unmap_recorded(&self, start: u64, end: u64) {
+        self.lock().remove_vma_range(start, end);
+        self.unmap_pages(start, end);
+    }
+
+    /// Take every page in `[start, end)` away, a table's worth per turn of the
+    /// lock.
+    ///
+    /// The caller has already made the range one nothing can fault into: the
+    /// regions are gone, or the break is below it. That is what lets the lock
+    /// be let go between chunks.
+    pub fn unmap_pages(&self, start: u64, end: u64) {
+        let mut page = start;
+        while page < end {
+            let stop = end.min(page + UNMAP_CHUNK * PAGE_SIZE_U64);
+            self.lock().unmap_range(page, stop);
+            page = stop;
+        }
     }
 
     /// Put a prepared page in at `virt`, going back outside the lock for the

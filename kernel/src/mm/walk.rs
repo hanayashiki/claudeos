@@ -623,20 +623,22 @@ impl<'a, M: Machine> Tables<'a, M> {
         None
     }
 
-    /// Share every page of the last-level table covering `block` out of
-    /// `parent` into this hierarchy, as `share_from` does one.
+    /// Share `count` pages from `start` out of `parent` into this hierarchy,
+    /// as `share_from` does one.
     ///
-    /// A block is one table, so three levels at most have to be created
-    /// whatever it holds, which is what makes the stock a fixed size.
-    pub fn share_block(
+    /// The caller walks a last-level table this way in pieces, so that the
+    /// lock it holds is let go between them: a table is five hundred and
+    /// twelve pages and each is a walk, a reference and a store.
+    pub fn share_range(
         &self,
         parent: &Tables<'a, M>,
-        block: u64,
+        start: u64,
+        count: usize,
         stock: &mut TableStock,
         tlb: &mut Tlb,
     ) -> Result<(), Refused> {
-        for index in 0..ENTRIES {
-            let virt = block + (index as u64) * level_size(0);
+        for index in 0..count {
+            let virt = start + (index as u64) * level_size(0);
             self.share_from(parent, virt, stock, tlb)?;
         }
         Ok(())

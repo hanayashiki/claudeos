@@ -15,7 +15,7 @@
 //! writes the page. Here it is a count.
 
 use mmtest::host::{page_flags, Host, COW, PRESENT, USER, WRITABLE};
-use mmtest::walk::{Machine, Refused, TableStock, Tables, Tlb, DEPTH, SPAN};
+use mmtest::walk::{Machine, Refused, TableStock, Tables, Tlb, DEPTH, ENTRIES, SPAN};
 
 /// Somewhere in the half a program owns, clear of anything else.
 const VIRT: u64 = 0x1000_0000;
@@ -304,7 +304,9 @@ fn a_fork_shares_pages_through_tables_of_its_own() {
     let (child_root, child) = hierarchy(&host);
     let before = host.live();
     let mut spare = stock(&host, DEPTH);
-    child.share_block(&parent, VIRT & !0x1F_FFFF, &mut spare, &mut tlb).expect("the block shares");
+    child
+        .share_range(&parent, VIRT & !0x1F_FFFF, ENTRIES, &mut spare, &mut tlb)
+        .expect("the block shares");
     give_back(&host, &mut spare);
 
     assert_eq!(child.translate(VIRT), Some(page), "the child reaches the same page");
@@ -351,7 +353,7 @@ fn a_fork_leaves_a_read_only_page_as_it_was() {
 
     let (child_root, child) = hierarchy(&host);
     let mut spare = stock(&host, DEPTH);
-    child.share_block(&parent, VIRT & !0x1F_FFFF, &mut spare, &mut tlb).unwrap();
+    child.share_range(&parent, VIRT & !0x1F_FFFF, ENTRIES, &mut spare, &mut tlb).unwrap();
     give_back(&host, &mut spare);
 
     assert_eq!(parent.flags_of(VIRT), Some(PRESENT | USER), "nothing to take away");

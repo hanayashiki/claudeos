@@ -1,20 +1,29 @@
 //! Memory-related system calls.
 //!
-//! Each of these changes the record of regions and the page tables together,
-//! and each takes the address space's lock once and does both under it. Apart,
-//! a sibling thread runs between the two halves and sees a state neither call
-//! ever meant to exist: a range checked free and not yet claimed, a region
-//! removed with its pages still mapped, a page mapped with no region over it.
-//! Those were findings 8 and 9 of docs/audit-2026-09-18-unsafe.md.
+//! Each of these changes the record of regions and the page tables together.
+//! What decides where a mapping goes, what checks the range is free, and what
+//! writes the record down are one step under the address space's lock; so are
+//! reading a descriptor and storing the one that replaces it. Apart, a sibling
+//! thread runs between the halves and sees a state neither call ever meant to
+//! exist: a range checked free and not yet claimed, a page mapped with no
+//! region over it, a descriptor written for a frame the space no longer owns.
+//! Those were findings 5, 8 and 9 of docs/audit-2026-09-18-unsafe.md.
 //!
-//! What the lock may not be held across is anything that allocates, zeroes or
-//! reads a file, because it masks interrupts. A call that needs a page
-//! therefore makes it first and publishes it under the lock, and gives back
-//! what the publish did not take once the lock is let go.
+//! The record goes first and the pages follow, which is what lets a range be
+//! walked in pieces. Once the region is gone, or the break is below the range,
+//! there is nothing left for a fault to publish into, so the lock is let go
+//! between pieces and the sweep cannot be raced from behind. Holding it for
+//! the whole of a range instead masks interrupts for as long as the largest
+//! range takes, which on a 64 MiB one was milliseconds.
+//!
+//! What the lock may not be held across at all is anything that allocates,
+//! zeroes or reads a file, because it masks interrupts. A call that needs a
+//! page therefore makes it first and publishes it under the lock, and gives
+//! back what the publish did not take once the lock is let go.
 
 use crate::abi::*;
 use crate::arch::paging::{is_user_addr, COW, NO_EXECUTE, PRESENT, USER, WRITABLE};
-use crate::mm::space::{Mm, MmGuard, Vma};
+use crate::mm::space::{Mm, Vma};
 use crate::mm::tables::Prepared;
 use crate::mm::{page_align_down, page_align_up, PAGE_SIZE_U64, USER_MMAP_BASE};
 use crate::sched;
@@ -23,6 +32,10 @@ use alloc::sync::Arc;
 
 /// Upper bound on a single mapping, so a bogus length fails fast.
 const MAX_MAPPING: u64 = 1 << 40;
+
+/// How many pages one turn of the lock retags. One last-level table's worth,
+/// for the reason `Mm::unmap_pages` gives for taking a range away in pieces.
+const PAGES_PER_TURN: u64 = crate::mm::walk::ENTRIES as u64;
 
 /// True when `[addr, addr + len)` lies entirely in the half a program owns.
 ///
@@ -62,24 +75,29 @@ fn prot_to_flags(prot: u64) -> u64 {
 
 pub fn brk(request: u64) -> SysResult {
     let mm = current_mm()?;
-    let mut space = mm.lock();
-    let (brk_start, current_brk) = (space.brk_start, space.brk);
-    if request == 0 || request < brk_start {
-        return Ok(current_brk);
-    }
+    let current_brk = {
+        let mut space = mm.lock();
+        let (brk_start, current_brk) = (space.brk_start, space.brk);
+        if request == 0 || request < brk_start {
+            return Ok(current_brk);
+        }
+        let new_brk = page_align_up(request);
+        if new_brk > USER_MMAP_BASE {
+            return Ok(current_brk);
+        }
+        // The bound moves first, in the same step that reads it. A sibling
+        // faulting above the new break is then refused, rather than being
+        // served a page the sweep below has already walked past and so leaves
+        // mapped at an address the program was told nothing is at.
+        // Growth is lazy: pages are faulted in on first touch.
+        space.brk = new_brk;
+        if new_brk >= current_brk {
+            return Ok(new_brk);
+        }
+        current_brk
+    };
     let new_brk = page_align_up(request);
-    if new_brk > USER_MMAP_BASE {
-        return Ok(current_brk);
-    }
-
-    // The bound and the pages move together. Apart, a sibling faulting in the
-    // range the shrink is walking is served a page the shrink has already gone
-    // past, which then stays mapped above a break that says nothing is there.
-    if new_brk < current_brk {
-        space.unmap_range(new_brk, current_brk);
-    }
-    // Growth is lazy: pages are faulted in on first touch.
-    space.brk = new_brk;
+    mm.unmap_pages(new_brk, current_brk);
     Ok(new_brk)
 }
 
@@ -123,15 +141,18 @@ pub fn mmap(
         offset: offset.raw(),
         length: len,
     });
+    if flags & MAP_FIXED != 0 {
+        if addr == 0 || addr & (PAGE_SIZE_U64 - 1) != 0 || !in_user_space(addr, len) {
+            return Err(Errno::EINVAL);
+        }
+        // Replace whatever was there: the region goes and so do its pages,
+        // before anything of this mapping is recorded. The address came from
+        // the program, so there is no placement to hold still around it.
+        mm.unmap_recorded(page_align_down(addr), page_align_up(addr + len));
+    }
     let base = {
         let mut space = mm.lock();
         let base = if flags & MAP_FIXED != 0 {
-            if addr == 0 || addr & (PAGE_SIZE_U64 - 1) != 0 || !in_user_space(addr, len) {
-                return Err(Errno::EINVAL);
-            }
-            // Replace whatever was there: the region goes and so do its pages,
-            // before anything of this mapping is recorded.
-            unmap_recorded(&mut space, addr, len);
             addr
         } else {
             let hint = page_align_down(addr);
@@ -168,7 +189,7 @@ pub fn mmap(
             // A mapping that fails leaves no mapping. What MAP_FIXED took away
             // above is gone either way, because replacing a mapping destroys
             // it before there is anything to put in its place.
-            unmap_recorded(&mut mm.lock(), base, len);
+            mm.unmap_recorded(base, base + len);
             return Err(err);
         }
     }
@@ -228,29 +249,12 @@ fn populate_from_file(
     Ok(())
 }
 
-/// Take a range of regions and every page under them away, under a lock the
-/// caller holds.
-///
-/// The region goes first. A thread sharing the address space that touches this
-/// range while the pages are being taken away faults, and a fault inside a
-/// region that is still recorded is served a fresh page of zeroes: one that
-/// this call has already walked past and so leaves behind, at an address the
-/// program was told nothing is at. With the region gone first there is nothing
-/// here to fault into, which is what an unmapped range is. Both halves are
-/// under the one lock, so no fault can be between them at all.
-fn unmap_recorded(space: &mut MmGuard<'_>, addr: u64, len: u64) {
-    let start = page_align_down(addr);
-    let end = page_align_up(addr + len);
-    space.remove_vma_range(start, end);
-    space.unmap_range(start, end);
-}
-
 pub fn munmap(addr: u64, length: u64) -> SysResult {
     if length == 0 || addr & (PAGE_SIZE_U64 - 1) != 0 || !in_user_space(addr, length) {
         return Err(Errno::EINVAL);
     }
     let mm = current_mm()?;
-    unmap_recorded(&mut mm.lock(), addr, length);
+    mm.unmap_recorded(page_align_down(addr), page_align_up(addr + length));
     Ok(0)
 }
 
@@ -263,26 +267,34 @@ pub fn mprotect(addr: u64, length: u64, prot: u64) -> SysResult {
     let end = page_align_up(addr + length);
     let bits = prot_to_flags(prot);
 
-    let mut space = mm.lock();
+    // The record changes first, so a page faulted in while the pages already
+    // there are being retagged arrives with the protection that was asked for
+    // rather than the one being replaced. That is what lets the lock be let go
+    // between pieces of a long range.
+    mm.lock().set_vma_prot(start, end, prot);
+
     let mut page = start;
     while page < end {
-        // Only pages that exist are retagged; the rest inherit the new
-        // protection when they fault in. A page still shared after a fork
-        // keeps its copy-on-write mark and stays read-only whatever is asked
-        // for: the copy happens when it is written to, as before.
-        //
-        // What the descriptor says and what is stored back are one step under
-        // the lock. Apart, a sibling's unmap between them stored a descriptor
-        // for a frame this address space no longer owned, and a sibling's
-        // copy-on-write break stored the shared frame back over the private
-        // copy it had just made.
-        if let Some(existing) = space.flags_of(page) {
-            let bits = if existing & COW != 0 { (bits & !WRITABLE) | COW } else { bits };
-            space.protect(page, bits);
+        let stop = end.min(page + PAGES_PER_TURN * PAGE_SIZE_U64);
+        let mut space = mm.lock();
+        while page < stop {
+            // Only pages that exist are retagged; the rest inherit the new
+            // protection when they fault in. A page still shared after a fork
+            // keeps its copy-on-write mark and stays read-only whatever is
+            // asked for: the copy happens when it is written to, as before.
+            //
+            // What the descriptor says and what is stored back are one step
+            // under the lock. Apart, a sibling's unmap between them stored a
+            // descriptor for a frame this address space no longer owned, and a
+            // sibling's copy-on-write break stored the shared frame back over
+            // the private copy it had just made.
+            if let Some(existing) = space.flags_of(page) {
+                let bits = if existing & COW != 0 { (bits & !WRITABLE) | COW } else { bits };
+                space.protect(page, bits);
+            }
+            page += PAGE_SIZE_U64;
         }
-        page += PAGE_SIZE_U64;
     }
-    space.set_vma_prot(start, end, prot);
     Ok(0)
 }
 
@@ -295,7 +307,7 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, _flags: u64) -> SysRe
     let mm = current_mm()?;
     if new_size <= old_size {
         if new_size < old_size {
-            unmap_recorded(&mut mm.lock(), old_addr + new_size, old_size - new_size);
+            mm.unmap_recorded(old_addr + new_size, old_addr + old_size);
         }
         return Ok(old_addr);
     }
@@ -345,6 +357,6 @@ pub fn mremap(old_addr: u64, old_size: u64, new_size: u64, _flags: u64) -> SysRe
     // read-only page.
     let task = sched::current();
     uaccess::copy_within_user_in(&task, base, old_addr, old_size.min(new_size))?;
-    unmap_recorded(&mut mm.lock(), old_addr, old_size);
+    mm.unmap_recorded(old_addr, old_addr + old_size);
     Ok(base)
 }
